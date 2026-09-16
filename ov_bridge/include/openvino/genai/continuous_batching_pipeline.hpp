@@ -1,0 +1,372 @@
+// Copyright (C) 2023-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <optional>
+
+#include <openvino/runtime/tensor.hpp>
+
+#include "openvino/genai/scheduler_config.hpp"
+#include "openvino/genai/tokenizer.hpp"
+#include "openvino/genai/generation_config.hpp"
+#include "openvino/genai/generation_handle.hpp"
+#include "openvino/genai/llm_pipeline.hpp"
+#include "openvino/genai/streamer_base.hpp"
+#include "openvino/genai/visibility.hpp"
+#include "openvino/genai/visual_language/pipeline.hpp"
+#include "openvino/genai/visual_language/video_metadata.hpp"
+
+#include "openvino/genai/cache_eviction.hpp"
+
+namespace ov::genai {
+
+class ContinuousBatchingAdapter;
+
+/**
+ * @brief Contains general pipeline metrics, either aggregated throughout the lifetime of the generation pipeline
+ * or measured at the previous generation step.
+ */
+struct PipelineMetrics {
+    /**
+     * Number of requests to be processed by the pipeline.
+     */
+    size_t requests = 0;
+
+    /**
+     * Number of requests that were scheduled for processing at the previous step of the pipeline.
+     */
+    size_t scheduled_requests = 0;
+
+    /**
+    * Maximum cache usage percentage across registered cache types in the last generation step.
+    */
+    float cache_usage = 0.0;
+
+    /**
+    * Maximum cache usage percentage observed during the last .generate() call.
+    */
+    float max_cache_usage = 0.0;
+
+    /**
+    * Running average of cache usage percentage during the last .generate() call, with max window size of 1000 internal model inferences.
+    */
+    float avg_cache_usage = 0.0;
+
+    /**
+     * Duration of the last generation step in microseconds.
+     */
+    float inference_duration = 0.0;
+
+    /**
+    * Total allocated cache size in bytes across registered cache types, based on the total number of cache blocks.
+     * This value represents reserved/allocated memory for the cache and does not
+     * distinguish between used and unused portions in dynamic cache configurations.
+     */
+    size_t cache_size_in_bytes = 0;
+
+    /**
+     * @deprecated Use cache_size_in_bytes instead. Kept for backward compatibility.
+     * Reference alias that always points to cache_size_in_bytes.
+     */
+    size_t& kv_cache_size_in_bytes{cache_size_in_bytes};
+
+    PipelineMetrics() = default;
+    ~PipelineMetrics() = default;
+
+    PipelineMetrics(const PipelineMetrics& other)
+        : requests{other.requests},
+          scheduled_requests{other.scheduled_requests},
+          cache_usage{other.cache_usage},
+          max_cache_usage{other.max_cache_usage},
+          avg_cache_usage{other.avg_cache_usage},
+          inference_duration{other.inference_duration},
+          cache_size_in_bytes{other.cache_size_in_bytes},
+          kv_cache_size_in_bytes{cache_size_in_bytes} {}
+
+    PipelineMetrics& operator=(const PipelineMetrics& other) {
+        requests = other.requests;
+        scheduled_requests = other.scheduled_requests;
+        cache_usage = other.cache_usage;
+        max_cache_usage = other.max_cache_usage;
+        avg_cache_usage = other.avg_cache_usage;
+        inference_duration = other.inference_duration;
+        cache_size_in_bytes = other.cache_size_in_bytes;
+        return *this;
+    }
+
+    PipelineMetrics(PipelineMetrics&& other) noexcept
+        : requests{std::move(other.requests)},
+          scheduled_requests{std::move(other.scheduled_requests)},
+          cache_usage{std::move(other.cache_usage)},
+          max_cache_usage{std::move(other.max_cache_usage)},
+          avg_cache_usage{std::move(other.avg_cache_usage)},
+          inference_duration{std::move(other.inference_duration)},
+          cache_size_in_bytes{std::move(other.cache_size_in_bytes)},
+          kv_cache_size_in_bytes{cache_size_in_bytes} {}
+
+    PipelineMetrics& operator=(PipelineMetrics&& other) noexcept {
+        requests = std::move(other.requests);
+        scheduled_requests = std::move(other.scheduled_requests);
+        cache_usage = std::move(other.cache_usage);
+        max_cache_usage = std::move(other.max_cache_usage);
+        avg_cache_usage = std::move(other.avg_cache_usage);
+        inference_duration = std::move(other.inference_duration);
+        cache_size_in_bytes = std::move(other.cache_size_in_bytes);
+        return *this;
+    }
+};
+
+class OPENVINO_GENAI_EXPORTS ContinuousBatchingPipeline {
+protected:
+    class IContinuousBatchingPipeline;
+    class ContinuousBatchingImpl;
+
+    class ContinuousBatchingForSpeculativeDecodingImpl;
+    class ContinuousBatchingForEagle3DecodingImpl;
+    class ContinuousBatchingForPromptLookupImpl;
+    class SpeculativeDecodingImpl;
+    class Eagle3DecodingImpl;
+    class PromptLookupImpl;
+
+    friend class ContinuousBatchingForSpeculativeDecodingImpl;
+    
+    friend class ContinuousBatchingForPromptLookupImpl;
+    friend class ContinuousBatchingForEagle3DecodingImpl;
+    friend class SpeculativeDecodingImpl;
+    friend class Eagle3DecodingImpl;
+    friend class PromptLookupImpl;
+    friend class VLMPipeline;
+    friend class ContinuousBatchingAdapter;
+
+    std::shared_ptr<IContinuousBatchingPipeline> m_impl;
+
+    ContinuousBatchingPipeline() = default;
+
+private:
+    // Uses preloaded language model to avoid redundant read_model() during pipeline initialization.
+    ContinuousBatchingPipeline(const std::shared_ptr<ov::Model>& language_model,
+                               const ModelsMap& models_map,
+                               const ov::genai::Tokenizer& tokenizer,
+                               const SchedulerConfig& scheduler_config,
+                               const std::string& device,
+                               std::optional<std::filesystem::path> embedder_config_dir_path = std::nullopt,
+                               const ov::AnyMap& properties = {},
+                               const ov::genai::GenerationConfig& generation_config = {}
+    );
+
+    ContinuousBatchingPipeline(const std::shared_ptr<ov::Model>& language_model,
+                               const std::filesystem::path& models_path,
+                               const SchedulerConfig& scheduler_config,
+                               const std::string& device,
+                               const ov::AnyMap& properties = {},
+                               const ov::AnyMap& tokenizer_properties = {},
+                               const ov::AnyMap& vision_encoder_properties = {});
+
+    // Used by LLMPipeline's ContinuousBatchingAdapter when the language model is already loaded.
+    // model_config_dir keeps access to config.json for Eagle3 metadata and to a stable cache path.
+    ContinuousBatchingPipeline(const std::shared_ptr<ov::Model>& language_model,
+                               const ov::genai::Tokenizer& tokenizer,
+                               const SchedulerConfig& scheduler_config,
+                               const std::string& device,
+                               const ov::AnyMap& properties,
+                               const ov::genai::GenerationConfig& generation_config,
+                               const std::filesystem::path& model_config_dir = {});
+
+public:
+    ContinuousBatchingPipeline(const std::filesystem::path& models_path,
+                               const SchedulerConfig& scheduler_config,
+                               const std::string& device,
+                               const ov::AnyMap& properties = {},
+                               const ov::AnyMap& tokenizer_properties = {},
+                               const ov::AnyMap& vision_encoder_properties = {});
+
+    /**
+    * @brief Constructs a ContinuousBatchingPipeline when ov::genai::Tokenizer is initialized manually using file from the different dirs.
+    *
+    * @param models_path Path to the dir with model, tokenizer .xml/.bin files, and generation_configs.json
+    * @param scheduler_config
+    * @param tokenizer manually initialized ov::genai::Tokenizer
+    * @param device optional device
+    * @param properties optional properties
+    */
+    ContinuousBatchingPipeline(
+        const std::filesystem::path& models_path,
+        const ov::genai::Tokenizer& tokenizer,
+        const SchedulerConfig& scheduler_config,
+        const std::string& device,
+        const ov::AnyMap& properties = {}
+    );
+
+    /**
+     * @brief Constructs a ContinuousBatchingPipeline from already existing model and tokenizer.
+     * 
+     * This constructor allows for the creation of a ContinuousBatchingPipeline using an existing model
+     * represented as a string and a weights tensor, along with a manually initialized tokenizer.
+     * This is useful when the model and tokenizer are already loaded or created in memory and do not
+     * need to be loaded from files.
+     *
+     * @param model_str A string representation of the model.
+     * @param weights_tensor A tensor containing the weights of the model.
+     * @param tokenizer A manually initialized ov::genai::Tokenizer.
+     * @param scheduler_config Configuration for the scheduler.
+     * @param device The device to run the pipeline on (e.g., CPU, GPU).
+     * @param properties Optional properties for the pipeline.
+     * @param generation_config Optional generation configuration for the pipeline.
+     */
+    ContinuousBatchingPipeline(
+        const std::string& model_str,
+        const ov::Tensor& weights_tensor,
+        const ov::genai::Tokenizer& tokenizer,
+        const SchedulerConfig& scheduler_config,
+        const std::string& device,
+        const ov::AnyMap& properties = {},
+        const ov::genai::GenerationConfig& generation_config = {}
+    );
+
+    /**
+    * @brief Constructs a ContinuousBatchingPipeline from models map.
+    *
+    * @param models_map  A map where key is model name (e.g. "vision_embeddings", "text_embeddings", "language", "resampler") 
+    * and value is a pair of model IR as string and weights as tensor.
+    * @param tokenizer A manually initialized ov::genai::Tokenizer.
+    * @param scheduler_config Configuration for the scheduler.
+    * @param device The device to run the pipeline on (e.g., CPU, GPU).
+    * @param embedder_config_dir_path Optional path to a directory containing embedder config.
+    * @param properties Optional properties for the pipeline.
+    * @param generation_config Optional generation configuration for the pipeline.
+    */
+    ContinuousBatchingPipeline(
+        const ModelsMap& models_map,
+        const ov::genai::Tokenizer& tokenizer,
+        const SchedulerConfig& scheduler_config,
+        const std::string& device,
+        std::optional<std::filesystem::path> embedder_config_dir_path = std::nullopt,
+        const ov::AnyMap& properties = {},
+        const ov::genai::GenerationConfig& generation_config = {}
+    );
+
+    ov::genai::Tokenizer get_tokenizer() const;
+
+    ov::genai::GenerationConfig get_config() const;
+    void set_config(const ov::genai::GenerationConfig& config);
+
+    /**
+     * Allows to get the current pipeline metrics.
+     * @return The struct with pipeline metrics for the previous generation step.
+     */
+    ov::genai::PipelineMetrics get_metrics() const;
+
+    /// @param request_id must be unique for every add_request() call.
+    GenerationHandle add_request(uint64_t request_id, const ov::Tensor& input_ids, const ov::genai::GenerationConfig& sampling_params);
+    GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const ov::genai::GenerationConfig& sampling_params);
+    GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const ov::genai::GenerationConfig& sampling_params);
+    GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const std::vector<ov::Tensor>& videos, const ov::genai::GenerationConfig& sampling_params);
+
+    GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const ov::AnyMap& properties_map);
+
+    template <typename... Properties>
+    util::EnableIfAllStringAny<GenerationHandle, Properties...> add_request(
+        uint64_t request_id,
+        const std::string& prompt,
+        Properties&&... properties
+    ) {
+        return add_request(request_id, prompt, AnyMap{std::forward<Properties>(properties)...});
+    }
+
+
+    void step();
+
+    bool has_non_finished_requests();
+
+    /// Higher level interface, which can process multiple prompts in continuous batching manner
+    std::vector<EncodedGenerationResult> generate(const std::vector<ov::Tensor>& input_ids, const std::vector<ov::genai::GenerationConfig>& sampling_params, const ov::genai::StreamerVariant& streamer=std::monostate{});
+    std::vector<GenerationResult> generate(const std::vector<std::string>& prompts, const std::vector<ov::genai::GenerationConfig>& sampling_params, const ov::genai::StreamerVariant& streamer=std::monostate{});
+    
+    std::vector<GenerationResult> generate(
+        const std::vector<ChatHistory>& histories,
+        const std::vector<ov::genai::GenerationConfig>& sampling_params,
+        const ov::genai::StreamerVariant& streamer=std::monostate{});
+
+    std::vector<VLMDecodedResults> generate(
+             const std::vector<std::string>& prompts,
+             const std::vector<std::vector<ov::Tensor>>& images,
+             const std::vector<GenerationConfig>& sampling_params,
+             const StreamerVariant& streamer=std::monostate{});
+
+    std::vector<VLMDecodedResults> generate(
+        const std::vector<std::string>& prompts,
+        const std::vector<std::vector<ov::Tensor>>& images,
+        const std::vector<std::vector<ov::Tensor>>& videos,
+        const std::vector<GenerationConfig>& sampling_params,
+        const StreamerVariant& streamer=std::monostate{});
+
+    std::vector<VLMDecodedResults> generate(
+        const std::vector<std::string>& prompts,
+        const ov::AnyMap& properties_map
+    );
+
+    template <typename... Properties>
+    util::EnableIfAllStringAny<std::vector<VLMDecodedResults>, Properties...> generate(
+        const std::vector<std::string>& prompts,
+        Properties&&... properties
+    ) {
+        return generate(prompts, AnyMap{std::forward<Properties>(properties)...});
+    }
+    
+    std::vector<VLMDecodedResults> generate(
+        const std::vector<ChatHistory>& histories,
+        const std::vector<std::vector<ov::Tensor>>& images,
+        const std::vector<GenerationConfig>& sampling_params,
+        const StreamerVariant& streamer=std::monostate{});
+
+    std::vector<VLMDecodedResults> generate(
+        const std::vector<ChatHistory>& histories,
+        const std::vector<std::vector<ov::Tensor>>& images,
+        const std::vector<std::vector<ov::Tensor>>& videos,
+        const std::vector<GenerationConfig>& sampling_params,
+        const StreamerVariant& streamer=std::monostate{});
+
+    std::vector<VLMDecodedResults> generate(
+        const std::vector<ChatHistory>& histories,
+        const ov::AnyMap& properties_map
+    );
+
+    template <typename... Properties>
+    util::EnableIfAllStringAny<std::vector<VLMDecodedResults>, Properties...> generate(
+        const std::vector<ChatHistory>& histories,
+        Properties&&... properties
+    ) {
+        return generate(histories, AnyMap{std::forward<Properties>(properties)...});
+    }
+
+    /**
+    * @brief start chat with keeping history in kv cache.
+    * @param system_message optional system message.
+    */
+    void start_chat(const std::string& system_message = {});
+
+    /**
+    * @brief finish chat and clear kv cache.
+    */
+    void finish_chat();
+};
+
+static constexpr ov::Property<std::vector<GenerationConfig>> generation_config_batches{"generation_config_batches"};
+
+OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> images_batches(
+    const std::vector<std::vector<ov::Tensor>>& images_batches
+);
+
+OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> videos_batches(
+    const std::vector<std::vector<ov::Tensor>>& videos_batches
+);
+
+OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> videos_metadata_batches(
+    const std::vector<std::vector<VideoMetadata>>& videos_metadata_batches
+);
+
+}

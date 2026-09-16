@@ -1,0 +1,9 @@
+/target/
+*.keys.json
+config.json
+config.*.json
+/ov_cache/
+*.blob
+.DS_Store
+.idea/
+.vscode/

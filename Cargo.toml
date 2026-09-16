@@ -1,0 +1,183 @@
+[lints.clippy]
+# Hard lints — enforced across the whole crate
+# CRASH COURSE — priority = -1:
+#   Cargo lint tables have a priority system. Without it, `pedantic`
+#   (a group) and `unwrap_used` (individual lints) have the same
+#   priority 0, so Cargo can't decide which wins. Setting pedantic to
+#   priority -1 means the individual deny lints (priority 0) override
+#   the group. This is clippy enforcing its own hygiene — it literally
+#   refuses to compile without the correct priority.
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[package]
+name = "rustedvino"
+version = "0.6.8"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "OpenAI-compatible inference server for Intel GPUs/NPU/CPU, built on OpenVINO GenAI"
+repository = "https://github.com/Jermalk/rustedvino-oe"
+readme = "README.md"
+authors = ["Jerzy Marek Majchrzak"]
+keywords = ["openvino", "llm", "inference", "intel-gpu", "openai-api"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[dependencies]
+# HTTP framework — axum is the standard for async Rust APIs
+# Tower middleware (CORS, auth) integrates natively.
+# `multipart`: STT `/v1/audio/transcriptions` takes a multipart/form-data file
+# upload, parsed with axum's built-in `Multipart` extractor (Phase 5.1).
+axum = { version = "0.8", features = ["multipart", "ws"] }
+
+# Async runtime — the engine that runs all our async code
+# "full" enables timers, channels, spawn_blocking (needed for OV calls)
+tokio = { version = "1", features = ["full"] }
+
+# JSON serialisation / deserialisation
+# #[derive(Serialize, Deserialize)] makes structs ↔ JSON automatic
+serde = { version = "1", features = ["derive"] }
+# preserve_order: keep JSON object key order through parse→render so the chat
+# template emits tool schemas in the order the client sent them — required to
+# byte-match HF `apply_chat_template` (which preserves insertion order).
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Structured logging — axum and tokio emit native tracing spans
+# RUST_LOG=debug cargo run  →  verbose output
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Application error handling — anyhow::Result<T> = Result<T, any error>
+# The ? operator propagates errors up the call stack (like Go's if err != nil)
+anyhow = "1"
+
+# Test helpers — only compiled for `cargo test`, not production builds
+# CRASH COURSE — [dev-dependencies]:
+#   These crates are compiled only when running `cargo test` or `cargo bench`.
+#   They never land in the release binary. Zero production cost.
+#
+#   tower = the middleware stack axum is built on. `ServiceExt` adds
+#           `.oneshot(request)` — fires one request into a Router without
+#           starting a real TCP listener. Fast, deterministic, no ports.
+#
+#   http-body-util = utilities for consuming async HTTP bodies.
+#           `.collect().await` drains a streaming body into bytes.
+#           Already in the dep tree (axum uses it); we just make it explicit.
+# Token streaming: wraps tokio mpsc::Receiver as a futures Stream
+# ReceiverStream<T> lives here; needed by the SSE handler
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
+
+# Stream combinators: flat_map, map, etc.
+# Used in chat handler to expand one StreamEvent into multiple SSE frames
+futures-util = "0.3"
+
+# Chat-template rendering (tool-call prompt injection). minijinja executes the
+# model's own Jinja chat_template. The `json` feature adds the `tojson` filter
+# that HF templates use to embed tool schemas; default features bring the
+# `context!` macro + builtins. We render from an in-memory string, so no
+# `loader` feature is needed.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
+# pycompat: HF chat templates call Python str methods (.split/.strip/.startswith
+# /.endswith/.replace) that minijinja core lacks. Wired via
+# set_unknown_method_callback — MANDATORY for the Qwen3 template to render.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+# Tool-call extraction from raw model output (<tool_call>…</tool_call> and the
+# Mistral name{json} form). Patterns are compiled once behind OnceLock.
+regex = "1"
+
+# Date/time formatting for the `strftime_now` Jinja function used by Mistral
+# chat templates. `chrono` is the standard Rust date library; we only need
+# the `clock` feature (Local::now) — no timezone DB needed.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Tower middleware layers (CORS). tower-http 0.6 pairs with axum 0.8.
+# Only the `cors` feature — one CorsLayer in create_router lets browser clients
+# (Open WebUI etc.) reach the API. Allowed origins come from config (default "*").
+tower-http = { version = "0.6", features = ["cors"] }
+
+# UUIDv4 generation for the x-request-id response header (request tracing).
+# v4 = random; no MAC/time leakage. Used only when the client sends no
+# x-client-request-id of its own to echo back.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Constant-time bearer-key comparison (`require_bearer_auth`) — a plain `==`
+# short-circuits on the first mismatched byte, letting response timing leak
+# how many leading characters of a guessed key were correct. Already in the
+# dependency tree transitively (via a TLS crate); declared directly here
+# because we call it ourselves.
+subtle = "2"
+
+# Lock-free swappable auth state (`AppState::auth`, `ModelManager::auth`) —
+# `require_bearer_auth` runs on every request across every worker thread;
+# `ArcSwap::load()` is a wait-free read, unlike an `RwLock::read()`'s atomic
+# RMW on a shared cache line for a value that changes maybe once a month.
+# Lets `POST /v1/admin/keys/reload` rotate API keys with no server restart
+# (no dropped connections, no VRAM-resident models evicted). Note that is the
+# KEYS reload endpoint — `config/reload` never touches keys.
+arc-swap = "1"
+
+# Prometheus /metrics (Phase 3.3). `metrics` is the instrumentation facade
+# (gauge!/counter!/describe_* macros); `metrics-exporter-prometheus` installs
+# a global recorder and renders the text exposition format. Names mirror vLLM
+# for ecosystem compatibility. Served same-port on :11437 (no second socket).
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# VLM image decoding (Phase 5.1):
+#   image: decode JPEG/PNG/WebP bytes → raw RGB pixels (NHWC uint8)
+#   base64ct: decode the base64 payload of OpenAI data-URI image attachments
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+base64ct = { version = "1", features = ["alloc"] }
+
+# Image-gen `model_hash` (Phase 5.3, PLAN_image_metadata_response.md Tier 2):
+# SHA-256 of the model's primary backbone weight file, computed once at load
+# time. No `unsafe`, no OS dependency — pure Rust hashing.
+sha2 = "0.10"
+
+# STT audio decoding (Phase 5.1c):
+#   symphonia: decode an uploaded audio file (wav/mp3/ogg/flac/m4a) → PCM f32.
+#     `wav` needs the `pcm` codec; `mp3`/`ogg`+`vorbis`/`flac`/`isomp4`+`aac`+
+#     `alac` cover the common OpenAI client upload formats. Pure Rust, no GPU.
+#   rubato: resample the decoded PCM to Whisper's required 16 kHz mono f32
+#     (high-quality sinc interpolation). Pure Rust, unit-testable off-GPU.
+symphonia = { version = "0.5", features = ["wav", "pcm", "mp3", "ogg", "vorbis", "flac", "isomp4", "aac", "alac"] }
+rubato = "0.16"
+
+# Kokoro-82M ONNX TTS (Phase 5.2b): pure-Rust ORT inference via kokoro-tts.
+# Apache-2.0; no espeak-ng system dep (English CMUdict phonemizer built in).
+kokoro-tts = "0.3.3"
+
+# Direct ORT session for the Polish VITS TTS backend (Coqui `pl/mai_female/vits`,
+# BSD-3-Clause weights — see dev/DECISIONS.md). Character-based model, no
+# phonemizer dependency (unlike Piper/espeak-ng, GPL-3.0, deliberately avoided —
+# see the same DECISIONS.md entry). Version pinned to match the one `kokoro-tts`
+# already locks, so no duplicate ORT build in the dependency tree.
+ort = "=2.0.0-rc.12"
+
+# Windows-only: live system-RAM read for the M1 memory admission gate
+# (os_memory::available_ram_gb / total_ram_gb). `sysinfo` wraps
+# GlobalMemoryStatusEx safely — no hand-rolled unsafe FFI. Linux keeps its
+# dependency-free /proc/meminfo reader, so this adds nothing to Linux builds.
+[target.'cfg(windows)'.dependencies]
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+# Unix-only: raw sigaction/backtrace FFI for crash_handler (native SIGSEGV/
+# SIGABRT logging — OpenVINO's C++ runtime can segfault on a model's engine
+# thread with nothing landing in the app log otherwise; see dev/DECISIONS.md).
+# No such handler on Windows yet — SEH crash reporting is a separate concern.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# Compiles ov_bridge/ov_bridge.cpp into a static library linked into the binary.
+# cc is the standard crate for building C/C++ code from build.rs.
+cc = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+

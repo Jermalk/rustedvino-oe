@@ -1,0 +1,1407 @@
+#!/usr/bin/env python3
+"""rv — Ollama-shaped management CLI for RustedVINO's admin API.
+
+Stdlib only (argparse + urllib) so it runs anywhere with no venv setup.
+Config resolution, most explicit first: RUSTEDVINO_CONFIG, else a
+config.json next to this script (the release-bundle layout), else a
+per-host shortcut, else /opt/rustedvino/config.json. The middle two are
+rv's own conveniences -- it does NOT resolve identically to the server,
+which knows only the env var and the default.
+
+Keys DO follow the server's convention exactly
+(src/model_manager/config.rs's resolve_keys_file_path): the resolved
+config's own "keys_file" field if set, else <config-stem>.keys.json next
+to it.
+
+    rv status                 full server report (process/health/auth/models/VRAM)
+    rv list                   registered models, PLUS on-disk-but-unregistered ones
+    rv ps                     loaded models only, with live KV%/in-flight counts
+    rv check MODEL            dry-run admission check — what would loading it evict?
+    rv add MODEL --vram-gb F  register an on-disk model (see `rv list`) and load it (needs -y)
+    rv load MODEL [opts]      load an already-registered model (runs a check first; confirms if it evicts)
+    rv unload MODEL           evict a model from VRAM (stays registered)
+    rv deregister MODEL       remove a model from the registry + config.json (needs -y)
+    rv logs [-n N]            tail the last N server log lines
+    rv reload-config          pick up config.json edits — registers new/changed entries, loads/evicts nothing
+
+A model must be registered (`rv add`, or a `config.json` stanza) before `rv
+load` can load it — a directory sitting under models_dir isn't enough on its
+own; `rv list`'s second section shows exactly which ones still need `add`.
+
+Not wrapped yet (use curl directly, or ask for it to be added):
+    POST   /v1/admin/models/{id}/resize      resize a live model's KV pool
+    GET    /v1/admin/models/completeness     per-model file-completeness report
+    POST   /v1/admin/keys/reload             reload the keys file
+    GET    /v1/admin/voice-pin               read the current voice-flow pin
+    GET    /v1/admin/realtime/sessions       list realtime sessions
+    GET    /v1/admin/realtime/sessions/{id}  one session's detail
+    DELETE /v1/admin/realtime/sessions/{id}  close one
+The router in src/lib.rs is the source of truth for this list -- regenerate it
+from there rather than trusting this comment. It had drifted before: `resize`
+and `completeness` both shipped without being added here, so anyone writing
+docs from this docstring concluded `rv` wrapped them.
+
+Admin key: read locally from the resolved keys file (see above). Override
+with RV_ADMIN_KEY, or --admin-key.
+
+Port: taken from the resolved config's own "port" (so `rv` and the server
+cannot disagree about where the server is), falling back to 11437 -- the
+server's own default. Override with --port or RV_PORT. The HOST is always
+localhost and is not configurable: `rv` reads the PID file, the log file and
+models_dir directly off this machine, so pointing it at a remote server would
+leave half its output describing the local box.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import timedelta
+
+# The server binary's argv[0] basename, both layouts: a source build runs
+# `rustedvino` out of target/release/, a released bundle runs `rustedvino-bin`
+# next to its launcher. Matching a dev-tree PATH instead made every packaged
+# server invisible to `rv`.
+SERVER_ARGV0_NAMES = ("rustedvino", "rustedvino-bin")
+# For pgrep -f, which matches the whole command line.
+SERVER_PGREP_PATTERN = r"rustedvino(-bin)?$"
+
+# Matches the server's own `default_port()` (src/model_manager/config.rs).
+# Only a FALLBACK: the resolved config's own "port" wins, and --port/RV_PORT
+# win over that -- see `Ctx.__init__`. `rv` drives a server on this machine
+# (it reads the PID file, the log file and models_dir directly), so the host
+# is deliberately not configurable; a --host would make half the subcommands
+# report on one machine and half on another.
+DEFAULT_PORT = 11437
+READ_TIMEOUT = 5
+MUTATE_TIMEOUT = 300  # load/unload/deregister can legitimately take 10-60s+
+
+# No per-host shortcuts in the public build -- resolution always falls
+# through to RUSTEDVINO_CONFIG / DEFAULT_CONFIG below.
+HOST_PREFIX: dict[str, str] = {}
+
+# Matches the server's own default (no hardcoded paths except this one).
+DEFAULT_CONFIG = "/opt/rustedvino/config.json"
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def green(t: str) -> str:
+    return c("32", t)
+
+
+def red(t: str) -> str:
+    return c("31", t)
+
+
+def yellow(t: str) -> str:
+    return c("33", t)
+
+
+def dim(t: str) -> str:
+    return c("2", t)
+
+
+def bold(t: str) -> str:
+    return c("1", t)
+
+
+OK, BAD, WARN = green("●"), red("●"), yellow("●")
+
+
+def repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def resolve_keys_file_path(config_path: str, explicit: str | None) -> str:
+    """Mirrors src/model_manager/config.rs's resolve_keys_file_path exactly,
+    so `rv` and the server always agree on where the keys file lives for a
+    given config. `explicit` is that config's own "keys_file" field, if set;
+    relative values resolve against the config file's own directory, never
+    cwd. With no explicit override: strip a trailing ".config.json" (or bare
+    ".json") off the config's filename and append ".keys.json"."""
+    config_dir = os.path.dirname(config_path) or "."
+    if explicit:
+        return explicit if os.path.isabs(explicit) else os.path.join(config_dir, explicit)
+    name = os.path.basename(config_path)
+    if name.endswith(".config.json"):
+        stem = name[: -len(".config.json")]
+    elif name.endswith(".json"):
+        stem = name[: -len(".json")]
+    else:
+        stem = name
+    return os.path.join(config_dir, f"{stem}.keys.json")
+
+
+class Api:
+    """Thin HTTP client for the admin API. Raw JSON/text/error, no formatting."""
+
+    def __init__(self, admin_key: str | None, base: str):
+        self.admin_key = admin_key
+        self.base = base
+
+    def _request(self, path: str, method: str, timeout: int, body: dict | None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if self.admin_key:
+            req.add_header("Authorization", f"Bearer {self.admin_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", "replace")
+                try:
+                    return resp.status, json.loads(text), None
+                except json.JSONDecodeError:
+                    return resp.status, text, None
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", "replace")
+            return e.code, None, body_text or e.reason
+        except (urllib.error.URLError, OSError) as e:
+            return None, None, str(e)
+
+    def get(self, path: str, timeout: int = READ_TIMEOUT):
+        return self._request(path, "GET", timeout, None)
+
+    def post(self, path: str, body: dict | None = None, timeout: int = MUTATE_TIMEOUT):
+        return self._request(path, "POST", timeout, body)
+
+    def delete(self, path: str, timeout: int = MUTATE_TIMEOUT):
+        return self._request(path, "DELETE", timeout, None)
+
+    def patch(self, path: str, body: dict, timeout: int = MUTATE_TIMEOUT):
+        return self._request(path, "PATCH", timeout, body)
+
+
+# ── formatting helpers ──────────────────────────────────────────────────────
+
+def human_bytes(n: float) -> str:
+    return f"{n / 1e9:.1f} GB"
+
+
+def bar(used: float, total: float, width: int = 20) -> str:
+    if total <= 0:
+        return dim("n/a")
+    frac = max(0.0, min(1.0, used / total))
+    filled = round(frac * width)
+    glyph = "#" * filled + "." * (width - filled)
+    pct = frac * 100
+    color = green if pct < 75 else (yellow if pct < 92 else red)
+    return f"[{color(glyph)}] {pct:4.0f}%"
+
+
+VRAM_ESTIMATE_MARGIN = 1.08  # OpenVINO's own device-side allocation runs a bit
+                              # above raw weight bytes (alignment/padding) --
+                              # calibrated against ministral-3-3b-int8-ov: its
+                              # openvino_model.bin is ~3.2 GiB on disk against a
+                              # real, working configured vram_gb of 3.3.
+
+
+def estimate_vram_gb(model_dir: str) -> tuple[float, float] | None:
+    """(raw_disk_gb, estimated_vram_gb), or None if the directory has nothing
+    in it (missing/empty) to estimate from. Sums every file under the model's
+    directory recursively -- not just the obvious `openvino_model.bin` --
+    since some kinds (image-gen's unet/vae/text_encoder, VLM's separate
+    vision-tower weights) split weights across several files with no single
+    dominant one, and the small metadata files (tokenizer/config JSON) this
+    would also catch are noise at the KB scale against GB-scale weights."""
+    total_bytes = 0
+    found = False
+    for root, _dirs, files in os.walk(model_dir):
+        for f in files:
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, f))
+                found = True
+            except OSError:
+                pass
+    if not found:
+        return None
+    raw_gb = total_bytes / 1e9
+    return raw_gb, round(raw_gb * VRAM_ESTIMATE_MARGIN, 1)
+
+
+def fmt_uptime(pid: int) -> str:
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "etimes=", "-p", str(pid)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return str(timedelta(seconds=int(out)))
+    except Exception:
+        return "unknown"
+
+
+def worker_pid(supervisor_pid: int) -> int | None:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(supervisor_pid), "-f", SERVER_PGREP_PATTERN],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        return int(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
+def pid_listening_on(port: int) -> int | None:
+    """PID of the process holding a LISTEN socket on `port`, or None.
+
+    Why this exists: `rv` used to report whatever rustedvino process the PID
+    file (or a process scan) turned up, with no link to the server it was
+    actually talking to. Run two instances -- a packaged bundle on one port and
+    a dev server on another -- and `rv status --port <bundle>` would print the
+    DEV server's PID and uptime above the bundle's own health. Measured, not
+    hypothetical.
+
+    Pure stdlib, no `ss`/`lsof`: read the LISTEN sockets for `port` out of
+    /proc/net/tcp{,6}, collect their inodes, then find the process holding a
+    matching socket fd. Returns None when it cannot tell -- notably when the
+    socket belongs to ANOTHER user, since /proc/<pid>/fd is unreadable then.
+    None means "unknown", never "not running".
+    """
+    inodes = set()
+    for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_net) as fh:
+                next(fh, None)  # header
+                for line in fh:
+                    f = line.split()
+                    if len(f) < 10:
+                        continue
+                    # local_address is HEX_IP:HEX_PORT; st == 0A is TCP_LISTEN
+                    if f[3] != "0A":
+                        continue
+                    try:
+                        if int(f[1].rsplit(":", 1)[1], 16) == port:
+                            inodes.add(f[9])
+                    except (ValueError, IndexError):
+                        continue
+        except OSError:
+            continue
+    if not inodes:
+        return None
+
+    targets = {f"socket:[{ino}]" for ino in inodes}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") in targets:
+                        return int(entry)
+                except OSError:
+                    continue
+        except OSError:
+            continue  # not ours, or gone
+    return None
+
+
+def parent_pid(pid: int) -> int | None:
+    """PPID of `pid` from /proc, or None. Stdlib; no `ps` dependency."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def is_rustedvino_pid(pid: int) -> bool:
+    """True when `pid` is a live process whose argv[0] is the rustedvino binary.
+
+    Guards against PID reuse: a stale PID file can name a PID the kernel has
+    since handed to something unrelated, and a bare `os.kill(pid, 0)` liveness
+    probe would then report a stranger's process as the server.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return False
+    # Match on the BASENAME, not a dev-tree path. This used to require argv0 to
+    # end with "target/release/rustedvino", which no released build ever does:
+    # a bundle runs `rustedvino-bin` from wherever it was unpacked, so `rv` could
+    # not recognise the very server it ships alongside.
+    return argv0.rsplit("/", 1)[-1] in SERVER_ARGV0_NAMES
+
+
+def discover_supervisor_pid() -> int | None:
+    """Find a live supervisor by command line, for when the PID file is absent
+    or stale.
+
+    This script is the only writer of the PID file, so any other way of
+    starting the server — `systemctl --user restart rustedvino.service`, or a
+    manual launch — leaves the file untouched and possibly holding a PID from a
+    process that died days ago. Reporting "not running" in that case is wrong
+    and actively misleading when the rest of the panel is green because it is
+    talking to a live HTTP API.
+
+    Returns the top of the rustedvino process tree: the one whose parent is not
+    itself a rustedvino process (the supervisor forks the worker, so both match
+    the pattern).
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", SERVER_PGREP_PATTERN],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+    except Exception:
+        return None
+    candidates = [int(p) for p in out.splitlines() if p.strip().isdigit()]
+    # `pgrep -f` matches anything whose command line CONTAINS the pattern —
+    # including a shell running `pgrep -f` with the same pattern, or an
+    # editor with the path in its title. Keep only processes whose argv[0] is
+    # actually the binary, so a passing mention can never be mistaken for the
+    # server.
+    pids = [pid for pid in candidates if is_rustedvino_pid(pid)]
+    if not pids:
+        return None
+    known = set(pids)
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/status") as fh:
+                ppid = next(
+                    int(line.split()[1]) for line in fh if line.startswith("PPid:")
+                )
+        except (OSError, ValueError, StopIteration):
+            continue
+        if ppid not in known:
+            return pid
+    return min(pids)
+
+
+def parse_metrics(text: str) -> list[tuple[str, dict[str, str], float]]:
+    rows = []
+    pat = re.compile(r'^(\w+)\{([^}]*)\}\s+([\d.eE+\-]+)\s*$')
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        m = pat.match(line)
+        if not m:
+            continue
+        name, label_str, value = m.groups()
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', label_str))
+        try:
+            rows.append((name, labels, float(value)))
+        except ValueError:
+            continue
+    return rows
+
+
+def metric_by_label(rows, name: str, **match) -> float | None:
+    for n, labels, val in rows:
+        if n == name and all(labels.get(k) == v for k, v in match.items()):
+            return val
+    return None
+
+
+def state_glyph(state: str) -> str:
+    return {"ready": green, "loading": yellow, "evicting": yellow, "not_loaded": dim}.get(state, lambda t: t)(state)
+
+
+def print_table(headers: list[str], rows: list[list[str]], colored_col: int | None = None):
+    if not rows:
+        print(dim("  (none)"))
+        return
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    print("  " + "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths)))
+    print("  " + "  ".join(dim("-" * w) for w in widths))
+    for r in rows:
+        cells = []
+        for i, (val, w) in enumerate(zip(r, widths)):
+            cells.append(state_glyph(val) + " " * (w - len(val)) if i == colored_col else f"{val:<{w}}")
+        print("  " + "  ".join(cells))
+
+
+# ── context: local state shared by every subcommand ─────────────────────────
+
+class Ctx:
+    def __init__(self, admin_key_override: str | None, port_override: int | None = None):
+        self.host = socket.gethostname()
+        self.prefix = HOST_PREFIX.get(self.host)
+        self.root = repo_root()
+        # Resolution order, strongest signal first:
+        #   1. RUSTEDVINO_CONFIG -- an explicit request always wins. It used to
+        #      lose to the HOST_PREFIX shortcut below, so on any mapped
+        #      hostnames the variable was silently ignored.
+        #   2. a config.json sitting next to this script -- the release-bundle
+        #      layout, where `rv` ships beside `rustedvino` and its config.
+        #      This MUST outrank the fleet shortcut: repo_root() is just
+        #      dirname(rv)/.., so unpacking a release tarball inside the repo
+        #      (the obvious way to smoke-test one) makes the shortcut resolve to
+        #      the real scripts/<box>.config.json and the bundle silently reads
+        #      the dev box's models and keys instead of its own. Measured, not
+        #      hypothesised. A config next to the script is a deliberate
+        #      placement; a hostname match is a guess.
+        #   3. the per-host shortcut, when it is populated and that file exists.
+        #      Unaffected by (2) in a repo checkout: there dirname(rv) is
+        #      scripts/, and scripts/config.json does not exist.
+        #   4. the server's own documented default.
+        env_config = os.environ.get("RUSTEDVINO_CONFIG")
+        fleet_config = (
+            os.path.join(self.root, "scripts", f"{self.prefix}.config.json")
+            if self.prefix is not None
+            else None
+        )
+        bundle_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        if env_config:
+            self.config_file = env_config
+        elif os.path.isfile(bundle_config):
+            self.config_file = bundle_config
+        elif fleet_config is not None and os.path.isfile(fleet_config):
+            self.config_file = fleet_config
+        else:
+            self.config_file = DEFAULT_CONFIG
+        self.pid_file = os.environ.get("RV_PID_FILE", "/tmp/rv.pid")
+
+        self.models_dir = None
+        self.raw_models: dict = {}
+        explicit_keys_file = None
+        # Bound before the try so an unreadable/absent config leaves it None
+        # rather than unbound -- the port resolution below reads it, and a
+        # missing config is an ordinary case (a bundle before `cp
+        # config.example.json config.json`, or a box with no /opt install).
+        cfg = None
+        try:
+            cfg = json.load(open(self.config_file))
+            self.models_dir = cfg.get("models_dir")
+            explicit_keys_file = cfg.get("keys_file")
+            # Kept for `list`/`ps`'s POLICY column -- pinned/priority/load are
+            # settable via `PATCH /v1/admin/models/{id}` but GET
+            # /v1/admin/models doesn't echo them back (it predates PATCH, and
+            # extending it is a server change, not an `rv` one), so reading
+            # the file directly is the only source `rv` has, no server call
+            # needed. Since `patch_model` persists before it applies live,
+            # this is always in sync with the live server's own state.
+            if isinstance(cfg.get("models"), dict):
+                self.raw_models = cfg["models"]
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            pass
+        self.keys_file = resolve_keys_file_path(self.config_file, explicit_keys_file)
+
+        self.api_count = self.admin_count = 0
+        self.keys_present = os.path.isfile(self.keys_file)
+        admin_key = admin_key_override or os.environ.get("RV_ADMIN_KEY")
+        if self.keys_present:
+            try:
+                kf = json.load(open(self.keys_file))
+                self.api_count = len(kf.get("api_keys", []))
+                self.admin_count = len(kf.get("admin_api_keys", []))
+                if not admin_key and kf.get("admin_api_keys"):
+                    admin_key = kf["admin_api_keys"][0]
+            except (json.JSONDecodeError, OSError):
+                pass
+        self.admin_key = admin_key
+
+        # Port resolution, most explicit first: --port, then RV_PORT, then the
+        # resolved config's own "port", then the server's documented default.
+        # Reading it from the config is the point: `rv` already parses that file
+        # for models_dir and keys_file, so ignoring its "port" let the tool and
+        # the server silently disagree about where the server is.
+        env_port = os.environ.get("RV_PORT")
+        if port_override is not None:
+            self.port = port_override
+        elif env_port:
+            try:
+                self.port = int(env_port)
+            except ValueError:
+                print(red(f"error: RV_PORT is not a number: {env_port!r}"), file=sys.stderr)
+                raise SystemExit(2) from None
+        else:
+            cfg_port = cfg.get("port") if isinstance(cfg, dict) else None
+            self.port = cfg_port if isinstance(cfg_port, int) else DEFAULT_PORT
+        self.base_url = f"http://localhost:{self.port}"
+        self.api = Api(admin_key, self.base_url)
+
+    def probe_auth_enforcement(self) -> tuple[bool | None, bool | None]:
+        """Ask the SERVER whether it enforces auth, rather than guessing from
+        the local keys file.
+
+        Returns (inference_enforced, admin_enforced); either is None when the
+        answer could not be determined. A deliberately key-less request to a
+        protected route answers it directly: 401 means the route is guarded,
+        200 means anyone can call it. The local keys file cannot answer this --
+        it may be absent while the server enforces auth from a different config,
+        or populated while the running server never loaded it.
+        """
+        keyless = Api(None, self.base_url)
+
+        def enforced(path: str) -> bool | None:
+            code, _, _ = keyless.get(path)
+            if code == 401:
+                return True
+            if code is not None and 200 <= code < 300:
+                return False
+            return None  # 5xx, connection error, anything else: don't claim.
+
+        return enforced("/v1/models"), enforced("/v1/admin/models")
+
+    def require_admin_key(self) -> bool:
+        """Prints a clear reason and returns False when no admin key is
+        available, instead of exiting directly -- callers stay in charge of
+        their own exit code/margin so a missing key reads the same as any
+        other reported failure, not a special early-abort."""
+        if self.admin_key:
+            return True
+        print(red("error: no admin key available — set RV_ADMIN_KEY, pass --admin-key, "
+                   f"or populate {self.keys_file}"), file=sys.stderr)
+        return False
+
+    def list_model_dirs(self) -> list[str] | None:
+        """Directory names under `models_dir` -- best-effort local scan, `None`
+        when `models_dir` is unknown or unreadable (not an empty list, so
+        callers can tell "no models" apart from "couldn't check")."""
+        if not self.models_dir or not os.path.isdir(self.models_dir):
+            return None
+        try:
+            return sorted(
+                d for d in os.listdir(self.models_dir)
+                if not d.startswith(".") and os.path.isdir(os.path.join(self.models_dir, d))
+            )
+        except OSError:
+            return None
+
+    def policy_flags(self, model_id: str) -> str:
+        """Compact one-line summary of the `PATCH`-settable fields worth
+        flagging at a glance -- empty string when everything's at its
+        default (the common case), so `list`/`ps` stay readable rather than
+        showing 17 mostly-null columns per model."""
+        entry = self.raw_models.get(model_id)
+        if not isinstance(entry, dict):
+            return ""
+        flags = []
+        if entry.get("pinned"):
+            flags.append("pinned")
+        if entry.get("priority", 0):
+            flags.append(f"prio:{entry['priority']}")
+        if entry.get("load") == "on_demand":
+            flags.append("on_demand")
+        if entry.get("evictable") is False:
+            flags.append("not_evictable")
+        if entry.get("eviction_grace_secs") is not None:
+            flags.append(f"grace:{entry['eviction_grace_secs']:.0f}s")
+        return ", ".join(flags)
+
+    def process_state(self):
+        """(alive, supervisor_pid, worker_pid, source).
+
+        `source` says how the process was identified, and the caller reports it:
+          "port"    -- the process actually holding this instance's port. The
+                       only attribution that is provably about the server `rv`
+                       is talking to.
+          "pidfile" -- named by the PID file, NOT confirmed against the port.
+          "scan"    -- found by command line; the PID file is stale or absent.
+
+        Port first, deliberately. The PID file is a single shared path
+        (/tmp/rv.pid by default), so two instances on one machine overwrite each
+        other's entry -- and `rv` would then print one server's PID and uptime
+        above another server's health. Falling back to the file is still useful
+        (the port owner is unknowable when it belongs to another user), but the
+        caller must not present an unconfirmed guess as fact.
+        """
+        sup_pid = wrk_pid = None
+        alive = False
+
+        # The listening socket belongs to the WORKER; the supervisor is its
+        # parent. A non-supervised run has no parent worth reporting, in which
+        # case the port owner is the server process itself.
+        port_pid = pid_listening_on(self.port)
+        if port_pid is not None and is_rustedvino_pid(port_pid):
+            parent = parent_pid(port_pid)
+            if parent is not None and is_rustedvino_pid(parent):
+                return True, parent, port_pid, "port"
+            return True, port_pid, None, "port"
+
+        source = "pidfile"
+        if os.path.isfile(self.pid_file):
+            try:
+                sup_pid = int(open(self.pid_file).read().strip())
+                os.kill(sup_pid, 0)
+                # Live, but is it OURS? A stale file can name a recycled PID.
+                if not is_rustedvino_pid(sup_pid):
+                    raise ProcessLookupError
+                alive = True
+            except (ValueError, ProcessLookupError, PermissionError, OSError):
+                alive = False
+                sup_pid = None
+        if not alive:
+            found = discover_supervisor_pid()
+            if found is not None:
+                sup_pid, alive, source = found, True, "scan"
+        if alive:
+            wrk_pid = worker_pid(sup_pid)
+        return alive, sup_pid, wrk_pid, source
+
+
+# ── subcommands ──────────────────────────────────────────────────────────────
+
+def render_auth_line(inf: bool | None, adm: bool | None, ctx: Ctx) -> str:
+    """The Auth row of `rv status`.
+
+    Reports each route class independently and states ONLY what was observed.
+    `inf`/`adm` are None when enforcement could not be determined (server
+    unreachable, or a 503 because the model manager is not initialised) -- and
+    an undetermined route is never described as enforced. Saying "admin
+    enforced" on the strength of a 503 would be the same unearned claim as the
+    old "no keys file -- routes are open", one level subtler.
+
+    The local keys file appears only as supporting detail, never as evidence
+    about the server: it can be absent while the server enforces auth from a
+    different config, or populated while the running server never loaded it.
+    """
+    label = f"{'Auth':<10}"
+    local = (f"{ctx.api_count} inference · {ctx.admin_count} admin key(s) in {ctx.keys_file}"
+             if ctx.keys_present else f"no keys file at {ctx.keys_file}")
+
+    def phrase(name: str, state: bool | None) -> str:
+        if state is True:
+            return f"{name} enforced"
+        if state is False:
+            return f"{name} OPEN"
+        return f"{name} undetermined"
+
+    summary = f"{phrase('inference', inf)}, {phrase('admin', adm)}"
+
+    # Glyph tracks the worst OBSERVED state: an open route is bad, an
+    # undetermined one is merely unknown, and "no key here" is an operator
+    # problem rather than a server problem.
+    if inf is False or adm is False:
+        glyph = BAD
+    elif inf is None or adm is None:
+        glyph = WARN
+    elif not ctx.admin_key:
+        return (f"{WARN} {label}{summary} — but no admin key available here; "
+                f"set RV_ADMIN_KEY or --admin-key; {dim(local)}")
+    else:
+        glyph = OK
+    return f"{glyph} {label}{summary}; {dim(local)}"
+
+
+def cmd_status(ctx: Ctx, args):
+    alive, sup_pid, wrk_pid, pid_source = ctx.process_state()
+    h_code, health, h_err = ctx.api.get("/health")
+    m_code, models, m_err = ctx.api.get("/v1/models")
+
+    # Only probe when the server actually answered — otherwise the two extra
+    # requests just burn the timeout twice to learn nothing.
+    inf_enforced = adm_enforced = None
+    if h_code == 200:
+        inf_enforced, adm_enforced = ctx.probe_auth_enforcement()
+
+    admin_models = admin_audit = admin_watchdog = None
+    metrics_rows = []
+    if ctx.admin_key:
+        _, admin_models, _ = ctx.api.get("/v1/admin/models")
+        _, admin_audit, _ = ctx.api.get("/v1/admin/config/audit")
+        _, admin_watchdog, _ = ctx.api.get("/v1/admin/health/watchdog")
+        _, m_body, _ = ctx.api.get("/metrics")
+        if isinstance(m_body, str):
+            metrics_rows = parse_metrics(m_body)
+
+    if args.json:
+        print(json.dumps({
+            "host": ctx.host, "prefix": ctx.prefix,
+            "process": {"alive": alive, "supervisor_pid": sup_pid, "worker_pid": wrk_pid},
+            "auth": {
+                "api_key_count": ctx.api_count,
+                "admin_key_count": ctx.admin_count,
+                "keys_file": ctx.keys_file,
+                "keys_file_present": ctx.keys_present,
+                # Observed from the server; null when undetermined. The counts
+                # above describe the LOCAL file and may not be what the running
+                # server loaded.
+                "inference_auth_enforced": inf_enforced,
+                "admin_auth_enforced": adm_enforced,
+            },
+            "health": health, "models": models,
+            "admin_models": admin_models, "admin_config_audit": admin_audit,
+            "admin_watchdog": admin_watchdog,
+        }, indent=2))
+        return 0 if h_code == 200 else 1
+
+    where = f"{ctx.host} ({ctx.prefix})" if ctx.prefix else ctx.host
+    print(bold(f"RustedVINO — {where}"))
+    print()
+    if alive:
+        up = fmt_uptime(sup_pid)
+        wrk_str = str(wrk_pid) if wrk_pid else dim("unknown")
+        if pid_source == "port":
+            # Confirmed: this process holds :{port}, so it IS the server the
+            # rest of this report describes.
+            note = f"(up {up}; holds :{ctx.port})"
+        elif pid_source == "scan":
+            # Found by command line, not from the PID file — say so, because the
+            # stale file is a real (if minor) inconsistency worth repairing.
+            note = (f"(up {up}; found by scan — {ctx.pid_file} is stale/absent; "
+                    f"NOT confirmed to be the server on :{ctx.port})")
+        else:
+            # Named by the PID file but not confirmed against the port. With two
+            # instances sharing one PID file this can be a DIFFERENT server, so
+            # it must not be presented as fact.
+            note = f"(up {up}; from {ctx.pid_file} — NOT confirmed to be the server on :{ctx.port})"
+        glyph = OK if pid_source == "port" else WARN
+        # No worker means an unsupervised single process (no --supervise), which
+        # is how the release bundle's launcher starts it. Calling that
+        # "supervisor N / worker unknown" invents a process tree that is not
+        # there and makes a healthy server look half-broken.
+        shape = (f"supervisor {sup_pid} / worker {wrk_str}" if wrk_pid
+                 else f"pid {sup_pid} {dim('(single process, not supervised)')}")
+        print(f"{glyph} {'Process':<10} running — {shape}  {dim(note)}")
+    else:
+        print(f"{BAD} {'Process':<10} not running  "
+              f"{dim(f'(nothing holds :{ctx.port}, no live PID at {ctx.pid_file}, no rustedvino process found)')}")
+
+    if h_code == 200 and isinstance(health, dict):
+        print(f"{OK} {'Health':<10} ok — v{health.get('version', '?')}")
+    else:
+        print(f"{BAD} {'Health':<10} unreachable  {dim(h_err or '')}")
+
+    # Report what the SERVER does, not what the local keys file implies. Both
+    # old branches asserted server behaviour from a local file: "no keys file —
+    # routes are open" was simply false against a server enforcing auth from
+    # another config (measured), and "N key(s) configured" quietly implied the
+    # running server had loaded them.
+    print(render_auth_line(inf_enforced, adm_enforced, ctx))
+    print()
+
+    if isinstance(models, dict) and models.get("data"):
+        by_id = {m["id"]: m for m in admin_models["models"]} if isinstance(admin_models, dict) else {}
+        rows = []
+        for m in models["data"]:
+            mid = m["id"]
+            a = by_id.get(mid, {})
+            vram = f"{a['vram_gb']:.1f} GB" if "vram_gb" in a else "n/a"
+            kv = metric_by_label(metrics_rows, "rustedvino_kv_cache_usage_percent", model=mid)
+            running = metric_by_label(metrics_rows, "rustedvino_requests_running", model=mid)
+            waiting = metric_by_label(metrics_rows, "rustedvino_requests_waiting", model=mid)
+            maxr = metric_by_label(metrics_rows, "rustedvino_requests_max", model=mid)
+            req = f"{int(running)}/{int(waiting)}/{int(maxr)}" if None not in (running, waiting, maxr) else "n/a"
+            rows.append([mid, a.get("state", "?"), a.get("device", "?"), vram,
+                         f"{kv:.0f}%" if kv is not None else "n/a", req])
+        print(bold("Models"))
+        print_table(["ID", "STATE", "DEVICE", "VRAM", "KV%", "RUN/WAIT/MAX"], rows, colored_col=1)
+        print()
+    elif m_code != 200:
+        print(f"{BAD} Models: unreachable/unauthorized  {dim(m_err or '')}")
+        print()
+
+    if metrics_rows:
+        devices = sorted({l["device"] for n, l, v in metrics_rows if n == "rustedvino_vram_total_bytes" and "device" in l})
+        if devices:
+            print(bold("VRAM"))
+            for dev in devices:
+                total = metric_by_label(metrics_rows, "rustedvino_vram_total_bytes", device=dev) or 0
+                used = metric_by_label(metrics_rows, "rustedvino_vram_used_bytes", device=dev) or 0
+                print(f"  {dev:<8} {human_bytes(used):>9} / {human_bytes(total):<9} {bar(used, total)}")
+            st = metric_by_label(metrics_rows, "rustedvino_vram_total_bytes", domain="system")
+            su = metric_by_label(metrics_rows, "rustedvino_vram_used_bytes", domain="system")
+            if st is not None:
+                su = max(su or 0, 0)
+                print(f"  {'system':<8} {human_bytes(su):>9} / {human_bytes(st):<9} {bar(su, st)}")
+            print()
+
+    if isinstance(admin_audit, dict):
+        problems = admin_audit.get("problems", [])
+        total = admin_audit.get("total_declared", "?")
+        if problems:
+            print(f"{WARN} {'Config':<10} {len(problems)} problem(s) of {total} declared model(s):")
+            for p in problems:
+                print(f"    - {p}")
+        else:
+            print(f"{OK} {'Config':<10} no drift — {total} model(s) declared, all healthy")
+    elif ctx.admin_key:
+        print(f"{WARN} {'Config':<10} audit unreachable/unauthorized")
+
+    if isinstance(admin_watchdog, dict):
+        age = admin_watchdog.get("oldest_generation_secs")
+        if age is None:
+            print(f"{OK} {'Watchdog':<10} idle — no in-flight generations")
+        else:
+            print(f"{OK if age < 30 else WARN} {'Watchdog':<10} oldest in-flight generation: {age:.1f}s")
+
+    if not ctx.admin_key:
+        print()
+        print(dim("(admin-gated sections skipped — no admin key available; "
+                   f"set RV_ADMIN_KEY or populate {ctx.keys_file})"))
+    return 0 if h_code == 200 else 1
+
+
+def _fetch_admin_models(ctx: Ctx) -> list | None:
+    """Raw fetch, no admin-key check and no "missing key" messaging -- that's
+    deliberately the caller's job (see `cmd_list` vs `cmd_ps` below, which
+    want different wording for the same condition). Returns `None` silently
+    if there's no key to try; prints and returns `None` if a key was sent but
+    the call still failed, since that's a real, distinct error."""
+    if not ctx.admin_key:
+        return None
+    code, body, err = ctx.api.get("/v1/admin/models")
+    if code != 200 or not isinstance(body, dict):
+        print(red(f"error: could not reach /v1/admin/models — {err or code}"), file=sys.stderr)
+        return None
+    return body["models"]
+
+
+def cmd_list(ctx: Ctx, args):
+    # Two independent sources, shown together: the *registry* (what the
+    # server knows about, any state -- needs an admin key) and a raw local
+    # directory scan of `models_dir` (what's physically present on disk,
+    # registered or not -- needs no key at all, since it's a filesystem
+    # read on the same box, not an HTTP call). Neither alone answers "what's
+    # available": the registry misses models nobody has `add`ed yet, and a
+    # bare directory listing can't say what's loaded.
+    registered = _fetch_admin_models(ctx) if ctx.admin_key else None
+    disk_dirs = ctx.list_model_dirs()  # None if models_dir unknown/unreadable
+
+    if args.json:
+        print(json.dumps({"registered": registered, "on_disk": disk_dirs}, indent=2))
+        return 0 if (registered is not None or disk_dirs is not None) else 1
+
+    reg_by_id = {m["id"]: m for m in registered} if registered is not None else {}
+    if registered is not None:
+        rows = [[m["id"], m["state"], m["device"], f"{m['vram_gb']:.1f} GB", m["kind"],
+                 ctx.policy_flags(m["id"])] for m in registered]
+        print(bold(f"{len(registered)} model(s) registered"))
+        print_table(["ID", "STATE", "DEVICE", "VRAM", "KIND", "POLICY"], rows, colored_col=1)
+    else:
+        print(f"{WARN} registered-model state unavailable (no admin key) — "
+              "showing on-disk directories only, load state unknown for all of them")
+
+    print()
+    if disk_dirs is not None:
+        unregistered = [d for d in disk_dirs if d not in reg_by_id]
+        if registered is not None:
+            print(bold(f"{len(unregistered)} more on disk, not registered") + dim(f"  ({ctx.models_dir})"))
+            for d in unregistered:
+                print(f"  {d}")
+            if not unregistered:
+                print(dim("  (every directory under models_dir is already registered)"))
+        else:
+            print(bold(f"{len(disk_dirs)} model director{'y' if len(disk_dirs) == 1 else 'ies'} on disk")
+                  + dim(f"  ({ctx.models_dir})"))
+            for d in disk_dirs:
+                print(f"  {d}")
+    else:
+        print(f"{WARN} models_dir unknown or unreadable — couldn't read "
+              f"'models_dir' from {ctx.config_file}, or the path doesn't exist")
+
+    if registered is None and disk_dirs is None:
+        return 1
+    return 0
+
+
+def cmd_ps(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    all_models = _fetch_admin_models(ctx)
+    if all_models is None:
+        return 1
+    models = [m for m in all_models if m["state"] == "ready"]
+    _, m_body, _ = ctx.api.get("/metrics")
+    metrics_rows = parse_metrics(m_body) if isinstance(m_body, str) else []
+    if args.json:
+        print(json.dumps(models, indent=2))
+        return 0
+    rows = []
+    for m in models:
+        mid = m["id"]
+        kv = metric_by_label(metrics_rows, "rustedvino_kv_cache_usage_percent", model=mid)
+        running = metric_by_label(metrics_rows, "rustedvino_requests_running", model=mid)
+        waiting = metric_by_label(metrics_rows, "rustedvino_requests_waiting", model=mid)
+        maxr = metric_by_label(metrics_rows, "rustedvino_requests_max", model=mid)
+        req = f"{int(running)}/{int(waiting)}/{int(maxr)}" if None not in (running, waiting, maxr) else "n/a"
+        rows.append([mid, m["device"], m["kind"], f"{m['vram_gb']:.1f} GB",
+                     f"{m['cache_size_gb']:.1f} GB", f"{kv:.0f}%" if kv is not None else "n/a", req,
+                     ctx.policy_flags(mid)])
+    print(bold(f"{len(models)} model(s) loaded"))
+    print_table(["ID", "DEVICE", "KIND", "VRAM", "KV GB", "KV%", "RUN/WAIT/MAX", "POLICY"], rows)
+    return 0
+
+
+def cmd_check(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    code, body, err = ctx.api.post(f"/v1/admin/models/{args.model}/check", timeout=READ_TIMEOUT)
+    if code != 200 or not isinstance(body, dict):
+        print(red(f"error: {err or code}"), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return 0
+    if body["already_loaded"]:
+        print(f"{OK} '{args.model}' is already loaded")
+        return 0
+    glyph = OK if body["fits"] else BAD
+    print(f"{glyph} '{args.model}' — needs {body['needed_gb']:.1f} GB, {body['free_gb']:.1f} GB free")
+    # Shared-memory (UMA) boxes gate on live system RAM as well as VRAM, and it
+    # is the RAM gate that refuses loads there. Absent on discrete-GPU servers,
+    # and absent from servers older than this field pair — hence .get().
+    ram_needed = body.get("ram_needed_gb")
+    ram_avail = body.get("ram_avail_gb")
+    if ram_needed is not None and ram_avail is not None:
+        ram_line = f"  system RAM: needs {ram_needed:.1f} GB, {ram_avail:.1f} GB available"
+        print(ram_line if body["fits"] else yellow(ram_line))
+    if body["would_evict"]:
+        print(f"  would evict: {', '.join(body['would_evict'])}")
+    elif not body["fits"]:
+        print(yellow("  does not fit even after evicting everything evictable"))
+    return 0 if body["fits"] else 1
+
+
+def _confirm(prompt: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(red(f"refusing without --yes (not an interactive terminal): {prompt}"), file=sys.stderr)
+        return False
+    return input(f"{prompt} [y/N]: ").strip().lower() in ("y", "yes")
+
+
+def cmd_add(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+
+    vram_gb = args.vram_gb
+    if vram_gb is None:
+        if not ctx.models_dir:
+            print(red(f"error: --vram-gb not given and models_dir is unknown (couldn't read it from "
+                       f"{ctx.config_file}) — pass --vram-gb explicitly"), file=sys.stderr)
+            return 1
+        model_dir = os.path.join(ctx.models_dir, args.model)
+        estimate = estimate_vram_gb(model_dir)
+        if estimate is None:
+            print(red(f"error: --vram-gb not given and couldn't estimate it — '{model_dir}' is missing "
+                       f"or empty. Check the model_id against `rv list`, or pass --vram-gb explicitly"),
+                  file=sys.stderr)
+            return 1
+        raw_gb, vram_gb = estimate
+        # Printed unconditionally -- NOT folded into the confirm prompt below,
+        # which -y/--yes skips printing entirely. An auto-detected number
+        # that only shows up when someone happens to read the prompt isn't
+        # transparent, it's a coin flip on whether they noticed.
+        print(f"{dim(f'auto-detected vram_gb: {raw_gb:.1f} GB on disk -> {vram_gb:.1f} GB with headroom '
+                      f'(override with --vram-gb)')}")
+
+    # `add_model` funnels through the same evicting `load_model` path `rv
+    # load` uses -- it can evict currently-serving models to make room, same
+    # as a load. Unlike `load`, there's no `/check` dry-run available here
+    # (check_admission needs the model already in the registry, which by
+    # definition it isn't yet) -- so this can't preview `would_evict` before
+    # acting, and needs the same confirmation gate `deregister` uses instead.
+    if not _confirm(f"register '{args.model}' as {vram_gb:.1f} GB (persists to config.json) and load it "
+                     f"now — may evict other resident models to make room, with no dry-run preview "
+                     f"available for a not-yet-registered model. Proceed?", args.yes):
+        print("aborted")
+        return 2
+
+    body = {"model_id": args.model, "vram_gb": vram_gb}
+    if args.kind is not None:
+        body["kind"] = args.kind
+    if args.device is not None:
+        body["device"] = args.device
+    if args.kv_cache_gb is not None:
+        body["kv_cache_gb"] = args.kv_cache_gb
+    if args.max_concurrent_streams is not None:
+        body["max_concurrent_streams"] = args.max_concurrent_streams
+    if args.pinned:
+        body["pinned"] = True
+
+    print(dim(f"registering + loading '{args.model}' — can take 10-60s..."))
+    code, resp, err = ctx.api.post("/v1/admin/models/add", body=body)
+    if code == 200:
+        print(f"{OK} {resp if isinstance(resp, str) else 'added and loaded'}")
+        return 0
+    if code == 409:
+        print(red(f"'{args.model}' is already registered — use `rv load {args.model}` instead"), file=sys.stderr)
+        return 1
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_load(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    if not args.no_check:
+        code, check, err = ctx.api.post(f"/v1/admin/models/{args.model}/check", timeout=READ_TIMEOUT)
+        if code == 404:
+            # Model isn't in the registry at all -- distinct from "registered
+            # but doesn't fit". Say so now, before also hitting the same 404
+            # on the real /load call below (confusing: two errors for one
+            # cause, in a misleading order under output buffering).
+            print(f"{BAD} '{args.model}' is not registered — `rv list` shows on-disk-but-unregistered "
+                  f"models; register it first with `rv add {args.model} --vram-gb ...`", file=sys.stderr)
+            return 1
+        if code == 200 and isinstance(check, dict):
+            if check["already_loaded"]:
+                print(f"{OK} '{args.model}' is already loaded")
+                return 0
+            if not check["fits"]:
+                print(f"{BAD} '{args.model}' does not fit — needs {check['needed_gb']:.1f} GB, "
+                      f"{check['free_gb']:.1f} GB free, nothing left evictable")
+                return 1
+            if check["would_evict"]:
+                if not _confirm(f"loading '{args.model}' will evict: {', '.join(check['would_evict'])}. Proceed?",
+                                 args.yes):
+                    print("aborted")
+                    return 2
+        elif code != 200:
+            print(yellow(f"warning: pre-load check failed ({err or code}) — attempting the load anyway"),
+                  file=sys.stderr)
+
+    body = {}
+    if args.kv_cache_gb is not None:
+        body["kv_cache_gb"] = args.kv_cache_gb
+    if args.max_concurrent_streams is not None:
+        body["max_concurrent_streams"] = args.max_concurrent_streams
+    if args.force:
+        body["force"] = True
+
+    print(dim(f"loading '{args.model}' — can take 10-60s (JIT compile on first load)..."))
+    code, resp, err = ctx.api.post(f"/v1/admin/models/{args.model}/load", body=body or None)
+    if code == 200:
+        print(f"{OK} {resp if isinstance(resp, str) else 'loaded'}")
+        return 0
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_unload(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    print(dim(f"unloading '{args.model}'..."))
+    code, resp, err = ctx.api.delete(f"/v1/admin/models/{args.model}")
+    if code == 200:
+        print(f"{OK} {resp if isinstance(resp, str) else 'evicted'}")
+        return 0
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_deregister(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    if not _confirm(f"deregister '{args.model}' — evicts if loaded AND removes it from config.json "
+                     f"(gone on next restart, not just VRAM). Proceed?", args.yes):
+        print("aborted")
+        return 2
+    code, resp, err = ctx.api.delete(f"/v1/admin/models/{args.model}/register")
+    if code == 200:
+        print(f"{OK} {resp if isinstance(resp, str) else 'deregistered'}")
+        return 0
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_logs(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    code, body, err = ctx.api.get(f"/v1/admin/logs/tail?lines={args.n}")
+    if code != 200:
+        print(red(f"error: {err or code}"), file=sys.stderr)
+        return 1
+    print(body if isinstance(body, str) else json.dumps(body, indent=2))
+    return 0
+
+
+def cmd_reload_config(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    # No confirmation gate, unlike add/deregister: reload_config only ever
+    # registers new/changed entries as NotLoaded or leaves Ready/Loading/
+    # Evicting ones untouched -- it never loads or evicts anything itself,
+    # so it carries none of their blast radius.
+    code, body, err = ctx.api.post("/v1/admin/config/reload", timeout=READ_TIMEOUT)
+    if code != 200 or not isinstance(body, dict):
+        print(red(f"error: {err or code}"), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return 0
+    for key, label in [("added", "added"), ("updated", "updated"),
+                        ("left_untouched", "left untouched (Ready/Loading/Evicting)"),
+                        ("skipped_missing_files", "skipped (directory missing under models_dir)")]:
+        items = body.get(key, [])
+        if items:
+            print(f"{OK if key != 'skipped_missing_files' else WARN} {len(items)} {label}: {', '.join(items)}")
+    print(dim(f"{body.get('unchanged', 0)} unchanged"))
+    # Reload re-reads only the per-model registry; global knobs are a boot
+    # snapshot. Without this line a 200 OK reads as "everything landed", which
+    # is how a changed min_kv_cache_gb silently does nothing. .get() so an
+    # older server (which omits the key) degrades quietly.
+    globals_skipped = body.get("globals_not_applied", [])
+    if globals_skipped:
+        # Deliberately does NOT say "these need a restart": some of these are
+        # read live on every load and could be refreshed, that is just not
+        # built. The server reports "not applied" and promises no taxonomy
+        # beyond it, so neither does this line.
+        print(yellow(f"{WARN} {len(globals_skipped)} global setting(s) not applied by reload — "
+                      f"restart to pick them up: {', '.join(globals_skipped)}"))
+    return 0
+
+
+def cmd_patch(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    if args.clear_device and args.device is not None:
+        print(red("error: --device and --clear-device are mutually exclusive"), file=sys.stderr)
+        return 1
+    if args.clear_eviction_grace_secs and args.eviction_grace_secs is not None:
+        print(red("error: --eviction-grace-secs and --clear-eviction-grace-secs are mutually "
+                   "exclusive"), file=sys.stderr)
+        return 1
+
+    body = {}
+    if args.vram_gb is not None:
+        body["vram_gb"] = args.vram_gb
+    if args.pinned is not None:
+        body["pinned"] = args.pinned == "true"
+    if args.priority is not None:
+        body["priority"] = args.priority
+    if args.load is not None:
+        body["load"] = args.load
+    if args.device is not None:
+        body["device"] = args.device
+    elif args.clear_device:
+        body["device"] = None
+    if args.eviction_grace_secs is not None:
+        body["eviction_grace_secs"] = args.eviction_grace_secs
+    elif args.clear_eviction_grace_secs:
+        body["eviction_grace_secs"] = None
+    if not body:
+        print(red("error: no fields supplied -- pass at least one of --vram-gb/--pinned/--priority/"
+                   "--load/--device/--clear-device/--eviction-grace-secs/"
+                   "--clear-eviction-grace-secs (anything else -- kv_cache_gb, tier_preference, "
+                   "capabilities, etc. -- needs a raw curl PATCH; see INTERFACE.md)"), file=sys.stderr)
+        return 1
+
+    code, resp, err = ctx.api.patch(f"/v1/admin/models/{args.model}", body)
+    if code == 200 and isinstance(resp, dict):
+        if args.json:
+            print(json.dumps(resp, indent=2))
+            return 0
+        applied = resp.get("applied_live", [])
+        next_load = resp.get("effective_on_next_load", [])
+        unchanged = resp.get("unchanged", [])
+        msg = f"{OK} patched '{args.model}'"
+        if applied:
+            msg += f" -- live now: {', '.join(applied)}"
+        if next_load:
+            msg += f"; next load: {', '.join(next_load)}"
+        if unchanged:
+            msg += f"; unchanged: {', '.join(unchanged)}"
+        print(msg)
+        return 0
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_preload(ctx: Ctx, args):
+    if not ctx.require_admin_key():
+        return 1
+    # `nargs="*"` yields [] (not the declared default=None) when the
+    # positional is simply absent -- `args.models is not None` is always
+    # true, so this used to fall into the explicit-list branch with an EMPTY
+    # list and happily wipe `preload` on a bare `rv preload`. Check
+    # truthiness, not identity.
+    if args.from_live and args.models:
+        print(red("error: --from-live and an explicit model list are mutually exclusive"),
+              file=sys.stderr)
+        return 1
+    if args.from_live:
+        body = {"from_live": True}
+    elif args.models:
+        body = {"model_ids": args.models}
+    else:
+        print(red("error: pass either --from-live or a list of model ids"), file=sys.stderr)
+        return 1
+
+    if not args.yes:
+        desc = "the currently-loaded set" if args.from_live else ", ".join(args.models)
+        if not _confirm(f"replace the persisted preload list with {desc} (takes effect on next "
+                         f"restart, changes nothing running now). Proceed?", args.yes):
+            print("aborted")
+            return 2
+
+    code, resp, err = ctx.api.post("/v1/admin/config/preload", body=body, timeout=READ_TIMEOUT)
+    if code == 200 and isinstance(resp, dict):
+        if args.json:
+            print(json.dumps(resp, indent=2))
+            return 0
+        print(f"{OK} preload is now: {', '.join(resp.get('preload', [])) or '(empty)'}")
+        if resp.get("skipped_not_ready"):
+            print(dim(f"not currently loaded, excluded: {', '.join(resp['skipped_not_ready'])}"))
+        return 0
+    print(red(f"error ({code}): {err or resp}"), file=sys.stderr)
+    return 1
+
+
+def cmd_save_defaults(ctx: Ctx, args):
+    """`rv save-defaults` -- snapshot the currently-loaded set as the new
+    boot-time preload list. A named shortcut for `rv preload --from-live`;
+    no separate implementation, just fixes the mode so the command reads as
+    what it does ("I'm happy with what's loaded, remember it")."""
+    args.from_live = True
+    args.models = None
+    return cmd_preload(ctx, args)
+
+
+def main() -> int:
+    # `--json`/`--admin-key` are defined ONLY on the subparsers (via this
+    # shared `common` parent), so they must come after the subcommand:
+    # `rv list --json`, not `rv --json list`. Also putting `common` on the
+    # top-level `parser` looks like it should make both orders work, but
+    # doesn't: each subparser's own default (False/None) then overwrites
+    # whatever the top-level parse already set, since subparser parsing
+    # merges into the same Namespace *after* the top-level flags are
+    # applied. One definition site avoids that footgun entirely.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    common.add_argument("--admin-key", default=None, help="override the auto-loaded admin key")
+    common.add_argument("--port", type=int, default=None,
+                        help=f"server port (default: config's \"port\", else {DEFAULT_PORT})")
+
+    parser = argparse.ArgumentParser(prog="rv", description="RustedVINO management CLI")
+    # Not required: bare `rv` (no subcommand) prints help instead of erroring,
+    # same as `rv help`/`rv -h`. `json`/`admin_key`/`fn` defaults here cover
+    # that bare-invocation namespace, since those three are otherwise only
+    # ever set by a chosen subparser (see the `common`-placement note above).
+    parser.set_defaults(cmd=None, fn=None, json=False, admin_key=None, port=None)
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("status", help="full server report", parents=[common]).set_defaults(fn=cmd_status)
+    sub.add_parser("list", help="every registered model, any state", parents=[common]).set_defaults(fn=cmd_list)
+    sub.add_parser("ps", help="loaded models only, with live load", parents=[common]).set_defaults(fn=cmd_ps)
+
+    p = sub.add_parser("check", help="dry-run admission check for a model", parents=[common])
+    p.add_argument("model")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("add", help="register an on-disk model (rv list) and load it", parents=[common])
+    p.add_argument("model", help="must match a directory name under models_dir (see `rv list`)")
+    p.add_argument("--vram-gb", type=float, default=None,
+                    help="VRAM estimate in GB (0.0 to skip VRAM gating). "
+                         "Omit to auto-detect from the model directory's on-disk size")
+    p.add_argument("--kind", default=None,
+                    help="text_gen|vision|embedding|stt|tts|image_gen|reranking (default: auto-detect)")
+    p.add_argument("--device", default=None, help="e.g. GPU.1, CPU, NPU (default: global config device)")
+    p.add_argument("--kv-cache-gb", type=float, default=None)
+    p.add_argument("--max-concurrent-streams", type=int, default=None)
+    p.add_argument("--pinned", action="store_true", help="never evict this model once loaded")
+    p.add_argument("-y", "--yes", action="store_true", help="don't prompt for confirmation")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("load", help="load a model into VRAM", parents=[common])
+    p.add_argument("model")
+    p.add_argument("--kv-cache-gb", type=float, default=None)
+    p.add_argument("--max-concurrent-streams", type=int, default=None)
+    p.add_argument("--force", action="store_true", help="bypass the eviction-grace window")
+    p.add_argument("--no-check", action="store_true", help="skip the pre-load admission check")
+    p.add_argument("-y", "--yes", action="store_true", help="don't prompt before an evicting load")
+    p.set_defaults(fn=cmd_load)
+
+    p = sub.add_parser("unload", help="evict a model from VRAM (stays registered)", parents=[common])
+    p.add_argument("model")
+    p.set_defaults(fn=cmd_unload)
+
+    p = sub.add_parser("deregister", aliases=["forget"], parents=[common],
+                        help="remove a model from the registry + config.json")
+    p.add_argument("model")
+    p.add_argument("-y", "--yes", action="store_true", help="don't prompt for confirmation")
+    p.set_defaults(fn=cmd_deregister)
+
+    p = sub.add_parser("logs", help="tail recent server log lines", parents=[common])
+    p.add_argument("-n", type=int, default=200, help="number of lines (default 200)")
+    p.set_defaults(fn=cmd_logs)
+
+    sub.add_parser("reload-config", parents=[common],
+                    help="pick up config.json edits — registers new/changed entries as NotLoaded, "
+                         "loads/evicts nothing").set_defaults(fn=cmd_reload_config)
+
+    p = sub.add_parser("patch", help="update fields of an already-registered model", parents=[common])
+    p.add_argument("model")
+    p.add_argument("--vram-gb", type=float, default=None)
+    p.add_argument("--pinned", choices=["true", "false"], default=None)
+    p.add_argument("--priority", type=int, default=None)
+    p.add_argument("--load", choices=["eager", "on_demand"], default=None)
+    p.add_argument("--device", default=None,
+                    help="placement-affecting -- rejected while the model is Ready (evict first)")
+    p.add_argument("--clear-device", action="store_true",
+                    help="clear the device override back to the global config default")
+    p.add_argument("--eviction-grace-secs", type=float, default=None)
+    p.add_argument("--clear-eviction-grace-secs", action="store_true",
+                    help="clear the override back to the global eviction_grace_secs default")
+    p.set_defaults(fn=cmd_patch)
+
+    p = sub.add_parser("preload", help="replace the persisted preload list",
+                        description="Either --from-live (snapshot the currently-loaded set) or an "
+                                     "explicit list of model ids. Persists to config.json; takes "
+                                     "effect on the next restart, loads/evicts nothing now.",
+                        parents=[common])
+    p.add_argument("models", nargs="*", default=None,
+                    help="explicit model ids (mutually exclusive with --from-live)")
+    p.add_argument("--from-live", action="store_true",
+                    help="snapshot whichever models are currently loaded as the new list")
+    p.add_argument("-y", "--yes", action="store_true", help="don't prompt for confirmation")
+    p.set_defaults(fn=cmd_preload)
+
+    p = sub.add_parser("save-defaults", parents=[common],
+                        help="snapshot the currently-loaded set as the new boot default "
+                             "(shortcut for `rv preload --from-live`)")
+    p.add_argument("-y", "--yes", action="store_true", help="don't prompt for confirmation")
+    p.set_defaults(fn=cmd_save_defaults)
+
+    # `rv help [command]` — same information `-h`/`--help` already gives,
+    # for anyone who reaches for the bare word instead of the switch (as
+    # `git help`/`docker help` also both support alongside `-h`).
+    p = sub.add_parser("help", help="show help, same as -h (optionally: rv help COMMAND)")
+    p.add_argument("topic", nargs="?", default=None)
+    p.set_defaults(fn=None)
+
+    args = parser.parse_args()
+
+    # Bare `rv` or `rv help [topic]` — print argparse's own help text and
+    # exit, before Ctx() (host detection, keys-file read) even runs; neither
+    # of those should be required just to see what the tool does.
+    if args.cmd is None:
+        parser.print_help()
+        return 0
+    if args.cmd == "help":
+        if args.topic:
+            target = sub.choices.get(args.topic)
+            if target is None:
+                print(red(f"no such command: {args.topic}"), file=sys.stderr)
+                parser.print_help()
+                return 1
+            target.print_help()
+        else:
+            parser.print_help()
+        return 0
+
+    ctx = Ctx(args.admin_key, args.port)
+
+    # Vertical margin around every command's output so it doesn't read as
+    # squished against the shell prompt or prior scrollback — skipped in
+    # --json mode, which should stay a single clean parseable value.
+    if not args.json:
+        print()
+    code = args.fn(ctx, args)
+    if not args.json:
+        print()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

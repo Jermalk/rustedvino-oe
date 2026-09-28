@@ -576,6 +576,18 @@ Phase table: **[`ROADMAP.md`](ROADMAP.md)**. Currently on Phase 5 (media/infrast
 
 ---
 
+## Authors
+
+- **Jerzy Marek Majchrzak** — project lead, architect, maintainer.
+- **Claude Code** (Anthropic) — engineering agent.
+
+RustedVINO is a product of agentic engineering. Jerzy set the direction, defined what the
+server must do, made every architectural and release decision, and verified the results on
+real Intel hardware. Claude Code, working as a coding agent under that direction, was
+responsible for the implementation details.
+
+---
+
 ## License
 
 Apache License 2.0 — see [`LICENSE`](LICENSE). Fully permissive, no copyleft: fork it, run it

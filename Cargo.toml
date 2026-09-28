@@ -20,7 +20,7 @@ license = "Apache-2.0"
 description = "OpenAI-compatible inference server for Intel GPUs/NPU/CPU, built on OpenVINO GenAI"
 repository = "https://github.com/Jermalk/rustedvino-oe"
 readme = "README.md"
-authors = ["Jerzy Marek Majchrzak"]
+authors = ["Jerzy Marek Majchrzak", "Claude Code (Anthropic)"]
 keywords = ["openvino", "llm", "inference", "intel-gpu", "openai-api"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 

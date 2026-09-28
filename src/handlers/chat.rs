@@ -1743,8 +1743,8 @@ pub async fn chat_completions(
     // match arm and use their own local instead. Stays the passthrough
     // default on the mock path (no device to gate on).
     let mut device_lease = crate::admission::WorkLease::default();
-    // Concurrent-KV-admission reservation (dev/decisions/decisions-055.md's
-    // root-cause entry). `None` on the mock path and whenever the check is
+    // Concurrent-KV-admission reservation (see `in_flight::AdmittedTokensGuard`
+    // for the root cause). `None` on the mock path and whenever the check is
     // skipped (gate disabled, tokenize fell back) — same "fail open" policy
     // as gate_prompt itself. Assigned by the TextGen arm below; held through
     // the shared streaming/buffered exit code the same way `device_lease` is.
@@ -1977,10 +1977,9 @@ pub async fn chat_completions(
                         device_lease,
                         // VLM path: out of scope for this pass — its own
                         // gate_vlm_prompt/EngineHandleKind::Vision have no
-                        // try_admit_tokens equivalent yet (dev/decisions/
-                        // decisions-055.md's root-cause entry only covers
-                        // the TextGen/CB path, matching the incident it
-                        // documents). Not a silent gap: VLM engines don't
+                        // try_admit_tokens equivalent yet (the concurrent-
+                        // KV-admission fix only covers the TextGen/CB path,
+                        // matching the incident that motivated it). Not a silent gap: VLM engines don't
                         // expose live cache_usage either (rustedvino_kv_
                         // cache_usage_supported is 0 for them), so this
                         // mirrors existing observability scope.
@@ -2233,8 +2232,8 @@ pub async fn chat_completions(
         // measured live (2026-08-29): a second request's tokenize call sat
         // queued behind a first request's in-flight prefill for ~2.3s before
         // this pre-check existed, so the "fast, honest rejection" the whole
-        // mechanism exists for wasn't actually fast under real contention
-        // (dev/decisions/decisions-055.md). `min_possible_tokens` uses the
+        // mechanism exists for wasn't actually fast under real contention.
+        // `min_possible_tokens` uses the
         // same conservative bound `gate_prompt_bytes` already relies on
         // (`MAX_BYTES_PER_TOKEN`): the true token count can never be LESS
         // than `prompt.len() / MAX_BYTES_PER_TOKEN`, so if even that
@@ -2271,8 +2270,8 @@ pub async fn chat_completions(
         // we don't have an exact count (prompt_ids == None).
         //
         // On a single-slot model (`max_concurrent_streams == 1`), also fold
-        // in this request's own `max_new_tokens` before reserving
-        // (`dev/decisions/decisions-048.md`'s deferred "fix 3"): a request
+        // in this request's own `max_new_tokens` before reserving (the
+        // single-slot self-overflow fix): a request
         // whose prompt fits but whose full generation would grow the KV
         // cache past pool capacity has no other in-flight request to
         // preempt when that happens on a single-slot model — it just runs,

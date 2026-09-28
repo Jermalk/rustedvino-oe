@@ -239,7 +239,7 @@ async fn gate_rerank_pair(
 /// handler under clippy's 100-line function cap.
 ///
 /// Includes the Slice 3c on-demand-load lazy path for `NotLoaded` (mirrors
-/// chat/media/embeddings; RTH-found gap, 2026-08-04 — reranking previously
+/// chat/media/embeddings; a gap found by stress testing, 2026-08-04 — reranking previously
 /// fell straight through to the generic "not ready" 503 with no auto-load).
 /// An `Eager` model (today's only configured reranking model on any fleet
 /// box) takes the `NotApplicable` arm, which reproduces byte-for-byte the

@@ -92,8 +92,8 @@ const POOL_CAPACITY_REJECTED_TOTAL: &str = "rustedvino_pool_capacity_rejected_to
 
 /// Own-budget admission rejections: a single-slot model (`max_concurrent_streams
 /// == 1`) rejecting a request whose own `prompt_tokens + max_tokens` can't fit
-/// the KV pool — no other in-flight request involved (`dev/decisions/
-/// decisions-048.md`'s deferred "fix 3"). Deliberately a separate metric from
+/// the KV pool — no other in-flight request involved (the single-slot
+/// self-overflow fix). Deliberately a separate metric from
 /// `POOL_CAPACITY_REJECTED_TOTAL`: that one means "the pool is busy with other
 /// requests right now, retry shortly" (genuinely good advice); this one means
 /// "this request's own generation budget can never fit here, retrying the same

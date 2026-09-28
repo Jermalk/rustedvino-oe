@@ -290,7 +290,7 @@ fn select_probe_target(models: &[crate::model_manager::ModelInfo]) -> Option<Str
 /// the engine is dead, or inference times out. Complements `GET /health`,
 /// which is a pure liveness probe (no GPU).
 ///
-/// RTH's own `health_generate_during_eviction_pressure` scenario caught the
+/// A `health_generate_during_eviction_pressure` stress-test scenario caught the
 /// bug [`select_probe_target`] fixes: the old code picked
 /// `list_ready_models().into_iter().next()`, the first entry in unspecified
 /// `HashMap` iteration order, and reported a blanket 503 "not implemented
@@ -2145,7 +2145,7 @@ mod tests {
 
     /// A Ready `TextGen`/`Vision` model is preferred over a Ready model of a
     /// kind the probe can't drive, regardless of registration order —
-    /// closes the bug an RTH scenario caught live: picking whichever model
+    /// closes the bug a stress-test scenario caught live: picking whichever model
     /// happened to be first in unspecified `HashMap` order reported a
     /// blanket 503 whenever that was an Embedding/STT/TTS/ImageGen/
     /// Reranking model, even with a perfectly healthy chat model sitting

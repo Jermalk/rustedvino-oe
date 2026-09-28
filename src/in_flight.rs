@@ -55,17 +55,16 @@ impl Drop for InFlightGuard {
 }
 
 /// RAII guard reserving `tokens` against a shared admitted-prompt-tokens
-/// counter, for the concurrent-KV-admission check (`dev/decisions/
-/// decisions-055.md`'s root-cause entry — the L0 gate sized a request's
-/// ceiling off a model's *entire* pool with no accounting for what else was
-/// already admitted). Unlike [`InFlightGuard`], construction is fallible:
+/// counter, for the concurrent-KV-admission check (root cause: the L0 gate
+/// sized a request's ceiling off a model's *entire* pool with no accounting
+/// for what else was already admitted). Unlike [`InFlightGuard`], construction is fallible:
 /// [`try_new`](Self::try_new) atomically reserves first, then checks whether
 /// that reservation fits under `capacity`, rolling back immediately if not
 /// — never a plain check-then-increment, which two requests arriving
 /// together could both pass (confirmed as a real risk, not a theoretical
 /// one, empirically measuring `rustedvino_kv_cache_usage_percent` staying
 /// at a stale `0.0` for ~1.5s after a large request is admitted, before the
-/// engine's first step publishes — see that entry for the measurement).
+/// engine's first step publishes).
 ///
 /// Bind the returned guard to a `_guard` local held for the WHOLE request
 /// lifetime (through prefill and decode, not just until submission) — same

@@ -1054,10 +1054,10 @@ fn handle_command<E: CbEngineOps>(
 ///
 /// Takes `req` (not just its `token_tx`) so the disconnect log below can
 /// report how far the request had gotten — a mid-generation client drop
-/// previously produced ZERO log output at any level (`dev/decisions/
-/// decisions-055.md`'s remote-verification entry: a real production
-/// disconnect was only reconstructible after the fact from 5-second metric
-/// samples, not visible in the log at all).
+/// previously produced ZERO log output at any level (found in remote
+/// verification: a real production disconnect was only reconstructible
+/// after the fact from 5-second metric samples, not visible in the log at
+/// all).
 fn deliver_or_drop(req: &ActiveRequest, id: u64, event: StreamEvent) -> bool {
     match req.token_tx.try_send(event) {
         Ok(()) => false,

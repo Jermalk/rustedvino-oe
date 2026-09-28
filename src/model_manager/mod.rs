@@ -10600,9 +10600,8 @@ mod tests {
             pool_capacity, raw_formula_result,
             "pool_capacity_tokens (the concurrent-admission ceiling) must stay the RAW, \
              unclamped formula estimate — the native-context clamp protects one request's \
-             own sanity, not shared physical pool capacity (dev/decisions/decisions-055.md's \
-             Phi-4 case study is exactly this: a tiny native context next to a much larger \
-             physical pool)"
+             own sanity, not shared physical pool capacity (the Phi-4 case is exactly \
+             this: a tiny native context next to a much larger physical pool)"
         );
         assert!(
             pool_capacity > result,

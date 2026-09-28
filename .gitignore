@@ -3,6 +3,11 @@
 config.json
 config.*.json
 /ov_cache/
+__pycache__/
+# semsearch: the key file (*.keys.json does not match it) and the local cache,
+# which holds queries.jsonl: every query you ran, with its embedding.
+/tools/semsearch/api_keys.json
+/tools/semsearch/.cache/
 *.blob
 .DS_Store
 .idea/

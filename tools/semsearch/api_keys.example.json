@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy this file to api_keys.json (gitignored — never commit real keys) and fill in real bearer tokens, keyed by the exact --target URL string you'll pass. A target that needs no auth doesn't need an entry.",
+  "http://localhost:11437": "REPLACE_ME"
+}

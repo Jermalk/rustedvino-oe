@@ -156,9 +156,9 @@ async fn gate_embed_text(
     handle: &EmbeddingHandle,
     text: &str,
     index: usize,
-) -> Result<(), Response> {
+) -> Result<Option<usize>, Response> {
     let Some(max_seq_len) = handle.max_seq_len() else {
-        return Ok(());
+        return Ok(None);
     };
     if text.len() > max_seq_len.saturating_mul(MAX_BYTES_PER_TOKEN) {
         return Err(openai_error(
@@ -178,13 +178,48 @@ async fn gate_embed_text(
             StatusCode::BAD_REQUEST,
             format!(
                 "input[{index}] has {count} tokens — exceeds this model's \
-                 max_position_embeddings capacity of {max_seq_len} tokens; shorten the input"
+                 maximum input length of {max_seq_len} tokens; shorten the input"
             ),
             "invalid_request_error",
             Some("context_length_exceeded"),
         )),
-        Ok(_) | Err(_) => Ok(()),
+        Ok(count) => Ok(Some(count)),
+        Err(_) => Ok(None),
     }
+}
+
+/// The batch's padded size: inputs × the longest input's token count — what
+/// the pipeline actually allocates, since a batch pads to its longest input.
+/// `None` when any count is unknown (gate skipped or tokenizer error), so the
+/// budget fails open like the length gate does.
+fn padded_batch_tokens(counts: &[Option<usize>]) -> Option<usize> {
+    let longest = counts
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()?;
+    Some(longest.saturating_mul(counts.len()))
+}
+
+/// Reject a batch whose padded size exceeds `max_embedding_batch_tokens`
+/// (`0` = no budget). `None` when within budget or the size is unknown.
+fn reject_over_token_budget(budget: usize, counts: &[Option<usize>]) -> Option<Response> {
+    let padded = padded_batch_tokens(counts)?;
+    (budget > 0 && padded > budget).then(|| {
+        let longest = padded / counts.len().max(1);
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "input array needs {padded} padded tokens ({} inputs × the longest input's \
+                 {longest} tokens) — this server accepts at most {budget} per request; split \
+                 it into smaller batches",
+                counts.len()
+            ),
+            "invalid_request_error",
+            Some("batch_too_large"),
+        )
+    })
 }
 
 /// Reject a `dimensions` request explicitly rather than silently returning a
@@ -202,14 +237,15 @@ fn reject_dimensions(req: &EmbeddingRequest) -> Option<Response> {
     })
 }
 
-/// Cap the input-array fan-out, mirroring `completions.rs`'s prompt-array cap
-/// (T2.1): each element occupies engine work for the request's lifetime, so
-/// an unbounded array lets a single call monopolize a model. Same config knob
-/// (`max_prompt_array`), same shape of check. `None` when within the cap.
+/// Cap the input-array fan-out: the whole array runs as one pipeline batch,
+/// so an unbounded array lets a single call monopolize the model and its
+/// memory. Its own knob (`max_embedding_inputs`, default 256) — embeddings
+/// used to share `/v1/completions`' `max_prompt_array` (16), which sized for
+/// one full generation per element. `None` when within the cap.
 fn reject_oversized_input_array(state: &AppState, n_inputs: usize) -> Option<Response> {
     let max_inputs = state.model_manager.as_ref().map_or_else(
-        crate::model_manager::config::default_max_prompt_array,
-        |mm| mm.max_prompt_array(),
+        crate::model_manager::config::default_max_embedding_inputs,
+        |mm| mm.max_embedding_inputs(),
     );
     (n_inputs > max_inputs).then(|| {
         openai_error(
@@ -291,10 +327,17 @@ pub async fn embeddings(
 
         // L0 length gate — before the device-admission lease below, so an
         // over-length input is rejected without occupying an admission slot.
+        let mut counts = Vec::with_capacity(texts.len());
         for (index, text) in texts.iter().enumerate() {
-            if let Err(resp) = gate_embed_text(&handle, text, index).await {
-                return resp;
+            match gate_embed_text(&handle, text, index).await {
+                Ok(count) => counts.push(count),
+                Err(resp) => return resp,
             }
+        }
+        // Batch working memory follows the padded size and stays allocated
+        // until eviction — bound it per request (measured 2026-09-29).
+        if let Some(resp) = reject_over_token_budget(mm.max_embedding_batch_tokens(), &counts) {
+            return resp;
         }
 
         // Cross-pipeline device admission (step 2): a second gate in front of
@@ -389,7 +432,35 @@ mod tests {
 
     use super::*;
 
-    // ── L0 length gate (dev/autotest/20260803_embeddings_512_token_limit.md) ──
+    /// Padded size = inputs × longest input; unknown if any count is unknown.
+    #[test]
+    fn padded_batch_tokens_uses_longest_input() {
+        assert_eq!(
+            padded_batch_tokens(&[Some(10), Some(512), Some(3)]),
+            Some(1536)
+        );
+        assert_eq!(padded_batch_tokens(&[Some(10), None]), None, "fail open");
+        assert_eq!(padded_batch_tokens(&[]), None);
+    }
+
+    /// Over budget → 400 `batch_too_large`; at budget, unknown size, or a `0`
+    /// (disabled) budget → accepted. 64 full chunks fit the 32768 default; 65 don't.
+    #[test]
+    fn token_budget_rejects_only_over_budget() {
+        let full = |n: usize| vec![Some(512); n];
+        assert!(reject_over_token_budget(32_768, &full(64)).is_none());
+        let resp = reject_over_token_budget(32_768, &full(65)).unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            reject_over_token_budget(0, &full(1000)).is_none(),
+            "0 = no budget"
+        );
+        assert!(reject_over_token_budget(32_768, &[Some(512), None]).is_none());
+        // 256 short queries are cheap: 256 × 12 = 3072 padded tokens.
+        assert!(reject_over_token_budget(32_768, &vec![Some(12); 256]).is_none());
+    }
+
+    // ── L0 length gate (the project's internal engineering log) ──
 
     /// A handle with no declared `max_position_embeddings` skips the gate
     /// entirely — no channel round-trip, never rejects.

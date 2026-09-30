@@ -178,6 +178,30 @@ Read trap 4 above before writing a query against these.
 Both are derived from GB values multiplied by `1e9`, so they are decimal gigabytes, not
 gibibytes.
 
+### Measured device memory (Linux)
+
+The two gauges above are the server's *accounting* — what each model's configured `vram_gb`
+reserves. These two are *measured* from the kernel (`/proc/self/fdinfo`, DRM drivers `xe`,
+`i915`, `intel_vpu`). They are absent on other OSes.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rustedvino_process_gpu_memory_bytes` | gauge | `driver`, `pdev`, `region` | Device memory this server process holds, read at scrape time. `pdev` is the PCI device, so two GPUs on one driver stay separate. `region` is the driver's own name: `gtt` / `system` / `stolen` / `vram0` for the GPU, `memory` for the NPU. Real bytes, not decimal-GB conversions |
+| `rustedvino_model_gpu_memory_estimate_bytes` | gauge | `model`, `device`, `kind` | Per loaded model: the measured change across its load, plus runtime growth for embedding engines (the batch cache OpenVINO keeps until eviction). **NaN** while loaded but unknown; 0 once evicted |
+
+The per-model figure is an **estimate** taken from the process-wide counter, so the server
+only trusts a measurement taken while nothing else changed memory. It reports NaN (and
+`gpu_memory_estimate_gb` is omitted) for the rest of a model's load when:
+
+- its load overlapped another model's load or eviction;
+- its load started within 20 s of an eviction or failed load — the kernel releases an evicted
+  model's memory about 11 s *after* the eviction returns (measured on Lunar Lake);
+- for an embedding model, any batch hit either of those conditions.
+
+A reload in a quiet moment measures it again. Use it to check `vram_gb`: when an estimate exceeds its model's `vram_gb`, the accounting
+under-counts that model. The server also logs this once per load, and
+`GET /v1/admin/models` shows it as `gpu_memory_estimate_gb`.
+
 ## KV cache
 
 The three KV metrics only make sense read together. Reading

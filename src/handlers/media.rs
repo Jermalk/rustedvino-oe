@@ -1,13 +1,13 @@
 // ============================================================
 // src/handlers/media.rs — Phase 5 media endpoints (STT / TTS / Image)
 // ============================================================
-// The three OpenAI media routes. STT (`/v1/audio/transcriptions`) is the first
-// to grow real request/response handling; TTS and Image stay 501 stubs until
-// their sub-plans land (dev/plans/phase5/{TTS,IMAGE}.md).
+// The OpenAI media routes:
 //
-//   POST /v1/audio/transcriptions → STT/Whisper  (phase5/STT.md) — 5.1a here
-//   POST /v1/audio/speech         → TTS          (phase5/TTS.md)  — 501 stub
-//   POST /v1/images/generations   → Image/SDXL   (phase5/IMAGE.md)— 501 stub
+//   POST /v1/audio/transcriptions → STT/Whisper
+//   POST /v1/audio/translations   → STT/Whisper, translate task (English out)
+//   POST /v1/audio/speech         → TTS
+//   POST /v1/images/generations   → Image/SDXL
+//   POST /v1/images/edits         → Image/SDXL img2img
 //
 // 5.1a scope: parse the multipart request, validate it, and render all four
 // OpenAI `response_format`s from a CANNED transcription — no GPU, no model
@@ -16,7 +16,7 @@
 // ============================================================
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Multipart, State},
     http::StatusCode,
     response::{IntoResponse as _, Response},
@@ -28,11 +28,12 @@ use super::error::{
     JsonBody, device_admission_error_response, inference_error_response, model_error_response,
     openai_error,
 };
+use crate::Authenticated;
 use crate::app_state::AppState;
 use crate::device_inventory::DeviceInfo;
 use crate::model_manager::{ModelError, OnDemandLoad};
 use crate::ov_image::{ImageEditOptions, ImageGenOptions, RgbImage};
-use crate::pipelines::stt::{Segment, Transcription};
+use crate::pipelines::stt::{Segment, SttTask, Transcription};
 use crate::pipelines::tts::TTS_SAMPLE_RATE;
 
 // ---- Request types --------------------------------------------------
@@ -118,6 +119,23 @@ struct VerboseSegment<'a> {
 /// rendering the requested `response_format`. With no model manager attached
 /// (the no-GPU integration-test path) it renders a canned transcription.
 pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart) -> Response {
+    speech_to_text(&state, multipart, SttTask::Transcribe).await
+}
+
+/// `POST /v1/audio/translations` — `OpenAI`-compatible speech translation:
+/// English text whatever the spoken language (Whisper's translate task).
+///
+/// Same request and response shapes as
+/// [`transcriptions`](transcriptions); `language`, not in `OpenAI`'s spec
+/// for this route, is accepted as a hint for the *spoken* language. A model
+/// known not to translate (English-only, from its `generation_config.json`)
+/// is refused with 400 `model_cannot_translate` before any work.
+pub async fn translations(State(state): State<AppState>, multipart: Multipart) -> Response {
+    speech_to_text(&state, multipart, SttTask::Translate).await
+}
+
+/// Shared body of the two Whisper routes.
+async fn speech_to_text(state: &AppState, multipart: Multipart, task: SttTask) -> Response {
     let req = match parse_request(multipart).await {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -135,7 +153,8 @@ pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart)
         bytes = req.file.len(),
         language = req.language.as_deref().unwrap_or("auto"),
         timestamps,
-        "transcription request"
+        ?task,
+        "speech-to-text request"
     );
 
     let transcription = if let Some(mm) = state.model_manager.as_ref() {
@@ -153,6 +172,13 @@ pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart)
             }
             Err(e) => return model_error_response(e),
         };
+        if task == SttTask::Translate && !handle.can_translate() {
+            return bad_request(
+                "this Whisper model is English-only and cannot translate — use a \
+                 multilingual Whisper model (not an .en one)",
+                "model_cannot_translate",
+            );
+        }
 
         // Cross-pipeline device admission (step 2): a second gate in front of
         // the engine's own per-engine gate below, capping concurrency across
@@ -167,7 +193,11 @@ pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart)
             Err(e) => return device_admission_error_response(&e),
         };
 
-        match handle.transcribe(req.file, req.language, timestamps).await {
+        let result = match task {
+            SttTask::Transcribe => handle.transcribe(req.file, req.language, timestamps).await,
+            SttTask::Translate => handle.translate(req.file, req.language, timestamps).await,
+        };
+        match result {
             Ok(t) => t,
             // Admission gate: 429 when the engine's at capacity, 503 when its
             // thread is gone — same mapping the chat handler uses for CB/VLM/NPU.
@@ -196,10 +226,14 @@ pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart)
     } else {
         // Mock path (no GPU): a canned transcription so the route and all four
         // response formats are exercisable in integration tests without a model.
-        mock_transcription(req.language.as_deref())
+        let mut t = mock_transcription(req.language.as_deref());
+        if task == SttTask::Translate {
+            "This is a mock translation.".clone_into(&mut t.text);
+        }
+        t
     };
 
-    render(&transcription, req.response_format)
+    render(&transcription, req.response_format, task)
 }
 
 /// Drain the multipart body into a validated [`TranscriptionRequest`], or an
@@ -217,8 +251,9 @@ async fn parse_request(mut multipart: Multipart) -> Result<TranscriptionRequest,
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(_) => {
-                return Err(bad_request(
+            Err(e) => {
+                return Err(multipart_error(
+                    &e,
                     "malformed multipart/form-data body",
                     "invalid_multipart",
                 ));
@@ -229,7 +264,13 @@ async fn parse_request(mut multipart: Multipart) -> Result<TranscriptionRequest,
         match name.as_deref() {
             Some("file") => match field.bytes().await {
                 Ok(bytes) => file = Some(bytes.to_vec()),
-                Err(_) => return Err(bad_request("could not read field 'file'", "invalid_field")),
+                Err(e) => {
+                    return Err(multipart_error(
+                        &e,
+                        "could not read field 'file'",
+                        "invalid_field",
+                    ));
+                }
             },
             Some("model") => model = field.text().await.ok(),
             Some("language") => language = field.text().await.ok(),
@@ -264,14 +305,18 @@ async fn parse_request(mut multipart: Multipart) -> Result<TranscriptionRequest,
 }
 
 /// Render a [`Transcription`] in the requested format. `json`/`verbose_json` are
-/// JSON; `text`/`srt` are `text/plain` bodies.
-fn render(t: &Transcription, format: ResponseFormat) -> Response {
+/// JSON; `text`/`srt` are `text/plain` bodies. `verbose_json`'s `task` names the
+/// route that produced it (`"transcribe"` / `"translate"`), as `OpenAI`'s does.
+fn render(t: &Transcription, format: ResponseFormat, task: SttTask) -> Response {
     match format {
         ResponseFormat::Json => Json(JsonResponse { text: &t.text }).into_response(),
         ResponseFormat::Text => t.text.clone().into_response(),
         ResponseFormat::Srt => to_srt(&t.segments).into_response(),
         ResponseFormat::VerboseJson => Json(VerboseResponse {
-            task: "transcribe",
+            task: match task {
+                SttTask::Transcribe => "transcribe",
+                SttTask::Translate => "translate",
+            },
             language: &t.language,
             duration: t.duration(),
             text: &t.text,
@@ -345,6 +390,22 @@ fn mock_transcription(language: Option<&str>) -> Transcription {
 }
 
 /// Build a 400 `invalid_request_error` with the shared `OpenAI` envelope.
+/// A multipart read error as a response. Exceeding the server's request-body
+/// limit is an honest 413 that names the limit — it used to surface as a 400
+/// "could not read field 'file'", which hid the cause (a 123 MB podcast
+/// upload, found by the rustedvino-www session). Anything else keeps the
+/// caller's 400.
+fn multipart_error(
+    e: &axum::extract::multipart::MultipartError,
+    message: &'static str,
+    code: &'static str,
+) -> Response {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return super::error::request_too_large();
+    }
+    bad_request(message, code)
+}
+
 fn bad_request(message: &'static str, code: &'static str) -> Response {
     openai_error(
         StatusCode::BAD_REQUEST,
@@ -543,7 +604,7 @@ pub async fn speech(
 }
 
 // ============================================================
-// Image generation — POST /v1/images/generations (SDXL, phase5/IMAGE.md)
+// Image generation — POST /v1/images/generations (SDXL, the phase-5 IMAGE plan)
 // ============================================================
 //
 // 5.3a scope: parse + validate the JSON request and render a CANNED image — no
@@ -600,7 +661,7 @@ struct ValidatedImageRequest {
 }
 
 /// `/v1/images/generations` response (`OpenAI` shape, plus `RustedVINO`'s additive
-/// `generation_metadata` — `PLAN_image_metadata_response.md`): `{ created,
+/// `generation_metadata` — the image-metadata plan): `{ created,
 /// data: [{ b64_json }], generation_metadata }`.
 #[derive(Serialize)]
 struct ImageGenerationResponse {
@@ -617,7 +678,7 @@ struct ImageData {
 }
 
 /// RustedVINO-specific generation metadata, additive to the `OpenAI` response
-/// shape — all three tiers of `PLAN_image_metadata_response.md` (model
+/// shape — all three tiers of the image-metadata plan (model
 /// identity, engine, device/host for hardware correlation, model hash,
 /// sampler, and operator-supplied precision/source/revision). Unknown/
 /// inapplicable fields are omitted, never emitted as `null`.
@@ -651,7 +712,7 @@ struct GenerationMetadata {
 }
 
 /// The first 10 hex chars of a `sha256:<hex>`-prefixed digest — the A1111-style
-/// short form (`pyramu-image-metadata-spec.md` §5.1: "first 10 hex chars of the
+/// short form (the Pyramu image-metadata spec §5.1: "first 10 hex chars of the
 /// model file's SHA-256"). `None` if `full` isn't the expected shape (defensive
 /// only — [`crate::pipelines::image::ImageHandle::model_hash`] always produces
 /// `sha256:` + 64 hex chars).
@@ -729,6 +790,7 @@ impl HandleMetadata {
 /// attached (the no-GPU integration-test path) it renders a canned image.
 pub async fn image_generations(
     State(state): State<AppState>,
+    authenticated: Option<Extension<Authenticated>>,
     JsonBody(req): JsonBody<ImageGenerationRequest>,
 ) -> Response {
     let valid = match validate_image_request(&req) {
@@ -823,7 +885,8 @@ pub async fn image_generations(
             model_source: hmeta.model_source,
             model_revision: hmeta.model_revision,
             device,
-            host: crate::os_memory::host_name(),
+            // Hostname only for key-validated callers (see `Authenticated`).
+            host: authenticated.and_then(|_| crate::os_memory::host_name()),
             engine: "RustedVINO",
             engine_version: env!("CARGO_PKG_VERSION"),
             openvino_version: crate::ov_cb::openvino_version(),
@@ -996,7 +1059,7 @@ fn encode_pngs(pngs: &[Vec<u8>]) -> Vec<ImageData> {
 
 /// Fields parsed from the `multipart/form-data` edit request. Only the fields the
 /// server acts on; `size`/`quality`/`background`/`user` are accepted-and-ignored
-/// (output size matches the source image — see sdxl-compat-plan §Gaps).
+/// (output size matches the source image).
 struct ImageEditMultipart {
     /// Target image model id (resolved through the manager).
     model: String,
@@ -1024,7 +1087,11 @@ struct ImageEditMultipart {
 /// runs the SDXL inpaint (mask) or img2img (no mask) pipeline before base64. With
 /// no model manager attached (no-GPU test path) it renders canned images.
 #[allow(clippy::too_many_lines)]
-pub async fn image_edits(State(state): State<AppState>, multipart: Multipart) -> Response {
+pub async fn image_edits(
+    State(state): State<AppState>,
+    authenticated: Option<Extension<Authenticated>>,
+    multipart: Multipart,
+) -> Response {
     let req = match parse_edit_request(multipart).await {
         Ok(r) => r,
         Err(resp) => return *resp,
@@ -1050,8 +1117,8 @@ pub async fn image_edits(State(state): State<AppState>, multipart: Multipart) ->
     // the smallest supported *generation* size, so this isn't a new number, just
     // applying the existing one to user-uploaded edit images too). Reject here,
     // before ever reaching the pipeline — this cannot be caught safely once
-    // triggered; only preventing it is reliable. Full writeup:
-    // dev/autotest/20260804_image_edit_small_image_segfault.md.
+    // triggered; only preventing it is reliable (full writeup in
+    // the project's internal engineering log).
     if init.width < MIN_EDIT_IMAGE_EDGE || init.height < MIN_EDIT_IMAGE_EDGE {
         return bad_request_owned(
             format!(
@@ -1184,7 +1251,8 @@ pub async fn image_edits(State(state): State<AppState>, multipart: Multipart) ->
             model_source: hmeta.model_source,
             model_revision: hmeta.model_revision,
             device,
-            host: crate::os_memory::host_name(),
+            // Hostname only for key-validated callers (see `Authenticated`).
+            host: authenticated.and_then(|_| crate::os_memory::host_name()),
             engine: "RustedVINO",
             engine_version: env!("CARGO_PKG_VERSION"),
             openvino_version: crate::ov_cb::openvino_version(),
@@ -1203,8 +1271,9 @@ async fn parse_edit_request(mut multipart: Multipart) -> Result<ImageEditMultipa
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(_) => {
-                return Err(Box::new(bad_request(
+            Err(e) => {
+                return Err(Box::new(multipart_error(
+                    &e,
                     "malformed multipart/form-data body",
                     "invalid_multipart",
                 )));
@@ -1221,8 +1290,9 @@ async fn parse_edit_request(mut multipart: Multipart) -> Result<ImageEditMultipa
                         raw.image = Some(bytes.to_vec());
                     }
                 }
-                Err(_) => {
-                    return Err(Box::new(bad_request(
+                Err(e) => {
+                    return Err(Box::new(multipart_error(
+                        &e,
                         "could not read field 'image'",
                         "invalid_field",
                     )));
@@ -1230,8 +1300,9 @@ async fn parse_edit_request(mut multipart: Multipart) -> Result<ImageEditMultipa
             },
             Some("mask") => match field.bytes().await {
                 Ok(bytes) => raw.mask = Some(bytes.to_vec()),
-                Err(_) => {
-                    return Err(Box::new(bad_request(
+                Err(e) => {
+                    return Err(Box::new(multipart_error(
+                        &e,
                         "could not read field 'mask'",
                         "invalid_field",
                     )));
@@ -1609,7 +1680,7 @@ mod tests {
 
     /// `model_hash_short` takes the first 10 hex chars after the `sha256:`
     /// prefix — the A1111 `Model hash:` convention
-    /// (`pyramu-image-metadata-spec.md` §5.1).
+    /// (the Pyramu image-metadata spec §5.1).
     #[test]
     fn model_hash_short_takes_first_ten_hex_chars_after_prefix() {
         let full = "sha256:1f4a2b3c4d5e6f708192a3b4c5d6e7f8";

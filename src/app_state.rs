@@ -68,8 +68,8 @@ pub struct AppState {
     /// updated as the session progresses. Inserted on WS connect, removed on close.
     pub realtime_sessions: RealtimeSessionRegistry,
 
-    /// Cross-pipeline device admission ceiling (`dev/plans/cross-pipeline-
-    /// admission-middleware.md` step 2). Always present (even mock/test
+    /// Cross-pipeline device admission ceiling
+    /// (the project's internal engineering log step 2). Always present (even mock/test
     /// mode) as a passthrough-by-default instance, mirroring `voice_pin`'s
     /// "always present, just empty" convention — see `admission.rs`.
     pub device_budgets: Arc<DeviceBudgets>,

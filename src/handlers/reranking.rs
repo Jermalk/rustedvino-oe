@@ -344,6 +344,8 @@ mod tests {
             embedding_normalize: true,
             default_embed_model: None,
             max_prompt_array: 16,
+            max_embedding_inputs: 256,
+            max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,
             bind_addr: "127.0.0.1".to_owned(),
             port: 11_437,
@@ -430,6 +432,8 @@ mod tests {
                 embedding_normalize: true,
                 default_embed_model: None,
                 max_prompt_array: 16,
+                max_embedding_inputs: 256,
+                max_embedding_batch_tokens: 32_768,
                 max_tokens_cap: 8192,
                 bind_addr: "127.0.0.1".to_owned(),
                 port: 11_437,
@@ -565,7 +569,7 @@ mod tests {
         assert_eq!(j["results"].as_array().unwrap().len(), 2);
     }
 
-    // ── L0 length gate (dev/autotest/20260804_rerank_shape_poisoning.md) ──
+    // ── L0 length gate (the project's internal engineering log) ──
 
     /// No configured ceiling → the gate never rejects, no matter how long.
     #[tokio::test]

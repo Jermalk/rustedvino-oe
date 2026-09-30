@@ -8,7 +8,7 @@
 //   automatically linked into the final binary. We use it here to compile
 //   ov_bridge.cpp with the flags required by the target platform's ABI.
 //
-// PLATFORM BRANCH (CHECK-00, dev/plans/windows-x86-compat.md):
+// PLATFORM BRANCH (CHECK-00, the project's internal engineering log):
 //   `CARGO_CFG_TARGET_OS` describes the TARGET, not the host — so a
 //   cross-compile from Linux to x86_64-pc-windows-msvc takes the Windows
 //   branch. We cannot use `#[cfg(windows)]` here: build.rs itself always
@@ -322,7 +322,7 @@ fn build_windows() {
     println!("cargo:rustc-link-lib=dylib=openvino_genai");
     println!("cargo:rustc-link-lib=dylib=openvino");
     // No rpath directives: Windows has no rpath. DLL discovery is exe-adjacent
-    // (the runtime/ bundle) per dev/plans/windows-x86-compat.md §2/§3.2.
+    // (the runtime/ bundle) per the project's internal engineering log
 
     rerun_triggers();
     println!("cargo:rerun-if-env-changed=OV_WIN_DIR");

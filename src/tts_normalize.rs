@@ -1,7 +1,7 @@
 //! Text normalization for speech synthesis: expands digit sequences and
 //! substitutes symbols a TTS phonemizer drops or mispronounces (`&`, `%`,
 //! `$`, `@`, `+`, `=`) into speakable words, before the text reaches the
-//! engine. See `dev/plans/realtime-tts-characters-parsing.md` for the
+//! engine. See the project's internal engineering log for the
 //! problem this solves and the scope decisions below.
 //!
 //! English gets full cardinal-number expansion, thousands-comma grouping

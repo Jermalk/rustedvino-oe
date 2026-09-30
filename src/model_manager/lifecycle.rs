@@ -34,7 +34,7 @@ use crate::model_manager::engine::{EngineHandleKind, ModelKind};
 
 /// A validated draft-model attachment for one target model's next load —
 /// draft-model speculative decoding
-/// (the project's internal engineering log Part 5d). Built by
+/// (the project's internal engineering log). Built by
 /// `ModelManager` from a target's `SpeculativeConfig` after
 /// `validate_speculative_pairing` succeeds, and consumed by
 /// [`OvEngineFactory::load`]'s `TextGen` arm to attach the draft at
@@ -91,24 +91,35 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     /// Record a `max_concurrent_streams` cap for `model_id` so the VLM engine
     /// spawned for it uses that channel size rather than [`VLM_CHANNEL_CAP`].
     /// Default no-op: test factories don't spawn real VLM threads.
-    fn register_concurrent_streams_hint(&self, _model_id: &str, _cap: usize) {}
+    /// `None` removes the hint, so clearing the field (PATCH `null`, or a
+    /// config reload while the model is not loaded) really restores the
+    /// default channel size on the next load.
+    fn register_concurrent_streams_hint(&self, _model_id: &str, _cap: Option<usize>) {}
 
     /// Record a `max_prompt_len` (NPU `MAX_PROMPT_LEN`) hint for `model_id` so
     /// an NPU-routed load compiles its `LLMPipeline` with that ceiling instead
     /// of `OpenVINO`'s own default (1024). Ignored for every other device.
     /// Default no-op: test factories don't spawn real NPU pipelines.
-    fn register_max_prompt_len_hint(&self, _model_id: &str, _max_prompt_len: u32) {}
+    /// `None` removes the hint, so clearing the field (PATCH `null`, or a
+    /// config reload while the model is not loaded) really restores
+    /// `OpenVINO`'s default on the next load.
+    fn register_max_prompt_len_hint(&self, _model_id: &str, _max_prompt_len: Option<u32>) {}
+
+    /// Record a `min_response_len` (NPU `MIN_RESPONSE_LEN`) hint for
+    /// `model_id` — same lifecycle as [`register_max_prompt_len_hint`].
+    /// Default no-op: test factories don't spawn real NPU pipelines.
+    fn register_min_response_len_hint(&self, _model_id: &str, _min_response_len: Option<u32>) {}
 
     /// Record (or, with `None`, clear) a draft-model attachment hint for
     /// `model_id`'s next load — draft-model speculative decoding
-    /// (the project's internal engineering log Part 5d). `None` lets
+    /// (the project's internal engineering log). `None` lets
     /// a `reload_config` that removes the `speculative` block clear a stale
     /// hint from a prior load. Default no-op: test factories never attach a
     /// draft (they build a stub engine that ignores it). See [`DraftHint`].
     fn register_draft_hint(&self, _model_id: &str, _hint: Option<DraftHint>) {}
 
     /// Record operator-supplied model provenance (`precision`/`model_source`/
-    /// `model_revision`, Tier 3 of `PLAN_image_metadata_response.md`) for
+    /// `model_revision`, Tier 3 of the image-metadata plan) for
     /// `model_id`'s next `ImageGen` load. Default no-op: test factories don't
     /// build real `ImageModelMetadata`.
     fn register_image_provenance_hint(
@@ -203,6 +214,9 @@ pub(crate) struct OvEngineFactory {
     /// NPU load so `OvPipeline::new` compiles with the configured ceiling
     /// instead of `OpenVINO`'s own default (1024).
     pub max_prompt_len_hints: std::sync::RwLock<HashMap<String, u32>>,
+    /// Per-model NPU `MIN_RESPONSE_LEN` hints from `min_response_len` config,
+    /// registered alongside [`max_prompt_len_hints`](Self::max_prompt_len_hints).
+    pub min_response_len_hints: std::sync::RwLock<HashMap<String, u32>>,
     /// Per-model draft-model attachment hints for speculative decoding, keyed
     /// by model ID. Set via [`register_draft_hint`] before each `TextGen`
     /// load; absent (or explicitly cleared via `None`) means plain decoding.
@@ -278,6 +292,11 @@ pub(crate) enum TtsBackend {
         onnx_name: &'static str,
         tokens_name: &'static str,
     },
+    /// A Piper voice: `<name>.onnx` + `<name>.onnx.json` (espeak phonemes).
+    Piper {
+        onnx: std::path::PathBuf,
+        config: std::path::PathBuf,
+    },
     SpeechT5,
 }
 
@@ -310,6 +329,9 @@ pub(crate) fn detect_tts_backend(model_path: &Path) -> anyhow::Result<TtsBackend
             voices_name,
         });
     }
+    if let Some((onnx, config)) = crate::pipelines::piper::find_piper_voice(model_path) {
+        return Ok(TtsBackend::Piper { onnx, config });
+    }
     if model_path.join("model.onnx").is_file() && model_path.join("tokens.txt").is_file() {
         return Ok(TtsBackend::CoquiVits {
             onnx_name: "model.onnx",
@@ -327,18 +349,37 @@ impl EngineFactory for OvEngineFactory {
             .insert(model_id.to_owned(), kind);
     }
 
-    fn register_concurrent_streams_hint(&self, model_id: &str, cap: usize) {
-        self.concurrent_streams
+    fn register_concurrent_streams_hint(&self, model_id: &str, cap: Option<usize>) {
+        let mut hints = self
+            .concurrent_streams
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(model_id.to_owned(), cap);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cap {
+            Some(v) => hints.insert(model_id.to_owned(), v),
+            None => hints.remove(model_id),
+        };
     }
 
-    fn register_max_prompt_len_hint(&self, model_id: &str, max_prompt_len: u32) {
-        self.max_prompt_len_hints
+    fn register_max_prompt_len_hint(&self, model_id: &str, max_prompt_len: Option<u32>) {
+        let mut hints = self
+            .max_prompt_len_hints
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(model_id.to_owned(), max_prompt_len);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match max_prompt_len {
+            Some(v) => hints.insert(model_id.to_owned(), v),
+            None => hints.remove(model_id),
+        };
+    }
+
+    fn register_min_response_len_hint(&self, model_id: &str, min_response_len: Option<u32>) {
+        let mut hints = self
+            .min_response_len_hints
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match min_response_len {
+            Some(v) => hints.insert(model_id.to_owned(), v),
+            None => hints.remove(model_id),
+        };
     }
 
     fn register_draft_hint(&self, model_id: &str, hint: Option<DraftHint>) {
@@ -404,7 +445,7 @@ impl EngineFactory for OvEngineFactory {
             .and_then(|s| s.to_str())
             .unwrap_or(device);
 
-        // OV compile-cache blob attribution (dev/plans/ov-cache-self-management.md):
+        // OV compile-cache blob attribution (the project's internal engineering log):
         // snapshot `ov_cache_dir` before dispatch, diff after, so any new files
         // this load's `compile_model`/pipeline-construction call created can be
         // attributed to (model_id, device) in the manifest. Safe with no new
@@ -432,8 +473,8 @@ impl EngineFactory for OvEngineFactory {
                 // in charge. cache_size_gb alone measured ~2x this project's
                 // configured VRAM budget; prefix caching being off separately
                 // measured a 30-40x per-turn cost on this server's own
-                // resent-full-history chat pattern (dev/autotest/
-                // 20260820_nudge_fix_verification_qwen3.5-4b-int8-ov.md —
+                // resent-full-history chat pattern
+                // (the project's internal engineering log —
                 // two distinct bugs found in the same investigation).
                 let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
                 let registered = self
@@ -494,8 +535,25 @@ impl EngineFactory for OvEngineFactory {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(model_id)
                         .copied();
-                    let pipeline =
-                        crate::ov_pipeline::OvPipeline::new(path_str, device, max_prompt_len)?;
+                    let min_response_len = self
+                        .min_response_len_hints
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(model_id)
+                        .copied();
+                    // `ov_cache_dir` → NPU `CACHE_DIR` (weightless blob by
+                    // default). Measured 2026-09-28: ~6 s cached load vs 30.7 s
+                    // cold, independent of the Level Zero driver cache
+                    // (the project's internal engineering log). Unlike the NPU
+                    // *Whisper* pipeline (see the Stt arm), the LLM pipeline
+                    // caches cleanly.
+                    let pipeline = crate::ov_pipeline::OvPipeline::new(
+                        path_str,
+                        device,
+                        max_prompt_len,
+                        min_response_len,
+                        self.ov_cache_dir.as_deref(),
+                    )?;
                     let queue_timeout =
                         std::time::Duration::from_millis(self.admission_queue_timeout_ms);
                     let (handle, thread) = crate::npu_engine::spawn_npu_engine(
@@ -503,7 +561,19 @@ impl EngineFactory for OvEngineFactory {
                         model_id,
                         device,
                         queue_timeout,
+                        // Resolved from the same values `OvPipeline::new` just
+                        // compiled with — the handle's prompt gate reads this,
+                        // so it can't drift from the resident graph.
+                        crate::npu_engine::NpuShape::resolve(max_prompt_len, min_response_len),
                     )?;
+                    // Early return skips the attribution at the end of this
+                    // function, so attribute the NPU blob here.
+                    self.attribute_new_blobs(
+                        model_id,
+                        device,
+                        cache_dir_path,
+                        blobs_before.as_ref(),
+                    );
                     return Ok((EngineHandleKind::NpuTextGen(handle), thread));
                 }
                 let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
@@ -609,7 +679,7 @@ impl EngineFactory for OvEngineFactory {
                 )?;
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
-                // L0 length gate (dev/autotest/20260803_embeddings_512_token_limit.md):
+                // L0 length gate (the project's internal engineering log):
                 // resolved once here from config.json, not re-read per request.
                 let max_seq_len = crate::ov_embed::resolve_max_seq_len(model_path);
                 let (handle, thread) = crate::embed_engine::spawn_embed_engine(
@@ -631,11 +701,13 @@ impl EngineFactory for OvEngineFactory {
                 // NPU never gets `ov::cache_dir`: the Level Zero NPU driver
                 // already persists its own compiled blob to
                 // `~/.cache/ze_intel_npu_cache/`, independent of this setting
-                // (dev/DECISIONS.md, 2026-07-11 follow-up) — and live-verified
+                // (the project's internal engineering log 2026-07-11 follow-up) — and live-verified
                 // (2026-08-27) that passing a non-empty `ov_cache_dir` into an
                 // NPU-targeted `WhisperPipeline` hangs the load past the
-                // supervisor's 90s health timeout. Same exclusion the TextGen
-                // arm above already applies via its separate NPU pipeline.
+                // supervisor's 90s health timeout. The NPU *LLM* pipeline (TextGen
+                // arm above) does get `CACHE_DIR` since 2026-09-28 — measured to
+                // cache cleanly; this Whisper exclusion stays (upstream
+                // openvino.genai#1992 is the same Whisper-only symptom).
                 let cache_dir = if device == "NPU" {
                     ""
                 } else {
@@ -649,6 +721,7 @@ impl EngineFactory for OvEngineFactory {
                     model_id,
                     device,
                     queue_timeout,
+                    crate::ov_whisper::resolve_can_translate(model_path),
                 )?;
                 Ok((EngineHandleKind::Stt(handle), thread))
             }
@@ -684,7 +757,7 @@ impl EngineFactory for OvEngineFactory {
                 // TextRerankPipeline on a dedicated thread. Device resolved-once at
                 // registration — same contract as the embedding arm.
                 let engine = crate::ov_rerank::OvRerankEngine::new(path_str, device)?;
-                // L0 length gate (dev/autotest/20260804_rerank_shape_poisoning.md):
+                // L0 length gate (the project's internal engineering log):
                 // resolved once here from config.json, not re-read per request.
                 // Reuses the embedding module's generic BERT-config reader.
                 let max_seq_len = crate::ov_embed::resolve_max_seq_len(model_path);
@@ -741,6 +814,23 @@ impl EngineFactory for OvEngineFactory {
                     )?;
                     Ok((EngineHandleKind::Tts(handle), thread))
                 }
+                TtsBackend::Piper { onnx, config } => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        onnx = %onnx.display(),
+                        "Piper TTS voice detected (phonemes via external espeak-ng)"
+                    );
+                    let queue_timeout =
+                        std::time::Duration::from_millis(self.admission_queue_timeout_ms);
+                    let (handle, thread) = crate::pipelines::tts::spawn_piper_engine(
+                        onnx.to_string_lossy().into_owned(),
+                        &config.to_string_lossy(),
+                        model_id,
+                        device,
+                        queue_timeout,
+                    )?;
+                    Ok((EngineHandleKind::Tts(handle), thread))
+                }
                 TtsBackend::SpeechT5 => {
                     // Phase 5.2a: OpenVINO Text2SpeechPipeline.
                     let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
@@ -758,22 +848,35 @@ impl EngineFactory for OvEngineFactory {
             },
         };
 
-        if result.is_ok()
-            && let (Some(cache_dir_path), Some(blobs_before)) = (cache_dir_path, blobs_before)
-        {
-            let blobs_after = crate::cache_manifest::snapshot_cache_dir(cache_dir_path);
-            let new_blobs: Vec<String> = blobs_after.difference(&blobs_before).cloned().collect();
-            if !new_blobs.is_empty()
-                && let Some(root) =
-                    crate::cache_manifest::manifest_root(self.ov_cache_dir.as_deref())
-            {
-                crate::cache_manifest::write_device_blobs_entry(
-                    &root, model_id, device, &new_blobs,
-                );
-            }
+        if result.is_ok() {
+            self.attribute_new_blobs(model_id, device, cache_dir_path, blobs_before.as_ref());
         }
 
         result
+    }
+}
+
+impl OvEngineFactory {
+    /// Record the `ov_cache_dir` files that appeared during a successful load
+    /// as this model's blobs in the cache manifest (a before/after directory
+    /// diff). No-op without a cache dir or when nothing new was written.
+    fn attribute_new_blobs(
+        &self,
+        model_id: &str,
+        device: &str,
+        cache_dir_path: Option<&Path>,
+        blobs_before: Option<&std::collections::HashSet<String>>,
+    ) {
+        let (Some(cache_dir_path), Some(blobs_before)) = (cache_dir_path, blobs_before) else {
+            return;
+        };
+        let blobs_after = crate::cache_manifest::snapshot_cache_dir(cache_dir_path);
+        let new_blobs: Vec<String> = blobs_after.difference(blobs_before).cloned().collect();
+        if !new_blobs.is_empty()
+            && let Some(root) = crate::cache_manifest::manifest_root(self.ov_cache_dir.as_deref())
+        {
+            crate::cache_manifest::write_device_blobs_entry(&root, model_id, device, &new_blobs);
+        }
     }
 }
 
@@ -895,7 +998,7 @@ fn resolve_vlm_channel_cap(registered: Option<usize>, max_num_seqs: usize) -> Op
 
 /// Low-entropy, RAG-shaped probe prompt for the speculative-decoding
 /// load-time self-check (Part 7). Deliberately NOT open-ended: fact #8
-/// (the project's internal engineering log Part 0) showed
+/// (the project's internal engineering log) showed
 /// open-ended prompts are exactly where a *working* draft pairing is
 /// expected to diverge from plain decoding, which would false-positive this
 /// gate on the feature's best pairings. Every pairing tested during the
@@ -1013,7 +1116,8 @@ fn verify_speculative_pairing(
         plain_output == assisted_output,
         "speculative decoding self-check FAILED for model {model_id:?}: plain and \
          draft-attached decode diverge on the load-time probe — this is the same \
-         silent-breakage class as the MoE finding (dev/DECISIONS.md 2026-07-17), \
+         silent-breakage class as the MoE target whose speculative output diverged \
+         from plain greedy decoding without any error, \
          not expected divergence (the probe is deliberately RAG-shaped, not \
          open-ended). The model will NOT be loaded. Plain: {plain_output:?} \
          Assisted: {assisted_output:?}. Remove the `speculative` block, or set \
@@ -1308,6 +1412,28 @@ mod tests {
         );
     }
 
+    /// A Piper voice (`<name>.onnx` + an espeak `<name>.onnx.json`) is
+    /// detected by its config, ahead of the Coqui `model.onnx` check.
+    #[test]
+    fn detect_tts_backend_finds_piper_voice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("vi_VN-vais1000-medium.onnx"), b"").expect("write onnx");
+        std::fs::write(
+            dir.path().join("vi_VN-vais1000-medium.onnx.json"),
+            r#"{"audio":{"sample_rate":22050},"espeak":{"voice":"vi"},
+                "inference":{"noise_scale":0.667,"length_scale":1,"noise_w":0.8},
+                "num_speakers":1,"phoneme_type":"espeak","phoneme_id_map":{"_":[0]}}"#,
+        )
+        .expect("write config");
+        assert_eq!(
+            detect_tts_backend(dir.path()).expect("detect"),
+            TtsBackend::Piper {
+                onnx: dir.path().join("vi_VN-vais1000-medium.onnx"),
+                config: dir.path().join("vi_VN-vais1000-medium.onnx.json"),
+            }
+        );
+    }
+
     #[test]
     fn detect_tts_backend_falls_back_to_speecht5_when_dir_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1333,6 +1459,7 @@ mod tests {
             model_kinds: std::sync::RwLock::new(HashMap::new()),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
             max_prompt_len_hints: std::sync::RwLock::new(HashMap::new()),
+            min_response_len_hints: std::sync::RwLock::new(HashMap::new()),
             draft_hints: std::sync::RwLock::new(HashMap::new()),
             image_provenance_hints: std::sync::RwLock::new(HashMap::new()),
             embedding_pooling: crate::ov_embed::Pooling::Mean,

@@ -19,6 +19,7 @@ error envelope. A client written against OpenAI's SDK works against these unmodi
 | `POST` | `/v1/completions` | Legacy raw-prompt completions |
 | `POST` | `/v1/embeddings` | Text embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech-to-text (Whisper) |
+| `POST` | `/v1/audio/translations` | Speech in any language → English text (Whisper) |
 | `POST` | `/v1/audio/speech` | Text-to-speech (Kokoro-82M, Coqui VITS, `SpeechT5`) |
 | `POST` | `/v1/images/generations` | Text-to-image (SDXL, FLUX.1-schnell) |
 | `POST` | `/v1/images/edits` | Image inpainting + img2img (SDXL) |
@@ -53,7 +54,7 @@ of OpenAI's actual Realtime API event schema.
 | `POST` | `/v1/admin/models/{id}/check` | Check model state without loading |
 | `POST` | `/v1/admin/models/{id}/resize` | Resize a **resident** model's KV-cache pool — evicts (draining in-flight requests) then reloads at the new size. Body `{"kv_cache_gb": <f64 > 0>}`; every other resolved override (`max_concurrent_streams`, …) is carried forward from the model's record, so the caller states only the delta. Deliberately **not** idempotent-when-`Ready` — that is exactly why it exists, since a repeated `/load` silently ignores a new `kv_cache_gb` on an already-loaded model |
 | `DELETE` | `/v1/admin/models/{id}` | Evict model from VRAM (drains in-flight requests, then joins engine thread) |
-| `PATCH` | `/v1/admin/models/{id}` | Update fields of an already-registered model — persisted always, live immediately for most fields, next-load for `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`speculative`; `device`/`tier_preference` need the model `NotLoaded` first. `kind` is immutable |
+| `PATCH` | `/v1/admin/models/{id}` | Update fields of an already-registered model — persisted always, live immediately for most fields, next-load for `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`min_response_len`/`speculative`; `device`/`tier_preference` need the model `NotLoaded` first. `kind` is immutable |
 | `DELETE` | `/v1/admin/models/{id}/register` | Deregister a model entirely (removed from `GET /v1/admin/models` until next restart/reload) |
 | `POST` | `/v1/admin/config/reload` | Diff `config.json` against the live registry — add new entries, refresh changed fields, skip disruptive ones |
 | `POST` | `/v1/admin/config/preload` | Replace the persisted `preload` list — `{"model_ids": [...]}` explicitly, or `{"from_live": true}` to snapshot the currently-`Ready` set |
@@ -65,6 +66,70 @@ of OpenAI's actual Realtime API event schema.
 | `GET` | `/v1/admin/realtime/sessions` | List all live realtime WebSocket sessions |
 | `GET` | `/v1/admin/realtime/sessions/{id}` | Full snapshot of one realtime session |
 | `DELETE` | `/v1/admin/realtime/sessions/{id}` | Force-close a live realtime session |
+
+---
+
+## Request limits and endpoint behaviour
+
+### Request size (every route)
+
+A request body may be at most **50 MiB**. That is a fixed server limit, not a config field. A
+larger request gets `413` with error code `request_too_large`, whether it is a JSON body (a chat
+request with a large inline image, say) or a multipart upload (audio, images).
+
+### `POST /v1/audio/transcriptions`
+
+- **Fields:**
+  - `file` (required): WAV, MP3, OGG, FLAC or M4A. The server decodes it and resamples it to
+    16 kHz mono itself.
+  - `model` (required).
+  - `language` (optional, e.g. `en`, `pl`). Recommended: detection from a few seconds of audio
+    is unreliable.
+  - `response_format`: `json` (default), `text`, `srt` or `verbose_json`.
+  - Other OpenAI fields (`prompt`, `temperature`, …) are accepted and ignored.
+- **Long audio:** one request transcribes the whole file, including audio longer than Whisper's
+  30-second window. For example, an 87.6-second file came back complete, with `verbose_json`
+  segments to the end. In practice the length limit is the 50 MiB upload cap: about 27 minutes
+  of 16 kHz mono 16-bit WAV, and much longer as MP3 or OGG.
+
+### `POST /v1/audio/translations`
+
+- **Output is always English**, whatever language is spoken. That is what Whisper's translate
+  task does, and what OpenAI's endpoint promises. For any other target language, transcribe and
+  then translate with `/v1/chat/completions`.
+- **Same request and response format as transcriptions**, and the same 50 MiB cap. `language`
+  isn't in OpenAI's spec for this route; RustedVINO accepts it as a hint for the *spoken*
+  language.
+- **The model has to be trained for translation.** An English-only Whisper model (`.en`) is
+  refused with `400` `model_cannot_translate`. `whisper-large-v3-turbo` was fine-tuned for
+  transcription only: it accepts the request but returns text in the spoken language, not
+  English, and the server can't detect that from the model's files. Measured on one Polish clip:
+
+  | Model | Result |
+  |---|---|
+  | `whisper-large-v3` | Correct English translation |
+  | `whisper-tiny` | English, but a loose paraphrase |
+  | `whisper-large-v3-turbo` | Polish text, untranslated |
+
+### `POST /v1/embeddings`
+
+- **Input length:** each input may be at most the model's own maximum (for example 512 tokens for
+  multilingual-e5, including special tokens). A longer input gets `400`
+  `context_length_exceeded`; nothing is truncated.
+- **Inputs per request:** at most `max_embedding_inputs` (default 256), else `400`
+  `too_many_inputs`.
+- **Batch size:** at most `max_embedding_batch_tokens` padded tokens per request (default 32768;
+  inputs × the longest input's token count), else `400` `batch_too_large`. See
+  [`CONFIG.md`](CONFIG.md).
+
+### `GET /v1/realtime` (WebSocket)
+
+- **Audio in:** binary frames of 16 kHz mono PCM, 16-bit little-endian.
+- **Voice activity detection** is server-side, with fixed values: speech starts after 100 ms
+  above an RMS level of 0.015 (about −36 dBFS), and an utterance ends after 500 ms below it.
+- **Every utterance goes speech-to-text → LLM → text-to-speech.** There is no transcription-only
+  mode. For captions only, send each utterance to `/v1/audio/transcriptions` instead, as
+  [`tools/livecaptions`](tools/livecaptions/README.md) does.
 
 ---
 

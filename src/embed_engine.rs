@@ -12,7 +12,7 @@
 //   - The thread processes one Embed at a time (the pipeline is single-stream
 //     and blocking), replying over the per-request oneshot.
 //   - Admission is a real `Semaphore` gate (mirrors `cb_engine`/`vlm_engine`,
-//     dev/plans/vlm-admission-gate-fix.md's recipe): a permit is acquired
+//     the project's internal engineering log's recipe): a permit is acquired
 //     *before* a command is sent and held by the engine thread until it
 //     replies, so `active()` is honest occupancy, not merely "callers who
 //     called `embed()`". Replaces the old `in_flight: AtomicUsize` +
@@ -20,7 +20,7 @@
 // ============================================================
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc::Sender, oneshot};
@@ -97,11 +97,21 @@ pub struct EmbeddingHandle {
     /// Callers currently parked in [`embed`](Self::embed) awaiting an
     /// admission permit — the engine's honest `rustedvino_requests_waiting`.
     waiting: Arc<AtomicUsize>,
-    /// The model's `config.json`-declared `max_position_embeddings`, resolved
-    /// once at load time ([`crate::ov_embed::resolve_max_seq_len`]). `None`
+    /// The model's usable input length in tokens, resolved once at load time
+    /// ([`crate::ov_embed::resolve_max_seq_len`]: tokenizer limit, else the
+    /// position table adjusted for RoBERTa-family offsets). `None`
     /// when the field wasn't declared/parseable — the L0 length gate is
     /// skipped in that case, same fail-open policy as the NPU prompt gate.
     max_seq_len: Option<usize>,
+    /// Net measured device-memory change (bytes) across this engine's embed
+    /// batches since load — the batch working memory `OpenVINO` keeps until
+    /// eviction. Updated on the engine thread, which runs batches one at a
+    /// time; stays 0 where [`crate::gpu_memory`] can't measure.
+    mem_growth: Arc<AtomicI64>,
+    /// Set when a batch's measurement window was polluted (another model's
+    /// load or eviction overlapped it): the growth is then unknown for the
+    /// rest of this load rather than silently wrong.
+    mem_tainted: Arc<AtomicBool>,
 }
 
 impl EmbeddingHandle {
@@ -123,6 +133,8 @@ impl EmbeddingHandle {
             cap,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            mem_growth: Arc::new(AtomicI64::new(0)),
+            mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
         }
     }
@@ -158,6 +170,8 @@ impl EmbeddingHandle {
             cap,
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
+            mem_growth: Arc::new(AtomicI64::new(0)),
+            mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
         }
     }
@@ -211,8 +225,8 @@ impl EmbeddingHandle {
         result.map_err(AdmitError::Failed)
     }
 
-    /// The model's `max_position_embeddings` ceiling (resolved once at load
-    /// time from `config.json`), or `None` when it wasn't declared/parseable.
+    /// The model's usable input length in tokens (resolved once at load time,
+    /// see [`crate::ov_embed::resolve_max_seq_len`]), or `None` when unknown.
     #[must_use]
     pub(crate) fn max_seq_len(&self) -> Option<usize> {
         self.max_seq_len
@@ -262,6 +276,10 @@ impl ManagedEngine for EmbeddingHandle {
     fn waiting(&self) -> usize {
         self.waiting.load(Ordering::Relaxed)
     }
+
+    fn runtime_memory_growth_bytes(&self) -> Option<i64> {
+        (!self.mem_tainted.load(Ordering::Relaxed)).then(|| self.mem_growth.load(Ordering::Relaxed))
+    }
 }
 
 // ── Engine thread ─────────────────────────────────────────────────────────────
@@ -289,6 +307,10 @@ pub fn spawn_embed_engine(
     // stream, so only request-count and end-to-end duration are emitted (ttft /
     // tok-per-second are generation concepts that do not apply).
     let metrics = HotMetrics::new(ModelKind::Embedding, model_id, &device);
+    let mem_growth = Arc::new(AtomicI64::new(0));
+    let thread_mem_growth = Arc::clone(&mem_growth);
+    let mem_tainted = Arc::new(AtomicBool::new(false));
+    let thread_mem_tainted = Arc::clone(&mem_tainted);
 
     let thread = std::thread::Builder::new()
         .name(format!("embed-engine-{model_id_owned}"))
@@ -309,7 +331,19 @@ pub fn spawn_embed_engine(
                     } => {
                         // Embedding input is always text → `Modality::Text`.
                         metrics.request_accepted(Modality::Text);
+                        let window = crate::gpu_memory::MeasureWindow::open();
+                        let before = crate::gpu_memory::process_total_bytes();
                         let result = run_embed(&engine, &model_id_owned, &texts);
+                        if let (Some(b), Some(a)) =
+                            (before, crate::gpu_memory::process_total_bytes())
+                        {
+                            if window.is_clean() {
+                                #[allow(clippy::cast_possible_wrap)] // device memory < 2^63 bytes
+                                thread_mem_growth.fetch_add(a as i64 - b as i64, Ordering::Relaxed);
+                            } else {
+                                thread_mem_tainted.store(true, Ordering::Relaxed);
+                            }
+                        }
                         metrics.record_duration(Modality::Text, started_at.elapsed().as_secs_f64());
                         // The receiver may be gone if the client disconnected — ignore.
                         let _ = reply.send(result);
@@ -337,6 +371,8 @@ pub fn spawn_embed_engine(
             cap: EMBED_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            mem_growth,
+            mem_tainted,
             max_seq_len,
         },
         thread,
@@ -413,6 +449,8 @@ pub(crate) fn spawn_mock_embed(model_id: &str) -> (EmbeddingHandle, std::thread:
             cap: EMBED_CHANNEL_CAP,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            mem_growth: Arc::new(AtomicI64::new(0)),
+            mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
         },
         thread,
@@ -427,6 +465,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A batch whose measurement window was polluted taints the engine's memory
+    /// growth for the rest of the load: reported as unknown, not a wrong number.
+    #[test]
+    fn tainted_memory_growth_reads_unknown() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let h = EmbeddingHandle::from_sender(tx, "e5");
+        h.mem_growth.store(2_000_000_000, Ordering::Relaxed);
+        assert_eq!(h.runtime_memory_growth_bytes(), Some(2_000_000_000));
+        h.mem_tainted.store(true, Ordering::Relaxed);
+        assert_eq!(h.runtime_memory_growth_bytes(), None);
+    }
 
     /// A fresh handle reports zero active/waiting requests and its configured cap.
     #[test]

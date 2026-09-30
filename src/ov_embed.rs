@@ -335,18 +335,49 @@ fn validate_embed_output(out: &[Vec<f32>], filled: usize, expected: usize) -> an
 /// error (root-caused 2026-08-03,
 /// the project's internal engineering log).
 ///
+/// The usable length is not always the table size: RoBERTa-family models
+/// (XLM-R, e.g. multilingual-e5, bge-reranker-v2-m3) offset position ids by
+/// `padding_idx + 1 = 2`, so a 514-row table holds 512 tokens. Inputs of 513–514
+/// tokens were *not* rejected by `OpenVINO` — they embedded silently with
+/// untrained positions (measured 2026-09-29). So the ceiling is, in order: the
+/// tokenizer's `model_max_length` (`tokenizer_config.json`) when it is a real
+/// value no larger than the table; else the table size minus 2 for a
+/// RoBERTa-family `model_type`; else the table size.
+///
 /// Returns `None` when `config.json` is absent, unparseable, or lacks the
 /// field — fail-open, mirroring the NPU `max_prompt_len` gate's "config.json
 /// absent/unparseable → skip the gate" policy: an unknown ceiling means no
 /// gate, not a guessed one.
 #[must_use]
 pub(crate) fn resolve_max_seq_len(model_dir: &std::path::Path) -> Option<usize> {
-    let text = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(model_dir.join(name)).ok()?;
+        serde_json::from_str(&text).ok()
+    };
+    let config = read_json("config.json")?;
+    let table = config
         .get("max_position_embeddings")?
         .as_u64()
+        .and_then(|n| usize::try_from(n).ok())?;
+    // HF writes a huge sentinel (1e30, often as a float) when the tokenizer
+    // has no limit; `as_u64` rejects floats and oversize values, and the
+    // `<= table` check rejects anything else implausible.
+    let tokenizer_limit = read_json("tokenizer_config.json")
+        .and_then(|t| t.get("model_max_length")?.as_u64())
         .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n >= 1 && n <= table);
+    if let Some(limit) = tokenizer_limit {
+        return Some(limit);
+    }
+    let roberta_family = matches!(
+        config.get("model_type").and_then(serde_json::Value::as_str),
+        Some("xlm-roberta" | "roberta" | "camembert")
+    );
+    Some(if roberta_family {
+        table.saturating_sub(2)
+    } else {
+        table
+    })
 }
 
 impl Drop for OvEmbedEngine {
@@ -380,6 +411,63 @@ mod tests {
             r#"{"architectures":["BertModel"],"max_position_embeddings":512}"#,
         )
         .expect("write config.json");
+        assert_eq!(resolve_max_seq_len(dir.path()), Some(512));
+    }
+
+    /// multilingual-e5's real files: table 514, tokenizer 512 → 512 (the gate
+    /// used to admit 513–514, embedded silently with untrained positions).
+    #[test]
+    fn resolve_max_seq_len_prefers_tokenizer_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"xlm-roberta","max_position_embeddings":514}"#,
+        )
+        .expect("write config.json");
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"model_max_length":512}"#,
+        )
+        .expect("write tokenizer_config.json");
+        assert_eq!(resolve_max_seq_len(dir.path()), Some(512));
+    }
+
+    /// Without a usable tokenizer limit (absent, HF's 1e30 "unset" sentinel, or
+    /// larger than the table), a RoBERTa-family table loses its 2 offset slots;
+    /// a BERT table is used as-is.
+    #[test]
+    fn resolve_max_seq_len_roberta_offset_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = |model_type: &str, table: u32| {
+            std::fs::write(
+                dir.path().join("config.json"),
+                format!(r#"{{"model_type":"{model_type}","max_position_embeddings":{table}}}"#),
+            )
+            .expect("write config.json");
+        };
+        cfg("xlm-roberta", 8194);
+        assert_eq!(resolve_max_seq_len(dir.path()), Some(8192));
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"model_max_length":1e30}"#,
+        )
+        .expect("write tokenizer_config.json");
+        assert_eq!(
+            resolve_max_seq_len(dir.path()),
+            Some(8192),
+            "1e30 sentinel ignored"
+        );
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"model_max_length":100000}"#,
+        )
+        .expect("write tokenizer_config.json");
+        assert_eq!(
+            resolve_max_seq_len(dir.path()),
+            Some(8192),
+            "> table ignored"
+        );
+        cfg("bert", 512);
         assert_eq!(resolve_max_seq_len(dir.path()), Some(512));
     }
 

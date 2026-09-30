@@ -94,12 +94,24 @@ fn prompt_too_long_error(
         "L0 prompt-length gate rejected request — context_length_exceeded"
     );
     crate::metrics::record_context_length_exceeded(model_id, gate);
-    openai_error(
-        StatusCode::BAD_REQUEST,
+    // The NPU ceiling is a compile-time graph shape (`max_prompt_len`), not
+    // a KV pool — pointing an NPU user at `cache_size_gb` sent them to a knob
+    // that cannot help.
+    let message = if gate == "npu" {
+        format!(
+            "prompt is {token_count} tokens — exceeds this NPU model's compiled prompt \
+             length of {max_prompt_tokens} tokens; shorten the prompt or raise the \
+             model's max_prompt_len"
+        )
+    } else {
         format!(
             "prompt is {token_count} tokens — exceeds this model's KV-pool capacity \
              of {max_prompt_tokens} tokens; shorten the prompt or increase cache_size_gb",
-        ),
+        )
+    };
+    openai_error(
+        StatusCode::BAD_REQUEST,
+        message,
         "invalid_request_error",
         Some("context_length_exceeded"),
     )
@@ -326,13 +338,16 @@ pub(crate) const NPU_DEFAULT_MAX_PROMPT_LEN: usize = 1024;
 /// limit, not a soft KV-pool budget — but until this gate, nothing checked it
 /// before calling `generate()`: a too-long prompt surfaced as `OpenVINO`'s raw
 /// C++ exception text instead of a clean 400 (found 2026-07-16 via an
-/// Ollama-comparison benchmark; the project's internal engineering log #6).
+/// Ollama-comparison benchmark; the project's internal engineering log).
 ///
 /// Mirrors [`gate_vlm_prompt`] exactly (count-only — `NpuHandle::generate`
 /// takes a plain string prompt, never pre-tokenized ids, so there is nothing
-/// to reuse downstream the way `gate_prompt` reuses CB ids). `max_prompt_len`
-/// is the resolved effective ceiling: the model's configured
-/// `max_prompt_len` override, or [`NPU_DEFAULT_MAX_PROMPT_LEN`] when unset.
+/// to reuse downstream the way `gate_prompt` reuses CB ids). The ceiling is
+/// [`NpuHandle::max_prompt_len`](crate::npu_engine::NpuHandle::max_prompt_len):
+/// the value the resident graph was compiled with (the model's configured
+/// `max_prompt_len` at load time, or [`NPU_DEFAULT_MAX_PROMPT_LEN`] when
+/// unset) — never the registry's current value, which can drift after a
+/// PATCH or config reload until the next load.
 ///
 /// Same fail-open policy as `gate_prompt`/`gate_vlm_prompt`: a tokenizer-call
 /// error does not become a false 400.
@@ -342,8 +357,8 @@ pub(crate) const NPU_DEFAULT_MAX_PROMPT_LEN: usize = 1024;
 pub(crate) async fn gate_npu_prompt(
     npu: &crate::npu_engine::NpuHandle,
     prompt: &str,
-    max_prompt_len: usize,
 ) -> Result<(), Box<Response>> {
+    let max_prompt_len = npu.max_prompt_len();
     gate_prompt_bytes(npu.model_id(), "npu", prompt, max_prompt_len)?;
     match npu.count_tokens(prompt.to_owned()).await {
         Ok(count) if count > max_prompt_len => Err(Box::new(prompt_too_long_error(
@@ -639,7 +654,7 @@ struct ChatChunk<'a> {
     model: &'a str,
     choices: Vec<ChunkChoice>,
     /// Non-standard `OpenAI` extension, same spirit as `generation_metadata`
-    /// on the image-gen endpoints (`PLAN_image_metadata_response.md`): the
+    /// on the image-gen endpoints (the image-metadata plan): the
     /// tool-call dialect detected from this model's chat template at load
     /// time ([`ModelFamily`]) — useful for debugging why tool-call parsing
     /// did or didn't happen for a given model. Always present (`Default` is a
@@ -780,7 +795,7 @@ struct ResponseMessage {
 
 /// Token accounting (`OpenAI` `usage` block). `prompt_tokens` is the engine's
 /// exact tokenizer count (Phase 3.6); `completion_tokens` is the count of
-/// non-empty per-step deltas, which ≈ generated tokens. See DECISIONS.md
+/// non-empty per-step deltas, which ≈ generated tokens. See the project's internal engineering log
 /// 2026-05-29. Shared by the chat and legacy-completions endpoints.
 // Field names are fixed by the OpenAI wire format; the shared `_tokens`
 // suffix is required, so the struct-field-names lint does not apply here.
@@ -960,7 +975,7 @@ pub fn stream_event_to_sse(
     meta: ResponseMeta,
 ) -> Vec<Result<Event, Infallible>> {
     match event {
-        StreamEvent::PromptTokens(_) => vec![],
+        StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => vec![],
         StreamEvent::Token(tok, _) => vec![Ok(token_event(&tok, id, model, created, meta))],
         StreamEvent::Done(reason) => {
             let mut frames = vec![Ok(finish_event(
@@ -1941,7 +1956,7 @@ pub async fn chat_completions(
                 // substitutes a fabricated "thinking was cut off" placeholder,
                 // and because tool parsing runs on that placeholder, EVERY
                 // tool call is silently lost. See
-                // `dev/plans/lfm2-tool-call-family.md`.
+                // the project's internal engineering log.
                 let vlm_starts_thinking =
                     template_prefills_thinking(&ctx.template) && req.enable_thinking != Some(false);
                 // G2 (VLM): same buffered tool-call branch as the text path —
@@ -2002,7 +2017,7 @@ pub async fn chat_completions(
             EngineHandleKind::NpuTextGen(npu) => {
                 // NPU LLM path: single-stream static LLMPipeline. Self-contained
                 // (like the VLM arm): builds the prompt, gates its length
-                // (gate_npu_prompt — dev/ovms-gap.md #6), submits, streams/
+                // (gate_npu_prompt — the project's internal engineering log), submits, streams/
                 // collects. Tool calls are not injected on this path for the
                 // initial implementation.
                 if has_images(&req.messages) {
@@ -2033,16 +2048,15 @@ pub async fn chat_completions(
                     Err(r) => return *r,
                 };
 
-                // L0: NPU prompt-length gate (dev/ovms-gap.md #6) — the NPU
-                // compiles a fixed-shape graph ahead of time, so this is a hard
-                // compile-time ceiling, not a soft KV-pool budget. Without this,
-                // an over-limit prompt reached `npu.generate` directly and
-                // surfaced OpenVINO's raw C++ exception text instead of a clean
-                // 400 (found via an Ollama-comparison benchmark, 2026-07-16).
-                let effective_max_prompt_len = ctx
-                    .configured_max_prompt_len
-                    .map_or(NPU_DEFAULT_MAX_PROMPT_LEN, |v| v as usize);
-                if let Err(resp) = gate_npu_prompt(npu, &prompt, effective_max_prompt_len).await {
+                // L0: NPU prompt-length gate (the project's internal engineering
+                // log #6) — the NPU compiles a fixed-shape graph ahead of time,
+                // so this is a hard compile-time ceiling, not a soft KV-pool
+                // budget. Without this, an over-limit prompt reached
+                // `npu.generate` directly and surfaced OpenVINO's raw C++
+                // exception text instead of a clean 400. The ceiling comes from
+                // the handle (what the resident graph was compiled with), not
+                // the registry, which a PATCH or config reload can change.
+                if let Err(resp) = gate_npu_prompt(npu, &prompt).await {
                     return *resp;
                 }
 
@@ -2083,10 +2097,7 @@ pub async fn chat_completions(
                 // AtCapacity  → 429: the admission gate is full: client should retry.
                 // EngineDead  → 503: engine thread exited (evicted mid-request?).
                 // Submitted   → proceed to stream the SSE response.
-                match npu
-                    .generate(prompt, gen_params.max_new_tokens, tx, requested_at)
-                    .await
-                {
+                match npu.generate(prompt, gen_params, tx, requested_at).await {
                     SubmitResult::Submitted => {}
                     SubmitResult::AtCapacity => {
                         return openai_error(
@@ -2521,13 +2532,18 @@ impl ScanState {
                 self.prompt_tokens = n;
                 vec![]
             }
+            // The engine's exact total replaces the running chunk sum.
+            StreamEvent::CompletionTokens(n) => {
+                self.completion_tokens = n;
+                vec![]
+            }
             StreamEvent::Token(tok, new_tokens) => {
                 // Count at the raw level (includes reasoning tokens), matching
                 // the non-streaming path which does the same. Sum the
                 // engine's own reported token count, not 1 per event — a
                 // speculative-decoding verification step can accept several
                 // draft tokens at once, all landing in one event (found live
-                // 2026-07-19, see dev/DECISIONS.md).
+                // 2026-07-19, see the project's internal engineering log).
                 if !tok.is_empty() {
                     self.completion_tokens += new_tokens;
                 }
@@ -2669,7 +2685,7 @@ pub(crate) struct Drained {
     /// tokenizer-count failure) — matching the pre-3.6 behaviour.
     pub(crate) prompt_tokens: usize,
     /// Count of non-empty deltas — a proxy for generated tokens
-    /// (see DECISIONS.md 2026-05-29).
+    /// (see the project's internal engineering log 2026-05-29).
     pub(crate) completion_tokens: usize,
     /// The engine's finish reason (`Stop`/`Length`).
     pub(crate) finish: FinishReason,
@@ -2691,6 +2707,8 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::PromptTokens(n) => prompt_tokens = n,
+            // The engine's exact total replaces the running chunk sum.
+            StreamEvent::CompletionTokens(n) => completion_tokens = n,
             StreamEvent::Token(tok, new_tokens) => {
                 // Sum the engine's own reported token count, not 1 per event
                 // — see the identical fix + rationale in ScanState::process.
@@ -2714,7 +2732,7 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
 
 /// Build a `usage` block. `prompt_tokens` is the engine's exact tokenizer count
 /// (Phase 3.6; `0` when unavailable, e.g. the mock path); `completion_tokens` is
-/// the non-empty-delta count (≈ generated tokens — see DECISIONS.md 2026-05-29).
+/// the non-empty-delta count (≈ generated tokens — see the project's internal engineering log 2026-05-29).
 pub(crate) fn usage_for(prompt_tokens: usize, completion_tokens: usize) -> Usage {
     Usage {
         prompt_tokens,
@@ -3130,8 +3148,8 @@ mod tests {
 
     /// A real gate rejection increments the observability counter end to
     /// end — closes the gap where a clean 400 `context_length_exceeded` was
-    /// fully visible to the client but invisible server-side (`dev/autotest/
-    /// 20260823_l0_gate_rejection_observability_gap.md`). Exercises
+    /// fully visible to the client but invisible server-side
+    /// (the project's internal engineering log). Exercises
     /// `gate_prompt_bytes` directly (sync, unlike the full `gate_prompt`)
     /// since `metrics::with_local_recorder`'s thread-local scoping can't
     /// safely wrap an `.await` that hops onto a background `tokio::spawn`
@@ -3256,7 +3274,7 @@ mod tests {
         assert!(gate_vlm_prompt(&dead2, "p", 100).await.is_ok());
     }
 
-    // ---- NPU L0 prompt-length gate (dev/ovms-gap.md #6) --------------------
+    // ---- NPU L0 prompt-length gate ----------------------------------------
 
     fn npu_with_token_count(n_tokens: usize) -> crate::npu_engine::NpuHandle {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -3277,10 +3295,11 @@ mod tests {
     async fn gate_npu_prompt_rejects_oversized_prompt_before_counting() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         drop(rx);
-        let dead = crate::npu_engine::NpuHandle::from_sender(tx, "dead-npu");
+        let dead = crate::npu_engine::NpuHandle::from_sender(tx, "dead-npu")
+            .with_shape(crate::npu_engine::NpuShape::resolve(Some(10), None));
         // max_prompt_len=10 -> byte ceiling is 10*32=320 bytes.
         let huge_prompt = "a".repeat(1_000);
-        let resp = *gate_npu_prompt(&dead, &huge_prompt, 10).await.unwrap_err();
+        let resp = *gate_npu_prompt(&dead, &huge_prompt).await.unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3295,7 +3314,7 @@ mod tests {
     #[tokio::test]
     async fn gate_npu_prompt_rejects_over_limit_prompt() {
         let npu = npu_with_token_count(1_061);
-        let resp = *gate_npu_prompt(&npu, "a chat-templated prompt", 1_024)
+        let resp = *gate_npu_prompt(&npu, "a chat-templated prompt")
             .await
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -3310,7 +3329,25 @@ mod tests {
     #[tokio::test]
     async fn gate_npu_prompt_passes_within_limit() {
         let npu = npu_with_token_count(100);
-        assert!(gate_npu_prompt(&npu, "ok prompt", 1_024).await.is_ok());
+        assert!(gate_npu_prompt(&npu, "ok prompt").await.is_ok());
+    }
+
+    /// The gate enforces the ceiling the resident graph was compiled with,
+    /// carried on the handle — not the registry's configured value (review
+    /// M1). A model loaded at 2048 then `PATCH`ed to `null` and reloaded is
+    /// compiled at the 1024 default, so a 1500-token prompt must now get a
+    /// clean 400 rather than reach `generate` and hit the C++ exception.
+    #[tokio::test]
+    async fn gate_npu_prompt_uses_compiled_shape_from_handle() {
+        use crate::npu_engine::NpuShape;
+        let compiled_2048 =
+            npu_with_token_count(1_500).with_shape(NpuShape::resolve(Some(2_048), None));
+        assert!(gate_npu_prompt(&compiled_2048, "p").await.is_ok());
+
+        let recompiled_default =
+            npu_with_token_count(1_500).with_shape(NpuShape::resolve(None, None));
+        let resp = *gate_npu_prompt(&recompiled_default, "p").await.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A dead engine (tokenize errors) fails open rather than producing a
@@ -3320,7 +3357,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let dead = crate::npu_engine::NpuHandle::from_sender(tx, "dead-npu");
-        assert!(gate_npu_prompt(&dead, "p", 1_024).await.is_ok());
+        assert!(gate_npu_prompt(&dead, "p").await.is_ok());
     }
 
     // ---- T7.1/T2.2 shared max_tokens clamp ---------------------------------
@@ -3770,7 +3807,9 @@ mod tests {
             embedding_pooling: "mean".to_owned(),
             embedding_normalize: true,
             default_embed_model: None,
-            max_prompt_array: 16,              // the production default
+            max_prompt_array: 16, // the production default
+            max_embedding_inputs: 256,
+            max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,              // the production default
             bind_addr: "127.0.0.1".to_owned(), // loopback — irrelevant for unit tests
             port: 11_437,
@@ -4169,6 +4208,54 @@ mod tests {
             state.completion_tokens, 7,
             "must sum 4+1+2=7 real tokens across 3 events, not count 3 events"
         );
+    }
+
+    /// 0.7.0 plan A4: the engine's `CompletionTokens` total replaces the running
+    /// chunk sum in both accumulators — the NPU sends chunks immediately at
+    /// n=1 (one chunk can hold several tokens) and corrects the count at the
+    /// end. The usage frame emitted at `Done` must carry the exact total.
+    #[tokio::test]
+    async fn completion_tokens_event_replaces_chunk_sum() {
+        let mut state = ScanState::new(
+            None,
+            false,
+            None,
+            crate::admission::WorkLease::default(),
+            None,
+        );
+        for ev in [
+            StreamEvent::Token("two tokens".into(), 1),
+            StreamEvent::Token(" one".into(), 1),
+            StreamEvent::CompletionTokens(5),
+        ] {
+            state.process(ev, "id", "m", 0, true, test_meta());
+        }
+        assert_eq!(state.completion_tokens, 5);
+        let frames = state.process(
+            StreamEvent::Done(FinishReason::Stop),
+            "id",
+            "m",
+            0,
+            true,
+            test_meta(),
+        );
+        let usage = format!("{:?}", frames[frames.len() - 2]);
+        assert!(usage.contains(r#"\"completion_tokens\":5"#), "{usage}");
+
+        let (tx, rx) = crate::streaming::stream_channel();
+        for ev in [
+            StreamEvent::PromptTokens(9),
+            StreamEvent::Token("two tokens".into(), 1),
+            StreamEvent::Token(" one".into(), 1),
+            StreamEvent::CompletionTokens(5),
+            StreamEvent::Done(FinishReason::Stop),
+        ] {
+            tx.send(ev).await.unwrap();
+        }
+        drop(tx);
+        let drained = drain_channel(rx).await.unwrap();
+        assert_eq!(drained.completion_tokens, 5);
+        assert_eq!(drained.content, "two tokens one");
     }
 
     /// `Done(Stop)` emits `finish_reason: "stop"`.
@@ -5335,8 +5422,8 @@ mod tests {
     }
 
     /// `vlm_gate_text` must include `tool_calls` JSON, not just `content` —
-    /// the L0-gate-undercount bug (`dev/autotest/
-    /// 20260823_l0_gate_token_count_discrepancy.md`): an assistant turn
+    /// the L0-gate-undercount bug
+    /// (the project's internal engineering log): an assistant turn
     /// that only made a tool call has empty `content`, so a gate measuring
     /// `content` alone sees nothing from it at all.
     #[test]

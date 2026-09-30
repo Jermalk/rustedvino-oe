@@ -78,7 +78,7 @@ pub struct ImageHandle {
     /// The model ID of the loaded image model (the response `model` field).
     model_id: Arc<str>,
     /// Model-directory-derived identity, read once at load time — never
-    /// per request (`PLAN_image_metadata_response.md`).
+    /// per request (the image-metadata plan).
     metadata: Arc<ImageModelMetadata>,
     /// Accepted-but-unfinished requests (queued + the one generating). Each
     /// request holds an [`InFlightGuard`] for its whole lifetime so the counter
@@ -120,7 +120,7 @@ impl ImageHandle {
     }
 
     /// The raw `scheduler/scheduler_config.json` contents, passed through
-    /// verbatim — no per-scheduler-algorithm parsing (`PLAN_image_metadata_response.md`
+    /// verbatim — no per-scheduler-algorithm parsing (the image-metadata plan
     /// §1a Finding 1).
     #[must_use]
     pub fn scheduler_config(&self) -> Option<&serde_json::Value> {
@@ -341,7 +341,7 @@ pub fn spawn_image_engine(
 }
 
 /// Model-directory-derived identity for `generation_metadata`
-/// (`PLAN_image_metadata_response.md`), read once at load time and cached on
+/// (the image-metadata plan), read once at load time and cached on
 /// [`ImageHandle`] — never per request. Each field independently omits
 /// (`None`) rather than fabricates when its source file is missing or
 /// unparseable.
@@ -365,7 +365,7 @@ pub struct ImageModelMetadata {
 }
 
 /// Operator-supplied model provenance (Tier 3,
-/// `PLAN_image_metadata_response.md`) — precision, HF source repo, HF
+/// the image-metadata plan) — precision, HF source repo, HF
 /// revision. Unlike Tiers 1-2, these are never derivable from the model
 /// directory, so they come from config (`ModelPolicy`) via the same
 /// hint-registry pattern `max_prompt_len`/draft-model hints already use
@@ -441,9 +441,9 @@ fn read_pipeline_class(model_dir: &std::path::Path) -> Option<String> {
 /// pipelines) or `transformer/openvino_model.bin` (FLUX/SD3-family — `DiT`
 /// backbones use this directory name instead) — the two backbone directory
 /// names the diffusers `OpenVINO` export convention uses across every pipeline
-/// family surveyed (`PLAN_image_metadata_response.md` §1a).
+/// family surveyed (the image-metadata plan §1a).
 ///
-/// Matches the pyramu-panel spec's convention (`pyramu-image-metadata-spec.md`
+/// Matches the pyramu-panel spec's convention (the Pyramu image-metadata spec
 /// §5.1: "Model hash = ... the model file's SHA-256") — a single representative
 /// file, the one that changes when an operator swaps checkpoints, not the
 /// VAE/text-encoder submodels often shared across them.
@@ -492,7 +492,7 @@ fn hash_file(path: &std::path::Path) -> Option<String> {
     Some(format!("sha256:{hex}"))
 }
 
-/// Memoized wrapper around [`compute_model_hash`] (`PLAN_image_metadata_response.md`
+/// Memoized wrapper around [`compute_model_hash`] (the image-metadata plan
 /// Tier 2, the project's internal engineering log's 2026-08-01 update): checks
 /// `crate::cache_manifest` for a cached digest keyed by
 /// `(backbone_relpath, size_bytes, mtime_unix)` before streaming the backbone
@@ -553,7 +553,7 @@ pub(crate) fn resolve_model_hash(
 /// (not the model root, unlike `model_index.json`) and generalizes across every
 /// pipeline family surveyed; deliberately does NOT consult `model_index.json`'s
 /// own `scheduler` pointer, which can be stale relative to this file
-/// (`PLAN_image_metadata_response.md` §1a Findings 1 and 2).
+/// (the image-metadata plan §1a Findings 1 and 2).
 ///
 /// Returns `None` if the file is missing, unparseable, or not a JSON object
 /// (a pathological `scheduler_config.json` whose whole content is e.g. `null`
@@ -743,7 +743,7 @@ mod tests {
     }
 
     /// `read_pipeline_class` extracts `_class_name` from `model_index.json`,
-    /// generically across pipeline families (`PLAN_image_metadata_response.md`
+    /// generically across pipeline families (the image-metadata plan
     /// §1a Finding 1) — no per-family parsing branch.
     #[test]
     fn read_pipeline_class_extracts_class_name_across_families() {

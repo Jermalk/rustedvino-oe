@@ -13,7 +13,7 @@ expect_used = "deny"
 
 [package]
 name = "rustedvino"
-version = "0.6.8"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -132,7 +132,7 @@ metrics-exporter-prometheus = "0.16"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64ct = { version = "1", features = ["alloc"] }
 
-# Image-gen `model_hash` (Phase 5.3, PLAN_image_metadata_response.md Tier 2):
+# Image-gen `model_hash` (Phase 5.3, the image-metadata plan Tier 2):
 # SHA-256 of the model's primary backbone weight file, computed once at load
 # time. No `unsafe`, no OS dependency — pure Rust hashing.
 sha2 = "0.10"
@@ -151,11 +151,16 @@ rubato = "0.16"
 kokoro-tts = "0.3.3"
 
 # Direct ORT session for the Polish VITS TTS backend (Coqui `pl/mai_female/vits`,
-# BSD-3-Clause weights — see dev/DECISIONS.md). Character-based model, no
-# phonemizer dependency (unlike Piper/espeak-ng, GPL-3.0, deliberately avoided —
-# see the same DECISIONS.md entry). Version pinned to match the one `kokoro-tts`
+# BSD-3-Clause weights — see the project's internal engineering log). Character-based model, no
+# phonemizer dependency (unlike Piper voices, which need espeak-ng — GPL-3.0, so
+# the Piper backend runs it as an external program, never linked). Version pinned to match the one `kokoro-tts`
 # already locks, so no duplicate ORT build in the dependency tree.
 ort = "=2.0.0-rc.12"
+
+# NFD decomposition for Piper voices: Piper feeds each Unicode codepoint of the
+# NFD-normalized espeak-ng IPA as one phoneme (src/pipelines/piper.rs).
+# MIT/Apache-2.0 (unicode-rs).
+unicode-normalization = "0.1"
 
 # Windows-only: live system-RAM read for the M1 memory admission gate
 # (os_memory::available_ram_gb / total_ram_gb). `sysinfo` wraps
@@ -166,7 +171,7 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Unix-only: raw sigaction/backtrace FFI for crash_handler (native SIGSEGV/
 # SIGABRT logging — OpenVINO's C++ runtime can segfault on a model's engine
-# thread with nothing landing in the app log otherwise; see dev/DECISIONS.md).
+# thread with nothing landing in the app log otherwise; see the project's internal engineering log).
 # No such handler on Windows yet — SEH crash reporting is a separate concern.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

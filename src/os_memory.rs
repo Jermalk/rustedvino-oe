@@ -64,8 +64,7 @@ pub fn total_ram_gb() -> Option<f64> {
 }
 
 /// The local hostname — for tying a generation record back to the per-box
-/// benchmark corpus (`dev/torture-room/<host>/`, `PLAN_image_metadata_response.md`
-/// §1). Linux reads `/proc/sys/kernel/hostname` directly (same dependency-free
+/// benchmark results. Linux reads `/proc/sys/kernel/hostname` directly (same dependency-free
 /// `/proc` convention as [`total_ram_gb`] — the whole fleet is Linux); Windows
 /// uses the already-Windows-gated `sysinfo` crate this module's memory query
 /// also uses. `None` if unreadable/empty on Linux, or unreported on Windows —
@@ -154,7 +153,7 @@ pub fn ram_floor_admits(avail_gb: f64, need_gb: f64, floor_gb: f64) -> bool {
 /// will hand back on demand, and which `MemAvailable` therefore **omits**.
 ///
 /// This exists because of a real, measured defect (2026-09-07,
-/// `dev/autotest/20260907_uma_ram_admission_ttm_pool.md`): on a UMA box the
+/// the project's internal engineering log): on a UMA box the
 /// DRM/TTM subsystem keeps freed GPU pages in a pool for fast reuse. Those
 /// pages are `used` and absent from `MemAvailable`, so the M1 gate refused a
 /// 12 GB model on a 30 GB machine with "this load can never fit" — while

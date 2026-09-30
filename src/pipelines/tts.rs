@@ -13,7 +13,7 @@
 //   Coqui `pl/mai_female/vits` (5.2c, Polish) — direct `ort` session, 22.05 kHz
 //     mono f32. `spawn_coqui_vits_engine(onnx_path, tokens_path, …)` — dedicated
 //     OS thread, fully synchronous ORT calls (no embedded runtime needed, unlike
-//     Kokoro). Character-based model (no phonemizer) — see `dev/DECISIONS.md` for
+//     Kokoro). Character-based model (no phonemizer) — see the project's internal engineering log for
 //     why this replaced an earlier Piper/espeak-ng prototype (GPL-3.0, incompatible
 //     with RustedVINO's BSL→Apache-2.0 licensing plan).
 //
@@ -725,6 +725,169 @@ pub fn spawn_coqui_vits_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             sample_rate: COQUI_VITS_PL_SAMPLE_RATE,
+        },
+        thread,
+    ))
+}
+
+// ── Piper VITS (espeak-ng phonemes, e.g. vi_VN vais1000) ─────────────────────
+
+/// One Piper synthesis: phonemize (external espeak-ng), then one ONNX run per
+/// sentence, audio concatenated. `speed` maps to `length_scale / speed`, as
+/// for Coqui VITS.
+fn piper_synthesize(
+    session: &mut ort::session::Session,
+    cfg: &crate::pipelines::piper::PiperConfig,
+    text: &str,
+    speed: f32,
+) -> anyhow::Result<Vec<f32>> {
+    use crate::pipelines::piper::{espeak_cli, phonemes_to_ids, phonemize};
+    let sentences = phonemize(&cfg.espeak.voice, &clean_text_for_piper(text), &espeak_cli)?;
+    anyhow::ensure!(!sentences.is_empty(), "no speakable text in input");
+    let length_scale = cfg.inference.length_scale / speed.clamp(0.25, 4.0);
+    let mut audio = Vec::new();
+    for phonemes in &sentences {
+        let ids = phonemes_to_ids(phonemes, &cfg.phoneme_id_map);
+        let len = i64::try_from(ids.len()).context("input text too long")?;
+        let input = ort::value::Tensor::<i64>::from_array(([1_i64, len], ids))
+            .context("building `input` tensor")?;
+        let lengths = ort::value::Tensor::<i64>::from_array(([1_i64], vec![len]))
+            .context("building `input_lengths` tensor")?;
+        let scales = ort::value::Tensor::<f32>::from_array((
+            [3_i64],
+            vec![
+                cfg.inference.noise_scale,
+                length_scale,
+                cfg.inference.noise_w,
+            ],
+        ))
+        .context("building `scales` tensor")?;
+        let outputs = if cfg.num_speakers > 1 {
+            let sid = ort::value::Tensor::<i64>::from_array(([1_i64], vec![0_i64]))
+                .context("building `sid` tensor")?;
+            session.run(ort::inputs![input, lengths, scales, sid])
+        } else {
+            session.run(ort::inputs![input, lengths, scales])
+        }
+        .context("ORT session run failed")?;
+        let (_shape, samples) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .context("extracting audio tensor")?;
+        audio.extend_from_slice(samples);
+    }
+    Ok(audio)
+}
+
+/// Light text cleanup for espeak-ng input: [`crate::tts_normalize`]'s symbol
+/// substitutions are English-oriented, so for Piper only whitespace is
+/// collapsed — espeak-ng reads the text in the voice's own language.
+fn clean_text_for_piper(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Spawn a dedicated OS thread owning an `ort` session for a Piper voice
+/// (`<name>.onnx` + `<name>.onnx.json`).
+///
+/// Before accepting requests it runs [`crate::pipelines::piper::self_check`]:
+/// espeak-ng missing, or phonemizing the voice's reference sentence
+/// differently from Piper, fails the load — otherwise the voice would be
+/// mispronounced without any error.
+///
+/// # Errors
+/// Config/model load errors, the self-check, and thread-spawn errors.
+pub fn spawn_piper_engine(
+    onnx_path: String,
+    config_path: &str,
+    model_id: &str,
+    device: &str,
+    queue_timeout: Duration,
+) -> anyhow::Result<(TtsHandle, std::thread::JoinHandle<()>)> {
+    let cfg = crate::pipelines::piper::load_config(Path::new(config_path))?;
+    let verified = crate::pipelines::piper::self_check(
+        &cfg.espeak.voice,
+        &crate::pipelines::piper::espeak_cli,
+    )?;
+    if verified {
+        tracing::info!(model_id, voice = %cfg.espeak.voice, "Piper espeak-ng self-check passed");
+    } else {
+        tracing::warn!(
+            model_id,
+            voice = %cfg.espeak.voice,
+            "no espeak-ng self-check reference for this voice's language — pronunciation not verified"
+        );
+    }
+    let sample_rate = cfg.audio.sample_rate;
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<TtsCommand>(TTS_CHANNEL_CAP);
+    let sem = Arc::new(Semaphore::new(TTS_CHANNEL_CAP));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+
+    let model_id_arc: Arc<str> = Arc::from(model_id);
+    let model_id_owned = model_id.to_owned();
+    let device_owned = device.to_owned();
+    let metrics = HotMetrics::new(ModelKind::Tts, model_id, device);
+
+    let thread = std::thread::Builder::new()
+        .name(format!("piper-tts-{model_id_owned}"))
+        .spawn(move || {
+            let mut session = match ort::session::Session::builder()
+                .and_then(|mut b| b.commit_from_file(&onnx_path))
+                .with_context(|| format!("loading Piper ONNX model {onnx_path}"))
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            tracing::info!(
+                model_id = %model_id_owned,
+                device = %device_owned,
+                voice = %cfg.espeak.voice,
+                sample_rate,
+                "Piper TTS engine loaded"
+            );
+            let _ = ready_tx.send(Ok(()));
+
+            while let Some(TtsCommand::Synthesize {
+                text,
+                speed,
+                reply,
+                started_at,
+                permit,
+                ..
+            }) = cmd_rx.blocking_recv()
+            {
+                metrics.request_accepted(Modality::Text);
+                let result = piper_synthesize(&mut session, &cfg, &text, speed);
+                let elapsed = started_at.elapsed();
+                metrics.record_duration(Modality::Text, elapsed.as_secs_f64());
+                if let Ok(ref samples) = result {
+                    #[allow(clippy::cast_precision_loss)]
+                    let duration_s = samples.len() as f64 / f64::from(sample_rate);
+                    metrics.record_rtf(elapsed.as_secs_f64() / duration_s.max(0.001));
+                }
+                let _ = reply.send(result);
+                drop(permit);
+            }
+            tracing::info!(
+                model_id = %model_id_owned,
+                "Piper TTS engine thread exiting — all handles dropped"
+            );
+        })?;
+
+    ready_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Piper engine exited before signaling ready"))??;
+
+    Ok((
+        TtsHandle {
+            tx: cmd_tx,
+            model_id: model_id_arc,
+            sem,
+            cap: TTS_CHANNEL_CAP,
+            queue_timeout,
+            waiting: Arc::new(AtomicUsize::new(0)),
+            sample_rate,
         },
         thread,
     ))

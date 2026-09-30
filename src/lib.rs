@@ -14,6 +14,7 @@ pub mod cb_engine;
 pub mod crash_handler;
 pub mod device_inventory;
 pub mod embed_engine;
+pub mod gpu_memory;
 mod handlers;
 pub mod image_util;
 pub mod in_flight;
@@ -67,7 +68,7 @@ use handlers::chat::chat_completions;
 use handlers::completions::completions;
 use handlers::embeddings::embeddings;
 use handlers::error::openai_error;
-use handlers::media::{image_edits, image_generations, speech, transcriptions};
+use handlers::media::{image_edits, image_generations, speech, transcriptions, translations};
 use handlers::realtime::realtime_handler;
 use handlers::reranking::rerank;
 use handlers::tokenize::{detokenize, tokenize};
@@ -78,7 +79,7 @@ use tower_http::cors::{Any, CorsLayer};
 /// 50 MB — covers full-res smartphone photos (base64 adds ~33 % overhead,
 /// so this accepts ~37 MB of raw image data). Raised from axum's 2 MB default
 /// to support VLM image payloads sent by clients like `AnythingLLM`.
-const MAX_REQUEST_BODY: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 50 * 1024 * 1024;
 
 /// Assembles the axum [`Router`] for the full `RustedVINO` API with a
 /// **permissive** CORS policy (`Access-Control-Allow-Origin: *`).
@@ -192,6 +193,7 @@ pub fn create_router_with_extension(
         // 5.2a: /v1/audio/speech (SpeechT5 TTS) — live
         // 5.3a: /v1/images/generations (Text2Image) — live
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/speech", post(speech))
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/images/edits", post(image_edits))
@@ -304,10 +306,12 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 }
 
 /// Middleware: attach an `x-ruvi-host` response header carrying this box's
-/// hostname — every response on every pipeline (chat, VLM, STT, TTS,
-/// embeddings, rerank, images), not just the image-gen `generation_metadata`
-/// Tier 1 added. Lets fleet tooling attribute a response to the physical
-/// machine that served it without an extra admin round-trip.
+/// hostname — on every pipeline (chat, VLM, STT, TTS, embeddings, rerank,
+/// images), but only on responses to key-validated requests
+/// ([`Authenticated`]). Lets fleet tooling attribute a response to the
+/// physical machine that served it without an extra admin round-trip, without
+/// handing the hostname to anyone who can reach the port: `/health`, a `401`,
+/// and every response of a server with no keys configured carry no header.
 ///
 /// `os_memory::host_name()` reads `/proc/sys/kernel/hostname` on Linux — cheap,
 /// but static for the process lifetime, so it's read once and cached rather
@@ -320,7 +324,8 @@ async fn attach_ruvi_host(req: Request, next: Next) -> Response {
     let host = HOST.get_or_init(crate::os_memory::host_name);
 
     let mut response = next.run(req).await;
-    if let Some(host) = host
+    if response.extensions().get::<Authenticated>().is_some()
+        && let Some(host) = host
         && let Ok(value) = HeaderValue::from_str(host)
     {
         response
@@ -555,7 +560,7 @@ struct AuthMiddlewareState {
 /// never let `/v1/admin/*` fall through to the (usually wide open)
 /// inference gate just because `admin_api_keys` also happens to be empty —
 /// see `app_state::AppState::admin_locked`'s doc comment for the reasoning
-/// and the the project's internal engineering log entry for the full design discussion.
+/// and the project's internal engineering log entry for the full design discussion.
 ///
 /// **Admin routes with `admin_api_keys` configured (T4.3, `admin_locked`
 /// false):**
@@ -624,7 +629,7 @@ async fn require_bearer_auth(
                 if let Some(suffix) = key_suffix(key) {
                     crate::metrics::record_key_usage(suffix);
                 }
-                next.run(req).await
+                run_authenticated(req, next).await
             }
             // A valid inference key reaching admin → authenticated but unauthorized.
             Some(key) if keys.api_keys.iter().any(|k| key_matches(k, key)) => openai_error(
@@ -650,11 +655,32 @@ async fn require_bearer_auth(
             if let Some(suffix) = key_suffix(key) {
                 crate::metrics::record_key_usage(suffix);
             }
-            next.run(req).await
+            run_authenticated(req, next).await
         }
         Some(_) => invalid_api_key(),
         None => missing_api_key(),
     }
+}
+
+/// Marks a request that passed a key check — a valid inference *or* admin
+/// key. Set by [`require_bearer_auth`] only on those two branches, never on
+/// the exempt probes or a server with no keys configured, so "no marker"
+/// covers every unauthenticated case. Inserted into the request extensions
+/// (handlers read it as `Option<Extension<Authenticated>>`) and the response
+/// extensions (outer middleware such as `attach_ruvi_host` reads it there,
+/// since it runs outside the auth layer).
+///
+/// It gates host disclosure: the `x-ruvi-host` header and the hostname in
+/// image `generation_metadata` / the admin `server` block go only to callers
+/// who proved they hold a key.
+#[derive(Clone, Copy, Debug)]
+pub struct Authenticated;
+
+async fn run_authenticated(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(Authenticated);
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(Authenticated);
+    response
 }
 
 /// Constant-time equality for one configured key against one presented

@@ -996,33 +996,158 @@ async fn response_has_generated_request_id() {
     assert_eq!(id.len(), 36, "generated id should be a UUIDv4: {id}");
 }
 
-/// Every response carries a real `x-ruvi-host` — the box's actual hostname
-/// (`os_memory::host_name()`), not the old hardcoded placeholder string
-/// `"ruvi-host"` this header used to send unconditionally.
+// ------------------------------------------------------------------
+// x-ruvi-host / generation_metadata.host — hostname only for callers who
+// passed a key check (inference or admin key); never on an open server,
+// the exempt `/health`, or any rejected (401/403) request.
+// ------------------------------------------------------------------
+
+/// GET `uri` (optionally with a bearer key) and return the response.
+async fn get_with_key(
+    app: axum::Router,
+    uri: &str,
+    key: Option<&str>,
+) -> axum::http::Response<Body> {
+    let mut req = Request::builder().uri(uri);
+    if let Some(key) = key {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+    app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+}
+
+fn keyed_app() -> axum::Router {
+    rustedvino::create_router_with_cors(
+        AppState::mock(),
+        &["*".to_owned()],
+        &["sk-secret".to_owned()],
+    )
+}
+
+/// A valid inference key gets the box's real hostname (not the old
+/// hardcoded `"ruvi-host"` placeholder).
 #[tokio::test]
-async fn response_has_real_ruvi_host_header() {
-    let app = rustedvino::create_router(AppState::mock());
+async fn ruvi_host_header_sent_for_valid_inference_key() {
+    let resp = get_with_key(keyed_app(), "/v1/models", Some("sk-secret")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let host = resp.headers().get("x-ruvi-host").unwrap().to_str().unwrap();
+    assert_eq!(host, rustedvino::os_memory::host_name().unwrap());
+}
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
+/// An admin key on an admin-scoped server also counts as key-validated.
+#[tokio::test]
+async fn ruvi_host_header_sent_for_valid_admin_key() {
+    let resp = get_with_key(admin_scope_app(), "/v1/models", Some("sk-admin")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-ruvi-host").is_some());
+}
+
+#[tokio::test]
+async fn ruvi_host_header_absent_without_valid_key() {
+    for (key, want) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("sk-wrong"), StatusCode::UNAUTHORIZED),
+    ] {
+        let resp = get_with_key(keyed_app(), "/v1/models", key).await;
+        assert_eq!(resp.status(), want);
+        assert!(
+            resp.headers().get("x-ruvi-host").is_none(),
+            "key {key:?} must not see the host"
+        );
+    }
+    // Authenticated but out of scope (inference key on an admin route) → 403, still no host.
+    let resp = get_with_key(admin_scope_app(), "/v1/admin/models", Some("sk-inference")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(resp.headers().get("x-ruvi-host").is_none());
+}
+
+/// The exempt probe never carries it, even when a valid key is presented.
+#[tokio::test]
+async fn ruvi_host_header_absent_on_health() {
+    for key in [None, Some("sk-secret")] {
+        let resp = get_with_key(keyed_app(), "/health", key).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-ruvi-host").is_none());
+    }
+}
+
+/// A server with no keys configured never discloses its hostname.
+#[tokio::test]
+async fn ruvi_host_header_absent_on_open_server() {
+    for uri in ["/health", "/v1/models"] {
+        let resp = get_with_key(rustedvino::create_router(AppState::mock()), uri, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-ruvi-host").is_none(), "{uri}");
+    }
+}
+
+/// The admin-scope branch of the auth gate (an admin key on an admin route —
+/// `/metrics` shares that gate) marks the request too; `/v1/models` with an
+/// admin key only exercises the inference gate's superset branch.
+#[tokio::test]
+async fn ruvi_host_header_sent_on_admin_branch() {
+    let resp = get_with_key(admin_scope_app(), "/metrics", Some("sk-admin")).await;
+    // Past the gate (the mock state's handler answers 503: no metrics recorder).
+    assert!(![StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&resp.status()));
+    assert!(resp.headers().get("x-ruvi-host").is_some());
+}
+
+/// Admin keys only (no inference keys): inference routes are open, so no host
+/// there even with the admin key; admin routes validate the key and get it.
+#[tokio::test]
+async fn ruvi_host_on_admin_keys_only_server() {
+    let app = || {
+        rustedvino::create_router_with_auth(
+            AppState::mock(),
+            &["*".to_owned()],
+            &[],
+            &["sk-admin".to_owned()],
         )
-        .await
-        .unwrap();
+    };
+    for key in [None, Some("sk-admin")] {
+        let resp = get_with_key(app(), "/v1/models", key).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-ruvi-host").is_none(),
+            "open inference route, key {key:?}"
+        );
+    }
+    let resp = get_with_key(app(), "/metrics", Some("sk-admin")).await;
+    assert!(![StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&resp.status()));
+    assert!(resp.headers().get("x-ruvi-host").is_some());
+}
 
-    let host = response
-        .headers()
-        .get("x-ruvi-host")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let expected = rustedvino::os_memory::host_name().unwrap();
+/// Image `generation_metadata.host` follows the same gate as the header.
+#[tokio::test]
+async fn image_metadata_host_only_for_valid_key() {
+    let body = r#"{"model":"sdxl","prompt":"a red circle","n":1,"size":"512x512"}"#;
+    let post = |app: axum::Router, key: Option<&'static str>| async move {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = app
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp.into_body()).await
+    };
+    let open = post(rustedvino::create_router(AppState::mock()), None).await;
+    assert!(
+        open["generation_metadata"].get("host").is_none(),
+        "open server: {open}"
+    );
+    assert!(
+        open["generation_metadata"].get("engine").is_some(),
+        "metadata itself still present"
+    );
+    let keyed = post(keyed_app(), Some("sk-secret")).await;
     assert_eq!(
-        host, expected,
-        "x-ruvi-host must be the box's actual hostname"
+        keyed["generation_metadata"]["host"],
+        rustedvino::os_memory::host_name().unwrap()
     );
 }
 
@@ -1560,7 +1685,7 @@ async fn admin_scope_empty_falls_back_to_inference_gate() {
 }
 
 // ------------------------------------------------------------------
-// admin_locked — no keys file existed at boot (dev/DECISIONS.md,
+// admin_locked — no keys file existed at boot (the project's internal engineering log,
 // "shall not allow inference open but admin also open when keys.json is
 // not present")
 // ------------------------------------------------------------------
@@ -1991,14 +2116,13 @@ async fn embeddings_dimensions_param_is_rejected() {
     assert_eq!(json["error"]["param"], "dimensions");
 }
 
-/// An `input` array beyond the fan-out cap (`max_prompt_array`, default 16) is
-/// rejected with a clean 400 rather than accepted unbounded — mirrors the
-/// same cap already enforced on `/v1/completions`' `prompt` array.
+/// An `input` array beyond the embeddings cap (`max_embedding_inputs`, default
+/// 256) is rejected with a clean 400 rather than accepted unbounded.
 #[tokio::test]
 async fn embeddings_input_array_beyond_cap_is_rejected() {
     let app = rustedvino::create_router(AppState::mock());
 
-    let inputs: Vec<String> = (0..17).map(|i| format!("\"input {i}\"")).collect();
+    let inputs: Vec<String> = (0..257).map(|i| format!("\"input {i}\"")).collect();
     let body = format!(r#"{{"model":"mock-embed","input":[{}]}}"#, inputs.join(","));
     let response = app
         .oneshot(
@@ -2018,12 +2142,13 @@ async fn embeddings_input_array_beyond_cap_is_rejected() {
     assert_eq!(json["error"]["code"], "too_many_inputs");
 }
 
-/// An `input` array at (not beyond) the cap is accepted.
+/// An `input` array at (not beyond) the cap is accepted — 256, well past the
+/// `/v1/completions` `max_prompt_array` (16) embeddings used to share.
 #[tokio::test]
 async fn embeddings_input_array_at_cap_is_accepted() {
     let app = rustedvino::create_router(AppState::mock());
 
-    let inputs: Vec<String> = (0..16).map(|i| format!("\"input {i}\"")).collect();
+    let inputs: Vec<String> = (0..256).map(|i| format!("\"input {i}\"")).collect();
     let body = format!(r#"{{"model":"mock-embed","input":[{}]}}"#, inputs.join(","));
     let response = app
         .oneshot(
@@ -2039,7 +2164,7 @@ async fn embeddings_input_array_at_cap_is_accepted() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
-    assert_eq!(json["data"].as_array().unwrap().len(), 16);
+    assert_eq!(json["data"].as_array().unwrap().len(), 256);
 }
 
 // ------------------------------------------------------------------
@@ -2234,6 +2359,106 @@ async fn post_transcription(fields: &[(&str, Option<&str>, &[u8])]) -> axum::htt
     )
     .await
     .unwrap()
+}
+
+/// An upload over the 50 MiB request-body limit is an honest 413
+/// `request_too_large` naming the limit — it used to be a 400
+/// "could not read field 'file'" (a 123 MB podcast hit it).
+#[tokio::test]
+async fn transcription_over_body_limit_is_413() {
+    let big = vec![0u8; 51 * 1024 * 1024];
+    let response = post_transcription(&[
+        ("model", None, b"whisper-stt"),
+        ("file", Some("big.wav"), &big),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "request_too_large");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("50 MiB")
+    );
+}
+
+/// The same honest 413 for an oversized JSON body (a chat request with a huge
+/// inline image, say) — it used to be 400 "malformed request body".
+#[tokio::test]
+async fn json_body_over_limit_is_413() {
+    let app = rustedvino::create_router(AppState::mock());
+    let body = format!(
+        r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(51 * 1024 * 1024)
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "request_too_large");
+}
+
+/// POST a multipart request to `/v1/audio/translations`.
+async fn post_translation(fields: &[(&str, Option<&str>, &[u8])]) -> axum::http::Response<Body> {
+    let app = rustedvino::create_router(AppState::mock());
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/audio/translations")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={MP_BOUNDARY}"),
+            )
+            .body(Body::from(build_multipart(fields)))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// `/v1/audio/translations` is routed, shares the transcription request
+/// parsing and response formats, and runs the translate task.
+#[tokio::test]
+async fn translation_route_returns_translated_text_in_each_format() {
+    let json_resp = post_translation(&[
+        ("model", None, b"whisper-stt"),
+        ("file", Some("a.wav"), b"fake-audio"),
+    ])
+    .await;
+    assert_eq!(json_resp.status(), StatusCode::OK);
+    let json = body_json(json_resp.into_body()).await;
+    assert_eq!(json["text"], "This is a mock translation.");
+
+    let srt = post_translation(&[
+        ("model", None, b"whisper-stt"),
+        ("response_format", None, b"srt"),
+        ("file", Some("a.wav"), b"fake-audio"),
+    ])
+    .await;
+    assert_eq!(srt.status(), StatusCode::OK);
+
+    // verbose_json names the task that ran, as OpenAI's does.
+    let verbose = post_translation(&[
+        ("model", None, b"whisper-stt"),
+        ("response_format", None, b"verbose_json"),
+        ("file", Some("a.wav"), b"fake-audio"),
+    ])
+    .await;
+    assert_eq!(verbose.status(), StatusCode::OK);
+    assert_eq!(body_json(verbose.into_body()).await["task"], "translate");
+
+    let missing = post_translation(&[("model", None, b"whisper-stt")]).await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2432,7 +2657,7 @@ async fn post_image_edit(fields: &[(&str, Option<&str>, &[u8])]) -> axum::http::
 /// reach `OpenVINO`'s img2img pipeline directly, whose shape-inference failure
 /// left the C++ pipeline corrupted and crashed the whole process on the next
 /// operation against it. Full writeup:
-/// `dev/autotest/20260804_image_edit_small_image_segfault.md`.
+/// the project's internal engineering log.
 #[tokio::test]
 async fn image_edit_too_small_source_is_400_not_a_crash() {
     let png = encode_test_png(64, 64);
@@ -2460,4 +2685,49 @@ async fn image_edit_minimum_size_source_is_accepted() {
     ])
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `image_edits`' `generation_metadata.host` is gated like the header: none on
+/// an open server, the real hostname for a key-validated caller.
+#[tokio::test]
+async fn image_edit_metadata_host_only_for_valid_key() {
+    let png = encode_test_png(256, 256);
+    let body = build_multipart(&[
+        ("image", Some("source.png"), png.as_slice()),
+        ("model", None, b"sdxl"),
+        ("prompt", None, b"test"),
+    ]);
+    let post = |app: axum::Router, key: Option<&'static str>, body: Vec<u8>| async move {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={MP_BOUNDARY}"),
+            );
+        if let Some(key) = key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = app
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp.into_body()).await
+    };
+    let open = post(
+        rustedvino::create_router(AppState::mock()),
+        None,
+        body.clone(),
+    )
+    .await;
+    assert!(
+        open["generation_metadata"].get("host").is_none(),
+        "open server: {open}"
+    );
+    let keyed = post(keyed_app(), Some("sk-secret"), body).await;
+    assert_eq!(
+        keyed["generation_metadata"]["host"],
+        rustedvino::os_memory::host_name().unwrap()
+    );
 }

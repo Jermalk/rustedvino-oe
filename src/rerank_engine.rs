@@ -60,7 +60,7 @@ pub struct RerankingHandle {
     tx: Sender<RerankCommand>,
     model_id: Arc<str>,
     in_flight: Arc<AtomicUsize>,
-    /// The model's `max_position_embeddings`, resolved once at load time
+    /// The model's usable input length in tokens, resolved once at load time
     /// ([`crate::ov_embed::resolve_max_seq_len`] — a generic BERT-family
     /// `config.json` reader, not embedding-specific despite its module).
     /// `None` when `config.json` didn't declare it — fail-open, no gate.
@@ -74,7 +74,7 @@ impl RerankingHandle {
         &self.model_id
     }
 
-    /// The model's `max_position_embeddings` ceiling, if known. Used by the
+    /// The model's usable input length in tokens, if known. Used by the
     /// `/v1/rerank` handler's pre-inference length gate
     /// (the project's internal engineering log).
     #[must_use]
@@ -227,7 +227,7 @@ pub fn spawn_rerank_engine(
                         let result = engine
                             .rerank(&query, &documents)
                             .map(|results| RerankOutput { results });
-                        // Self-healing recovery (dev/autotest/20260804_rerank_shape_poisoning.md):
+                        // Self-healing recovery (the project's internal engineering log):
                         // a failed call can leave the pipeline's internal tensor state
                         // permanently inconsistent, so every later call on this same
                         // load would otherwise fail identically until an admin

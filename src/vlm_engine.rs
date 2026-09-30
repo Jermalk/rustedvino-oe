@@ -622,8 +622,8 @@ fn run_generate(
                 completion_tokens,
                 "VLM generation complete"
             );
-            // KV-admission wedge detection (`dev/autotest/
-            // 20260821_omnicoder9b_qwen35_hybrid_stall.md`): `generated_tokens`
+            // KV-admission wedge detection
+            // (the project's internal engineering log): `generated_tokens`
             // comes from the pipeline's OWN `perf_metrics`, independent of the
             // streamer callback above — the callback never receives the EOS
             // token itself, so a genuine single-token EOS decode reports

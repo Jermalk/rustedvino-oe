@@ -1,9 +1,8 @@
 // ============================================================
 // src/admission/mod.rs — cross-pipeline device admission middleware
 // ============================================================
-// Migration step 2 of dev/plans/cross-pipeline-admission-middleware.md
-// (design: Part 3; rationale: dev/DECISIONS.md 2026-07-14 "Cross-pipeline
-// admission middleware design").
+// Step 2 of the cross-pipeline admission middleware migration (rationale:
+// the project's internal engineering log, 2026-07-14 "Cross-pipeline admission middleware design").
 //
 // A SECOND admission gate, sitting IN FRONT OF each engine's own per-engine
 // Semaphore gate (cb_engine/vlm_engine/npu_engine/embed_engine/pipelines::
@@ -16,8 +15,8 @@
 // `device_budgets` config gets no `Semaphore` at all. `admit()` never waits,
 // never allocates, never holds anything for an unconfigured device — see
 // `admit_is_pure_passthrough_for_unconfigured_device` below. Every device
-// budget ships empty (disabled) until dev/plans/device-wide-concurrency-
-// ceiling.md's empirical testing produces real numbers (Migration order #4).
+// budget ships empty (disabled) until empirical testing produces real
+// numbers.
 //
 // Metrics are explicitly OUT OF SCOPE this step (Migration order #2 defers
 // Prometheus to step 4's calibration work) — `WorkClass` exists now only so

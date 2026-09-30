@@ -570,8 +570,12 @@ fn completion_stream(
                     crate::streaming::StreamEvent::Token(t, new_tokens) if !t.is_empty() => {
                         // Sum the engine's own reported token count, not 1 per
                         // event — see the identical fix in chat.rs's
-                        // ScanState::process (dev/DECISIONS.md 2026-07-19).
+                        // ScanState::process (the project's internal engineering log 2026-07-19).
                         state.completion_tokens += *new_tokens;
+                    }
+                    // The engine's exact total replaces the running chunk sum.
+                    crate::streaming::StreamEvent::CompletionTokens(n) => {
+                        state.completion_tokens = *n;
                     }
                     crate::streaming::StreamEvent::Error(_) => state.errored = true,
                     _ => {}
@@ -625,7 +629,7 @@ fn completion_event_to_sse(
     mm: Option<&Arc<ModelManager>>,
 ) -> Vec<Result<Event, Infallible>> {
     match event {
-        StreamEvent::PromptTokens(_) => vec![],
+        StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => vec![],
         StreamEvent::Token(tok, _) => {
             vec![Ok(completion_chunk_event(id, model, created, tok, None))]
         }

@@ -15,7 +15,7 @@
 // - "crash": raises a real, hardware-fault SIGSEGV immediately — not a
 //   software `raise()` or Rust's null-check panic->SIGABRT path, both of
 //   which behave differently (see
-//   dev/autotest/20260707_supervisor_crash_survival.md for why this
+//   the project's internal engineering log for why this
 //   distinction mattered when building the original test harness).
 // - "hang": ignores SIGTERM and sleeps — simulates a worker wedged in a
 //   dirty-GPU cold init, so a test can exercise the supervisor's SIGKILL

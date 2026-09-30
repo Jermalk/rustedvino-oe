@@ -8,8 +8,7 @@
 // `#[cfg(unix)]` module gate): the Windows build never compiles this module
 // at all, so it carries zero risk to the Windows cross-build.
 //
-// See `dev/DECISIONS.md` and
-// `dev/autotest/20260707_supervisor_crash_survival.md` for why this design
+// See the project's internal engineering log for why this design
 // (vs. systemd `Restart=` or a shell supervisor loop) was chosen, and why a
 // worker crashing with SIGSEGV/SIGABRT is safe to catch this way even inside
 // a `systemd-run --user` scope (verified live, both signals, both plain and

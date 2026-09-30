@@ -120,6 +120,15 @@ pub trait ManagedEngine: Send + Sync {
     fn waiting(&self) -> usize {
         0
     }
+    /// Net measured device-memory change (bytes) across this engine's requests
+    /// since load — working memory the runtime keeps between requests, which
+    /// the config-declared `vram_gb` doesn't see. Only the embedding engine
+    /// measures it today (its batch cache is the measured case); `Some(0)`
+    /// elsewhere. `None` = unknown for this load: a request's measurement
+    /// overlapped another model's load or eviction.
+    fn runtime_memory_growth_bytes(&self) -> Option<i64> {
+        Some(0)
+    }
     /// Live KV-cache pool occupancy as a percentage (0–100) from the engine's
     /// last step (`rustedvino_kv_cache_usage_percent`, co-residency Slice 3a).
     ///

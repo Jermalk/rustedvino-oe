@@ -13,7 +13,7 @@ use std::sync::{OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Json,
+    Extension, Json,
     body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
@@ -232,10 +232,7 @@ async fn submit_health_probe(
                     format!("prompt build: {e}"),
                 )
             })?;
-            match npu
-                .generate(prompt, gen_params.max_new_tokens, tx, start)
-                .await
-            {
+            match npu.generate(prompt, gen_params, tx, start).await {
                 crate::cb_engine::SubmitResult::Submitted => Ok(()),
                 crate::cb_engine::SubmitResult::AtCapacity => Err(hg_err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -419,8 +416,8 @@ struct AdminModelEntry {
     /// `max_position_embeddings`, `rope_scaling`-adjusted. A hardware-
     /// independent model property: contrast with `max_prompt_tokens`, which
     /// is what this box's KV pool can currently *serve*. The two can differ
-    /// wildly (confirmed live 2026-08-23, `dev/autotest/
-    /// 20260823_max_position_embeddings_gate_gap.md`: a VRAM-derived ceiling
+    /// wildly (confirmed live 2026-08-23,
+    /// the project's internal engineering log: a VRAM-derived ceiling
     /// of 142k-306k tokens against a real trained ceiling of 40,960) —
     /// when `max_prompt_tokens < native_context_limit`, VRAM is the binding
     /// constraint; when the two are equal, the model itself is. Omitted
@@ -434,11 +431,17 @@ struct AdminModelEntry {
     kv_cache_usage_pct: f64,
     /// Whether this model's KV occupancy has been continuously at/above the
     /// configured pressure threshold for at least the configured sustained
-    /// duration (`dev/plans/kv-cache-pressure-detection.md`). Always `false`
+    /// duration (the project's internal engineering log). Always `false`
     /// while the monitor is disabled (the fleet-wide default) — surfaced
     /// here, not only in `/metrics`, so an operator not watching Prometheus
     /// can still see it via this endpoint.
     kv_pressure_flagged: bool,
+    /// Measured device memory for a loaded model, in GB: the change across its
+    /// load plus runtime growth (the embedding batch cache). Compare with
+    /// `vram_gb` — a larger figure means the memory accounting under-counts
+    /// this model. Omitted when not loaded or on an OS without DRM fdinfo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_memory_estimate_gb: Option<f64>,
 }
 
 /// Response envelope for `GET /v1/admin/models`.
@@ -468,9 +471,15 @@ struct ServerInfo {
 }
 
 impl ServerInfo {
-    fn current() -> Self {
+    /// `with_host`: whether the caller was key-validated — the hostname goes
+    /// only to those (see [`crate::Authenticated`]), never on a keyless server.
+    fn current(with_host: bool) -> Self {
         Self {
-            host: crate::os_memory::host_name(),
+            host: if with_host {
+                crate::os_memory::host_name()
+            } else {
+                None
+            },
             openvino_version: crate::ov_cb::openvino_version(),
             engine: "RustedVINO",
             engine_version: env!("CARGO_PKG_VERSION"),
@@ -489,18 +498,21 @@ impl ServerInfo {
 /// `0`/`0.0` before first load or once evicted. Added so an external client
 /// or operator can discover a model's real usable context window
 /// proactively, instead of only reactively via a `400
-/// context_length_exceeded` after crossing it (`dev/autotest/
-/// 20260823_external_metrics_interface_audit.md`).
+/// context_length_exceeded` after crossing it
+/// (the project's internal engineering log).
 ///
 /// Also carries `native_context_limit` (omitted when unknown) — the model's
 /// own trained/converted context ceiling, independent of `max_prompt_tokens`'
 /// VRAM-derived number, so an operator can tell "VRAM-limited" from
-/// "model-limited" at a glance (`dev/autotest/
-/// 20260823_max_position_embeddings_gate_gap.md`).
+/// "model-limited" at a glance
+/// (the project's internal engineering log).
 ///
 /// - 200 OK — registry snapshot returned
 /// - 503 Service Unavailable — model manager not initialised
-pub async fn admin_list_models(State(state): State<AppState>) -> Response {
+pub async fn admin_list_models(
+    State(state): State<AppState>,
+    authenticated: Option<Extension<crate::Authenticated>>,
+) -> Response {
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -531,12 +543,13 @@ pub async fn admin_list_models(State(state): State<AppState>) -> Response {
             native_context_limit: info.native_context_limit,
             kv_cache_usage_pct: info.kv_cache_usage_pct,
             kv_pressure_flagged: info.kv_pressure_flagged,
+            gpu_memory_estimate_gb: info.gpu_memory_estimate_gb,
         })
         .collect();
 
     Json(AdminModelsResponse {
         models,
-        server: ServerInfo::current(),
+        server: ServerInfo::current(authenticated.is_some()),
     })
     .into_response()
 }
@@ -668,7 +681,7 @@ struct VoicePinResponse {
 
 /// GET /v1/admin/voice-pin — return the current voice flow pin.
 ///
-/// ruvi-voice clients should call this before doing model discovery. If a pin
+/// Pyramu clients should call this before doing model discovery. If a pin
 /// is present, use those model IDs directly in the `ConfigEvent` rather than
 /// running `/v1/admin/models` discovery, so all clients converge on the same
 /// model set.
@@ -702,8 +715,8 @@ pub struct ModelObject {
     /// JSON keys are ignored by strict `OpenAI` clients, so this is
     /// additive/zero-risk. Gives non-admin clients (no admin key) the number
     /// they need to budget context without requiring `GET
-    /// /v1/admin/models` (`dev/autotest/
-    /// 20260823_max_position_embeddings_gate_gap.md`).
+    /// /v1/admin/models`
+    /// (the project's internal engineering log).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
 }
@@ -793,8 +806,8 @@ struct LoadRequest {
     /// Must be `>= 1`.
     #[serde(default)]
     max_concurrent_streams: Option<usize>,
-    /// Realtime voice arbitration v2 (`dev/plans/realtime-voice-model-
-    /// arbitration-v2.md`, D3): bypass the eviction-grace window for this
+    /// Realtime voice arbitration v2
+    /// (the project's internal engineering log, D3): bypass the eviction-grace window for this
     /// load. Only the grace window — never the realtime serving set,
     /// `pinned`, or non-`evictable`, all of which remain unconditionally
     /// protected. Default `false`.
@@ -924,7 +937,7 @@ struct ResizeRequest {
 #[allow(clippy::doc_markdown)]
 /// POST /v1/admin/models/{model_id}/resize — evict then reload a currently-
 /// resident model with a new KV-cache size
-/// (`dev/plans/kv-cache-pressure-detection.md`).
+/// (the project's internal engineering log).
 ///
 /// Unlike `/load`, this is NOT idempotent-when-Ready by design: `/load`'s
 /// idempotency is exactly why this endpoint exists (a repeated `/load` call
@@ -1078,7 +1091,7 @@ pub async fn admin_unload_model(
                         return (StatusCode::CONFLICT, e.to_string()).into_response();
                     }
                     // L3 gate, eviction side (2026-08-04,
-                    // dev/autotest/20260804_gpu_poisoned_eviction_crash.md):
+                    // the project's internal engineering log):
                     // begin_evict now refuses eviction while the GPU context is
                     // poisoned, so this arm is reachable — mapped the same way
                     // model_error_response maps it for the load path.
@@ -1170,7 +1183,7 @@ struct PatchModelResponse {
     applied_live: Vec<&'static str>,
     /// Field names persisted but only changing engine behaviour at this
     /// model's next load (`vram_gb`, `kv_cache_gb`, `max_concurrent_streams`,
-    /// `max_prompt_len`, `speculative`).
+    /// `max_prompt_len`, `min_response_len`, `speculative`).
     effective_on_next_load: Vec<&'static str>,
     /// Field names supplied whose value already matched — accepted, a no-op.
     unchanged: Vec<&'static str>,
@@ -1196,7 +1209,7 @@ struct PatchModelResponse {
 /// `device`/`tier_preference` are placement-affecting: rejected (409) while
 /// the model is `Ready` (they'd disagree with the resident engine's actual
 /// placement — evict first), applied immediately while `NotLoaded`.
-/// `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/
+/// `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`min_response_len`/
 /// `speculative` persist immediately but only take effect at this model's
 /// *next* load. Everything else (`pinned`/`priority`/`evictable`/`load`/
 /// `reasoning_parser`/`capabilities`/`eviction_grace_secs`/image-provenance
@@ -1467,7 +1480,7 @@ pub async fn admin_kill_realtime_session(
 /// at the JSON level exactly like a static `config.json` model stanza (same
 /// shape, same optionality): `pinned`, `priority`, `kv_cache_gb`,
 /// `max_concurrent_streams`, `load`, `evictable`, `device`, `tier_preference`,
-/// `reasoning_parser`, `max_prompt_len`, `speculative`, and the image-gen Tier
+/// `reasoning_parser`, `max_prompt_len`, `min_response_len`, `speculative`, and the image-gen Tier
 /// 3 provenance fields `precision`/`model_source`/`model_revision`. None of
 /// these are obligatory — an operator adding a model at runtime may not know
 /// all of it yet; every field defaults exactly as it would in `config.json`.
@@ -1970,8 +1983,8 @@ mod tests {
     /// `AdminModelEntry` exposes `max_prompt_tokens`/`cache_size_gb` so an
     /// external client/operator can discover a model's real usable context
     /// window proactively, instead of only reactively via a `400
-    /// context_length_exceeded` (`dev/autotest/
-    /// 20260823_external_metrics_interface_audit.md`).
+    /// context_length_exceeded`
+    /// (the project's internal engineering log).
     #[test]
     fn admin_model_entry_exposes_context_ceiling_fields() {
         let entry = AdminModelEntry {
@@ -1988,6 +2001,7 @@ mod tests {
             native_context_limit: Some(40_960),
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
+            gpu_memory_estimate_gb: None,
         };
         let json = serde_json::to_value(entry).unwrap();
         assert_eq!(json["max_prompt_tokens"], 37_137);
@@ -2015,6 +2029,7 @@ mod tests {
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
+            gpu_memory_estimate_gb: None,
         };
         let json = serde_json::to_value(entry).unwrap();
         assert!(
@@ -2056,9 +2071,17 @@ mod tests {
     /// produces valid JSON either way.
     #[test]
     fn server_info_current_serializes_without_panicking() {
-        let value = serde_json::to_value(ServerInfo::current()).unwrap();
+        let value = serde_json::to_value(ServerInfo::current(true)).unwrap();
         assert_eq!(value["engine"], "RustedVINO");
         assert_eq!(value["engine_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Without a key-validated caller the admin `server` block omits `host`.
+    #[test]
+    fn server_info_without_auth_omits_host() {
+        let value = serde_json::to_value(ServerInfo::current(false)).unwrap();
+        assert!(value.get("host").is_none(), "{value}");
+        assert_eq!(value["engine"], "RustedVINO");
     }
 
     /// `ModelsResponse` with one entry serialises to the `OpenAI` envelope shape.
@@ -2140,6 +2163,7 @@ mod tests {
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
+            gpu_memory_estimate_gb: None,
         }
     }
 

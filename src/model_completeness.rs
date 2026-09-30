@@ -8,7 +8,7 @@
 // directory" check (`EngineFactory::model_exists`) and, for some kinds,
 // even complete `load()` successfully — the gap only surfaces on first
 // real inference, as an opaque OpenVINO C++ exception (root-caused
-// 2026-08-03, `dev/DECISIONS.md`: `ms-marco-MiniLM-L6-v2-int8-ov` was
+// 2026-08-03, the project's internal engineering log: `ms-marco-MiniLM-L6-v2-int8-ov` was
 // missing its converted `openvino_tokenizer.{xml,bin}` pair; reranking
 // loaded fine and only failed on the first real `/v1/rerank` call).
 //
@@ -227,8 +227,8 @@ fn check_stt(model_dir: &Path, report: &mut CompletenessReport) {
     );
 }
 
-/// Kokoro/Coqui detection (`detect_tts_backend`) already proves both of
-/// their required files exist by construction — a successful match means
+/// Kokoro/Coqui/Piper detection (`detect_tts_backend`) already proves their
+/// required files exist by construction — a successful match means
 /// nothing further to check. The `SpeechT5` arm is genuinely new: unlike
 /// the other two, `detect_tts_backend` treats `SpeechT5` as its bare
 /// fallback (whatever didn't match Kokoro or Coqui), never validating that
@@ -237,7 +237,8 @@ fn check_stt(model_dir: &Path, report: &mut CompletenessReport) {
 /// detokenizer is advisory like Embedding/Reranking.
 fn check_tts(model_dir: &Path, report: &mut CompletenessReport) {
     match detect_tts_backend(model_dir) {
-        Ok(TtsBackend::Kokoro { .. } | TtsBackend::CoquiVits { .. }) => {}
+        Ok(TtsBackend::Kokoro { .. } | TtsBackend::CoquiVits { .. } | TtsBackend::Piper { .. }) => {
+        }
         Ok(TtsBackend::SpeechT5) => {
             require_pair(
                 model_dir,

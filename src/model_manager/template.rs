@@ -255,8 +255,8 @@ struct KvCapacityRatchet {
 }
 
 /// Read a previously-learned KV-capacity ceiling for `model_dir`, if this
-/// model has ever tripped the VLM-wedge detector (`dev/autotest/
-/// 20260821_omnicoder9b_qwen35_hybrid_stall.md`) and had one written, scaled
+/// model has ever tripped the VLM-wedge detector
+/// (the project's internal engineering log) and had one written, scaled
 /// to `current_kv_gb` — the KV pool size (GB) about to be used for the load
 /// this ceiling will gate.
 ///

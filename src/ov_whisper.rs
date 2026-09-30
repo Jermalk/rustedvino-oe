@@ -59,12 +59,36 @@ unsafe extern "C" {
         num_samples: usize,
         language: *const std::ffi::c_char,
         return_timestamps: std::ffi::c_int,
+        translate: std::ffi::c_int,
         text_cb: Option<OvWhisperTextCallback>,
         chunk_cb: Option<OvWhisperChunkCallback>,
         user_data: *mut c_void,
         language_out: *mut std::ffi::c_char,
         language_cap: usize,
     ) -> std::ffi::c_int;
+}
+
+/// Whether the Whisper model in `model_dir` supports the translate task, from
+/// its `generation_config.json`: `is_multilingual` and a `translate` entry in
+/// `task_to_id`. English-only (`.en`) models have neither.
+///
+/// `None` when the file is missing or unreadable — unknown, so callers let
+/// the request through rather than refuse a model that might work. Note what
+/// this can't tell: `whisper-large-v3-turbo` declares translation but was
+/// fine-tuned on transcription only, so its translations are weak.
+#[must_use]
+pub(crate) fn resolve_can_translate(model_dir: &std::path::Path) -> Option<bool> {
+    let text = std::fs::read_to_string(model_dir.join("generation_config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let multilingual = cfg
+        .get("is_multilingual")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let has_task = cfg
+        .get("task_to_id")
+        .and_then(|t| t.get("translate"))
+        .is_some();
+    Some(multilingual && has_task)
 }
 
 // ── Result types ─────────────────────────────────────────────────────────────
@@ -142,7 +166,9 @@ impl OvWhisperEngine {
     ///
     /// `language`: a source-language code (`"en"`, `"pl"`, …) or `None` to
     /// autodetect. `timestamps`: when `true`, the result carries per-segment
-    /// [`WhisperChunk`]s.
+    /// [`WhisperChunk`]s. `translate`: Whisper's translate task — English
+    /// output whatever the spoken language; check [`resolve_can_translate`]
+    /// first, it only works on multilingual models.
     ///
     /// # Errors
     /// Returns an error if the C++ pipeline call fails or a callback panics.
@@ -155,6 +181,7 @@ impl OvWhisperEngine {
         samples: &[f32],
         language: Option<&str>,
         timestamps: bool,
+        translate: bool,
     ) -> anyhow::Result<WhisperResult> {
         let c_language = match language {
             Some(l) => Some(CString::new(l).context("language contains interior NUL")?),
@@ -186,6 +213,7 @@ impl OvWhisperEngine {
                 samples.len(),
                 language_ptr,
                 std::ffi::c_int::from(timestamps),
+                std::ffi::c_int::from(translate),
                 Some(text_trampoline),
                 Some(chunk_trampoline),
                 user_data,
@@ -313,6 +341,34 @@ mod tests {
 
     use super::*;
 
+    /// Real `generation_config.json` shapes: a multilingual model with a
+    /// `translate` task can translate; an English-only (.en) model can't; no
+    /// file means unknown.
+    #[test]
+    fn resolve_can_translate_reads_generation_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |json: &str| {
+            std::fs::write(dir.path().join("generation_config.json"), json).expect("write");
+        };
+        assert_eq!(resolve_can_translate(dir.path()), None, "no file");
+        write(
+            r#"{"is_multilingual": true, "task_to_id": {"transcribe": 50360, "translate": 50359}}"#,
+        );
+        assert_eq!(resolve_can_translate(dir.path()), Some(true));
+        write(r#"{"is_multilingual": false}"#);
+        assert_eq!(
+            resolve_can_translate(dir.path()),
+            Some(false),
+            "English-only"
+        );
+        write(r#"{"is_multilingual": true, "task_to_id": {"transcribe": 1}}"#);
+        assert_eq!(
+            resolve_can_translate(dir.path()),
+            Some(false),
+            "no translate task"
+        );
+    }
+
     /// End-to-end FFI smoke test: load a real Whisper model and transcribe a
     /// short silence buffer. Requires a real GPU + model, so it is `#[ignore]`d.
     /// Point `RV_WHISPER_MODEL` at a converted Whisper IR dir to run it:
@@ -332,7 +388,7 @@ mod tests {
         // 1 s of 16 kHz silence.
         let samples = vec![0.0_f32; 16_000];
         let result = engine
-            .transcribe(&samples, Some("en"), true)
+            .transcribe(&samples, Some("en"), true, false)
             .expect("transcribe");
         eprintln!(
             "text={:?} language={:?} chunks={}",

@@ -6,7 +6,7 @@
 // its name ("GPU.1"/"CPU"/"NPU"), kind (discrete/integrated GPU, CPU, NPU),
 // capability *tier*, memory *domain*, and total memory.
 //
-// WHY tiers, not names (see dev/plans/PLAN_device_aware_placement.md):
+// WHY tiers, not names (see the project's internal engineering log):
 //   Device roles invert across boxes. On one dual-GPU box, GPU.0 (an
 //   integrated Intel UHD) is the weak offload target and GPU.1 (the Arc dGPU)
 //   is the workhorse; on a Lunar Lake laptop

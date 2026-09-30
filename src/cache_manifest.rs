@@ -6,7 +6,7 @@
 // per-model content-identity metadata that would otherwise be recomputed
 // from scratch on every load: `pipelines/image.rs`'s `model_hash` today,
 // OV compile-cache blob attribution in a later pass
-// (`dev/plans/ov-cache-self-management.md`).
+// (the project's internal engineering log).
 //
 // All I/O here is best-effort: a missing, corrupt, or unwritable manifest
 // degrades to "no caching, compute as before" — it must never turn a

@@ -151,8 +151,8 @@ impl OvVlmEngine {
     /// `scheduler_config` property — same semantics as [`crate::ov_cb::OvCbEngine`]'s
     /// parameter of the same name. `0.0` keeps `OpenVINO`'s own default (dynamic/
     /// unbounded), which measured ~2x this value in real VRAM at 75-100K context
-    /// depth on `qwen3.5-4b-int8-ov` (dev/autotest/
-    /// 20260820_nudge_fix_verification_qwen3.5-4b-int8-ov.md) — always pass a
+    /// depth on `qwen3.5-4b-int8-ov`
+    /// (the project's internal engineering log) — always pass a
     /// real budget in production. Hybrid attention architectures reserve a
     /// fixed floor for their linear-attention layers' state regardless of
     /// context length; too small a value fails construction outright rather
@@ -293,8 +293,8 @@ impl OvVlmEngine {
             presence_penalty: params.presence_penalty.unwrap_or(f32::NAN),
             frequency_penalty: params.frequency_penalty.unwrap_or(f32::NAN),
             repetition_penalty: params.repetition_penalty.unwrap_or(f32::NAN),
-            use_rng_seed: std::ffi::c_int::from(params.seed.is_some()),
-            rng_seed: params.seed.unwrap_or(0),
+            use_rng_seed: 1,
+            rng_seed: crate::ov_cb::effective_seed(params.seed),
             stop_strings: if stop_ptrs.is_empty() {
                 ptr::null()
             } else {

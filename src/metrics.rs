@@ -38,8 +38,10 @@ const REQUESTS_WAITING: &str = "rustedvino_requests_waiting";
 const MODEL_LOADED: &str = "rustedvino_model_loaded";
 const VRAM_TOTAL_BYTES: &str = "rustedvino_vram_total_bytes";
 const VRAM_USED_BYTES: &str = "rustedvino_vram_used_bytes";
+const PROCESS_GPU_MEMORY_BYTES: &str = "rustedvino_process_gpu_memory_bytes";
+const MODEL_GPU_MEMORY_ESTIMATE_BYTES: &str = "rustedvino_model_gpu_memory_estimate_bytes";
 
-/// `OpenVINO` compile-cache disk usage (`dev/plans/ov-cache-self-management.md`)
+/// `OpenVINO` compile-cache disk usage (the project's internal engineering log)
 /// — pushed from the background sweep (`ModelManager::prune_ov_cache_if_over_budget`,
 /// every `ov_cache_sweep_interval_secs`), not pulled at scrape time: computing
 /// it walks every file in `ov_cache_dir` (thousands of tiny `.cl_cache` files
@@ -60,7 +62,7 @@ const MODEL_PRIORITY: &str = "rustedvino_model_priority";
 const KV_CACHE_USAGE_PERCENT: &str = "rustedvino_kv_cache_usage_percent";
 const KV_CACHE_USAGE_SUPPORTED: &str = "rustedvino_kv_cache_usage_supported";
 
-/// KV-cache pressure flag (`dev/plans/kv-cache-pressure-detection.md`) — 1
+/// KV-cache pressure flag (the project's internal engineering log) — 1
 /// while a model's occupancy has been continuously at/above
 /// `kv_pressure_threshold_pct` for at least `kv_pressure_sustained_secs`, 0
 /// otherwise. Pull-at-scrape via `record_state`/`MetricsSnapshot`, same as
@@ -75,8 +77,8 @@ const KV_CACHE_PRESSURE_FLAGGED: &str = "rustedvino_kv_cache_pressure_flagged";
 /// L0 prompt-length gate rejections (`400 context_length_exceeded`) — pushed
 /// from the handler layer (`handlers/chat.rs`'s three gates), not the engine
 /// thread, since a rejection never reaches `add_request`/the hot path at all.
-/// Previously invisible server-side entirely (`dev/autotest/
-/// 20260823_l0_gate_rejection_observability_gap.md`).
+/// Previously invisible server-side entirely
+/// (the project's internal engineering log).
 const CONTEXT_LENGTH_EXCEEDED_TOTAL: &str = "rustedvino_context_length_exceeded_total";
 
 /// Concurrent-admission rejections: a request whose own length is within the
@@ -273,6 +275,18 @@ fn register_state_gauges() {
         VRAM_USED_BYTES,
         Unit::Bytes,
         "VRAM reserved across all loaded models of every kind (weights + KV pool)"
+    );
+    describe_gauge!(
+        PROCESS_GPU_MEMORY_BYTES,
+        Unit::Bytes,
+        "Device memory this process actually holds, per DRM driver and region, read from \
+         /proc/self/fdinfo (Linux only) — measured, unlike the configured vram_gb accounting"
+    );
+    describe_gauge!(
+        MODEL_GPU_MEMORY_ESTIMATE_BYTES,
+        Unit::Bytes,
+        "Estimated device memory per loaded model: the measured change across its load plus \
+         runtime growth (embedding batch cache); compare with its configured vram_gb"
     );
 
     // Co-residency Slice 3a: sizing + policy gauges.
@@ -590,6 +604,16 @@ pub fn record_state(snap: &MetricsSnapshot) {
         // `None` only in the narrow window before this model's first load has
         // ever completed — skip the series entirely rather than emit a
         // misleading 0.0 (a real load never completes in ~0s).
+        // Measured estimate while loaded; NaN while loaded but unknown (the
+        // measurement overlapped another load/eviction) so the series never
+        // shows a stale figure; 0 once evicted.
+        let estimate = match (m.gpu_memory_estimate_bytes, m.loaded) {
+            (Some(bytes), _) => bytes,
+            (None, true) => f64::NAN,
+            (None, false) => 0.0,
+        };
+        gauge!(MODEL_GPU_MEMORY_ESTIMATE_BYTES, "model" => model.to_owned(), "device" => device.to_owned(), "kind" => kind)
+            .set(estimate);
         if let Some(secs) = m.load_duration_secs {
             gauge!(MODEL_LOAD_DURATION_SECONDS, "model" => model.to_owned(), "device" => device.to_owned(), "kind" => kind)
                 .set(secs);
@@ -599,6 +623,12 @@ pub fn record_state(snap: &MetricsSnapshot) {
     let primary = snap.device.as_str();
     gauge!(VRAM_TOTAL_BYTES, "device" => primary.to_owned()).set(snap.total_vram_gb * 1e9);
     gauge!(VRAM_USED_BYTES, "device" => primary.to_owned()).set(snap.used_vram_gb * 1e9);
+    // Measured process-wide device memory, read live at scrape time.
+    for ((driver, pdev, region), bytes) in crate::gpu_memory::read_process().unwrap_or_default() {
+        #[allow(clippy::cast_precision_loss)]
+        gauge!(PROCESS_GPU_MEMORY_BYTES, "driver" => driver, "pdev" => pdev, "region" => region)
+            .set(bytes as f64);
+    }
     // Per-domain gauges (multi-GPU: each domain gets its own labelled series).
     for (domain, total_gb, used_gb) in &snap.domain_vram {
         gauge!(VRAM_TOTAL_BYTES, "domain" => domain.clone()).set(*total_gb * 1e9);
@@ -692,8 +722,8 @@ mod tests {
 
     /// `record_context_length_exceeded` actually increments the counter, with
     /// the `gate` label distinguishing which pipeline rejected — the fix for
-    /// a clean L0-gate rejection being fully invisible server-side (`dev/
-    /// autotest/20260823_l0_gate_rejection_observability_gap.md`).
+    /// a clean L0-gate rejection being fully invisible server-side
+    /// (the project's internal engineering log).
     #[test]
     fn context_length_exceeded_counter_increments_per_gate() {
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -849,6 +879,8 @@ mod tests {
                 // Monitor disabled in these tests — always false, same as
                 // production default.
                 kv_pressure_flagged: false,
+                // Measured only while loaded (None once evicted).
+                gpu_memory_estimate_bytes: loaded.then_some(3.2e9),
             }],
         }
     }
@@ -861,6 +893,22 @@ mod tests {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| panic!("no `{metric}` series for qwen3-8b-int4-ov in:\n{rendered}"))
+    }
+
+    /// The per-model measured-memory gauge reports the estimate while loaded
+    /// and resets to 0 on eviction instead of holding a stale figure.
+    #[test]
+    fn model_gpu_memory_estimate_gauge_follows_load_state() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_state(&snap_with(true, 0, 16));
+            let loaded = handle.render();
+            assert!((series_value(&loaded, MODEL_GPU_MEMORY_ESTIMATE_BYTES) - 3.2e9).abs() < 1.0);
+            record_state(&snap_with(false, 0, 0));
+            let evicted = handle.render();
+            assert!(series_value(&evicted, MODEL_GPU_MEMORY_ESTIMATE_BYTES).abs() < f64::EPSILON);
+        });
     }
 
     /// `record_state` must drive `model_loaded` (and the request gauges) back to

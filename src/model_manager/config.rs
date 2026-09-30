@@ -159,7 +159,7 @@ pub struct Config {
     /// fit"; `drop_caches` moved `MemAvailable` 14.76 → 23.39 GB and the same
     /// load then succeeded untouched. The pool grows with every load/evict
     /// cycle, so the defect worsens with use. Full write-up:
-    /// `dev/autotest/20260907_uma_ram_admission_ttm_pool.md`.
+    /// the project's internal engineering log.
     ///
     /// Crediting reclaimable cache is the *less* conservative direction, so it
     /// stays behind an explicit operator declaration — a box that never sets
@@ -219,8 +219,8 @@ pub struct Config {
     #[serde(default)]
     pub domain_budgets: HashMap<String, f64>,
 
-    /// Realtime voice arbitration v2 (`dev/plans/realtime-voice-model-
-    /// arbitration-v2.md`, D3): how long, in seconds, a model stays
+    /// Realtime voice arbitration v2
+    /// (the project's internal engineering log, D3): how long, in seconds, a model stays
     /// hard-protected from eviction after any channel — admin load, plain
     /// API use, or a realtime turn — last used it. Self-expiring, checked
     /// against `last_used` on top of the always-on `pinned`/`evictable` hard
@@ -245,8 +245,8 @@ pub struct Config {
     #[serde(default)]
     pub realtime_viable_minimum: Option<RealtimeViableMinimum>,
 
-    /// Cross-pipeline device admission ceiling (`dev/plans/cross-pipeline-
-    /// admission-middleware.md` step 2): explicit per-device concurrency caps,
+    /// Cross-pipeline device admission ceiling
+    /// (the project's internal engineering log step 2): explicit per-device concurrency caps,
     /// keyed by the live `OpenVINO` device string (e.g. `"GPU.1"`). Sits IN
     /// FRONT OF each engine's own per-engine admission gate — a second,
     /// device-wide layer that also counts different engine kinds sharing one
@@ -254,7 +254,7 @@ pub struct Config {
     /// one GPU). A device with **no** entry here is pure passthrough: no
     /// `Semaphore` is created for it and `DeviceBudgets::admit` never waits or
     /// holds anything for it. Default empty (disabled) — real numbers are set
-    /// only after the project's internal engineering log's empirical
+    /// only after empirical
     /// per-device testing lands (Migration order #4). A configured cap must be
     /// at least `1` (validated below) — omit the entry to disable gating for a
     /// device rather than setting `0`.
@@ -423,6 +423,30 @@ pub struct Config {
     #[serde(default = "default_max_prompt_array")]
     pub max_prompt_array: usize,
 
+    /// Maximum number of inputs accepted in one `/v1/embeddings` request.
+    /// Default **256** (`OpenAI` allows 2048).
+    ///
+    /// Separate from [`max_prompt_array`](Self::max_prompt_array): an
+    /// embeddings array is one short batched pipeline call, not one full
+    /// generation per element. The whole array still runs as a single batch,
+    /// so memory and latency grow with inputs × input length — lower it on a
+    /// small shared-memory iGPU. Must be `>= 1`.
+    #[serde(default = "default_max_embedding_inputs")]
+    pub max_embedding_inputs: usize,
+
+    /// Per-request budget for `/v1/embeddings` in **padded** tokens: inputs ×
+    /// the longest input's token count (a batch is padded to its longest
+    /// input). Default **32768** (64 full 512-token chunks); `0` = no budget.
+    ///
+    /// Bounds the batch's GPU working memory, which the memory accounting
+    /// can't see and which `OpenVINO` keeps until the model is evicted —
+    /// measured on multilingual-e5-large: ≈28 MB per 512-token input (+1.5 GB
+    /// at 64 inputs, +7 GB at 256). Keep the model's `vram_gb` at least its
+    /// weights plus this budget's worth. Short inputs are cheap: 256 queries
+    /// of ~10 tokens are ~2.5k padded tokens.
+    #[serde(default = "default_max_embedding_batch_tokens")]
+    pub max_embedding_batch_tokens: usize,
+
     /// Server-wide ceiling on the per-request generation budget
     /// (`max_tokens` / `max_completion_tokens`), applied to chat AND legacy
     /// completions. Default **8192**; `0` = uncapped (explicit opt-out).
@@ -464,14 +488,11 @@ pub struct Config {
     ///
     /// On Windows use a path next to the exe, e.g. `"C:\\RustedVINO\\ov_cache"`.
     ///
-    /// **Does not apply to NPU-routed models.** `ov_pipeline_create`
-    /// (`src/npu_engine.rs`'s `OvPipeline::new`) never receives this value and
-    /// never sets `ov::cache_dir` — every NPU model load (including a plain
-    /// server restart with an unchanged config) always recompiles from
-    /// scratch, ~20–40 s. This is also why changing a model's `max_prompt_len`
-    /// and restarting is always safe: there is no persisted blob that could go
-    /// stale against the new value, because nothing is ever persisted for this
-    /// path today.
+    /// **NPU:** NPU LLMs use it too (since 2026-09-28): `ov_pipeline_create`
+    /// sets `CACHE_DIR`, storing one weightless compiled `.blob` per model
+    /// (~0.66 GB for an 8B int4 model) — measured ~6 s cached load vs 30.7 s
+    /// cold. The NPU *Whisper* pipeline is deliberately excluded (it hangs with
+    /// a cache dir; see the `Stt` arm in `lifecycle.rs`).
     #[serde(default)]
     pub ov_cache_dir: Option<String>,
 
@@ -497,7 +518,7 @@ pub struct Config {
     pub ov_cache_sweep_interval_secs: u64,
 
     /// Master switch for the KV-cache pressure monitor
-    /// (`dev/plans/kv-cache-pressure-detection.md`). Default `false` —
+    /// (the project's internal engineering log). Default `false` —
     /// deliberately, not incidentally: unlike a numeric ceiling that happens
     /// to be inert at `0.0`, this is an explicit gate an operator must flip,
     /// per the plan's own ops-review finding that "detect and log" is not
@@ -619,8 +640,8 @@ pub struct SupervisorConfig {
     /// merely slow, triggering the same [`hang_kill_grace_secs`]-graced
     /// `SIGTERM`→`SIGKILL` escalation as a worker that never became healthy.
     /// Default 600s (10 min) — deliberately generous: the only measured decode
-    /// rate so far is ~60 tok/s (256 tokens in ~4.3s, `dev/autotest/
-    /// 20260728_b70_qwen36_35b_bench.md`), so this should comfortably outlast
+    /// rate so far is ~60 tok/s (256 tokens in ~4.3s,
+    /// the project's internal engineering log), so this should comfortably outlast
     /// any legitimate single request, but is **provisional** until a clean
     /// benchmark across realistic `max_tokens`/prompt sizes exists. Set to `0`
     /// to disable the generation watchdog entirely.
@@ -824,7 +845,7 @@ fn default_evictable() -> bool {
 /// resident, and when it is loaded. Every field defaults to the pre-feature
 /// behaviour, so a model with no policy block (or an absent map entry) is
 /// treated exactly as before.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ModelPolicy {
     /// When `true`, this model is **never** chosen as an eviction victim — the
     /// always-resident primary for a multiuser box. A load that needs VRAM
@@ -848,7 +869,7 @@ pub struct ModelPolicy {
     ///
     /// Exists because a converted model can ship a template that is a stale or
     /// incomplete revision of upstream's. Measured case (2026-09-08,
-    /// `dev/plans/lfm2-tool-call-family.md`): `lfm2-24b-a2b-int4-ov`'s template
+    /// the project's internal engineering log): `lfm2-24b-a2b-int4-ov`'s template
     /// renders **nothing** for an assistant turn carrying `tool_calls`, so a
     /// tool-call turn replays to the model as an empty
     /// `<|im_start|>assistant<|im_end|>` — the model is shown a tool result it
@@ -947,10 +968,22 @@ pub struct ModelPolicy {
     /// tokens) untouched — pure passthrough. Raising it grows the compiled
     /// KV-cache allocation and load/compile time; there is no documented upper
     /// ceiling to validate against, only `>= 1` when present. Ignored for every
-    /// non-NPU model. See the project's internal engineering log #6 and `src/npu_engine.rs`'s module
+    /// non-NPU model. See the project's internal engineering log and `src/npu_engine.rs`'s module
     /// doc comment for the full rationale.
     #[serde(default)]
     pub max_prompt_len: Option<u32>,
+
+    /// NPU-only: compile-time `MIN_RESPONSE_LEN` — the room the static NPU
+    /// KV cache reserves for the answer on top of `max_prompt_len`. The NPU
+    /// cache holds `max_prompt_len + min_response_len` tokens in total, so a
+    /// long prompt leaves only this much for output regardless of the
+    /// request's `max_tokens` (the server then reports `finish_reason:
+    /// "length"`). `None` keeps `OpenVINO`'s default (128 — measured on Lunar
+    /// Lake: 863-token prompt + 290 generated = 1024 + 128 + 1). Raising it
+    /// grows the compiled KV cache; 512 cost no measurable extra load time.
+    /// Ignored for every non-NPU model.
+    #[serde(default)]
+    pub min_response_len: Option<u32>,
 
     /// Draft-model speculative decoding (opt-in). `None` = plain decoding,
     /// today's behaviour. See [`SpeculativeConfig`].
@@ -958,7 +991,7 @@ pub struct ModelPolicy {
     pub speculative: Option<SpeculativeConfig>,
 
     /// Image-gen `generation_metadata.precision` (Tier 3,
-    /// `PLAN_image_metadata_response.md`) — operator-supplied, e.g. `"int8"`,
+    /// the image-metadata plan) — operator-supplied, e.g. `"int8"`,
     /// `"fp16"`. Not derivable from the model directory (only a naming
     /// convention, which the plan explicitly rejects as a source — see
     /// `src/ov_image.rs`'s directory-naming comment). `None` (the default)
@@ -1010,6 +1043,7 @@ impl Default for ModelPolicy {
             tier_preference: Vec::new(),
             reasoning_parser: None,
             max_prompt_len: None,
+            min_response_len: None,
             speculative: None,
             precision: None,
             model_source: None,
@@ -1029,7 +1063,7 @@ impl Default for ModelPolicy {
 /// `RuntimeError`). Opt in only after verifying a net win for this specific
 /// target — see the project's internal engineering log 2026-07-17: benefit requires target TPOT
 /// ≳ 19 ms/token.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// Directory name of the draft model under `models_dir` (NOT required to
@@ -1074,7 +1108,7 @@ fn default_verify_on_load() -> bool {
 /// ```json
 /// "gpt-oss-20b-int4-ov": { "vram_gb": 12.0, "reasoning_parser": "gpt_oss" }
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ModelEntry {
     /// VRAM estimate in GB. Required for every registered model.
     /// Use `0.0` to register a model without VRAM gating (CPU-only or
@@ -1188,6 +1222,8 @@ pub struct ModelEntryPatch {
     #[serde(default, deserialize_with = "deserialize_some")]
     pub max_prompt_len: Option<Option<u32>>,
     #[serde(default, deserialize_with = "deserialize_some")]
+    pub min_response_len: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub speculative: Option<Option<SpeculativeConfig>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub precision: Option<Option<String>>,
@@ -1218,6 +1254,7 @@ impl ModelEntryPatch {
             && self.tier_preference.is_none()
             && self.reasoning_parser.is_none()
             && self.max_prompt_len.is_none()
+            && self.min_response_len.is_none()
             && self.speculative.is_none()
             && self.precision.is_none()
             && self.model_source.is_none()
@@ -1305,6 +1342,7 @@ impl ModelEntryPatch {
         }
         hot_opt!(reasoning_parser, "reasoning_parser");
         next_load!(max_prompt_len, "max_prompt_len");
+        next_load!(min_response_len, "min_response_len");
         if let Some(inner) = self.speculative.clone() {
             // SpeculativeConfig has no PartialEq, so a genuine field-by-field
             // change can't be detected — but `None` vs `None` (clearing an
@@ -1365,7 +1403,7 @@ fn default_dgpu_size_ceiling_fraction() -> f64 {
 fn default_max_num_seqs() -> usize {
     // 16, not 8: leaves ~2× headroom over a typical ~8-concurrent workload so
     // pipelined-client refire bursts do not trip spurious 429s (see the doc
-    // comment on `max_num_seqs` and dev/autotest/20260530_429_saturation_below_cap.md).
+    // comment on `max_num_seqs` and the project's internal engineering log).
     16
 }
 
@@ -1391,6 +1429,14 @@ fn default_embedding_normalize() -> bool {
 
 /// Default cap on the `/v1/completions` prompt-array fan-out. Also used by
 /// the handler when no config is loaded (mock mode).
+pub(crate) fn default_max_embedding_inputs() -> usize {
+    256
+}
+
+pub(crate) fn default_max_embedding_batch_tokens() -> usize {
+    32_768
+}
+
 pub(crate) fn default_max_prompt_array() -> usize {
     16 // one engine's worth of slots — a sane per-request fan-out ceiling
 }
@@ -1448,6 +1494,10 @@ impl Config {
     ///   `total_vram_gb` when gating is on — no model could ever load.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_embedding_inputs >= 1,
+            "max_embedding_inputs must be at least 1 (0 would reject every /v1/embeddings request)"
+        );
         let knobs: [(&str, f64); 7] = [
             ("total_vram_gb", self.total_vram_gb),
             ("cache_size_gb", self.cache_size_gb),
@@ -1470,7 +1520,7 @@ impl Config {
             self.kv_pressure_threshold_pct
         );
         // kv_pressure_monitor_enabled has no usable numeric default on
-        // purpose (dev/plans/kv-cache-pressure-detection.md's ops-review
+        // purpose (the project's internal engineering log's ops-review
         // section) — a box that turns monitoring on must state its own real
         // threshold/duration, not silently inherit whatever this codebase
         // happens to ship as a "default." `0.0`/`0` are the "not configured"
@@ -1480,14 +1530,14 @@ impl Config {
             anyhow::ensure!(
                 self.kv_pressure_threshold_pct > 0.0,
                 "config kv_pressure_threshold_pct must be set (>0) when \
-                 kv_pressure_monitor_enabled is true — no default is provided deliberately, \
-                 see dev/plans/kv-cache-pressure-detection.md"
+                 kv_pressure_monitor_enabled is true — no default is provided deliberately: \
+                 the right threshold depends on this box's models and traffic"
             );
             anyhow::ensure!(
                 self.kv_pressure_sustained_secs > 0,
                 "config kv_pressure_sustained_secs must be set (>0) when \
-                 kv_pressure_monitor_enabled is true — no default is provided deliberately, \
-                 see dev/plans/kv-cache-pressure-detection.md"
+                 kv_pressure_monitor_enabled is true — no default is provided deliberately: \
+                 the right threshold depends on this box's models and traffic"
             );
         }
         // Per-model knob validation, shared with `ModelManager::add_model` (the
@@ -1743,6 +1793,13 @@ pub(crate) fn validate_model_entry(model_id: &str, entry: &ModelEntry) -> anyhow
              (omit it to keep OpenVINO's own NPU default)"
         );
     }
+    if let Some(min_response_len) = policy.min_response_len {
+        anyhow::ensure!(
+            min_response_len >= 1,
+            "models['{model_id}'].min_response_len must be at least 1, got {min_response_len} \
+             (omit it to keep OpenVINO's own NPU default)"
+        );
+    }
     anyhow::ensure!(
         entry.vram_gb.is_finite() && entry.vram_gb >= 0.0,
         "models['{model_id}'].vram_gb must be a finite non-negative number, got {}",
@@ -1767,7 +1824,7 @@ pub(crate) fn validate_model_entry(model_id: &str, entry: &ModelEntry) -> anyhow
         );
     }
     // Speculative decoding (Layer A — pure config, no disk access; see
-    // dev/plans/speculative-decoding-integration.md Part 4).
+    // the project's internal engineering log).
     if let Some(spec) = &policy.speculative {
         anyhow::ensure!(
             entry.vram_gb > 0.0,
@@ -1849,7 +1906,8 @@ define_globals_not_applied! {
         device_budgets, kv_cache_precision, enable_prefix_caching,
         cors_allowed_origins, admission_queue_timeout_ms,
         device_admission_queue_timeout_ms, embedding_device, default_embed_model,
-        embedding_pooling, embedding_normalize, max_prompt_array, max_tokens_cap,
+        embedding_pooling, embedding_normalize, max_prompt_array, max_embedding_inputs,
+        max_embedding_batch_tokens, max_tokens_cap,
         bind_addr, port, allow_insecure_public_bind, ov_cache_dir,
         ov_cache_max_gb, ov_cache_sweep_interval_secs, kv_pressure_monitor_enabled,
         kv_pressure_threshold_pct, kv_pressure_sustained_secs,
@@ -1967,7 +2025,7 @@ mod tests {
         assert!((cfg.min_kv_cache_gb - 1.0).abs() < 1e-9);
     }
 
-    /// Tier 3 (`PLAN_image_metadata_response.md`): `precision`/`model_source`/
+    /// Tier 3 (the image-metadata plan): `precision`/`model_source`/
     /// `model_revision` parse from the flattened model stanza when present, and
     /// default to `None` (never fabricated) when absent.
     #[test]
@@ -2204,7 +2262,7 @@ mod tests {
     /// duration default to their "not configured" sentinels (`0.0`/`0`) —
     /// an existing config file with none of these keys must keep working
     /// exactly as before this feature existed
-    /// (`dev/plans/kv-cache-pressure-detection.md`'s ops-review finding:
+    /// (the project's internal engineering log's ops-review finding:
     /// default off, not an incidentally-safe threshold).
     #[test]
     fn kv_pressure_knobs_default_off_when_omitted() {
@@ -2820,11 +2878,24 @@ mod tests {
     }
 
     /// A models entry parses `max_prompt_len` (NPU `MAX_PROMPT_LEN` override,
-    /// the project's internal engineering log #6).
+    /// the project's internal engineering log).
     #[test]
     fn model_policy_parses_max_prompt_len() {
         let cfg = minimal(r#", "models": {"npu-model": {"vram_gb": 0.0, "max_prompt_len": 2048}}"#);
         assert_eq!(cfg.models["npu-model"].policy.max_prompt_len, Some(2048));
+    }
+
+    /// A models entry parses `min_response_len` (NPU `MIN_RESPONSE_LEN`), and 0 is rejected.
+    #[test]
+    fn model_policy_parses_min_response_len_and_rejects_zero() {
+        let cfg =
+            minimal(r#", "models": {"npu-model": {"vram_gb": 0.0, "min_response_len": 512}}"#);
+        assert_eq!(cfg.models["npu-model"].policy.min_response_len, Some(512));
+        let cfg = from_json(
+            r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0,"models":{"m":{"vram_gb":0.0,"min_response_len":0}}}"#,
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("models['m'].min_response_len"), "{err}");
     }
 
     /// A zero `max_prompt_len` is rejected — a 0-token ceiling admits nothing;

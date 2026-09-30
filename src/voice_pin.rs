@@ -46,8 +46,8 @@ struct PinInner {
     /// Dropping this cancels the TTL timer: the spawned task's `oneshot::Receiver`
     /// resolves with `Err` and the task exits without clearing the pin.
     ttl_cancel: Option<oneshot::Sender<()>>,
-    /// Realtime voice arbitration v2 (`dev/plans/realtime-voice-model-
-    /// arbitration-v2.md`, D2): `model_id -> count of active sessions whose
+    /// Realtime voice arbitration v2
+    /// (the project's internal engineering log, D2): `model_id -> count of active sessions whose
     /// resolved {stt, llm, tts} set includes it`. `ModelManager::
     /// eviction_protected` consults `count > 0` to hard-exclude a model any
     /// live session depends on — independent of the first-writer-wins
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(vp.get().unwrap().llm_model, "llm-b");
     }
 
-    // ---- D2: realtime serving set (dev/plans/realtime-voice-model-arbitration-v2.md) ----
+    // ---- D2: realtime serving set (the project's internal engineering log) ----
 
     #[test]
     fn serving_count_is_zero_for_an_unregistered_model() {

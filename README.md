@@ -59,10 +59,11 @@ included.
 | `GET /metrics` — Prometheus endpoint (same port); full metric reference in [`METRICS.md`](METRICS.md) | ✅ |
 | `POST /v1/chat/completions` (SSE streaming + non-streaming) | ✅ |
 | `POST /v1/completions` — legacy raw-prompt completions | ✅ |
-| `POST /v1/embeddings` — text embeddings (bge, e5, …) | ✅ |
+| `POST /v1/embeddings` — text embeddings (bge, e5, …); per-input length checked against the model's own limit, up to 256 inputs and 32k padded tokens per request (limits in [`INTERFACE.md`](INTERFACE.md)) | ✅ |
 | `POST /v1/rerank` — cross-encoder document reranking | ✅ |
 | `POST /v1/audio/transcriptions` — STT via Whisper OpenVINO | ✅ |
-| `POST /v1/audio/speech` — TTS (Kokoro-82M, Coqui VITS, `SpeechT5`) | ✅ |
+| `POST /v1/audio/translations` — speech in any Whisper language → English text (needs a multilingual Whisper trained for translation, e.g. `large-v3`; `large-v3-turbo` isn't) | ✅ |
+| `POST /v1/audio/speech` — TTS (Kokoro-82M, Coqui VITS, Piper VITS voices such as Vietnamese `vi_VN-vais1000`, `SpeechT5`) | ✅ |
 | `POST /v1/images/generations` — text-to-image (SDXL, FLUX.1-schnell) | ✅ |
 | `POST /v1/images/edits` — inpainting + img2img (SDXL) | ✅ |
 | `POST /tokenize` / `POST /detokenize` | ✅ |
@@ -82,7 +83,7 @@ included.
 |---|---|
 | Exact `usage.prompt_tokens` via tokenizer bridge | ✅ |
 | `stream_options.include_usage` — token counts on streaming final chunk | ✅ |
-| Sampling params: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty` (extension field — server applies a `1.1` safety-net default unless the client sends `1.0` to opt out) | ✅ |
+| Sampling params: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty` (extension field — server applies a `1.1` safety-net default unless the client sends `1.0` to opt out). Without a `seed`, each request gets a fresh random one; an explicit `seed` is reproducible (with prefix caching on, the first request for a prompt can differ from its repeats — see `enable_prefix_caching` in CONFIG.md) | ✅ |
 | `max_completion_tokens` alias for `max_tokens` | ✅ |
 | Streaming `<think>` strip — `ThinkFilter` removes reasoning tokens from output | ✅ |
 | Non-streaming `<think>` strip — reasoning in `reasoning_content`, hidden from `content` | ✅ |
@@ -114,7 +115,7 @@ included.
 | Runtime model update — `PATCH /v1/admin/models/{id}` (partial update of an already-registered model's fields; persisted always, live where safe) | ✅ |
 | Runtime KV-pool resize — `POST /v1/admin/models/{id}/resize` (evict + reload a resident model at a new `kv_cache_gb`; other overrides carried forward, cooldown-gated) | ✅ |
 | Preload-list management — `POST /v1/admin/config/preload` (explicit list, or `{"from_live": true}` to snapshot the currently-loaded set as the new boot default) | ✅ |
-| Config reload — `POST /v1/admin/config/reload` (diffs disk config vs. live registry) | ✅ |
+| Config reload — `POST /v1/admin/config/reload` (diffs disk config vs. live registry; a model that isn't loaded picks up any changed field, including next-load settings like `max_prompt_len` or `kv_cache_gb`; loaded models are left alone) | ✅ |
 | Config/registry drift audit — `GET /v1/admin/config/audit` | ✅ |
 | Voice-flow pin — `GET /v1/admin/voice-pin` (shared STT/LLM/TTS set for realtime sessions) | ✅ |
 | Realtime session introspection/kill — `GET`/`DELETE /v1/admin/realtime/sessions[/{id}]` | ✅ |
@@ -131,15 +132,16 @@ included.
 
 | Feature | Status |
 |---|---|
-| Response headers: `x-request-id`, `x-server`, `x-api-version`, `x-server-version` (admin-only), `x-ruvi-host`; CORS config | ✅ |
-| OpenAI-compatible error envelopes on all error paths | ✅ |
+| Response headers: `x-request-id`, `x-server`, `x-api-version`, `x-server-version` (admin-only), `x-ruvi-host` (the box's hostname, only on responses to a request with a valid inference or admin key; never on `/health`, or on routes left open because no key of that scope is configured); CORS config | ✅ |
+| OpenAI-compatible error envelopes on all error paths; an oversized request (over 50 MiB) gets `413 request_too_large` | ✅ |
 | Prometheus push metrics: tokens/sec EMA, TTFT histogram, request duration histogram | ✅ |
-| Image-gen `generation_metadata` (`/v1/images/generations`/`/edits`) — `model_family`, `device`, `host`, `model_hash`, `sampler`/`scheduler_config`, `openvino_version`, `precision`/`model_source`/`model_revision` | ✅ |
+| Image-gen `generation_metadata` (`/v1/images/generations`/`/edits`) — `model_family`, `device`, `host` (valid-key callers only, like `x-ruvi-host`), `model_hash`, `sampler`/`scheduler_config`, `openvino_version`, `precision`/`model_source`/`model_revision` | ✅ |
 | Chat completions — `model_family` + effective `sampling` (`temperature`/`top_p`/`top_k` actually used) on every response | ✅ |
-| `GET /v1/admin/models` — `server{host, openvino_version, engine, engine_version}` block | ✅ |
+| `GET /v1/admin/models` — `server{host, openvino_version, engine, engine_version}` block (`host` only for a valid-key caller) | ✅ |
 | OV compile-cache metrics — `rustedvino_ov_cache_bytes` (current on-disk size), `rustedvino_ov_cache_pruned_bytes_total`/`_pruned_files_total` (cumulative, from the `ov_cache_max_gb` sweep) | ✅ |
 | KV-cache pressure metrics — `rustedvino_kv_cache_usage_percent` + `rustedvino_kv_cache_usage_supported` (per model; `supported=0` means the value is structurally unqueryable for that engine kind, **not** an empty pool) and `rustedvino_kv_cache_pressure_flagged` (1/0, set by the optional monitor — see [`CONFIG.md`](CONFIG.md)) | ✅ |
 | `GET /v1/admin/models` — per-model `kv_cache_usage_pct` + `kv_pressure_flagged`, so the pressure signal is readable without Prometheus | ✅ |
+| Measured device memory (Linux) — `rustedvino_process_gpu_memory_bytes` (per driver/device/region, from the kernel) and a per-model estimate (`rustedvino_model_gpu_memory_estimate_bytes`, admin `gpu_memory_estimate_gb`), with a log warning when a model uses more than its configured `vram_gb`. See [`METRICS.md`](METRICS.md) | ✅ |
 | `GET /v1/admin/health/watchdog` — oldest in-flight generation age; polled by `--supervise` to kill+restart a wedged worker `/health` can't see | ✅ |
 | `GET /v1/admin/logs/tail` — tail an in-memory log ring buffer over HTTP | ✅ |
 
@@ -181,7 +183,13 @@ included.
   conversation's history — a hard `ChatHistory` API contract in OpenVINO GenAI, not a bug.
   Chaining multiple images across turns doesn't work the way it might for a text-only
   history.
-- **NPU LLM prompt cap and blob-cache absence** — see [Hardware & NPU notes](#hardware--npu-notes) below.
+- **NPU LLM prompt and answer caps** — see [Hardware & NPU notes](#hardware--npu-notes) below.
+- **Speech translation is into English only** (`/v1/audio/translations`, as in OpenAI's API), and
+  it needs a Whisper model trained for it: `whisper-large-v3` translates well, while
+  `whisper-large-v3-turbo` returns untranslated text. For other target languages, transcribe and
+  translate with a chat model.
+- **Kokoro TTS voices are English only** (US `af_*`/`am_*`, UK `bf_*`/`bm_*`). Any other voice name,
+  including Kokoro's own non-English voices, silently falls back to the default English voice.
 
 ---
 
@@ -263,6 +271,24 @@ hf download OpenVINO/<model>-ov --local-dir "$MODELS_DIR/<model>-ov"
 
 # (b) convert any HF model yourself with optimum-cli (needs `optimum[openvino]` installed)
 optimum-cli export openvino --model Qwen/Qwen3-8B --weight-format int4 "$MODELS_DIR/qwen3-8b-int4-ov"
+```
+
+**Piper voices (TTS)** are plain ONNX, no conversion needed: put the voice's `<name>.onnx` and
+`<name>.onnx.json` from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) in
+their own model directory and register it with `"kind": "tts"`. Piper voices read *phonemes*,
+which RustedVINO gets from **espeak-ng run as a separate program** (`sudo apt install
+espeak-ng`); it is never linked into or shipped with RustedVINO. At load, the server checks
+that your espeak-ng phonemizes a reference sentence exactly as the voice expects and refuses the
+voice if not, so an espeak-ng that would mispronounce fails loudly instead. That check exists
+for Vietnamese (`vi_VN-vais1000-medium`, measured to match Piper's own phonemes exactly with
+espeak-ng 1.52.0); other languages load with a warning that pronunciation is unverified. Mind
+each voice's license: vais1000's training data is CC BY 4.0 (attribution required).
+
+```bash
+mkdir -p "$MODELS_DIR/vi-vais1000-piper" && cd "$MODELS_DIR/vi-vais1000-piper"
+for f in vi_VN-vais1000-medium.onnx vi_VN-vais1000-medium.onnx.json MODEL_CARD; do
+  curl -sLO "https://huggingface.co/rhasspy/piper-voices/resolve/main/vi/vi_VN/vais1000/medium/$f"
+done
 ```
 
 ### 4. Create config file
@@ -449,6 +475,19 @@ The router in `src/lib.rs` is the source of truth for this list.
 
 ---
 
+## Client tools
+
+Small, dependency-free Python clients in `tools/`. They use the server's own API, so they work
+against any RustedVINO instance (`--target`, default `http://localhost:11437`):
+
+- **[`tools/semsearch`](tools/semsearch/README.md)** — semantic search over a folder of Markdown
+  notes, through `/v1/embeddings` and, optionally, `/v1/rerank`.
+- **[`tools/livecaptions`](tools/livecaptions/README.md)** — live captions from a microphone, a
+  call or a media file, through `/v1/audio/transcriptions`, with optional per-caption
+  translation through `/v1/chat/completions` and SRT output. Needs `ffmpeg`.
+
+---
+
 ## Compile-cache management
 
 OpenVINO JIT-compiles a model for the target device on first load and caches the
@@ -537,14 +576,32 @@ plain `GPU` (no suffix), plus `NPU`.
 - **Prompt/context cap: 1024 tokens by default, configurable.** The NPU compiles a fixed-shape
   graph ahead of time (unlike GPU/CPU's dynamic-shape kernels), so `MAX_PROMPT_LEN` is baked in
   at compile time. Set a per-model `"max_prompt_len"` (e.g. `2048`) on the model's `models` entry
-  to raise it; omit it to keep OpenVINO's default. A templated prompt over the effective cap gets
-  a clean `400 context_length_exceeded`, pre-flighted before generation starts — GPU has no such
-  ceiling.
-- **Never uses the `ov_cache_dir` blob cache** (unlike every other engine kind). Every load —
-  including a plain restart with unchanged config — recompiles from scratch (~20–40 s on Lunar
-  Lake). One consequence: changing `max_prompt_len` between restarts is always safe (nothing
-  persisted could go stale), but there's no fast-restart path for NPU LLMs the way there is for
-  everything else.
+  to raise it; omit it to keep OpenVINO's default. A change takes effect at the model's next load.
+  A templated prompt over the cap the loaded model was compiled with gets a clean
+  `400 context_length_exceeded`, pre-flighted before generation starts — GPU has no such ceiling.
+- **Answer room: 128 tokens by default on top of the prompt cap, configurable.** The NPU's KV
+  cache is fixed at `max_prompt_len + min_response_len` tokens, so the answer gets whatever the
+  prompt leaves: `max_prompt_len + min_response_len − prompt tokens`, whatever the request's
+  `max_tokens`. When prompt + answer fill it, generation ends and the response says
+  `finish_reason: "length"`. Set a per-model
+  `"min_response_len"` (e.g. `512`) for long answers to long prompts; measured on one Lunar Lake laptop
+  (Arc 140V), 512 added no noticeable load time.
+- **Memory:** an NPU LLM is charged its weights only (`vram_gb`), not a GPU-style KV pool; its
+  fixed KV cache is small and inside the measured footprint.
+- **NPU LLMs use the `ov_cache_dir` blob cache.** With `ov_cache_dir` set,
+  an NPU LLM stores one weightless compiled `.blob` (~0.66 GB for an 8B int4 model) and later
+  loads take ~6 s instead of ~30 s cold (measured on one Lunar Lake laptop, identical output).
+  Without it, the NPU driver's own cache (`~/.cache/ze_intel_npu_cache/`) still keeps repeat loads
+  at ~8–12 s. Each `max_prompt_len`/`min_response_len` combination compiles its own blob, and
+  blobs from earlier combinations stay attributed to the model, so the `ov_cache_max_gb` sweep
+  won't prune them while it is loaded (and never prunes anything with the default
+  `ov_cache_max_gb: 0`). After experimenting with shapes, stop the server and clear
+  `ov_cache_dir`; the next load recompiles the current shape (~30 s).
+  NPU *Whisper* is the exception: it never gets the cache dir, because it hangs with one. That
+  makes a large Whisper slow to start on the NPU: on one Lunar Lake laptop, `whisper-large-v3`
+  took 138 s to load there (1.6 s on the same box's GPU) and held 4.7 GB against 1.9 GB on the
+  GPU, for no speed gain.
+  Keep large Whisper models on the GPU; the NPU suits small ones.
 
 ---
 
@@ -565,6 +622,7 @@ Module-to-purpose map (`src/`, `ov_bridge/`, `scripts/rv-cargo.sh`/`rv`, `tests/
 ## Roadmap
 
 Phase table: **[`ROADMAP.md`](ROADMAP.md)**. Currently on Phase 5 (media/infrastructure).
+What changed in each release: **[`CHANGELOG.md`](CHANGELOG.md)**.
 
 ---
 

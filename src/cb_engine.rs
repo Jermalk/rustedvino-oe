@@ -131,8 +131,8 @@ struct ActiveRequest {
     /// see the `AddRequest` handler). Embedded in the `pool_exhausted` error
     /// message's `observed_prompt_tokens=` field so
     /// `ModelManager::spawn_kv_wedge_recovery` can ratchet on it the same
-    /// way it already does for the VLM wedge marker (`dev/autotest/
-    /// 20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`).
+    /// way it already does for the VLM wedge marker
+    /// (the project's internal engineering log).
     prompt_tokens: usize,
 }
 
@@ -817,7 +817,7 @@ fn engine_loop<E: CbEngineOps>(
         // set are two independently maintained views of "work in flight" and
         // can silently diverge (observed: KV-pool exhaustion under
         // GenerationStatus::IGNORED left a request un-finalized on both sides
-        // at once — dev/DECISIONS.md 2026-08-19, nanbeige hang). If the
+        // at once — the project's internal engineering log 2026-08-19, nanbeige hang). If the
         // pipeline ever reports nothing left to do while Rust still tracks
         // live routes, those routes are orphaned — nothing will ever step
         // them again (has_unfinished() below would keep this branch skipped
@@ -1132,7 +1132,7 @@ fn step_and_route<E: CbEngineOps>(
                 // Count the engine's own reported token count, not 1 per
                 // callback: a speculative-decoding verification step can
                 // accept several draft tokens at once, all landing in this
-                // same callback (found live 2026-07-19, see dev/DECISIONS.md).
+                // same callback (found live 2026-07-19, see the project's internal engineering log).
                 // On this request's very first token, record its
                 // time-to-first-token exactly once.
                 let new_tokens_u64 = new_tokens as u64;
@@ -1432,7 +1432,9 @@ mod tests {
                     );
                     saw_done = true;
                 }
-                StreamEvent::Token(..) | StreamEvent::PromptTokens(_) => {}
+                StreamEvent::Token(..)
+                | StreamEvent::PromptTokens(_)
+                | StreamEvent::CompletionTokens(_) => {}
             }
         }
         assert!(saw_done, "must see a natural Done(Stop) after the drain");
@@ -1522,7 +1524,7 @@ mod tests {
                         "shutdown let more than one extra step run — not prompt"
                     );
                 }
-                StreamEvent::PromptTokens(_) => {}
+                StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => {}
                 StreamEvent::Error(_) => saw_error = true,
                 StreamEvent::Done(reason) => {
                     assert_eq!(reason, FinishReason::Stop);

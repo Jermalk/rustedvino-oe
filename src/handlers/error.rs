@@ -49,6 +49,11 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(Self(v)),
+            // Over the request-body limit: say so, instead of calling a valid
+            // (just too large) body malformed.
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(request_too_large())
+            }
             Err(rejection) => {
                 // T4.4 (committee finding 52): the serde rejection text reflects
                 // the caller's input back and fingerprints our struct layout
@@ -65,6 +70,23 @@ where
             }
         }
     }
+}
+
+/// 413 for a request body over the server's limit (`MAX_REQUEST_BODY`),
+/// naming the limit. Shared by the JSON extractor and the multipart
+/// (audio/image upload) parsers, which used to answer 400 "malformed body" /
+/// "could not read field" and hide the cause.
+pub(crate) fn request_too_large() -> Response {
+    openai_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "request body exceeds this server's {} MiB limit — send a smaller request \
+             (for audio, 16 kHz mono is all speech-to-text needs)",
+            crate::MAX_REQUEST_BODY >> 20
+        ),
+        "invalid_request_error",
+        Some("request_too_large"),
+    )
 }
 
 /// OpenAI-compatible error wrapper: `{"error": {...}}`.
@@ -189,7 +211,7 @@ fn sse_error_frame(message: &str, code: &'static str) -> axum::response::sse::Ev
 /// Build the standard 400 for a known `OpenAI` parameter this server cannot
 /// honor.
 ///
-/// Per the compat policy (`PLAN_openai_compat_llm_vlm.md`), an unsupported but
+/// Per the OpenAI-compat policy, an unsupported but
 /// well-known param is **rejected explicitly** rather than silently
 /// accepted-and-dropped (the "A1 silent-drop" trap): a client that asked for
 /// `logprobs`/`n>1`/`logit_bias` must learn it was not honored. `param` is the
@@ -322,8 +344,8 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
 ///   context (the project's internal engineering log). When no
 ///   *other* request was in flight against the model at the time (so
 ///   nothing else could have caused the shortfall), this also triggers the
-///   same evict+reload+ratchet recovery as the VLM wedge below (`dev/
-///   autotest/20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`) — a
+///   same evict+reload+ratchet recovery as the VLM wedge below
+///   (the project's internal engineering log) — a
 ///   genuinely busy model with real concurrent load does not get evicted for
 ///   an ordinary capacity blip;
 /// - anything else is an opaque 500 `server_error`.
@@ -390,8 +412,8 @@ enum InferenceErrorKind {
     /// only request against the model), nothing else could have crowded out
     /// the pool — that's not congestion, it's the static formula being
     /// wrong, so `spawn_kv_wedge_recovery` is triggered the same as
-    /// [`InferenceErrorKind::VlmKvWedge`] (`dev/autotest/
-    /// 20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`).
+    /// [`InferenceErrorKind::VlmKvWedge`]
+    /// (the project's internal engineering log).
     PoolExhausted,
     /// VLM-path KV-admission wedge (`VLM_KV_WEDGE_MARKER`) — the pipeline
     /// itself never self-recovers; `spawn_kv_wedge_recovery` was triggered
@@ -423,8 +445,7 @@ fn classify_inference_error(
         // recovery: unlike the VLM wedge, plain pool exhaustion usually
         // *is* legitimate and retryable, so misreading "solo" is the wrong
         // direction to be wrong in (see `POOL_EXHAUSTED_MARKER`'s doc
-        // comment, `dev/autotest/
-        // 20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`).
+        // comment and the project's internal engineering log).
         let active_requests = pool_exhausted_active_requests(raw);
         if active_requests.is_some_and(|n| n <= 1) {
             let observed_prompt_tokens = kv_wedge_observed_prompt_tokens(raw).unwrap_or(0);

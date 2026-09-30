@@ -32,7 +32,7 @@
 use anyhow::{Context, bail};
 use std::ffi::{CStr, CString};
 
-use crate::ov_cb::FinishReason;
+use crate::ov_cb::{FinishReason, GenParams, OvCbEngine, OvGenParamsC};
 
 // ── Raw C declarations ────────────────────────────────────────────────────────
 //
@@ -52,6 +52,8 @@ unsafe extern "C" {
         model_path: *const std::ffi::c_char,
         device: *const std::ffi::c_char,
         max_prompt_len: u32,
+        min_response_len: u32,
+        ov_cache_dir: *const std::ffi::c_char,
     ) -> *mut std::ffi::c_void;
 
     fn ov_pipeline_free(handle: *mut std::ffi::c_void);
@@ -59,10 +61,12 @@ unsafe extern "C" {
     fn ov_pipeline_generate(
         handle: *mut std::ffi::c_void,
         prompt: *const std::ffi::c_char,
-        max_new_tokens: usize,
+        params: *const OvGenParamsC,
         callback: Option<OvTokenCallback>,
         user_data: *mut std::ffi::c_void,
         finish_code_out: *mut std::ffi::c_int,
+        generated_tokens_out: *mut usize,
+        input_tokens_out: *mut usize,
     ) -> std::ffi::c_int;
 
     fn ov_pipeline_encode(
@@ -116,6 +120,22 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     })
 }
 
+// ── Generation outcome ───────────────────────────────────────────────────────
+
+/// Result of one [`OvPipeline::generate`] call, with the pipeline's OWN token
+/// counts (`perf_metrics`). The token callback fires once per decoded text
+/// chunk, and a chunk can carry several tokens, so counting callbacks
+/// undercounts (seen live: 192 counted for a 200-token generation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NpuGenOutcome {
+    /// `Length` when the token budget cut the generation, `Stop` otherwise.
+    pub finish: FinishReason,
+    /// Tokens the pipeline actually generated.
+    pub generated_tokens: usize,
+    /// Prompt tokens as the pipeline encoded them.
+    pub input_tokens: usize,
+}
+
 // ── OvPipeline ───────────────────────────────────────────────────────────────
 
 /// A loaded `OpenVINO` `GenAI` `LLMPipeline` — the actual GPU inference engine.
@@ -148,7 +168,12 @@ impl OvPipeline {
     /// * `device` – `OpenVINO` device string (`"GPU.1"`, `"CPU"`, …)
     /// * `max_prompt_len` – NPU-only compile-time `MAX_PROMPT_LEN` ceiling.
     ///   `None` keeps `OpenVINO`'s own default (1024 as of this writing);
-    ///   ignored (harmlessly) for non-NPU devices. See the project's internal engineering log #6.
+    ///   ignored (harmlessly) for non-NPU devices. See the project's internal engineering log.
+    /// * `min_response_len` – NPU-only compile-time `MIN_RESPONSE_LEN`: output
+    ///   room reserved on top of `max_prompt_len`. `None` keeps `OpenVINO`'s
+    ///   default (128).
+    /// * `ov_cache_dir` – `OpenVINO` `CACHE_DIR`; `None`/empty = no
+    ///   OpenVINO-level blob cache (the NPU driver may still cache on its own).
     ///
     /// # Errors
     /// Returns an error if the model directory is invalid, the device is
@@ -161,17 +186,23 @@ impl OvPipeline {
         model_path: &str,
         device: &str,
         max_prompt_len: Option<u32>,
+        min_response_len: Option<u32>,
+        ov_cache_dir: Option<&str>,
     ) -> anyhow::Result<Self> {
         let c_path = CString::new(model_path).context("model_path contains interior NUL byte")?;
         let c_device = CString::new(device).context("device contains interior NUL byte")?;
+        let c_cache_dir = CString::new(ov_cache_dir.unwrap_or(""))
+            .context("ov_cache_dir contains interior NUL byte")?;
 
-        // SAFETY: Both CStrings are alive for the duration of the call.
+        // SAFETY: All three CStrings are alive for the duration of the call.
         // ov_pipeline_create returns either a valid pointer or NULL.
         let handle = unsafe {
             ov_pipeline_create(
                 c_path.as_ptr(),
                 c_device.as_ptr(),
                 max_prompt_len.unwrap_or(0),
+                min_response_len.unwrap_or(0),
+                c_cache_dir.as_ptr(),
             )
         };
 
@@ -179,7 +210,7 @@ impl OvPipeline {
             bail!("ov_pipeline_create failed: {}", last_error());
         }
 
-        tracing::info!(model = %model_path, device = %device, max_prompt_len, "OV pipeline loaded");
+        tracing::info!(model = %model_path, device = %device, max_prompt_len, min_response_len, "OV pipeline loaded");
         Ok(Self { handle })
     }
 
@@ -211,16 +242,18 @@ impl OvPipeline {
         Ok(count)
     }
 
-    /// Run inference synchronously, streaming tokens to `on_token`.
+    /// Run inference synchronously, streaming decoded text to `on_token`.
     ///
     /// # Arguments
-    /// * `prompt` – the user's text; the model applies its chat template
-    /// * `max_new_tokens` – token budget; `0` means use model default
-    /// * `on_token` – closure called once per generated token;
-    ///   return `true` to continue, `false` to stop early
+    /// * `prompt` – the prompt ALREADY rendered through the model's chat
+    ///   template (Rust side); the bridge disables `OpenVINO`'s own templating
+    /// * `params` – sampling / stop / structured-output settings, marshalled
+    ///   through the same `OvGenParams` layout as the CB path
+    /// * `on_token` – closure called once per decoded text chunk (one chunk
+    ///   may hold several tokens); return `true` to continue, `false` to stop
     ///
-    /// Returns the generation's [`FinishReason`]: `Length` when the token
-    /// budget cut the generation, `Stop` otherwise (EOS or early stop).
+    /// Returns an [`NpuGenOutcome`] with the finish reason and the pipeline's
+    /// own generated/prompt token counts.
     ///
     /// # Errors
     /// Returns an error if inference fails (e.g. OOM, device error).
@@ -230,9 +263,9 @@ impl OvPipeline {
     pub fn generate(
         &mut self,
         prompt: &str,
-        max_new_tokens: usize,
+        params: &GenParams,
         mut on_token: impl FnMut(&str) -> bool,
-    ) -> anyhow::Result<FinishReason> {
+    ) -> anyhow::Result<NpuGenOutcome> {
         let c_prompt = CString::new(prompt).context("prompt contains interior NUL byte")?;
 
         // We pass `on_token` to C as a raw pointer in `user_data`.
@@ -255,21 +288,28 @@ impl OvPipeline {
         let user_data_ptr = std::ptr::addr_of_mut!(ctx).cast::<std::ffi::c_void>();
 
         let mut finish_code: std::ffi::c_int = 1; // STOP default
+        let mut generated_tokens: usize = 0;
+        let mut input_tokens: usize = 0;
+        let handle = self.handle;
 
-        // SAFETY: handle is non-null (invariant), c_prompt is valid,
-        // trampoline has the correct signature, user_data points to a valid
-        // FnMut on this stack frame, and finish_code lives on this frame —
-        // all alive for the (blocking) call duration.
-        let ret = unsafe {
+        // SAFETY: handle is non-null (invariant); c_prompt is valid; `c_params`
+        // points into `with_c_params`' stack frame (stop-string / schema
+        // CStrings included), which outlives this blocking call; the
+        // trampoline has the correct signature; user_data points to a valid
+        // TokenCbCtx on this stack frame; the three out-params live on this
+        // frame — all alive for the (blocking) call duration.
+        let ret = OvCbEngine::with_c_params(params, 0, |c_params| unsafe {
             ov_pipeline_generate(
-                self.handle,
+                handle,
                 c_prompt.as_ptr(),
-                max_new_tokens,
+                c_params,
                 Some(token_trampoline),
                 user_data_ptr,
                 &raw mut finish_code,
+                &raw mut generated_tokens,
+                &raw mut input_tokens,
             )
-        };
+        });
 
         if ret != 0 {
             bail!("ov_pipeline_generate failed: {}", last_error());
@@ -277,9 +317,13 @@ impl OvPipeline {
         if ctx.panicked {
             bail!("token callback panicked during generation");
         }
-        Ok(match finish_code {
-            2 => FinishReason::Length,
-            _ => FinishReason::Stop,
+        Ok(NpuGenOutcome {
+            finish: match finish_code {
+                2 => FinishReason::Length,
+                _ => FinishReason::Stop,
+            },
+            generated_tokens,
+            input_tokens,
         })
     }
 }

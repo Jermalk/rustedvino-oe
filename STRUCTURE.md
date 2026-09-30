@@ -1,6 +1,6 @@
 # RustedVINO — Project Structure
 
-Module-to-purpose map (`src/`, `ov_bridge/`, `scripts/rv-cargo.sh`/`rv`, `tests/`). For prose (why,
+Module-to-purpose map (`src/`, `ov_bridge/`, `scripts/rv-cargo.sh`/`rv`, `tools/`, `tests/`). For prose (why,
 what's implemented, setup) see **[`README.md`](README.md)**; for the HTTP surface see
 **[`INTERFACE.md`](INTERFACE.md)**.
 
@@ -26,7 +26,7 @@ src/
     completions.rs           — /v1/completions (legacy raw-prompt)
     embeddings.rs            — /v1/embeddings
     reranking.rs             — /v1/rerank (cross-encoder document reranking)
-    media.rs                 — /v1/audio/transcriptions, /v1/audio/speech, /v1/images/*
+    media.rs                 — /v1/audio/transcriptions, /v1/audio/translations, /v1/audio/speech, /v1/images/*
     tokenize.rs              — /tokenize, /detokenize
     realtime.rs              — /v1/realtime WebSocket voice-flow handler (STT → LLM → TTS)
     error.rs                 — OpenAI-compatible error envelope helpers
@@ -63,6 +63,7 @@ src/
   image_util.rs              — Base64 encode/decode, image format helpers
   in_flight.rs               — In-flight request drain tracker
   os_memory.rs               — System RAM probing (for UMA budget)
+  gpu_memory.rs              — Measured device memory from /proc/self/fdinfo (Linux DRM: xe/i915/intel_vpu) + measurement windows for per-model estimates
   metrics.rs                 — Prometheus registry, counters, histograms
   prompt_builder.rs          — Chat template rendering (minijinja), tool-call parsing, ThinkFilter
   bin/
@@ -76,6 +77,10 @@ ov_bridge/
 scripts/
   rv-cargo.sh                — run any cargo command with the OpenVINO build/runtime env wired in (auto-detects the OV install, or set RV_OV_VENV)
   rv                         — Ollama-shaped admin CLI (status/list/ps/check/add/load/unload/deregister/logs); stdlib-only Python, no venv needed
+
+tools/                       — stdlib-only Python clients of the server's API
+  semsearch/                 — semantic search over Markdown notes (/v1/embeddings, /v1/rerank)
+  livecaptions/              — live captions + optional translation (/v1/audio/transcriptions, /v1/chat/completions)
 
 tests/
   api.rs                     — integration tests, mock path, no GPU needed

@@ -14,7 +14,7 @@
 //   - Commands arrive via an mpsc channel (capacity `STT_CHANNEL_CAP`); one job
 //     runs at a time (the pipeline is single-stream and blocking).
 //   - Admission is a real `Semaphore` gate (mirrors `cb_engine`/`vlm_engine`,
-//     dev/plans/vlm-admission-gate-fix.md's recipe): a permit is acquired
+//     the project's internal engineering log's recipe): a permit is acquired
 //     *before* a command is sent and held by the engine thread until it
 //     replies, so `active()` is honest occupancy. Replaces the old
 //     `in_flight: AtomicUsize` + `InFlightGuard` approximation.
@@ -79,6 +79,15 @@ impl Transcription {
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
+/// What the Whisper model does with the audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttTask {
+    /// Text in the spoken language (`/v1/audio/transcriptions`).
+    Transcribe,
+    /// English text whatever the spoken language (`/v1/audio/translations`).
+    Translate,
+}
+
 pub(crate) enum SttCommand {
     /// Decode + resample + transcribe one uploaded audio file.
     Transcribe {
@@ -88,6 +97,8 @@ pub(crate) enum SttCommand {
         language: Option<String>,
         /// When `true`, the result carries per-segment timings.
         timestamps: bool,
+        /// Transcribe or translate to English.
+        task: SttTask,
         /// One-shot reply channel — carries the transcription back to the handler.
         reply: oneshot::Sender<anyhow::Result<Transcription>>,
         /// Wall-clock start (handler entry) for the duration metric.
@@ -122,9 +133,19 @@ pub struct SttHandle {
     /// Callers currently parked in [`transcribe`](Self::transcribe) awaiting an
     /// admission permit — the engine's honest `rustedvino_requests_waiting`.
     waiting: Arc<AtomicUsize>,
+    /// Whether the model supports the translate task (`None` = unknown, see
+    /// [`crate::ov_whisper::resolve_can_translate`]).
+    can_translate: Option<bool>,
 }
 
 impl SttHandle {
+    /// `false` only when the model is known not to translate (English-only);
+    /// `true` when it can, or when that's unknown.
+    #[must_use]
+    pub fn can_translate(&self) -> bool {
+        self.can_translate != Some(false)
+    }
+
     /// The model ID of the loaded Whisper model.
     #[must_use]
     pub fn model_id(&self) -> &str {
@@ -143,6 +164,7 @@ impl SttHandle {
             cap,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            can_translate: Some(true),
         }
     }
 
@@ -162,6 +184,7 @@ impl SttHandle {
             cap,
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
+            can_translate: Some(true),
         }
     }
 
@@ -184,6 +207,33 @@ impl SttHandle {
         audio_bytes: Vec<u8>,
         language: Option<String>,
         timestamps: bool,
+    ) -> Result<Transcription, AdmitError> {
+        self.submit(audio_bytes, language, timestamps, SttTask::Transcribe)
+            .await
+    }
+
+    /// Translate one uploaded audio file into English — same contract as
+    /// [`transcribe`](Self::transcribe); `language` is the *spoken* language
+    /// hint. Check [`can_translate`](Self::can_translate) first.
+    ///
+    /// # Errors
+    /// As [`transcribe`](Self::transcribe).
+    pub async fn translate(
+        &self,
+        audio_bytes: Vec<u8>,
+        language: Option<String>,
+        timestamps: bool,
+    ) -> Result<Transcription, AdmitError> {
+        self.submit(audio_bytes, language, timestamps, SttTask::Translate)
+            .await
+    }
+
+    async fn submit(
+        &self,
+        audio_bytes: Vec<u8>,
+        language: Option<String>,
+        timestamps: bool,
+        task: SttTask,
     ) -> Result<Transcription, AdmitError> {
         // `InFlightGuard` (not just an increment) so a cancelled caller — an
         // HTTP client disconnecting while parked at the gate — still
@@ -208,6 +258,7 @@ impl SttHandle {
                 audio_bytes,
                 language,
                 timestamps,
+                task,
                 reply: reply_tx,
                 started_at,
                 permit,
@@ -259,6 +310,7 @@ pub fn spawn_stt_engine(
     model_id: &str,
     device: &str,
     queue_timeout: Duration,
+    can_translate: Option<bool>,
 ) -> anyhow::Result<(SttHandle, std::thread::JoinHandle<()>)> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SttCommand>(STT_CHANNEL_CAP);
     let sem = Arc::new(Semaphore::new(STT_CHANNEL_CAP));
@@ -284,6 +336,7 @@ pub fn spawn_stt_engine(
                 audio_bytes,
                 language,
                 timestamps,
+                task,
                 reply,
                 started_at,
                 permit,
@@ -296,6 +349,7 @@ pub fn spawn_stt_engine(
                     &audio_bytes,
                     language.as_deref(),
                     timestamps,
+                    task,
                 );
                 let elapsed = started_at.elapsed();
                 metrics.record_duration(Modality::Text, elapsed.as_secs_f64());
@@ -327,6 +381,7 @@ pub fn spawn_stt_engine(
             cap: STT_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            can_translate,
         },
         thread,
     ))
@@ -341,10 +396,11 @@ fn run_transcribe(
     audio_bytes: &[u8],
     language: Option<&str>,
     timestamps: bool,
+    task: SttTask,
 ) -> anyhow::Result<(Transcription, usize)> {
     let samples = prepare_samples(audio_bytes)?;
     let n = samples.len();
-    let result = engine.transcribe(&samples, language, timestamps)?;
+    let result = engine.transcribe(&samples, language, timestamps, task == SttTask::Translate)?;
     tracing::debug!(
         model_id,
         samples = n,
@@ -530,13 +586,18 @@ pub(crate) fn spawn_mock_stt(model_id: &str) -> (SttHandle, std::thread::JoinHan
     let thread = std::thread::spawn(move || {
         while let Some(SttCommand::Transcribe {
             language,
+            task,
             reply,
             permit,
             ..
         }) = rx.blocking_recv()
         {
             let _ = reply.send(Ok(Transcription {
-                text: "This is a mock transcription.".to_owned(),
+                text: match task {
+                    SttTask::Transcribe => "This is a mock transcription.",
+                    SttTask::Translate => "This is a mock translation.",
+                }
+                .to_owned(),
                 language: language.unwrap_or_else(|| "english".to_owned()),
                 segments: vec![
                     Segment {
@@ -563,6 +624,8 @@ pub(crate) fn spawn_mock_stt(model_id: &str) -> (SttHandle, std::thread::JoinHan
             cap: STT_CHANNEL_CAP,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            // Mirrors Whisper's naming: an `.en` model is English-only.
+            can_translate: Some(!model_id.contains(".en")),
         },
         thread,
     )
@@ -582,6 +645,26 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The task reaches the engine thread (the mock answers per task), and an
+    /// English-only model reports it can't translate.
+    #[tokio::test]
+    async fn translate_task_reaches_engine_and_en_models_cannot_translate() {
+        let (handle, _thread) = spawn_mock_stt("mock-stt");
+        assert!(handle.can_translate());
+        let t = handle
+            .translate(b"audio".to_vec(), Some("pl".to_owned()), false)
+            .await
+            .unwrap();
+        assert_eq!(t.text, "This is a mock translation.");
+        let t = handle
+            .transcribe(b"audio".to_vec(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(t.text, "This is a mock transcription.");
+        let (en_only, _thread) = spawn_mock_stt("whisper-tiny.en");
+        assert!(!en_only.can_translate());
+    }
 
     /// Build a minimal 16-bit PCM WAV in memory: `sample_rate` Hz, mono, holding
     /// `samples` (clamped to i16). Enough for symphonia's WAV reader to decode.

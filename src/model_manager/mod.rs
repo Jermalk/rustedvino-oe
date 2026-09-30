@@ -85,8 +85,8 @@ pub(crate) fn is_gpu_poison_error(msg: &str) -> bool {
 /// conversation alone hitting the model's real ceiling (`M <= 1` — nothing
 /// else can be crowding it out, so the static `compute_max_prompt_tokens`
 /// formula estimate is simply wrong for this model and retrying the same
-/// request can never succeed). See `dev/autotest/
-/// 20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`, which found a dense
+/// request can never succeed). See
+/// the project's internal engineering log, which found a dense
 /// (non-hybrid) model's real capacity ~15% below the formula's advertised
 /// ceiling with zero contention — the same class of static-formula miss the
 /// VLM wedge below was built for, just on the plain CB path, where it
@@ -135,8 +135,8 @@ pub(crate) fn pool_exhausted_active_requests(msg: &str) -> Option<usize> {
     extract_marker_field(msg, "active_requests=")
 }
 
-/// Substring marker for the VLM-path KV-admission wedge (`dev/autotest/
-/// 20260821_omnicoder9b_qwen35_hybrid_stall.md`) — hybrid attention
+/// Substring marker for the VLM-path KV-admission wedge
+/// (the project's internal engineering log) — hybrid attention
 /// architectures (Qwen3.5/3.6's `GatedDeltaNet`) whose real usable KV
 /// capacity the static `compute_max_prompt_tokens` formula cannot precisely
 /// predict (same root cause independently reported as
@@ -373,6 +373,14 @@ struct ModelRecord {
     /// keeps reporting the last-known figure for a model that's since been
     /// evicted, instead of the gauge disappearing.
     last_load_duration_secs: Option<f64>,
+    /// Measured change in this process's device memory across the model's
+    /// most recent load ([`crate::gpu_memory`]), in bytes. `None` before the
+    /// first measured load or where the OS can't measure. An estimate: a
+    /// concurrent load of another model lands in the same window.
+    gpu_load_delta_bytes: Option<i64>,
+    /// Set once the "measured memory exceeds `vram_gb`" warning has fired for
+    /// the current load, so it logs once per load rather than per scrape.
+    gpu_over_budget_warned: std::sync::atomic::AtomicBool,
     /// Co-residency Slice 1: when `true`, this model is never an eviction victim
     /// (`select_eviction_victim` hard-excludes it). Set once at registration
     /// from `config.model_policies`; static for the process lifetime.
@@ -403,12 +411,6 @@ struct ModelRecord {
     /// means no scan — correct for non-thinking models and prevents false-positive
     /// strips on models that emit `<think>` as literal content.
     reasoning_parser: Option<config::ReasoningParser>,
-    /// NPU-only `MAX_PROMPT_LEN` override from
-    /// [`config::ModelPolicy::max_prompt_len`], set at registration. `None`
-    /// means the NPU chat gate falls back to
-    /// `crate::handlers::chat::NPU_DEFAULT_MAX_PROMPT_LEN`. Ignored for
-    /// every non-NPU model. See the project's internal engineering log #6.
-    configured_max_prompt_len: Option<u32>,
     /// The model's own shipped sampling defaults, from `generation_config.json`
     /// (see [`template::load_generation_defaults`]). Loaded once at first
     /// successful load, alongside `template`/`eos_token`/`bos_token` — empty
@@ -431,6 +433,44 @@ struct ModelRecord {
 }
 
 impl ModelRecord {
+    /// Record the measured device-memory change across a just-finished load
+    /// (`before` = the reading taken before it started) and re-arm the
+    /// over-budget warning for this load. The delta is `None` (unknown) when
+    /// the window wasn't clean — another model loaded or was evicted during
+    /// it, or recently enough that the kernel was still releasing memory —
+    /// or when it came out negative, which only such pollution produces.
+    fn note_gpu_load(&mut self, before: Option<u64>, window: crate::gpu_memory::MeasureWindow) {
+        #[allow(clippy::cast_possible_wrap)] // device memory < 2^63 bytes
+        {
+            self.gpu_load_delta_bytes = before
+                .zip(crate::gpu_memory::process_total_bytes())
+                .map(|(b, a)| a as i64 - b as i64)
+                .filter(|&d| d >= 0 && window.is_clean());
+        }
+        self.gpu_over_budget_warned
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether loading this model reserves a continuous-batching KV pool —
+    /// the single source for both the real load
+    /// ([`load_model_with_overrides`](ModelManager::load_model_with_overrides))
+    /// and the dry-run [`check_admission`](ModelManager::check_admission).
+    ///
+    /// True for text/vision models, except a text model placed on the NPU: it
+    /// runs the static `LLMPipeline`, whose KV cache is a small fixed compiled
+    /// shape (`max_prompt_len + min_response_len` tokens) that the measured
+    /// weight footprint already covers. Charging it `cache_size_gb` as well
+    /// overstated an 8B int4 NPU model at ~12.5 GB against ~5.0 GB measured
+    /// (2026-09-29), which made NPU + GPU co-residency on a UMA box depend on
+    /// the moment's free RAM.
+    fn needs_kv_pool(&self) -> bool {
+        match self.configured_kind {
+            ModelKind::TextGen => self.device != "NPU",
+            ModelKind::Vision => true,
+            _ => false,
+        }
+    }
+
     /// The victim-ordering sort key for a Ready eviction candidate:
     /// `(busy, priority, last_used)`, ascending. A busy model (in-flight `> 0`,
     /// read live through the `ManagedEngine` facade) sorts LAST; then the
@@ -483,11 +523,6 @@ pub struct ChatContext {
     /// buffered responses. `None` = no scan; `Some(_)` = strip `<think>` and
     /// surface reasoning as `reasoning_content`. See [`config::ReasoningParser`].
     pub reasoning_parser: Option<config::ReasoningParser>,
-    /// NPU-only `MAX_PROMPT_LEN` override (the project's internal engineering log #6). `None` means
-    /// the NPU chat gate falls back to
-    /// [`crate::handlers::chat::NPU_DEFAULT_MAX_PROMPT_LEN`]. Ignored for
-    /// every non-NPU model.
-    pub configured_max_prompt_len: Option<u32>,
     /// The model's own shipped sampling defaults (`generation_config.json`),
     /// resolved by [`crate::handlers::chat::resolve_sampling_defaults`]
     /// against the request's `tools_active` state and any client-explicit
@@ -522,8 +557,8 @@ pub struct ModelInfo {
     /// model's first successful load, once evicted, for media/embedding
     /// models, or when the gate is disabled (`config.json` unparseable).
     /// Exposed so an external client/operator can discover the real ceiling
-    /// proactively instead of only reactively via that error (`dev/autotest/
-    /// 20260823_external_metrics_interface_audit.md`).
+    /// proactively instead of only reactively via that error
+    /// (the project's internal engineering log).
     pub max_prompt_tokens: usize,
     /// The KV cache pool actually reserved for this model at load time (GB),
     /// `0.0` before first load / once evicted. Companion figure to
@@ -535,8 +570,8 @@ pub struct ModelInfo {
     /// [`template::read_native_context_limit`]). Contrast with
     /// `max_prompt_tokens`: this is what the model was *built for*; that is
     /// what this box's KV pool can currently *serve* — the two can differ
-    /// wildly (confirmed live 2026-08-23, `dev/autotest/
-    /// 20260823_max_position_embeddings_gate_gap.md`: a VRAM-derived ceiling
+    /// wildly (confirmed live 2026-08-23,
+    /// the project's internal engineering log: a VRAM-derived ceiling
     /// of 142k-306k tokens against a real trained ceiling of 40,960).
     /// Resolved once at registration — a static disk property, so it's
     /// accurate even before the model's first load and survives eviction.
@@ -545,7 +580,7 @@ pub struct ModelInfo {
     /// Live KV-cache occupancy percentage (0-100), same source and same
     /// unloaded/unsupported-engine-kind caveats as
     /// [`ModelMetrics::kv_cache_usage_pct`] — surfaced here too
-    /// (`dev/plans/kv-cache-pressure-detection.md`'s ops-review finding)
+    /// (the project's internal engineering log's ops-review finding)
     /// so an operator not watching Prometheus can see it via
     /// `GET /v1/admin/models` directly.
     pub kv_cache_usage_pct: f64,
@@ -554,6 +589,10 @@ pub struct ModelInfo {
     /// Same reasoning for surfacing it here: a gauge nobody looks at is not
     /// a monitor.
     pub kv_pressure_flagged: bool,
+    /// Measured device-memory estimate in GB while `Ready` — compare with
+    /// `vram_gb` (see `ModelManager::gpu_memory_estimate_bytes`). `None`
+    /// when not loaded or where the OS can't measure.
+    pub gpu_memory_estimate_gb: Option<f64>,
 }
 
 /// Result of the dry-run admission check ("what fits"), returned by
@@ -837,7 +876,7 @@ fn apply_moe_cap(
 /// Maximum `max_num_seqs` applied automatically to speculative-decoding
 /// models when no explicit concurrency cap is set. Multi-stream speculative
 /// serving is completely unverified — every measurement in
-/// the project's internal engineering log Part 0 used
+/// the project's internal engineering log used
 /// `max_num_seqs=1`; batched-verification bandwidth-amortization math is an
 /// open question (Part 0 fact #7).
 const SPECULATIVE_MAX_NUM_SEQS: usize = 1;
@@ -883,7 +922,7 @@ fn apply_speculative_cap(
 /// Validate a draft/target pairing for speculative decoding — the
 /// disk-inspecting checks that [`Config::validate`]'s pure-config Layer A
 /// cannot make (they need the model directories on disk). See
-/// the project's internal engineering log Part 4.
+/// the project's internal engineering log.
 ///
 /// Not yet called anywhere in the load path (Migration step 2) — step 3 wires
 /// it into both `build_not_loaded_record` (fail-fast at registration) and
@@ -917,8 +956,7 @@ pub(crate) fn validate_speculative_pairing(
     anyhow::ensure!(
         template::read_moe_num_experts(target_dir).is_none(),
         "speculative decoding target is a MoE model — measured as a net \
-         throughput loss on the only MoE model tested (dev/DECISIONS.md \
-         2026-07-17); blocked until separately verified"
+         throughput loss (0.31–0.46x) on the only MoE model tested; blocked until separately verified"
     );
 
     // Gate 2: draft directory must be a plain dense LLM.
@@ -973,14 +1011,14 @@ pub(crate) fn validate_speculative_pairing(
             draft_model_type = %d,
             "speculative decoding pairing has differing model_type — vocab_size \
              matched so the load proceeds, but cross-family pairings have shown \
-             latency alone does not predict a win (dev/DECISIONS.md 2026-07-17 \
-             \"First non-Qwen target tested\")",
+             latency alone does not predict a win (draft/target training lineage \
+             matters too, not just a shared tokenizer)",
         );
     }
 
     // Gate 4: device. v1 restricts draft_device to equal the target's
     // resolved device — implementation-simplicity scope decision, not
-    // evidence cross-device drafting doesn't work (dev/DECISIONS.md
+    // evidence cross-device drafting doesn't work (the project's internal engineering log
     // 2026-07-17 "Correction: cross-device drafting is direction-dependent").
     if let Some(d) = &spec.draft_device {
         anyhow::ensure!(
@@ -1060,10 +1098,14 @@ pub struct ModelMetrics {
     /// eviction — an evicted model keeps reporting its last-known load time
     /// instead of the gauge disappearing (same lifetime as `kind`/`loaded`).
     pub load_duration_secs: Option<f64>,
+    /// Measured device-memory estimate in bytes while `Ready` (see
+    /// `ModelManager::gpu_memory_estimate_bytes`); `None` otherwise or where
+    /// unmeasurable. Drives `rustedvino_model_gpu_memory_estimate_bytes`.
+    pub gpu_memory_estimate_bytes: Option<f64>,
     /// Whether this model's KV occupancy has been continuously at/above
     /// `kv_pressure_threshold_pct` for at least `kv_pressure_sustained_secs`
     /// (`rustedvino_kv_cache_pressure_flagged`, 1/0) — see
-    /// `dev/plans/kv-cache-pressure-detection.md`. Always `false` while
+    /// the project's internal engineering log. Always `false` while
     /// `kv_pressure_monitor_enabled` is off, for an unloaded model, or for a
     /// `kind` where `kv_cache_usage_supported` is `false` (a permanently-0.0
     /// reading can never cross a positive threshold, so this never
@@ -1331,7 +1373,7 @@ pub struct ModelManager {
     /// stale pre-lock read and silently discarding the other's change.
     config_mutation_lock: Mutex<()>,
     /// Per-model KV-cache pressure tracking
-    /// (`dev/plans/kv-cache-pressure-detection.md`) — a plain
+    /// (the project's internal engineering log) — a plain
     /// `std::sync::Mutex` since every access is a short in-memory read/write,
     /// never held across an `.await`. Absent entry means "never sampled over
     /// threshold" / "never resized." `over_threshold_since` is cleared on
@@ -1745,6 +1787,7 @@ impl ModelManager {
             model_kinds: std::sync::RwLock::new(model_kinds),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
             max_prompt_len_hints: std::sync::RwLock::new(HashMap::new()),
+            min_response_len_hints: std::sync::RwLock::new(HashMap::new()),
             draft_hints: std::sync::RwLock::new(HashMap::new()),
             image_provenance_hints: std::sync::RwLock::new(HashMap::new()),
             embedding_pooling: crate::ov_embed::Pooling::from_config(&config.embedding_pooling),
@@ -1831,8 +1874,8 @@ impl ModelManager {
         // `resolve_model_device` below, which received `None` and lost the
         // kind-aware tier preference) even though the *actual* engine
         // construction at load time detected Vision correctly via the same
-        // file-sniffing, independently — see `dev/autotest/
-        // 20260717_qwen3_4b_int8_sigsegv.md` Finding 3.
+        // file-sniffing, independently — see
+        // the project's internal engineering log.
         let resolved_kind = entry
             .kind
             .as_deref()
@@ -1846,9 +1889,8 @@ impl ModelManager {
         // independently re-derive the identical answer from the same files)
         // and keeps the factory and this record from ever disagreeing.
         self.factory.register_kind_hint(model_id, resolved_kind);
-        if let Some(cap) = entry.policy.max_concurrent_streams {
-            self.factory.register_concurrent_streams_hint(model_id, cap);
-        }
+        self.factory
+            .register_concurrent_streams_hint(model_id, entry.policy.max_concurrent_streams);
         // NPU max_prompt_len is registered later, at the single load choke point
         // (`load_model_with_overrides`, right before `execute_load`) — not here.
         // This function isn't called for startup-preloaded models (only
@@ -1870,7 +1912,7 @@ impl ModelManager {
         // the model's next load. `load_model_with_overrides` re-validates at
         // the actual load choke point regardless — this is belt-and-braces
         // for the paths that go through this function (see Part 4 of
-        // dev/plans/speculative-decoding-integration.md).
+        // the project's internal engineering log).
         if let Some(spec) = entry.policy.speculative.as_ref() {
             let draft_dir = self.config.models_dir.join(&spec.draft_model);
             validate_speculative_pairing(
@@ -1898,13 +1940,14 @@ impl ModelManager {
             configured_kind: resolved_kind,
             last_kind: None,
             last_load_duration_secs: None,
+            gpu_load_delta_bytes: None,
+            gpu_over_budget_warned: std::sync::atomic::AtomicBool::new(false),
             pinned: entry.policy.pinned,
             priority: entry.policy.priority,
             evictable: entry.policy.evictable,
             device: resolved_device,
             domain,
             reasoning_parser: entry.policy.reasoning_parser,
-            configured_max_prompt_len: entry.policy.max_prompt_len,
             generation_defaults: template::GenerationDefaults::default(),
             native_context_limit: template::read_native_context_limit(
                 &self.config.models_dir.join(model_id),
@@ -2033,7 +2076,7 @@ impl ModelManager {
         // permanent, possibly-wrong-metadata `NotLoaded` entry in config.json
         // for a load that never worked: "the add failed" would stop meaning
         // "nothing happened". See
-        // dev/autotest/20260804_doomed_load_evicts_everything_first.md's
+        // the project's internal engineering log's
         // "separate, smaller finding" for the live repro that flagged this.
         //
         // The `models` insert below is guarded by an ATOMIC recheck (same
@@ -2119,7 +2162,7 @@ impl ModelManager {
     ///   the model is `Ready` (409: evict first), applied via a full record
     ///   rebuild ([`build_not_loaded_record`](Self::build_not_loaded_record))
     ///   while `NotLoaded`.
-    /// - `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/
+    /// - `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`min_response_len`/
     ///   `speculative` persist immediately but only change engine behaviour
     ///   at the model's *next* load (`effective_on_next_load` in the report).
     /// - Everything else (`pinned`/`priority`/`evictable`/`load`/
@@ -2273,13 +2316,15 @@ impl ModelManager {
         // values — mirrors `load_model_with_overrides`'s own refresh-on-load
         // choke point, done here too so a hint isn't stuck at its
         // registration-time value until some unrelated load happens to touch it.
-        if let Some(cap) = merged.policy.max_concurrent_streams {
-            self.factory.register_concurrent_streams_hint(model_id, cap);
-        }
-        if let Some(max_prompt_len) = merged.policy.max_prompt_len {
-            self.factory
-                .register_max_prompt_len_hint(model_id, max_prompt_len);
-        }
+        // Always re-register (None removes): a PATCH that clears these must
+        // restore the default on the next load, not keep the old value
+        // (found live 2026-09-28: a cleared min_response_len kept loading 512).
+        self.factory
+            .register_concurrent_streams_hint(model_id, merged.policy.max_concurrent_streams);
+        self.factory
+            .register_max_prompt_len_hint(model_id, merged.policy.max_prompt_len);
+        self.factory
+            .register_min_response_len_hint(model_id, merged.policy.min_response_len);
         self.sync_image_provenance_hint(model_id, Some(&merged));
 
         tracing::info!(
@@ -2514,8 +2559,9 @@ impl ModelManager {
 
     /// Re-read `config.json` from disk and register any newly-declared model
     /// (validated via `EngineFactory::model_exists`, same guard as startup),
-    /// refreshing the config-derived fields of any existing `NotLoaded` entry
-    /// whose file values changed.
+    /// refreshing any existing `NotLoaded` entry whose file entry differs in
+    /// any field — including next-load-only fields like `max_prompt_len`,
+    /// which the model's next load then uses.
     ///
     /// Deliberately narrow in scope, to keep a reload's blast radius zero for
     /// anything already live:
@@ -2627,7 +2673,16 @@ impl ModelManager {
                     report.left_untouched.push(model_id.clone());
                 }
                 Some(ModelState::NotLoaded) => {
-                    let differs = {
+                    // The entry every load path actually reads (overlay ∪
+                    // startup snapshot). Resolved before taking the models
+                    // lock, and compared whole: next-load fields
+                    // (`max_prompt_len`, `min_response_len`, `kv_cache_gb`,
+                    // `max_concurrent_streams`, `speculative`, …) are not on
+                    // the record, so the record comparison below alone let a
+                    // file-only change to them report `unchanged` and never
+                    // reach the next load (0.7.0 review, Fable M2).
+                    let entry_changed = self.effective_entry(model_id).as_ref() != Some(entry);
+                    let differs = entry_changed || {
                         let guard = self.read_models("reload_config");
                         let Some(current) = guard.get(model_id) else {
                             continue; // evicted between the check above and here
@@ -2642,7 +2697,11 @@ impl ModelManager {
                             || current.pinned != entry.policy.pinned
                             || current.priority != entry.policy.priority
                             || current.evictable != entry.policy.evictable
-                            || current.reasoning_parser != entry.policy.reasoning_parser
+                            // Not `reasoning_parser`: the record holds the value
+                            // auto-detected at load (Qwen3 templates), so comparing
+                            // it to the file's `null` flagged every once-loaded
+                            // Qwen3 model `updated` on every reload. The configured
+                            // value is covered by `entry_changed` above.
                             || entry
                                 .policy
                                 .device
@@ -3039,7 +3098,7 @@ impl ModelManager {
             // `None` — an unhinted `None` here previously lost the kind-aware
             // tier preference for `resolve_model_device` below, and defaulted
             // `configured_kind` to a hardcoded `TextGen` even for a real VLM
-            // (see `dev/autotest/20260717_qwen3_4b_int8_sigsegv.md` Finding 3).
+            // (see the project's internal engineering log).
             let kind = entry
                 .kind
                 .as_deref()
@@ -3091,13 +3150,14 @@ impl ModelManager {
                     configured_kind: kind,
                     last_kind: None,
                     last_load_duration_secs: None,
+                    gpu_load_delta_bytes: None,
+                    gpu_over_budget_warned: std::sync::atomic::AtomicBool::new(false),
                     pinned: policy.pinned,
                     priority: policy.priority,
                     evictable: policy.evictable,
                     device,
                     domain,
                     reasoning_parser: policy.reasoning_parser,
-                    configured_max_prompt_len: policy.max_prompt_len,
                     generation_defaults: template::GenerationDefaults::default(),
                     native_context_limit: template::read_native_context_limit(&model_dir),
                 },
@@ -3226,6 +3286,18 @@ impl ModelManager {
         self.config.max_prompt_array
     }
 
+    /// The configured `/v1/embeddings` input-array cap.
+    #[must_use]
+    pub fn max_embedding_inputs(&self) -> usize {
+        self.config.max_embedding_inputs
+    }
+
+    /// The configured `/v1/embeddings` padded-token budget; `0` = none.
+    #[must_use]
+    pub fn max_embedding_batch_tokens(&self) -> usize {
+        self.config.max_embedding_batch_tokens
+    }
+
     /// The configured server-wide `max_tokens` ceiling (T7.1/T2.2); `0` = uncapped.
     #[must_use]
     pub fn max_tokens_cap(&self) -> usize {
@@ -3294,7 +3366,7 @@ impl ModelManager {
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — /v1/audio/transcriptions serves STT models only"
+                "model '{model_id}' is a {kind:?} model — the speech-to-text routes (/v1/audio/transcriptions, /v1/audio/translations) serve STT models only"
             ))),
         }
     }
@@ -3359,7 +3431,7 @@ impl ModelManager {
     /// Returns the resolved [`DeviceInfo`] (silicon identity, capability tier,
     /// total memory) for a registered model's placement device.
     ///
-    /// `PLAN_image_metadata_response.md` §1a: `ModelRecord.device` already holds
+    /// the image-metadata plan §1a: `ModelRecord.device` already holds
     /// the resolved `OpenVINO` device name (e.g. `"GPU.1"`); this just looks it
     /// up in the startup [`DeviceInventory`] snapshot. Returns `None` if the
     /// model is unknown or its device isn't in the inventory (should not happen
@@ -3432,7 +3504,6 @@ impl ModelManager {
                             pool_capacity_tokens: r.pool_capacity_tokens,
                             max_concurrent_streams: r.max_concurrent_streams,
                             reasoning_parser: r.reasoning_parser,
-                            configured_max_prompt_len: r.configured_max_prompt_len,
                             generation_defaults: r.generation_defaults,
                         })
                     } else {
@@ -3520,20 +3591,29 @@ impl ModelManager {
         // (Slice 2b); every other caller passes `LoadOverrides::default()`.
         let params = resolve_runtime_params(&self.config, entry.as_ref(), &overrides);
 
-        // NPU MAX_PROMPT_LEN hint: registered fresh on every load (not just at
-        // registration, unlike register_kind_hint/register_concurrent_streams_hint
-        // in build_not_loaded_record — those miss startup-preloaded models, which
-        // never go through build_not_loaded_record). This is the single choke
+        // Next-load hints (VLM channel cap, NPU MAX_PROMPT_LEN/MIN_RESPONSE_LEN):
+        // registered fresh on every load (not just at registration, unlike
+        // register_kind_hint in build_not_loaded_record — that misses
+        // startup-preloaded models, which never go through
+        // build_not_loaded_record). This is the single choke
         // point every load path (preload, on-demand, add_model, reload_config)
         // funnels through, using the freshest resolved `entry` (dynamic overlay
         // wins), so a config reload's new value is picked up on the model's next
         // load. Ignored for non-NPU devices inside `load()`.
-        if let Some(max_prompt_len) = entry.as_ref().and_then(|e| e.policy.max_prompt_len) {
-            self.factory
-                .register_max_prompt_len_hint(model_id, max_prompt_len);
-        }
+        self.factory.register_concurrent_streams_hint(
+            model_id,
+            entry.as_ref().and_then(|e| e.policy.max_concurrent_streams),
+        );
+        self.factory.register_max_prompt_len_hint(
+            model_id,
+            entry.as_ref().and_then(|e| e.policy.max_prompt_len),
+        );
+        self.factory.register_min_response_len_hint(
+            model_id,
+            entry.as_ref().and_then(|e| e.policy.min_response_len),
+        );
 
-        // Image-gen provenance hint (Tier 3, PLAN_image_metadata_response.md):
+        // Image-gen provenance hint (Tier 3, the image-metadata plan):
         // registered fresh on every load, like the MAX_PROMPT_LEN hint above —
         // ignored by every non-ImageGen load inside `load()`. NOTE (unlike that
         // hint's comment, which overstates this): `entry` is resolved from
@@ -3615,7 +3695,7 @@ impl ModelManager {
         // (e.g. an embedding/STT/TTS model registered without a `"kind"`
         // field) got `needs_kv_pool = true` here regardless, silently
         // reserving a full grab-all KV pool it never needed — see
-        // `dev/autotest/20260807_needs_kv_pool_ignores_auto_detected_kind.md`.
+        // the project's internal engineering log.
         // Unknown/missing record still defaults to `true` (the original
         // LLM-assumption fallback — safe, and this path is unreachable in
         // practice since `begin_load` above already confirmed the record
@@ -3623,7 +3703,7 @@ impl ModelManager {
         let needs_kv_pool = self
             .read_models("load_model_with_overrides:needs_kv_pool")
             .get(model_id)
-            .is_none_or(|r| matches!(r.configured_kind, ModelKind::TextGen | ModelKind::Vision));
+            .is_none_or(ModelRecord::needs_kv_pool);
 
         // Compute KV pool size.  For models with a known weight footprint we
         // compute it dynamically from remaining VRAM, bounded by the resolved
@@ -3663,7 +3743,7 @@ impl ModelManager {
     }
 
     /// `POST /v1/admin/models/{id}/resize`
-    /// (`dev/plans/kv-cache-pressure-detection.md`): evict then reload a
+    /// (the project's internal engineering log): evict then reload a
     /// currently-`Ready` model with a new `kv_cache_gb`, carrying every
     /// other resolved runtime parameter forward unchanged so the caller only
     /// has to say what's changing. Exists because the obvious "just call
@@ -3779,7 +3859,7 @@ impl ModelManager {
         Ok(achieved)
     }
 
-    /// Image-gen provenance hint (Tier 3, `PLAN_image_metadata_response.md`),
+    /// Image-gen provenance hint (Tier 3, the image-metadata plan),
     /// extracted from [`load_model_with_overrides`](Self::load_model_with_overrides)
     /// to keep it under the 100-line clippy cap — same reason
     /// [`resolve_speculative_draft_vram_gb`](Self::resolve_speculative_draft_vram_gb)
@@ -4327,6 +4407,9 @@ impl ModelManager {
         // reservation in the tracker, which then permanently over-counts and
         // spuriously rejects every later load.
         self.finish_evict(model_id);
+        // The kernel releases the engine's device memory seconds later —
+        // mark it so per-model memory measurements don't absorb the drop.
+        crate::gpu_memory::note_release_event();
 
         if !clean_exit {
             tracing::error!(
@@ -4406,6 +4489,9 @@ impl ModelManager {
                     native_context_limit: r.native_context_limit,
                     kv_cache_usage_pct: live.map_or(0.0, ManagedEngine::cache_usage_pct),
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
+                    #[allow(clippy::cast_precision_loss)]
+                    gpu_memory_estimate_gb: Self::gpu_memory_estimate_bytes(id, r)
+                        .map(|b| b as f64 / 1e9),
                 }
             })
             .collect()
@@ -4542,7 +4628,7 @@ impl ModelManager {
     }
 
     /// One pass of the KV-cache pressure monitor
-    /// (`dev/plans/kv-cache-pressure-detection.md`): samples every Ready
+    /// (the project's internal engineering log): samples every Ready
     /// model's live KV occupancy and updates how long each has been
     /// continuously at/above `kv_pressure_threshold_pct`. On a sustained
     /// trip, logs a warning — **does not evict, resize, or otherwise act**;
@@ -4781,6 +4867,46 @@ impl ModelManager {
     /// engine counters. The `/metrics` handler turns this into Prometheus
     /// gauges at scrape time — nothing is pushed on the request hot path.
     #[must_use]
+    /// Measured device-memory estimate for a `Ready` model, in bytes: the
+    /// change across its load plus its engine's runtime growth (the embedding
+    /// batch cache — see [`ManagedEngine::runtime_memory_growth_bytes`]).
+    /// `None` when not `Ready` or where the OS can't measure.
+    ///
+    /// Warns once per load when the estimate exceeds the configured
+    /// `vram_gb`: the memory accounting charges `vram_gb`, so an under-sized
+    /// value lets other loads over-commit the device. Checked whenever this
+    /// runs (every `/metrics` scrape and `GET /v1/admin/models`).
+    fn gpu_memory_estimate_bytes(model_id: &str, r: &ModelRecord) -> Option<i64> {
+        if r.state != ModelState::Ready {
+            return None;
+        }
+        let growth = r
+            .handle
+            .as_ref()
+            .map_or(Some(0), |h| h.as_managed().runtime_memory_growth_bytes())?;
+        let estimate = r.gpu_load_delta_bytes? + growth;
+        if estimate < 0 {
+            return None; // only a polluted measurement goes negative
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let estimate_gb = estimate as f64 / 1e9;
+        if r.vram_gb > 0.0
+            && estimate_gb > r.vram_gb
+            && !r
+                .gpu_over_budget_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                model_id,
+                estimate_gb,
+                vram_gb = r.vram_gb,
+                "measured device memory exceeds the configured vram_gb — raise vram_gb so \
+                 the memory accounting covers it"
+            );
+        }
+        Some(estimate)
+    }
+
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         let guard = self.read_models("metrics_snapshot");
         let models = guard
@@ -4813,6 +4939,9 @@ impl ModelManager {
                         .is_some_and(ManagedEngine::cache_usage_supported),
                     load_duration_secs: r.last_load_duration_secs,
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
+                    #[allow(clippy::cast_precision_loss)]
+                    gpu_memory_estimate_bytes: Self::gpu_memory_estimate_bytes(id, r)
+                        .map(|b| b as f64),
                 })
             })
             .collect();
@@ -4859,10 +4988,10 @@ impl ModelManager {
     }
 
     /// Detect → Ratchet → Reload for a KV-admission wedge — originally built
-    /// for the VLM hybrid-attention wedge (`dev/autotest/
-    /// 20260821_omnicoder9b_qwen35_hybrid_stall.md`), and reused for a solo
-    /// plain-CB pool exhaustion (`dev/autotest/
-    /// 20260823_qwen3-4b-int4-ov_cb_pool_exhaustion_gap.md`) — both are the
+    /// for the VLM hybrid-attention wedge
+    /// (the project's internal engineering log), and reused for a solo
+    /// plain-CB pool exhaustion
+    /// (the project's internal engineering log) — both are the
     /// same root cause, a static `compute_max_prompt_tokens` estimate that
     /// doesn't match this model's real capacity. Called from the
     /// error-shaping path (`handlers/error.rs`) once either
@@ -5122,7 +5251,7 @@ impl ModelManager {
         // The VRAM-derived formula above has no idea what the model was
         // actually trained on — a KV pool can easily afford more tokens than
         // the model's own `max_position_embeddings` (confirmed live
-        // 2026-08-23, `dev/autotest/20260823_max_position_embeddings_gate_gap.md`:
+        // 2026-08-23, the project's internal engineering log:
         // qwen3-4b-int4-ov's formula promised 142k-306k tokens depending on
         // pool size, against a real trained ceiling of 40,960). Clamp to it
         // when known and tighter — unmargined, since `FORMULA_SAFETY_MARGIN`
@@ -5180,6 +5309,30 @@ impl ModelManager {
         )
     }
 
+    /// L0 gate limits for a freshly loaded engine: max tokens before the
+    /// prompt-length gate rejects, plus the unclamped pool-capacity figure the
+    /// concurrent-admission check uses (see [`compute_max_prompt_tokens`](Self::compute_max_prompt_tokens)).
+    /// An NPU LLM has no CB pool, so both come from its compiled shape
+    /// (`max_prompt_len`, `max_prompt_len + min_response_len`). Extracted to
+    /// keep `execute_load` under the 100-line clippy cap.
+    fn load_token_limits(
+        &self,
+        model_id: &str,
+        handle: &EngineHandleKind,
+        kv_gb: f64,
+    ) -> (usize, usize) {
+        if let EngineHandleKind::NpuTextGen(h) = handle {
+            let shape = h.shape();
+            return (shape.max_prompt_len, shape.kv_capacity);
+        }
+        Self::compute_max_prompt_tokens(
+            model_id,
+            &self.config.models_dir.join(model_id),
+            kv_gb,
+            &self.config.kv_cache_precision,
+        )
+    }
+
     async fn execute_load(&self, model_id: &str, kv_gb: f64, max_num_seqs: usize) -> Result<()> {
         let model_path = self.config.models_dir.join(model_id);
         // Phase C1: load on the model's resolved device (per-model `device`
@@ -5192,6 +5345,9 @@ impl ModelManager {
         // Measures exactly the engine-construction/JIT-compile window — not
         // admission-check or HTTP overhead — for `rustedvino_model_load_duration_seconds`.
         let load_started = Instant::now();
+        crate::gpu_memory::note_load_event();
+        let gpu_window = crate::gpu_memory::MeasureWindow::open();
+        let gpu_before = crate::gpu_memory::process_total_bytes();
         let result = tokio::task::spawn_blocking(move || {
             factory.load(&model_path, &device, kv_gb, max_num_seqs)
         })
@@ -5203,6 +5359,8 @@ impl ModelManager {
             Ok((handle, thread)) => {
                 // Get kind first — gates template loading and L0 warn suppression.
                 let kind = handle.kind();
+                let (max_prompt_tokens, pool_capacity_tokens) =
+                    self.load_token_limits(model_id, &handle, kv_gb);
 
                 // Chat template: only meaningful for text/vision generation.
                 // Media models (embedding, STT, TTS, image) don't ship
@@ -5241,18 +5399,10 @@ impl ModelManager {
                 let record = guard
                     .get_mut(model_id)
                     .ok_or_else(|| anyhow::anyhow!("model record disappeared during load"))?;
-                // L0 gate: max tokens before the prompt-length gate rejects, plus
-                // the unclamped pool-capacity figure the concurrent-admission
-                // check uses (see compute_max_prompt_tokens's doc comment).
-                // Extracted to keep execute_load under the 100-line clippy cap.
-                let (max_prompt_tokens, pool_capacity_tokens) = Self::compute_max_prompt_tokens(
-                    model_id,
-                    &self.config.models_dir.join(model_id),
-                    kv_gb,
-                    &self.config.kv_cache_precision,
-                );
                 record.last_kind = Some(kind);
                 record.last_load_duration_secs = Some(load_duration_secs);
+                record.note_gpu_load(gpu_before, gpu_window);
+                crate::gpu_memory::note_load_event();
                 record.handle = Some(handle);
                 record.thread = Some(thread);
                 record.template = Arc::from(template);
@@ -5293,6 +5443,8 @@ impl ModelManager {
                 Ok(())
             }
             Err(e) => {
+                // A failed load frees its partial allocations late, like an eviction.
+                crate::gpu_memory::note_release_event();
                 // L3: detect GPU context poisoning. Once set, gpu_poisoned blocks
                 // all future load attempts with a 503 until a process restart.
                 if is_gpu_poison_error(&e.to_string()) {
@@ -5395,14 +5547,9 @@ impl ModelManager {
                 record.vram_gb,
                 record.state == ModelState::Ready,
                 record.domain.clone(),
-                // Mirror `load_model_with_overrides`'s (now-fixed) needs_kv_pool
-                // logic so the dry-run admission prediction matches the real
-                // load path — read the record's resolved `configured_kind`,
-                // not the raw config field alone (see the fix note there).
-                matches!(
-                    record.configured_kind,
-                    ModelKind::TextGen | ModelKind::Vision
-                ),
+                // Same method as `load_model_with_overrides`, so the dry-run
+                // admission prediction matches the real load path.
+                record.needs_kv_pool(),
             )
         };
         let needed_gb = weight_gb
@@ -5564,8 +5711,8 @@ impl ModelManager {
         // this domain. Without this, a genuinely oversized request destructively
         // evicts every co-resident model one at a time (real service disruption
         // for their in-flight clients) only to fail anyway once the last
-        // evictable victim is gone — the eviction was doomed from the start. See
-        // dev/autotest/20260804_doomed_load_evicts_everything_first.md.
+        // evictable victim is gone — the eviction was doomed from the start (see
+        // the project's internal engineering log).
         {
             let reclaimable_gb = self.max_reclaimable_gb(model_id, &domain, force);
             // `free_gb()` reports `0.0` for a gating-disabled (`total_gb == 0.0`)
@@ -5974,8 +6121,8 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
-        // L3 gate, eviction side (2026-08-04, dev/autotest/20260804_gpu_poisoned
-        // _eviction_crash.md): refuse to evict *anything* while the GPU context
+        // L3 gate, eviction side (2026-08-04, the project's internal engineering log):
+        // refuse to evict *anything* while the GPU context
         // is poisoned. Dropping a resident pipeline runs its C++ destructor,
         // which can itself make an OpenCL call (e.g. clFinish) on the already
         // -broken context — a second exception thrown during that cleanup
@@ -6567,7 +6714,7 @@ mod tests {
     use crate::device_inventory::{DeviceInfo, DeviceKind, DeviceTier};
     use crate::model_manager::lifecycle::MockEngineFactory;
 
-    // ---- KV-cache pressure state machine (dev/plans/kv-cache-pressure-detection.md) ----
+    // ---- KV-cache pressure state machine (the project's internal engineering log) ----
 
     /// Usage below threshold never sets `over_threshold_since`, no transition.
     #[test]
@@ -6884,7 +7031,9 @@ mod tests {
             embedding_pooling: "mean".to_owned(),
             embedding_normalize: true,
             default_embed_model: None,
-            max_prompt_array: 16,              // the production default
+            max_prompt_array: 16, // the production default
+            max_embedding_inputs: 256,
+            max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,              // the production default
             bind_addr: "127.0.0.1".to_owned(), // loopback — irrelevant for unit tests
             port: 11_437,
@@ -6911,7 +7060,7 @@ mod tests {
             .expect("ModelManager::new failed in test")
     }
 
-    // ---- resize_model_kv_cache (dev/plans/kv-cache-pressure-detection.md) ----
+    // ---- resize_model_kv_cache (the project's internal engineering log) ----
 
     /// Resizing an unregistered model → `NotFound`, same as every other
     /// model-scoped call.
@@ -7221,7 +7370,7 @@ mod tests {
         // `used_vram_gb` is scoped to the primary inference domain only (T1/F7).
         // Now that registration correctly detects this model's kind up front
         // (the build_not_loaded_record/new_with_inventory fix — see
-        // dev/autotest/20260717_qwen3_4b_int8_sigsegv.md Finding 3),
+        // the project's internal engineering log),
         // `resolve_model_device` routes it through the real
         // `resolve_embedding_device` probe like production does, which may
         // land it on a different device/domain than the primary one — so
@@ -7903,6 +8052,111 @@ mod tests {
         );
     }
 
+    /// Records the factory's next-load hints with the production insert-or-
+    /// remove semantics, so a test can see what the next load would use.
+    #[derive(Default)]
+    struct HintRecordingFactory {
+        inner: MockEngineFactory,
+        streams: std::sync::Mutex<HashMap<String, usize>>,
+        prompt: std::sync::Mutex<HashMap<String, u32>>,
+        response: std::sync::Mutex<HashMap<String, u32>>,
+    }
+
+    fn set_hint<T>(map: &std::sync::Mutex<HashMap<String, T>>, id: &str, v: Option<T>) {
+        let mut m = map.lock().unwrap();
+        match v {
+            Some(v) => m.insert(id.to_owned(), v),
+            None => m.remove(id),
+        };
+    }
+
+    impl HintRecordingFactory {
+        fn hints(&self, id: &str) -> (Option<usize>, Option<u32>, Option<u32>) {
+            (
+                self.streams.lock().unwrap().get(id).copied(),
+                self.prompt.lock().unwrap().get(id).copied(),
+                self.response.lock().unwrap().get(id).copied(),
+            )
+        }
+    }
+
+    impl crate::model_manager::lifecycle::EngineFactory for HintRecordingFactory {
+        fn detect_kind(&self, model_dir: &std::path::Path) -> ModelKind {
+            self.inner.detect_kind(model_dir)
+        }
+        fn register_concurrent_streams_hint(&self, id: &str, cap: Option<usize>) {
+            set_hint(&self.streams, id, cap);
+        }
+        fn register_max_prompt_len_hint(&self, id: &str, v: Option<u32>) {
+            set_hint(&self.prompt, id, v);
+        }
+        fn register_min_response_len_hint(&self, id: &str, v: Option<u32>) {
+            set_hint(&self.response, id, v);
+        }
+        fn load(
+            &self,
+            model_path: &std::path::Path,
+            device: &str,
+            cache_size_gb: f64,
+            max_num_seqs: usize,
+        ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+            self.inner
+                .load(model_path, device, cache_size_gb, max_num_seqs)
+        }
+    }
+
+    /// 0.7.0 plan A6: clearing a next-load field via PATCH `null` removes its
+    /// factory hint (`max_concurrent_streams` used to stay stuck — only set,
+    /// never removed), and the load choke point re-registers all three from
+    /// the effective entry, so a stale hint can't survive into a load.
+    #[tokio::test]
+    async fn next_load_hints_follow_patch_and_load() {
+        let factory = Arc::new(HintRecordingFactory::default());
+        let (mm, _dir) = make_mm_from_file(BASE_CONFIG, factory.clone()).await;
+
+        mm.patch_model(
+            "existing",
+            &config::ModelEntryPatch {
+                max_concurrent_streams: Some(Some(4)),
+                max_prompt_len: Some(Some(2048)),
+                min_response_len: Some(Some(512)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(factory.hints("existing"), (Some(4), Some(2048), Some(512)));
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(factory.hints("existing"), (Some(4), Some(2048), Some(512)));
+
+        mm.patch_model(
+            "existing",
+            &config::ModelEntryPatch {
+                max_concurrent_streams: Some(None),
+                max_prompt_len: Some(None),
+                min_response_len: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            factory.hints("existing"),
+            (None, None, None),
+            "PATCH null clears"
+        );
+
+        // A stale hint (e.g. left by some other path) must not reach the load.
+        set_hint(&factory.streams, "existing", Some(9));
+        set_hint(&factory.prompt, "existing", Some(9));
+        set_hint(&factory.response, "existing", Some(9));
+        mm.evict_model("existing").await.unwrap();
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(
+            factory.hints("existing"),
+            (None, None, None),
+            "load re-registers"
+        );
+    }
+
     // ---- set_preload -------------------------------------------------------
 
     /// An explicit `preload` list naming an unregistered model id is
@@ -8531,7 +8785,7 @@ mod tests {
         );
     }
 
-    // ---- OV-cache background sweep (dev/plans/ov-cache-self-management.md) ----
+    // ---- OV-cache background sweep (the project's internal engineering log) ----
 
     /// `run_cache_sweep_once_blocking` is a complete no-op on the default
     /// config shape: `ov_cache_max_gb: 0.0` (default, unbounded) and
@@ -9035,6 +9289,96 @@ mod tests {
             used > 5.0,
             "LLM with no kind hint must claim more than weight alone, got {used:.2} GB"
         );
+    }
+
+    /// An NPU LLM runs the static `LLMPipeline` (fixed compiled KV), so it must
+    /// not be charged a CB KV pool — neither by the dry-run admission check nor
+    /// by the real load — while the same model on a CB device still is
+    /// (0.7.0 plan item 12: 12.5 GB charged vs ~5.0 GB measured).
+    #[tokio::test]
+    async fn npu_llm_is_not_charged_a_kv_pool() {
+        let mut config = make_config(&[("cb-llm", 5.0), ("npu-llm", 5.0)], 64.0);
+        config.min_kv_cache_gb = 1.0;
+        config
+            .models
+            .entry("npu-llm".to_owned())
+            .or_default()
+            .policy = config::ModelPolicy {
+            device: Some("NPU".to_owned()),
+            ..Default::default()
+        };
+        let margin = config.vram_safety_margin_gb;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+
+        let npu = mm.check_admission("npu-llm").unwrap();
+        let cb = mm.check_admission("cb-llm").unwrap();
+        assert!(
+            (npu.needed_gb - (5.0 + margin)).abs() < 1e-9,
+            "{}",
+            npu.needed_gb
+        );
+        assert!(
+            (cb.needed_gb - (5.0 + 1.0 + margin)).abs() < 1e-9,
+            "{}",
+            cb.needed_gb
+        );
+
+        mm.load_model("npu-llm").await.unwrap();
+        mm.load_model("cb-llm").await.unwrap();
+        let infos = mm.list_models();
+        let kv = |id: &str| infos.iter().find(|i| i.id == id).unwrap().kv_cache_gb;
+        assert!(
+            kv("npu-llm").abs() < 1e-9,
+            "NPU LLM got a KV pool: {}",
+            kv("npu-llm")
+        );
+        assert!(kv("cb-llm") > 0.0, "CB LLM must still get a KV pool");
+    }
+
+    /// Plan item 14: the measured estimate is the load delta (+ engine runtime
+    /// growth), reported only while `Ready`; exceeding `vram_gb` sets the
+    /// once-per-load warning flag, and a new load re-arms it.
+    #[tokio::test]
+    async fn gpu_memory_estimate_reports_while_ready_and_warns_once() {
+        let mm = make_mm(&[("m", 2.5)], 16.0).await;
+        let estimate = |mm: &ModelManager| {
+            mm.list_models()
+                .into_iter()
+                .find(|i| i.id == "m")
+                .unwrap()
+                .gpu_memory_estimate_gb
+        };
+        let warned = |mm: &ModelManager| {
+            mm.read_models("t")
+                .get("m")
+                .unwrap()
+                .gpu_over_budget_warned
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(estimate(&mm), None, "not loaded");
+
+        mm.load_model("m").await.unwrap();
+        // The live failure (2026-09-29): a load right after an eviction measured
+        // a negative delta. An unknown delta must read as unknown, never warn.
+        mm.write_models("t")
+            .get_mut("m")
+            .unwrap()
+            .gpu_load_delta_bytes = None;
+        assert_eq!(estimate(&mm), None, "unknown load delta");
+        assert!(!warned(&mm), "no warning without a real figure");
+        mm.write_models("t")
+            .get_mut("m")
+            .unwrap()
+            .gpu_load_delta_bytes = Some(3_900_000_000);
+        assert!((estimate(&mm).unwrap() - 3.9).abs() < 1e-9);
+        assert!(warned(&mm), "3.9 GB measured > vram_gb 2.5");
+
+        mm.evict_model("m").await.unwrap();
+        assert_eq!(estimate(&mm), None, "evicted");
+        mm.load_model("m").await.unwrap();
+        assert!(!warned(&mm), "a new load re-arms the warning");
     }
 
     /// Co-residency Slice 2: the precedence chain
@@ -10664,8 +11008,8 @@ mod tests {
         assert_eq!(*model_err, ModelError::GpuPoisoned);
     }
 
-    /// L3 gate, eviction side (`dev/autotest/20260804_gpu_poisoned_eviction
-    /// _crash.md`): once the GPU context is poisoned, evicting a `Ready`
+    /// L3 gate, eviction side (the project's internal engineering log): once the GPU
+    /// context is poisoned, evicting a `Ready`
     /// model is refused with `GpuPoisoned` instead of proceeding to drop its
     /// handle — dropping a pipeline on a broken `OpenCL` context can crash
     /// the whole process, not just fail the one request.
@@ -11496,6 +11840,64 @@ mod tests {
             .find(|m| m.id == "new-model")
             .expect("new-model registered");
         assert_eq!(new_record.state, ModelState::NotLoaded);
+    }
+
+    /// 0.7.0 review (Fable M2): a file-only change to a next-load field on a
+    /// `NotLoaded` model is picked up by reload and used by the next load —
+    /// both adding one and removing it again (restoring the default). These
+    /// fields aren't on the registry record, so reload used to say `unchanged`.
+    #[tokio::test]
+    async fn reload_config_refreshes_next_load_fields_on_not_loaded_entry() {
+        let factory = Arc::new(HintRecordingFactory::default());
+        let (mm, dir) = make_mm_from_file(BASE_CONFIG, factory.clone()).await;
+        let write = |models: &str| {
+            std::fs::write(
+                dir.path().join("config.json"),
+                format!(
+                    r#"{{"models_dir": "/tmp/test-models", "device": "CPU",
+                        "total_vram_gb": 0.0, "models": {{ "existing": {models} }} }}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write(r#"{ "vram_gb": 1.0, "min_response_len": 512, "max_prompt_len": 2048 }"#);
+        let report = mm.reload_config().unwrap();
+        assert_eq!(report.updated, vec!["existing".to_owned()]);
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(factory.hints("existing"), (None, Some(2048), Some(512)));
+
+        mm.evict_model("existing").await.unwrap();
+        write(r#"{ "vram_gb": 1.0 }"#);
+        let report = mm.reload_config().unwrap();
+        assert_eq!(report.updated, vec!["existing".to_owned()]);
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(
+            factory.hints("existing"),
+            (None, None, None),
+            "removal restores default"
+        );
+
+        // Unchanged file → still reported unchanged (no spurious updates).
+        mm.evict_model("existing").await.unwrap();
+        assert_eq!(mm.reload_config().unwrap().unchanged, 1);
+    }
+
+    /// A `reasoning_parser` auto-detected at load (a Qwen3 template) lives on
+    /// the record while the file says `null`; an unchanged file must still
+    /// reload as `unchanged` (found live 2026-09-29: every once-loaded Qwen3
+    /// model reported `updated` on every reload).
+    #[tokio::test]
+    async fn reload_config_ignores_auto_detected_reasoning_parser() {
+        let (mm, _dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        mm.write_models("test")
+            .get_mut("existing")
+            .unwrap()
+            .reasoning_parser = Some(config::ReasoningParser::Qwen3);
+        let report = mm.reload_config().unwrap();
+        assert!(report.updated.is_empty(), "{:?}", report.updated);
+        assert_eq!(report.unchanged, 1);
     }
 
     /// A `NotLoaded` entry whose `vram_gb` changed in the file is refreshed

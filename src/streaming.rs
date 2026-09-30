@@ -64,6 +64,13 @@ pub enum StreamEvent {
     /// events silently undercounts `usage.completion_tokens` under
     /// speculative decoding (found live 2026-07-19, see the project's internal engineering log).
     Token(String, usize),
+    /// The engine's exact generated-token count for the whole request, sent at
+    /// most once, after the last `Token` and before `Done`. Usage accounting
+    /// must use it in place of the running `Token` sum when present. Sent by
+    /// engines whose text chunks don't map to known token counts (the NPU
+    /// `LLMPipeline` streamer can pack several tokens into one chunk), so each
+    /// chunk can go out immediately and the count is corrected here instead.
+    CompletionTokens(usize),
     /// Normal end of generation. Carries why generation stopped so the
     /// `OpenAI` `finish_reason` field reflects EOS vs the token budget.
     Done(FinishReason),

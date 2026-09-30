@@ -11,7 +11,7 @@
 //   - Token stream goes to the same StreamEvent / TokenSender as the
 //     CB path, so the chat handler and SSE layer are reused unchanged
 //   - Admission is a real `Semaphore` gate (mirrors `cb_engine`/`vlm_engine`,
-//     dev/plans/vlm-admission-gate-fix.md's recipe): a blocking channel send
+//     the project's internal engineering log's recipe): a blocking channel send
 //     with no timeout previously let a full queue park the caller forever
 //     instead of returning a 429.
 //   - NPU compiles a FIXED-SHAPE graph ahead of time (unlike GPU/CPU's
@@ -19,21 +19,22 @@
 //     compile-time `MAX_PROMPT_LEN` (default 1024 tokens) — a request whose
 //     templated prompt exceeds it hard-fails. Configurable via the per-model
 //     `max_prompt_len` config field (`ModelPolicy`), threaded through
-//     `OvPipeline::new` → `ov_pipeline_create`'s AnyMap (`dev/ovms-gap.md` #6,
+//     `OvPipeline::new` → `ov_pipeline_create`'s AnyMap (the project's internal engineering log,
 //     CLOSED 2026-07-16) — raising it grows the compiled KV-cache and compile
 //     time; it is a build-time tradeoff, not a per-request setting. The chat
-//     handler's `gate_npu_prompt` pre-flights the effective limit (config
-//     override, else `NPU_DEFAULT_MAX_PROMPT_LEN`) via `NpuCommand::
+//     handler's `gate_npu_prompt` pre-flights the compiled limit (carried on
+//     the handle as `NpuShape`, resolved at load) via `NpuCommand::
 //     CountTokens`, independent of `generate()`, so an over-limit prompt gets
 //     a clean 400 instead of OpenVINO's raw C++ exception text.
-//   - `OvPipeline::new` never receives (and `ov_pipeline_create` never sets)
-//     `ov::cache_dir` — unlike every other engine kind in this codebase
-//     (CB/VLM/TTS/STT/image, all of which thread `Config::ov_cache_dir`
-//     through). Every NPU model load, including a plain server restart with
-//     an unchanged config, recompiles from scratch (~20–40 s on Lunar Lake).
-//     One consequence worth knowing: changing `max_prompt_len` between
-//     restarts is always safe — there is no persisted blob that could go
-//     stale against the new value, because nothing is ever persisted here.
+//   - `OvPipeline::new` receives `Config::ov_cache_dir` and `ov_pipeline_create`
+//     sets it as `CACHE_DIR` (since 2026-09-28): one weightless compiled blob
+//     per model, ~6 s cached load vs 30.7 s cold on Lunar Lake, identical
+//     output (the project's internal engineering log). Without a cache dir,
+//     the Level Zero driver's own cache (`~/.cache/ze_intel_npu_cache/`)
+//     still keeps repeat loads at ~8–12 s.
+//     Changing `max_prompt_len` / `min_response_len` between loads compiles
+//     a new shape. OpenVINO keys the cached blob on it (verified live), so
+//     every combination tried leaves its own ~0.66 GB blob behind.
 // ============================================================
 
 use std::sync::Arc;
@@ -46,7 +47,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use crate::cb_engine::SubmitResult;
 use crate::metrics::{HotMetrics, Modality};
 use crate::model_manager::{ManagedEngine, ModelKind};
-use crate::ov_cb::FinishReason;
+use crate::ov_cb::{FinishReason, GenParams};
 use crate::ov_pipeline::OvPipeline;
 use crate::streaming::{StreamEvent, TokenSender};
 
@@ -57,15 +58,73 @@ use crate::streaming::{StreamEvent, TokenSender};
 /// channel itself never needs to absorb more than `NPU_CHANNEL_CAP` commands.
 pub(crate) const NPU_CHANNEL_CAP: usize = 8;
 
+/// `OpenVINO`'s default NPU `MIN_RESPONSE_LEN`: output room the static KV
+/// cache reserves on top of `MAX_PROMPT_LEN`. Measured on Lunar Lake: an
+/// 863-token prompt stopped after 290 generated tokens (863 + 290 = 1024 +
+/// 128 + 1), and `MIN_RESPONSE_LEN = 512` lifted the cap.
+pub(crate) const NPU_DEFAULT_MIN_RESPONSE_LEN: usize = 128;
+
+/// Total tokens (prompt + generated) the compiled NPU KV cache holds:
+/// `max_prompt_len + min_response_len`, each falling back to `OpenVINO`'s
+/// default. Generation that reaches it ends without an EOS, so
+/// [`run_generate`] reports it as `Length`, not `Stop`.
+///
+/// No alignment: the NPU does not round either value up (e.g. to 64).
+/// Measured on Lunar Lake: `1000 / 100` filled at `1100 + 1` total tokens,
+/// the `1024 / 128` default at `1152 + 1`.
+#[must_use]
+pub(crate) fn npu_kv_capacity(max_prompt_len: Option<u32>, min_response_len: Option<u32>) -> usize {
+    let response = min_response_len.map_or(NPU_DEFAULT_MIN_RESPONSE_LEN, |v| v as usize);
+    npu_effective_max_prompt_len(max_prompt_len) + response
+}
+
+/// The effective NPU `MAX_PROMPT_LEN`: the configured override, or
+/// `OpenVINO`'s default when unset.
+fn npu_effective_max_prompt_len(max_prompt_len: Option<u32>) -> usize {
+    max_prompt_len.map_or(crate::handlers::chat::NPU_DEFAULT_MAX_PROMPT_LEN, |v| {
+        v as usize
+    })
+}
+
+/// The fixed shape a resident NPU LLM was compiled with.
+///
+/// Resolved once, at load, from the same `max_prompt_len` / `min_response_len`
+/// values handed to `OvPipeline::new`, and carried on the [`NpuHandle`] so the
+/// chat handler's prompt gate checks the ceiling the engine *actually has* —
+/// not the registry's configured value, which a PATCH or config reload can
+/// change without recompiling the resident graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NpuShape {
+    /// Longest prompt (in tokens) the compiled graph accepts.
+    pub max_prompt_len: usize,
+    /// Prompt + generated tokens the static KV cache holds; see [`npu_kv_capacity`].
+    pub kv_capacity: usize,
+}
+
+impl NpuShape {
+    /// Resolve the compiled shape from the load-time overrides (`None` =
+    /// `OpenVINO`'s default for that dimension).
+    #[must_use]
+    pub fn resolve(max_prompt_len: Option<u32>, min_response_len: Option<u32>) -> Self {
+        Self {
+            max_prompt_len: npu_effective_max_prompt_len(max_prompt_len),
+            kv_capacity: npu_kv_capacity(max_prompt_len, min_response_len),
+        }
+    }
+}
+
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 pub(crate) enum NpuCommand {
     /// Run a single-stream NPU LLM generation.
     Generate {
-        /// Pre-rendered prompt string (chat template already applied in Rust).
+        /// Pre-rendered prompt string (chat template already applied in Rust;
+        /// the bridge disables `OpenVINO`'s own templating).
         prompt: String,
-        /// Maximum new tokens to generate.
-        max_new_tokens: usize,
+        /// Sampling / stop / structured-output settings and the token budget —
+        /// the same [`GenParams`] the CB and VLM engines take. Boxed to keep
+        /// the command small (mirrors `vlm_engine::VlmCommand`).
+        params: Box<GenParams>,
         /// Token stream sink — receives `Token`, `Done`, and `Error` events.
         token_tx: TokenSender,
         /// Wall-clock start (handler entry) for TTFT / duration / tok/s metrics.
@@ -109,6 +168,8 @@ pub struct NpuHandle {
     /// Callers currently parked in [`generate`](Self::generate) awaiting an
     /// admission permit — the engine's honest `rustedvino_requests_waiting`.
     waiting: Arc<AtomicUsize>,
+    /// The shape the resident pipeline was compiled with.
+    shape: NpuShape,
 }
 
 impl NpuHandle {
@@ -116,6 +177,27 @@ impl NpuHandle {
     #[must_use]
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Longest prompt (in tokens) the resident pipeline was compiled to
+    /// accept — what the chat handler's prompt gate enforces.
+    #[must_use]
+    pub fn max_prompt_len(&self) -> usize {
+        self.shape.max_prompt_len
+    }
+
+    /// The shape the resident pipeline was compiled with.
+    #[must_use]
+    pub fn shape(&self) -> NpuShape {
+        self.shape
+    }
+
+    /// Test seam: replace the handle's compiled shape.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_shape(mut self, shape: NpuShape) -> Self {
+        self.shape = shape;
+        self
     }
 
     /// Test seam: build a handle around an existing channel with no GPU.
@@ -130,6 +212,7 @@ impl NpuHandle {
             cap,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            shape: NpuShape::resolve(None, None),
         }
     }
 
@@ -149,6 +232,7 @@ impl NpuHandle {
             cap,
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
+            shape: NpuShape::resolve(None, None),
         }
     }
 
@@ -163,7 +247,7 @@ impl NpuHandle {
     pub(crate) async fn generate(
         &self,
         prompt: String,
-        max_new_tokens: usize,
+        params: GenParams,
         token_tx: TokenSender,
         started_at: Instant,
     ) -> SubmitResult {
@@ -188,7 +272,7 @@ impl NpuHandle {
             .tx
             .send(NpuCommand::Generate {
                 prompt,
-                max_new_tokens,
+                params: Box::new(params),
                 token_tx,
                 started_at,
                 permit,
@@ -265,6 +349,7 @@ pub fn spawn_npu_engine(
     model_id: &str,
     device: &str,
     queue_timeout: Duration,
+    shape: NpuShape,
 ) -> anyhow::Result<(NpuHandle, std::thread::JoinHandle<()>)> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<NpuCommand>(NPU_CHANNEL_CAP);
     let sem = Arc::new(Semaphore::new(NPU_CHANNEL_CAP));
@@ -286,7 +371,7 @@ pub fn spawn_npu_engine(
                 match cmd {
                     NpuCommand::Generate {
                         prompt,
-                        max_new_tokens,
+                        params,
                         token_tx,
                         started_at,
                         permit,
@@ -295,10 +380,11 @@ pub fn spawn_npu_engine(
                             &mut pipeline,
                             &model_id_owned,
                             &prompt,
-                            max_new_tokens,
+                            &params,
                             &token_tx,
                             &metrics,
                             started_at,
+                            shape.kv_capacity,
                         );
                         // Balance the handle's admission acquire, whatever the
                         // generation outcome — releases the slot for the next
@@ -324,6 +410,7 @@ pub fn spawn_npu_engine(
             cap: NPU_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            shape,
         },
         thread,
     ))
@@ -366,6 +453,7 @@ pub(crate) fn spawn_mock_npu(model_id: &str) -> (NpuHandle, std::thread::JoinHan
             cap: NPU_CHANNEL_CAP,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            shape: NpuShape::resolve(None, None),
         },
         thread,
     )
@@ -377,14 +465,13 @@ fn run_generate(
     pipeline: &mut OvPipeline,
     model_id: &str,
     prompt: &str,
-    max_new_tokens: usize,
+    params: &GenParams,
     token_tx: &TokenSender,
     metrics: &HotMetrics,
     started_at: Instant,
+    kv_capacity: usize,
 ) {
     metrics.request_accepted(Modality::Text);
-    let mut completion_tokens: u64 = 0;
-    let mut first_token_seen = false;
 
     // Same tokenizer call `NpuCommand::CountTokens`/`gate_npu_prompt` already
     // use, just made from inside this generation instead of a separate
@@ -394,38 +481,63 @@ fn run_generate(
     // very first event, same convention as `cb_engine.rs`'s `PromptTokens`
     // send; fail-open (log and continue) rather than aborting the request,
     // matching `gate_npu_prompt`'s own `Ok(_) | Err(_) => Ok(())` policy.
-    match pipeline.count_tokens(prompt) {
+    let counted_prompt_tokens = match pipeline.count_tokens(prompt) {
         Ok(n) => {
             let _ = token_tx.try_send(StreamEvent::PromptTokens(n));
+            Some(n)
         }
         Err(e) => {
             tracing::warn!(model_id, error = %e, "NPU prompt token count failed");
+            None
         }
-    }
+    };
 
-    let result = pipeline.generate(prompt, max_new_tokens, |text| {
-        if !first_token_seen {
-            first_token_seen = true;
-            metrics.record_ttft(Modality::Text, started_at.elapsed().as_secs_f64());
+    // The callback fires once per decoded text CHUNK, and a chunk can carry
+    // several tokens (the streamer holds back incomplete pieces), so counting
+    // chunks undercounts (seen live: 192 for a 200-token generation). Each
+    // chunk goes out immediately; the pipeline's own total follows as
+    // `CompletionTokens` just before `Done`, and consumers use it in place of
+    // their running sum.
+    let mut acct = ChunkAccounting::default();
+    let mut stopped_by_client = false;
+    let result = pipeline.generate(prompt, params, |text| {
+        if text.is_empty() {
+            return true; // consumers skip empty deltas; nothing to send or count
         }
-        completion_tokens += 1;
-        metrics.token_generated(1);
         // try_send, never blocking: same backpressure policy as the VLM and CB
         // engines — a stalled client must not wedge this engine thread and park
         // every queued NPU request behind it.
         // NOTE: OvPipeline::generate convention is true=continue, false=stop.
         // This is the opposite of the VLM engine callback — do not copy vlm_engine.rs here.
         match token_tx.try_send(StreamEvent::Token(text.to_owned(), 1)) {
-            Ok(()) => true,
+            Ok(()) => {
+                if acct.record_sent() {
+                    // TTFT = the first token the client can actually receive.
+                    metrics.record_ttft(Modality::Text, started_at.elapsed().as_secs_f64());
+                }
+                metrics.token_generated(1);
+                true
+            }
             Err(TrySendError::Full(_)) => {
                 tracing::warn!(
                     "NPU client not keeping up (token channel full) — stopping generation"
                 );
+                stopped_by_client = true;
                 false
             }
-            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Closed(_)) => {
+                stopped_by_client = true;
+                false
+            }
         }
     });
+
+    let generated = acct.total(result.as_ref().ok().map(|o| o.generated_tokens));
+    metrics.token_generated(u64::try_from(generated - acct.sent()).unwrap_or(u64::MAX));
+    if !stopped_by_client {
+        let _ = token_tx.try_send(StreamEvent::CompletionTokens(generated));
+    }
+    let completion_tokens = u64::try_from(generated).unwrap_or(u64::MAX);
 
     let elapsed = started_at.elapsed().as_secs_f64();
     metrics.record_duration(Modality::Text, elapsed);
@@ -435,7 +547,35 @@ fn run_generate(
     }
 
     match result {
-        Ok(finish) => {
+        Ok(outcome) => {
+            if outcome.input_tokens == 0 {
+                tracing::debug!(
+                    model_id,
+                    counted_prompt_tokens,
+                    "NPU perf metrics reported 0 input tokens — using the tokenizer count \
+                     for the KV-full rule"
+                );
+            }
+            let outcome = with_input_fallback(outcome, counted_prompt_tokens);
+            if outcome.input_tokens != 0 {
+                tracing::debug!(
+                    model_id,
+                    input_tokens = outcome.input_tokens,
+                    generated_tokens = outcome.generated_tokens,
+                    "NPU generation complete"
+                );
+            }
+            let finish = npu_finish_reason(outcome, kv_capacity);
+            if finish != outcome.finish {
+                tracing::warn!(
+                    model_id,
+                    input_tokens = outcome.input_tokens,
+                    generated_tokens = outcome.generated_tokens,
+                    kv_capacity,
+                    "NPU generation hit the compiled KV size (max_prompt_len + \
+                     min_response_len) — reporting finish_reason length"
+                );
+            }
             let _ = token_tx.try_send(StreamEvent::Done(finish));
         }
         Err(e) => {
@@ -443,6 +583,74 @@ fn run_generate(
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             let _ = token_tx.try_send(StreamEvent::Done(FinishReason::Stop));
         }
+    }
+}
+
+/// Per-request token accounting for NPU streaming, kept free of the pipeline
+/// so its edge cases are unit-testable.
+///
+/// Counts the chunks actually delivered to the client; the request's total is
+/// the pipeline's own generated-token count, which can exceed the chunk count
+/// (one chunk may carry several tokens) but never legitimately fall below it.
+#[derive(Debug, Default)]
+struct ChunkAccounting {
+    sent: usize,
+}
+
+impl ChunkAccounting {
+    /// Record one delivered chunk; `true` when it was the first (TTFT point).
+    fn record_sent(&mut self) -> bool {
+        self.sent += 1;
+        self.sent == 1
+    }
+
+    /// Chunks delivered so far.
+    fn sent(&self) -> usize {
+        self.sent
+    }
+
+    /// The request's completion-token total: the pipeline's count when it
+    /// returned one (`None` on a generation error), floored at the chunks
+    /// already delivered — each delivered chunk held at least one token.
+    fn total(&self, pipeline_generated: Option<usize>) -> usize {
+        pipeline_generated.map_or(self.sent, |g| g.max(self.sent))
+    }
+}
+
+/// Fill a missing prompt count: when the pipeline's perf metrics report
+/// `input_tokens == 0` (a build that doesn't populate them), use the
+/// tokenizer count taken at the start of the request, so the KV-full rule in
+/// [`npu_finish_reason`] doesn't silently weaken to "generated alone".
+fn with_input_fallback(
+    mut outcome: crate::ov_pipeline::NpuGenOutcome,
+    counted_prompt_tokens: Option<usize>,
+) -> crate::ov_pipeline::NpuGenOutcome {
+    if outcome.input_tokens == 0
+        && let Some(n) = counted_prompt_tokens
+    {
+        outcome.input_tokens = n;
+    }
+    outcome
+}
+
+/// The honest finish reason for an NPU generation. The pipeline reports
+/// `Stop` whenever the token budget was not reached, including when the
+/// static KV cache filled up and cut the answer short — that is a length
+/// stop, not an EOS. A full cache always shows as `prompt + generated ==
+/// kv_capacity + 1` (the final token is sampled from the last slot but never
+/// stored), so the rule is `>` — a genuine EOS on the last slot (`==`) stays
+/// `Stop`.
+fn npu_finish_reason(
+    outcome: crate::ov_pipeline::NpuGenOutcome,
+    kv_capacity: usize,
+) -> FinishReason {
+    if outcome.finish == FinishReason::Stop
+        && kv_capacity > 0
+        && outcome.input_tokens + outcome.generated_tokens > kv_capacity
+    {
+        FinishReason::Length
+    } else {
+        outcome.finish
     }
 }
 
@@ -482,7 +690,15 @@ mod tests {
 
         let (tok_tx, _tok_rx) = stream_channel();
         let result1 = handle
-            .generate("hi".to_owned(), 8, tok_tx, Instant::now())
+            .generate(
+                "hi".to_owned(),
+                GenParams {
+                    max_new_tokens: 8,
+                    ..GenParams::default()
+                },
+                tok_tx,
+                Instant::now(),
+            )
             .await;
         assert_eq!(
             result1,
@@ -498,7 +714,15 @@ mod tests {
 
         let (tok_tx2, _tok_rx2) = stream_channel();
         let result2 = handle
-            .generate("hi again".to_owned(), 8, tok_tx2, Instant::now())
+            .generate(
+                "hi again".to_owned(),
+                GenParams {
+                    max_new_tokens: 8,
+                    ..GenParams::default()
+                },
+                tok_tx2,
+                Instant::now(),
+            )
             .await;
         assert_eq!(
             result2,
@@ -516,12 +740,28 @@ mod tests {
 
         let (tok_tx, _) = stream_channel();
         let _ = handle
-            .generate("hi".to_owned(), 8, tok_tx, Instant::now())
+            .generate(
+                "hi".to_owned(),
+                GenParams {
+                    max_new_tokens: 8,
+                    ..GenParams::default()
+                },
+                tok_tx,
+                Instant::now(),
+            )
             .await;
 
         let (tok_tx2, _) = stream_channel();
         let result = handle
-            .generate("hi again".to_owned(), 8, tok_tx2, Instant::now())
+            .generate(
+                "hi again".to_owned(),
+                GenParams {
+                    max_new_tokens: 8,
+                    ..GenParams::default()
+                },
+                tok_tx2,
+                Instant::now(),
+            )
             .await;
         assert_eq!(result, SubmitResult::AtCapacity, "must 429 after timeout");
     }
@@ -537,7 +777,15 @@ mod tests {
         let (tok_tx, _r) = stream_channel();
         assert_eq!(
             handle
-                .generate("hi".to_owned(), 8, tok_tx, Instant::now())
+                .generate(
+                    "hi".to_owned(),
+                    GenParams {
+                        max_new_tokens: 8,
+                        ..GenParams::default()
+                    },
+                    tok_tx,
+                    Instant::now()
+                )
                 .await,
             SubmitResult::Submitted
         );
@@ -547,7 +795,15 @@ mod tests {
         let parked = tokio::spawn(async move {
             let (tok_tx2, _r2) = stream_channel();
             handle2
-                .generate("hi".to_owned(), 8, tok_tx2, Instant::now())
+                .generate(
+                    "hi".to_owned(),
+                    GenParams {
+                        max_new_tokens: 8,
+                        ..GenParams::default()
+                    },
+                    tok_tx2,
+                    Instant::now(),
+                )
                 .await
         });
 
@@ -572,8 +828,145 @@ mod tests {
 
         let (tok_tx, _) = stream_channel();
         let result = handle
-            .generate("hi".to_owned(), 8, tok_tx, Instant::now())
+            .generate(
+                "hi".to_owned(),
+                GenParams {
+                    max_new_tokens: 8,
+                    ..GenParams::default()
+                },
+                tok_tx,
+                Instant::now(),
+            )
             .await;
         assert_eq!(result, SubmitResult::EngineDead);
+    }
+
+    /// The measured Lunar Lake case: an 863-token prompt stopped after 290
+    /// generated tokens with the default 1024 + 128 KV — the pipeline said
+    /// `Stop`, the answer was cut short, so the server must say `Length`.
+    #[test]
+    fn kv_full_stop_is_reported_as_length() {
+        let outcome = crate::ov_pipeline::NpuGenOutcome {
+            finish: FinishReason::Stop,
+            generated_tokens: 290,
+            input_tokens: 863,
+        };
+        assert_eq!(
+            npu_finish_reason(outcome, npu_kv_capacity(None, None)),
+            FinishReason::Length
+        );
+    }
+
+    /// A real EOS well inside the KV, and a budget stop, pass through unchanged.
+    #[test]
+    fn eos_and_budget_stops_pass_through() {
+        let eos = crate::ov_pipeline::NpuGenOutcome {
+            finish: FinishReason::Stop,
+            generated_tokens: 29,
+            input_tokens: 32,
+        };
+        assert_eq!(npu_finish_reason(eos, 1152), FinishReason::Stop);
+        let budget = crate::ov_pipeline::NpuGenOutcome {
+            finish: FinishReason::Length,
+            generated_tokens: 200,
+            input_tokens: 32,
+        };
+        assert_eq!(npu_finish_reason(budget, 1152), FinishReason::Length);
+    }
+
+    /// `input_tokens == 0` from the pipeline falls back to the tokenizer count
+    /// (0.7.0 plan A5): without it the live KV-full case (40 + 1113 over a
+    /// 1152 capacity) would read as a genuine EOS.
+    #[test]
+    fn zero_input_tokens_falls_back_to_counted_prompt() {
+        let reported = crate::ov_pipeline::NpuGenOutcome {
+            finish: FinishReason::Stop,
+            generated_tokens: 1113,
+            input_tokens: 0,
+        };
+        let cap = npu_kv_capacity(None, None);
+        assert_eq!(
+            npu_finish_reason(reported, cap),
+            FinishReason::Stop,
+            "weakened rule"
+        );
+        let filled = with_input_fallback(reported, Some(40));
+        assert_eq!(filled.input_tokens, 40);
+        assert_eq!(npu_finish_reason(filled, cap), FinishReason::Length);
+        // A real pipeline count is never overridden; no count leaves it at 0.
+        let real = crate::ov_pipeline::NpuGenOutcome {
+            input_tokens: 41,
+            ..reported
+        };
+        assert_eq!(with_input_fallback(real, Some(40)).input_tokens, 41);
+        assert_eq!(with_input_fallback(reported, None).input_tokens, 0);
+    }
+
+    /// Chunk accounting edge cases (0.7.0 plan A4): multi-token chunks take the
+    /// pipeline's larger count; a pipeline count below the delivered chunks
+    /// (impossible in theory) is floored at them; an error falls back to the
+    /// chunks delivered; nothing delivered + error is 0.
+    #[test]
+    fn chunk_accounting_totals() {
+        let mut acct = ChunkAccounting::default();
+        assert!(
+            acct.record_sent(),
+            "first delivered chunk is the TTFT point"
+        );
+        assert!(!acct.record_sent());
+        assert!(!acct.record_sent());
+        assert_eq!(acct.sent(), 3);
+        assert_eq!(acct.total(Some(7)), 7, "multi-token chunks");
+        assert_eq!(acct.total(Some(2)), 3, "floored at delivered chunks");
+        assert_eq!(acct.total(None), 3, "error path: what was delivered");
+        assert_eq!(ChunkAccounting::default().total(None), 0);
+        assert_eq!(
+            ChunkAccounting::default().total(Some(4)),
+            4,
+            "stopped before any send"
+        );
+    }
+
+    #[test]
+    fn kv_capacity_defaults_and_overrides() {
+        assert_eq!(npu_kv_capacity(None, None), 1024 + 128);
+        assert_eq!(npu_kv_capacity(Some(2048), Some(512)), 2560);
+        // Unaligned values are used as-is (live-verified: 1000/100 filled at 1101).
+        assert_eq!(npu_kv_capacity(Some(1000), Some(100)), 1100);
+    }
+
+    /// The KV-full boundary, from live data: a full cache shows as capacity + 1
+    /// total tokens (`Length`); ending exactly at capacity is a genuine EOS.
+    #[test]
+    fn kv_full_boundary_is_capacity_plus_one() {
+        let at = |total: usize| crate::ov_pipeline::NpuGenOutcome {
+            finish: FinishReason::Stop,
+            generated_tokens: total - 40,
+            input_tokens: 40,
+        };
+        let cap = npu_kv_capacity(Some(1000), Some(100));
+        assert_eq!(npu_finish_reason(at(1101), cap), FinishReason::Length);
+        assert_eq!(npu_finish_reason(at(1100), cap), FinishReason::Stop);
+    }
+
+    /// `NpuShape::resolve` falls back to `OpenVINO`'s defaults per dimension
+    /// — the shape a PATCH-to-`null` + reload actually compiles.
+    #[test]
+    fn npu_shape_resolves_defaults_and_overrides() {
+        assert_eq!(
+            NpuShape::resolve(None, None),
+            NpuShape {
+                max_prompt_len: 1024,
+                kv_capacity: 1024 + 128
+            }
+        );
+        assert_eq!(
+            NpuShape::resolve(Some(2048), None),
+            NpuShape {
+                max_prompt_len: 2048,
+                kv_capacity: 2048 + 128
+            }
+        );
+        assert_eq!(NpuShape::resolve(None, Some(512)).max_prompt_len, 1024);
     }
 }

@@ -49,6 +49,15 @@ Both are licensed under the **Apache License 2.0**.
 
 ---
 
+## Not included — espeak-ng
+
+Piper TTS voices need **espeak-ng** (GPL-3.0) to turn text into phonemes. RustedVINO
+neither links nor ships it: the server runs the `espeak-ng` program you install yourself
+(e.g. `apt install espeak-ng`) as a separate process and reads its output. Without it,
+Piper voices refuse to load; every other feature works.
+
+---
+
 ## Everything else
 
 The remaining Rust dependencies are permissively licensed — predominantly

@@ -1,8 +1,8 @@
 //! Last-resort logging for native (non-Rust) crashes.
 //!
 //! `OpenVINO`'s C++ runtime can segfault inside a model's dedicated OS thread
-//! (2026-07-06 — `internvl2.5-8b-int4-ov` VLM SIGSEGV, see `dev/PROGRESS.md`
-//! history). Rust's panic machinery never runs for these: the whole process
+//! (2026-07-06 — `internvl2.5-8b-int4-ov` VLM SIGSEGV, see
+//! the project's internal engineering log). Rust's panic machinery never runs for these: the whole process
 //! just vanishes, leaving a bare `segfault at ...` line in `dmesg` and
 //! nothing at all in the application log. This installs a handler for the
 //! fatal signals that writes a marker plus a raw backtrace to stderr —

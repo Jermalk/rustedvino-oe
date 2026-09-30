@@ -31,7 +31,7 @@ under `models_dir`.
 | `device_budgets` | `{}` | Cross-pipeline device admission caps, keyed by live OV device string; empty = passthrough |
 | `device_admission_queue_timeout_ms` | `5000` | Queue timeout for `device_budgets` (separate from `admission_queue_timeout_ms`) |
 | `kv_cache_precision` | `"u8"` | `"u8"` compresses the KV cache 8-bit, roughly doubling context capacity for a given VRAM budget, small quality cost; `""` keeps the plugin's native precision (f16 on Intel GPU); `"f16"`/`"f32"` explicit |
-| `enable_prefix_caching` | `true` | Reuse KV blocks across CB requests sharing an identical prompt prefix |
+| `enable_prefix_caching` | `true` | Reuse KV blocks across CB requests sharing an identical prompt prefix. Side effect on seeded sampling: a reused-prefix prefill rounds slightly differently from a full one, so the first request for a prompt can differ from its later identical repeats (the repeats match each other). Set `false` when exact reproducibility of the first answer matters |
 | `cors_allowed_origins` | `["*"]` | CORS allowed origins |
 | `api_keys` | `[]` | **Deprecated, migration tripwire only — never read for auth.** A non-empty value is a hard startup error naming where to move the keys. Real inference-scope keys live in `keys_file` |
 | `admin_api_keys` | `[]` | **Deprecated, same tripwire as `api_keys`.** Real admin-scope keys live in `keys_file` |
@@ -44,12 +44,14 @@ under `models_dir`.
 | `default_embed_model` | `null` | Default embedding model seeded into new realtime sessions |
 | `embedding_pooling` | `"mean"` | `"mean"`, `"cls"`, or `"last_token"` |
 | `embedding_normalize` | `true` | L2-normalize embedding vectors |
-| `max_prompt_array` | `16` | Max prompts accepted in one legacy `/v1/completions` array request |
+| `max_prompt_array` | `16` | Max prompts accepted in one legacy `/v1/completions` array request (each one is a full generation). Does not apply to `/v1/embeddings` |
+| `max_embedding_inputs` | `256` | Max inputs in one `/v1/embeddings` request (`400 too_many_inputs` beyond it); must be `≥ 1` |
+| `max_embedding_batch_tokens` | `32768` | Per-request `/v1/embeddings` budget in *padded* tokens — inputs × the longest input's token count, because a batch is padded to its longest input (`400 batch_too_large` beyond it; `0` = no budget). It bounds the batch's GPU working memory, which the server's memory accounting doesn't see and which is kept until the model is unloaded: ≈28 MB per 512-token input measured on multilingual-e5-large. The default is 64 full 512-token chunks; short queries are cheap (256 queries of ~10 tokens ≈ 2.6k) |
 | `max_tokens_cap` | `8192` | Server-wide ceiling on `max_tokens`/`max_completion_tokens`; `0` = uncapped |
-| `bind_addr` | `"127.0.0.1"` | Bind address; set `"0.0.0.0"` + `allow_insecure_public_bind: true` for LAN |
+| `bind_addr` | `"127.0.0.1"` | Bind address. For LAN access set `"0.0.0.0"` **and** populate the keys file (the safe way); `allow_insecure_public_bind: true` is needed only to run a non-loopback bind with no keys at all (an open server) |
 | `port` | `11437` | HTTP port |
 | `allow_insecure_public_bind` | `false` | Explicit opt-in to a non-loopback bind while no keys file is configured (open server, no credentials at all). Not required for a LAN bind that already has a populated keys file |
-| `ov_cache_dir` | `null` | Directory for the OV GPU kernel blob cache; **NPU-routed models never use this** — they always recompile from scratch. RustedVINO also maintains a `cache_manifest/` directory — one JSON file per model, recording OV blob attribution and (independent of `ov_cache_dir`) image-gen `model_hash` memoization across restarts. Placed alongside `ov_cache_dir` as its sibling when `ov_cache_dir` is set, otherwise `$XDG_CACHE_HOME/rustedvino/cache_manifest` or `~/.cache/rustedvino/cache_manifest` — not separately configurable |
+| `ov_cache_dir` | `null` | Directory for the OpenVINO compiled-blob cache (GPU kernels, and NPU LLMs' weightless compiled blob: ~6 s cached load vs ~30 s cold, measured on one Lunar Lake laptop). **NPU Whisper never uses it** (it hangs with a cache dir). Each NPU `max_prompt_len`/`min_response_len` combination adds its own blob (~0.66 GB for an 8B int4 model); blobs from earlier combinations stay attributed to the model, so the `ov_cache_max_gb` sweep won't prune them while it is loaded (and never with `ov_cache_max_gb: 0`) — after experimenting with shapes, stop the server and clear the cache dir (the next load recompiles, ~30 s). Once unloaded, a model's blobs become prunable, but the sweep then runs only every `ov_cache_sweep_interval_secs` and deletes oldest-first until under the cap, not stale shapes specifically. RustedVINO also maintains a `cache_manifest/` directory — one JSON file per model, recording OV blob attribution and (independent of `ov_cache_dir`) image-gen `model_hash` memoization across restarts. Placed alongside `ov_cache_dir` as its sibling when `ov_cache_dir` is set, otherwise `$XDG_CACHE_HOME/rustedvino/cache_manifest` or `~/.cache/rustedvino/cache_manifest` — not separately configurable |
 | `ov_cache_max_gb` | `0.0` | Ceiling on `ov_cache_dir`'s total on-disk size (GB); `0.0` = unbounded. Enforced by a sweep that runs once at startup and then on `ov_cache_sweep_interval_secs`, pruning once the cap is exceeded — blobs for models no longer in your config go first, then configured-but-not-resident ones, then unattributed files, oldest-modified first within each group. Blobs of `Ready` or `Loading` models are never deleted. `0.0` still reports the cache size every sweep; set a non-zero value only if you want files deleted |
 | `ov_cache_sweep_interval_secs` | `21600` (6h) | How often the cache-management sweep re-runs after its startup pass |
 | `kv_pressure_monitor_enabled` | `false` | Enables the KV-cache pressure monitor: samples every `Ready` model's live pool occupancy and flags one that stays at/above `kv_pressure_threshold_pct` continuously for `kv_pressure_sustained_secs`. **Detect-and-flag only** — it never evicts, resizes or otherwise acts, and it is deliberately excluded from `/health` (pressure is a live-load signal, not a fault). **Enabling it requires setting both knobs below: the server refuses to boot otherwise** (see the note under this table) |
@@ -76,19 +78,20 @@ under `models_dir`.
 
 | Field | Type / default | Description |
 |---|---|---|
-| `vram_gb` | required | VRAM estimate (GB); `0.0` skips VRAM gating for this model |
+| `vram_gb` | required | VRAM estimate (GB); `0.0` skips VRAM gating for this model. On Linux, `GET /v1/admin/models` shows what a loaded model really uses (`gpu_memory_estimate_gb`), and the server logs a warning when that's more than `vram_gb` — use it to size this value. An embedding model's figure includes its batch cache |
 | `kind` | `null` | `"text_gen"`, `"vision"`, `"embedding"`, `"stt"`, `"tts"`, `"image_gen"`, `"reranking"` — auto-detected if absent |
 | `pinned` | `false` | Never chosen as an eviction victim |
 | `priority` | `0` | Soft eviction-order weight; higher = evicted later |
 | `kv_cache_gb` | `null` | Per-model bounded KV pool target (GB), overriding `default_kv_cache_gb` |
 | `chat_template` | `null` | Path to a chat template that **overrides** the one in the model directory; relative paths resolve against the config file's directory. For converted models shipping a stale or incomplete template — e.g. LFM2's renders *nothing* for an assistant turn carrying `tool_calls`, so a tool-call turn replays as an empty assistant message and the model sees a result it never asked for. A corrected LFM2 template ships at `templates/lfm2.jinja`. A configured-but-unreadable override is a hard error, never a silent fall-back |
 | `max_concurrent_streams` | `null` | Per-model concurrency cap, overriding `max_num_seqs` for this model |
-| `load` | `"eager"` | `"eager"` (loads at startup) or `"on_demand"` (lazy first-request load, 503+`Retry-After` cold start) |
+| `load` | `"eager"` | What a chat request for this model does while it isn't loaded. `"eager"`: fails with a plain `503` — the model loads only via `preload` or the admin API. `"on_demand"`: starts a background load and answers `503` + `Retry-After` until it's ready (same on every device, NPU included). Neither value loads the model at startup; only `preload` does |
 | `evictable` | `true` | When `false`, never chosen as an eviction victim (separate hard-exclude from `pinned`) |
 | `device` | `null` | Explicit per-model OpenVINO device override (e.g. `"GPU.0"`) |
 | `tier_preference` | `[]` | Ordered capability-tier labels: `"heavy"`, `"strong-igpu"`, `"weak-igpu"`, `"npu"`, `"fallback"` |
-| `reasoning_parser` | `null` | `"qwen3"`, `"gpt_oss"`, `"mistral"`, `"phi"` — auto-detected from the chat template if absent |
+| `reasoning_parser` | `null` | `"qwen3"`, `"gpt_oss"`, `"mistral"`, `"phi"`. If absent, only `"qwen3"` is auto-detected (from a chat template that reads `enable_thinking`); `"gpt_oss"`, `"mistral"` and `"phi"` must be set explicitly |
 | `max_prompt_len` | `null` | **NPU-only**: compile-time `MAX_PROMPT_LEN` ceiling for the static `LLMPipeline`; must be `≥ 1` when set |
+| `min_response_len` | `null` | **NPU-only**: compile-time `MIN_RESPONSE_LEN`, the output room the NPU's fixed KV cache reserves on top of `max_prompt_len` (OpenVINO default 128). Prompt + answer can never exceed `max_prompt_len + min_response_len`; hitting it reports `finish_reason: "length"`. Raise it (e.g. `512`) for long answers to long prompts; must be `≥ 1` when set |
 | `speculative` | `null` | Opt-in draft-model speculative decoding — see [Speculative decoding](#speculative-decoding-draft-model-assisted-generation) below |
 | `precision` | `null` | Image-gen only: reported verbatim as `generation_metadata.precision` (e.g. `"int8"`); operator-supplied, not inferred |
 | `model_source` | `null` | Image-gen only: reported verbatim as `generation_metadata.model_source` (e.g. a HF repo id) |

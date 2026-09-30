@@ -65,7 +65,7 @@ pub enum ModelFamily {
     /// — a **Python list of keyword calls**, not JSON, optionally followed by
     /// prose in the same turn.
     ///
-    /// **Caveat measured 2026-09-08** (`dev/plans/lfm2-tool-call-family.md`):
+    /// **Caveat measured 2026-09-08** (the project's internal engineering log):
     /// those delimiters are *special* tokens (ids 8-13) and the model's
     /// detokenizer strips them — verified live via `/detokenize`, where each
     /// decodes to the empty string. [`parse_lfm2`] therefore bounds the call
@@ -1999,7 +1999,7 @@ mod tests {
 
     #[test]
     fn default_invalid_backslash_escape_is_repaired() {
-        // Reproduces the 2026-07-22 live incident (dev/DECISIONS.md): a model
+        // Reproduces the 2026-07-22 live incident (the project's internal engineering log): a model
         // embeds generated JS with an unescaped regex backslash inside the
         // JSON `content` argument. Un-repaired, this fails outright and the
         // client is left retrying a doomed generation forever.
@@ -2210,8 +2210,8 @@ mod tests {
 
     #[test]
     fn default_fenced_pythonic_call_with_leading_narration_is_parsed() {
-        // Reproduces the OTHER 2026-07-22 incident (dev/DECISIONS.md, "Real-
-        // Hermes tool-call flakiness"): qwen3-vl-8b-int8-ov narrated a fake
+        // Reproduces the OTHER 2026-07-22 incident (the project's internal engineering log,
+        // "Real-Hermes tool-call flakiness"): qwen3-vl-8b-int8-ov narrated a fake
         // ```bash\nread_file(path="./test.html")\n``` block instead of a
         // structured <tool_call>, prefixed by conversational narration —
         // unlike the bare mid-prose case above, `fenced_block_re` isn't

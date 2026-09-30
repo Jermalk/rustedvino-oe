@@ -10,7 +10,7 @@
 //   → Client binary frames (PCM16 16 kHz mono i16 LE)
 //
 // Control messages are JSON text frames in both directions.
-// See dev/REALTIME_WEBSOCKET_SPEC.md for the full protocol spec.
+// See INTERFACE.md (`GET /v1/realtime`) for the full protocol spec.
 // ============================================================
 
 use std::sync::{
@@ -224,8 +224,8 @@ enum ServerEvent<'a> {
     /// number of entries now in the retrieval pool (0 if entries was empty).
     HistoryReloaded { count: usize },
     /// D6 (the project's internal engineering log), extended to
-    /// all three slots by RTCC (`dev/plans/realtime-courtesy-channel-
-    /// rtcc.md`): what the session's most recent `Config` resolution
+    /// all three slots by RTCC
+    /// (the project's internal engineering log): what the session's most recent `Config` resolution
     /// actually produced. Sent once after every `Config` event (initial or
     /// mid-session re-resolve). STT/LLM/TTS all go through real
     /// server-side arbitration (`resolve_realtime_slot`) — `stt_source`/
@@ -668,8 +668,8 @@ impl SentenceSplitter {
                     // '.' (e.g. "...pi is 3.", next token "14") is very
                     // likely a decimal point, not a sentence end — hold the
                     // boundary back and let `flush()` (true end-of-stream)
-                    // or a later space/newline confirm it. See
-                    // dev/plans/realtime-tts-characters-parsing.md.
+                    // or a later space/newline confirm it (see
+                    // the project's internal engineering log).
                     let trailing_decimal_like = next.is_none()
                         && b[i] == b'.'
                         && b.get(i.wrapping_sub(1)).is_some_and(u8::is_ascii_digit);
@@ -907,14 +907,14 @@ async fn run_response(
 
     // ── Cross-pipeline device admission (step 3) ─────────────────────────────
     // The turn's whole multi-device cost, acquired atomically before touching
-    // any per-engine gate — see dev/plans/cross-pipeline-admission-middleware.md
+    // any per-engine gate — see the project's internal engineering log
     // Part 3. STT/LLM/TTS genuinely nest within one turn (the LLM engine's own
     // permit is held across every inline TTS call), so acquiring per-stage
     // would recreate the hold-and-wait risk the design exists to avoid.
     // Embed's device is deliberately excluded: `retrieve_memories` runs inside
     // `run_llm_tts`, not here, so including it would mean threading the lease
     // down another layer for a resource that's already gated by its own
-    // per-engine semaphore — see dev/DECISIONS.md 2026-07-17 "realtime turn
+    // per-engine semaphore — see the project's internal engineering log 2026-07-17 "realtime turn
     // admission lease".
     let mm_ref = state.model_manager.as_ref();
     let stt_device = mm_ref
@@ -1523,7 +1523,7 @@ async fn drain_voice_tokens(
             // `new_tokens` per piece would double-count. This telemetry-only
             // counter is a pre-existing approximation, not an OpenAI `usage`
             // field — left as-is; unlike `usage.completion_tokens`, it does
-            // not need the dev/DECISIONS.md 2026-07-19 fix applied here.
+            // not need the project's internal engineering log 2026-07-19 fix applied here.
             Some(StreamEvent::Token(delta, _new_tokens)) => {
                 for piece in think_filter.process(&delta) {
                     match piece {
@@ -1657,7 +1657,7 @@ async fn drain_voice_tokens(
                 .await;
                 break;
             }
-            Some(StreamEvent::PromptTokens(_)) => {}
+            Some(StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_)) => {}
             Some(StreamEvent::Error(e)) => return Err(anyhow::anyhow!("{e}")),
             None => break,
         }
@@ -2096,7 +2096,7 @@ async fn run_receiver(
     conn_id: u64,
     session_snap: Arc<RwLock<SessionSnapshot>>,
     shutdown: tokio_util::sync::CancellationToken,
-    // D5/D6/D8 (`dev/plans/realtime-voice-model-arbitration-v2.md`): needed
+    // D5/D6/D8 (the project's internal engineering log): needed
     // to resolve/arbitrate the LLM slot and update the realtime serving set
     // on `Config`/`RequestModelLoad`. `model_manager` mirrors `AppState`'s
     // own `Option` — `None` in mock/test mode leaves Config resolution as a
@@ -3671,7 +3671,7 @@ mod tests {
 
     // ── run_response device admission (step 3) ───────────────────────────────
     //
-    // Residual not covered here, deferred to step 4 (dev/DECISIONS.md
+    // Residual not covered here, deferred to step 4 (the project's internal engineering log
     // 2026-07-17 "realtime turn admission lease"): whether the STT device
     // token is released *promptly after run_stt* rather than merely *by the
     // time run_response returns* is not distinguishable by any test that
@@ -3730,6 +3730,8 @@ mod tests {
             embedding_normalize: true,
             default_embed_model: None,
             max_prompt_array: 16,
+            max_embedding_inputs: 256,
+            max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,
             bind_addr: "127.0.0.1".to_owned(),
             port: 11_437,
@@ -3878,7 +3880,7 @@ mod tests {
         );
     }
 
-    // ── VLM-in-voice-session support (dev/plans/realtime-vlm-support.md) ────
+    // ── VLM-in-voice-session support (the project's internal engineering log) ────
 
     /// `admission_test_config` plus one registered (not yet loaded) model —
     /// reuses the 30-odd-field `Config` literal rather than duplicating it.

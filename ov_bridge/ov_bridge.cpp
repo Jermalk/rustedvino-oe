@@ -56,7 +56,7 @@
 // VRAM/UMA-budget probe (Phase A device inventory). GPU-only property.
 #include "openvino/runtime/intel_gpu/properties.hpp"
 // ov::get_openvino_version() for ov_get_openvino_version() — Tier 3 of
-// PLAN_image_metadata_response.md. Pulled in transitively by core.hpp above,
+// the image-metadata plan. Pulled in transitively by core.hpp above,
 // included explicitly here for clarity.
 #include "openvino/core/version.hpp"
 // VLMPipeline (Phase 5.2): ChatHistory, JsonContainer, VLMPipeline.
@@ -112,12 +112,26 @@ typedef int (*OvTokenCallback)(const char* token, size_t len, void* user_data);
 /// max_prompt_len  – NPU-only compile-time MAX_PROMPT_LEN ceiling; 0 = unset,
 ///                   keep OpenVINO's own default (1024 as of this writing).
 ///                   Ignored (harmlessly) for non-NPU devices.
+/// min_response_len – NPU-only compile-time MIN_RESPONSE_LEN: output room the
+///                   static KV cache reserves on top of MAX_PROMPT_LEN; 0 =
+///                   unset (OpenVINO default 128). Verified live on Lunar Lake:
+///                   512 let an 863-token prompt generate its full 400 tokens
+///                   where the default stopped at 290.
+/// ov_cache_dir    – OpenVINO CACHE_DIR, or NULL/empty for no OpenVINO-level
+///                   cache. On NPU this stores a weightless compiled blob (default
+///                   CACHE_MODE): measured ~6 s cached load vs 30.7 s cold for an
+///                   8B int4 model on Lunar Lake, identical output.
 OvPipelineHandle ov_pipeline_create(const char* model_path, const char* device,
-                                     uint32_t max_prompt_len) {
+                                     uint32_t max_prompt_len, uint32_t min_response_len,
+                                     const char* ov_cache_dir) {
     s_last_error[0] = '\0';
     try {
-        if (max_prompt_len > 0) {
+        const bool has_cache_dir = ov_cache_dir && ov_cache_dir[0] != '\0';
+        if (max_prompt_len > 0 || min_response_len > 0 || has_cache_dir) {
             ov::AnyMap props;
+            if (has_cache_dir) {
+                props.emplace(ov::cache_dir(std::string(ov_cache_dir)));
+            }
             // Raw NPU-plugin config key — not a typed ov::genai::*_property
             // helper (none exists in the vendored headers for this). The NPU
             // plugin's property parser requires exactly int/int64_t — a plain
@@ -125,7 +139,13 @@ OvPipelineHandle ov_pipeline_create(const char* model_path, const char* device,
             // mismatch: expected types: int or int64_t" (confirmed live on
             // Lunar Lake/NPU). Widen explicitly rather than relying on
             // implicit conversion into ov::Any's type-erased storage.
-            props.emplace("MAX_PROMPT_LEN", static_cast<int64_t>(max_prompt_len));
+            if (max_prompt_len > 0) {
+                props.emplace("MAX_PROMPT_LEN", static_cast<int64_t>(max_prompt_len));
+            }
+            // Same int/int64_t requirement as MAX_PROMPT_LEN.
+            if (min_response_len > 0) {
+                props.emplace("MIN_RESPONSE_LEN", static_cast<int64_t>(min_response_len));
+            }
             auto* pipe = new ov::genai::LLMPipeline(
                 std::filesystem::path(model_path),
                 std::string(device),
@@ -157,76 +177,6 @@ void ov_pipeline_free(OvPipelineHandle handle) {
 }
 
 // ─── Generation ──────────────────────────────────────────────────────────────
-
-/// Run inference on `prompt` and stream tokens to `callback`.
-///
-/// This call BLOCKS until generation is complete or stopped.
-/// Run it inside tokio::task::spawn_blocking on the Rust side.
-///
-/// handle          – pipeline handle from ov_pipeline_create
-/// prompt          – null-terminated UTF-8 prompt string;
-///                   the pipeline applies the model's chat template
-/// max_new_tokens  – token budget; 0 = use model default (usually 256)
-/// callback        – called once per token; return 1 to stop early
-/// user_data       – passed through to callback unchanged
-/// finish_code_out – optional out-param: 1 = STOP (EOS), 2 = LENGTH
-///                   (token budget cut the generation). NULL to ignore.
-///
-/// Returns 0 on success, -1 on error (call ov_last_error() for details).
-int ov_pipeline_generate(
-    OvPipelineHandle handle,
-    const char*      prompt,
-    size_t           max_new_tokens,
-    OvTokenCallback  callback,
-    void*            user_data,
-    int*             finish_code_out
-) {
-    s_last_error[0] = '\0';
-
-    if (!handle) { set_error("null pipeline handle");  return -1; }
-    if (!prompt)  { set_error("null prompt");           return -1; }
-
-    auto* pipe = static_cast<ov::genai::LLMPipeline*>(handle);
-
-    ov::genai::GenerationConfig config;
-    if (max_new_tokens > 0) {
-        config.max_new_tokens = max_new_tokens;
-    }
-
-    // Lambda captures callback + user_data by value.
-    // StreamingStatus::RUNNING = 0, STOP = 1, CANCEL = 2.
-    auto streamer_fn = [callback, user_data](const std::string& token)
-        -> ov::genai::StreamingStatus
-    {
-        if (callback) {
-            int ret = callback(token.c_str(), token.size(), user_data);
-            if (ret != 0) {
-                return ov::genai::StreamingStatus::STOP;
-            }
-        }
-        return ov::genai::StreamingStatus::RUNNING;
-    };
-
-    try {
-        auto result = pipe->generate(std::string(prompt), config, streamer_fn);
-        // Finish reason from real token counts, same rule as ov_vlm_generate
-        // (NPU): budget reached → LENGTH; else STOP. The streamer
-        // callback counts chunks, not tokens, so it cannot detect this.
-        int finish_code = 1; // STOP (EOS) default
-        if (max_new_tokens > 0 &&
-            result.perf_metrics.get_num_generated_tokens() >= max_new_tokens) {
-            finish_code = 2; // LENGTH
-        }
-        if (finish_code_out) *finish_code_out = finish_code;
-        return 0;
-    } catch (const std::exception& e) {
-        set_error(e.what());
-        return -1;
-    } catch (...) {
-        set_error("unknown exception in ov_pipeline_generate");
-        return -1;
-    }
-}
 
 // ─── Tokenization ────────────────────────────────────────────────────────────
 
@@ -501,6 +451,108 @@ static void build_gen_config(ov::genai::GenerationConfig& cfg,
 
 extern "C" {
 
+/// Run one NPU (static LLMPipeline) generation on `prompt` and stream decoded
+/// text chunks to `callback`.
+///
+/// This call BLOCKS until generation is complete or stopped.
+/// Run it on the NPU engine thread (never on the async runtime).
+///
+/// handle               – pipeline handle from ov_pipeline_create
+/// prompt               – null-terminated UTF-8 prompt, ALREADY rendered through
+///                        the model's chat template on the Rust side. The
+///                        pipeline must not template it again, so this sets
+///                        GenerationConfig::apply_chat_template = false
+///                        (its default is true: generation_config.hpp,
+///                        llm_pipeline.hpp). Re-templating wrapped the whole
+///                        rendered prompt as one user turn and dropped the
+///                        closed-think prefill, so enable_thinking:false was
+///                        silently ignored (the project's internal engineering log).
+/// params               – sampling/stop/structured-output settings, the same
+///                        OvGenParams layout and build_gen_config the CB and VLM
+///                        paths use. Must be non-null. num_assistant_tokens is
+///                        ignored here (NPU speculative decoding is a
+///                        construction-time draft model, not a request field).
+/// callback             – called once per decoded text CHUNK (not per token: the
+///                        streamer can hold back and flush several tokens at
+///                        once); return non-zero to stop early
+/// user_data            – passed through to callback unchanged
+/// finish_code_out      – optional: 1 = STOP (EOS), 2 = LENGTH (budget reached)
+/// generated_tokens_out – optional: the pipeline's own generated-token count
+///                        (perf_metrics) — the authoritative count for usage
+/// input_tokens_out     – optional: the pipeline's own prompt-token count
+///
+/// Returns 0 on success, -1 on error (call ov_last_error() for details).
+int ov_pipeline_generate(
+    OvPipelineHandle   handle,
+    const char*        prompt,
+    const OvGenParams* params,
+    OvTokenCallback    callback,
+    void*              user_data,
+    int*               finish_code_out,
+    size_t*            generated_tokens_out,
+    size_t*            input_tokens_out
+) {
+    s_last_error[0] = '\0';
+
+    if (!handle) { set_error("null pipeline handle"); return -1; }
+    if (!prompt) { set_error("null prompt");          return -1; }
+    if (!params) { set_error("null params");          return -1; }
+
+    auto* pipe = static_cast<ov::genai::LLMPipeline*>(handle);
+
+    // Stream decoded chunks to Rust. StreamingStatus::RUNNING = 0, STOP = 1.
+    auto streamer_fn = [callback, user_data](const std::string& chunk)
+        -> ov::genai::StreamingStatus
+    {
+        if (callback) {
+            int ret = callback(chunk.c_str(), chunk.size(), user_data);
+            if (ret != 0) {
+                return ov::genai::StreamingStatus::STOP;
+            }
+        }
+        return ov::genai::StreamingStatus::RUNNING;
+    };
+
+    try {
+        ov::genai::GenerationConfig cfg;  // greedy by default, CB parity
+        cfg.apply_chat_template = false;  // prompt is pre-rendered in Rust
+        build_gen_config(cfg, params);
+        cfg.num_assistant_tokens = 0;     // see `params` above
+        // Keep the model's own extra stop ids (e.g. Qwen3's <|endoftext|>
+        // alongside <|im_end|>) — a fresh GenerationConfig would drop them.
+        const ov::genai::GenerationConfig model_cfg = pipe->get_generation_config();
+        cfg.stop_token_ids.insert(model_cfg.stop_token_ids.begin(),
+                                  model_cfg.stop_token_ids.end());
+        if (cfg.eos_token_id < 0) {
+            cfg.eos_token_id = model_cfg.eos_token_id;
+        }
+
+        auto result = pipe->generate(std::string(prompt), cfg, streamer_fn);
+
+        // Finish reason from the pipeline's own token count, same rule as
+        // ov_vlm_generate: generated >= budget → LENGTH, else STOP.
+        const size_t generated = result.perf_metrics.get_num_generated_tokens();
+        int finish_code = 1; // STOP (EOS) default
+        if (params->max_new_tokens > 0 && generated >= params->max_new_tokens) {
+            finish_code = 2; // LENGTH
+        }
+        if (finish_code_out)      *finish_code_out      = finish_code;
+        if (generated_tokens_out) *generated_tokens_out = generated;
+        if (input_tokens_out)     *input_tokens_out     = result.perf_metrics.num_input_tokens;
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_pipeline_generate");
+        return -1;
+    }
+}
+
+} // extern "C" (NPU generate)
+
+extern "C" {
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 // Opaque handle to an OvCbEngine. Rust sees *mut std::ffi::c_void.
@@ -682,6 +734,10 @@ int ov_cb_add_request(OvCbHandle         handle,
     auto* eng = static_cast<OvCbEngine*>(handle);
     try {
         ov::genai::GenerationConfig cfg;  // greedy by default (do_sample = false)
+        // The prompt arrives already chat-templated from Rust (this is the
+        // fail-open fallback when pre-tokenizing failed); never template it
+        // twice. Harmless if this pipeline version does not template strings.
+        cfg.apply_chat_template = false;
         build_gen_config(cfg, params);
 
         ov::genai::GenerationHandle h =
@@ -854,7 +910,7 @@ int ov_cb_step(OvCbHandle handle, OvCbTokenCallback callback, void* user_data) {
                 // goes false (nothing left to step), so no later drain ever
                 // gets a chance to notice either. Force finalization from the
                 // handle's status when the per-output reason didn't already
-                // give us one (dev/DECISIONS.md 2026-08-19, nanbeige hang).
+                // give us one (the project's internal engineering log 2026-08-19, nanbeige hang).
                 if (fr == 0 && st.handle->get_status() != ov::genai::GenerationStatus::RUNNING) {
                     // 2026-08-21 (found live, VLM instant-EOS investigation):
                     // confirmed by direct instrumentation that this branch is hit
@@ -1121,7 +1177,7 @@ int ov_device_property(const char* device, const char* key,
 /// `"2026.2.1-19140-c01cd93e24d"`) into `out` — `ov::get_openvino_version()`'s
 /// `buildNumber` field. Static for the process lifetime (no `Core` instance
 /// needed, no device argument); the Rust side caches it after the first call
-/// (`PLAN_image_metadata_response.md` Tier 3 — `generation_metadata.openvino_version`).
+/// (the image-metadata plan Tier 3 — `generation_metadata.openvino_version`).
 ///
 /// Returns the string length written (>= 0) on success, or -1 on a null/zero
 /// argument. `get_openvino_version()` is `noexcept`, so there is no exception
@@ -1195,8 +1251,8 @@ struct OvVlmState {
         // Omitting it (the previous behavior) left OpenVINO's own internal
         // default (dynamic/unbounded cache_size) in charge, which measured
         // ~2x this project's configured `kv_cache_gb` budget for
-        // qwen3.5-4b-int8-ov at 75-100K context depth (dev/autotest/
-        // 20260820_nudge_fix_verification_qwen3.5-4b-int8-ov.md). This
+        // qwen3.5-4b-int8-ov at 75-100K context depth
+        // (the project's internal engineering log). This
         // model's hybrid linear/full-attention architecture also reserves a
         // large *fixed* floor (~6-7GB observed) for the linear-attention
         // layers' state regardless of context length — too small a
@@ -1206,7 +1262,7 @@ struct OvVlmState {
         // instead of silent unbounded growth.
         //
         // `SchedulerConfig`'s own constructor defaults `enable_prefix_caching`
-        // to false — measured live (same autotest doc, isolated repro) at a
+        // to false — measured live (isolated repro) at a
         // 30-40x cost per turn on the exact resent-full-history-every-turn
         // pattern this server's own OpenAI-compatible chat handler produces:
         // ~16s/turn with it off vs ~0.4s/turn from the 2nd turn onward with
@@ -1680,7 +1736,7 @@ size_t ov_embed_count_tokens(OvEmbedHandle handle, const char* text) {
 // Like TextEmbeddingPipeline, TextRerankPipeline does not expose its own
 // tokenizer (no get_tokenizer()), so we bundle a standalone ov::genai::Tokenizer
 // loaded from the same model directory — used only for the pre-inference length
-// gate (dev/autotest/20260804_rerank_shape_poisoning.md), not for reranking
+// gate (the project's internal engineering log), not for reranking
 // itself.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1777,7 +1833,7 @@ int ov_rerank_documents(OvRerankHandle     handle,
 }
 
 /// Count the tokens `(query, document)` need combined, for the pre-inference
-/// length gate (dev/autotest/20260804_rerank_shape_poisoning.md).
+/// length gate (the project's internal engineering log).
 ///
 /// Encodes `query` and `document` as two independent single-text sequences
 /// and sums them, rather than using the tokenizer's paired-prompt encoding
@@ -1904,6 +1960,10 @@ void ov_whisper_free(OvWhisperHandle handle) {
 /// language          – source-language code ("en", "pl", …) or NULL to
 ///                     autodetect. Wrapped into the "<|xx|>" whisper token here.
 /// return_timestamps – 0/1; when 1, chunk_cb fires per timestamped segment.
+/// translate         – 0/1; when 1, Whisper's "translate" task: the output is
+///                     English whatever the spoken language (multilingual
+///                     models only — the caller checks). 0 keeps the model's
+///                     default task, transcription.
 /// text_cb           – called once with the full transcript.
 /// chunk_cb          – called per segment when return_timestamps != 0.
 /// user_data         – passed through to both callbacks unchanged.
@@ -1917,6 +1977,7 @@ int ov_whisper_generate(
     size_t                 num_samples,
     const char*            language,
     int                    return_timestamps,
+    int                    translate,
     OvWhisperTextCallback  text_cb,
     OvWhisperChunkCallback chunk_cb,
     void*                  user_data,
@@ -1938,6 +1999,9 @@ int ov_whisper_generate(
         cfg.language = std::string("<|") + language + "|>";
     }
     cfg.return_timestamps = (return_timestamps != 0);
+    if (translate != 0) {
+        cfg.task = std::string("translate");
+    }
 
     try {
         ov::genai::WhisperDecodedResults result = state->pipe->generate(raw, cfg);
@@ -1974,7 +2038,7 @@ int ov_whisper_generate(
 // constructor auto-detects the model family (SDXL, SD, SD3, FLUX) from the model
 // dir and compiles every submodel on one device — the first-pass placement.
 // Per-submodel device split (compile(text, denoise, vae)) is a later refinement
-// for heterogeneous GPU.0/GPU.1 boxes (see dev/plans/phase5/IMAGE.md).
+// for heterogeneous GPU.0/GPU.1 boxes (see the project's internal engineering log).
 //
 // generate() returns an ov::Tensor shaped [N, H, W, 3], NHWC u8 (0–255). Each
 // image is delivered via image_cb (same per-index callback pattern as
@@ -1987,7 +2051,7 @@ namespace {
 
 // OvImageState bundles the image pipelines for one model load.
 //
-// LOAD ARCHITECTURE (1× VRAM — see dev/DECISIONS.md 2026-06-16):
+// LOAD ARCHITECTURE (1× VRAM — see the project's internal engineering log 2026-06-16):
 //   OV GenAI's pipeline conversion graph is directional — Image2Image ⇄ Inpainting
 //   are mutually constructible, and Text2Image derives from either, but NOT the
 //   reverse. So the only single-load design that backs all three ops is to load

@@ -3,7 +3,7 @@
 // ============================================================
 // Extracted from main.rs so a second binary linking against this crate
 // (e.g. RustedVINO Bear Edition, a private crate — see
-// dev/plans/realtime-courtesy-channel-rtcc.md in dev notes) can build its
+// the project's internal engineering log) can build its
 // own Router via create_router_with_extension and still get the exact same
 // config load, device probe, model-manager construction, and graceful-
 // shutdown behaviour as the stock binary, without copying main.rs by hand.
@@ -196,8 +196,8 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     let ov_cache_sweep_interval = Duration::from_secs(config.ov_cache_sweep_interval_secs);
     // Read before `config` moves into `ModelManager::new_production` below —
     // both `Copy` types, no clone needed. `kv_pressure_monitor_enabled`
-    // gates whether the sweep task is spawned at all (dev/plans/
-    // kv-cache-pressure-detection.md's ops-review finding: default off, and
+    // gates whether the sweep task is spawned at all
+    // (the project's internal engineering log's ops-review finding: default off, and
     // when off there should be zero periodic cost, not just an inert check).
     let kv_pressure_monitor_enabled = config.kv_pressure_monitor_enabled;
     let kv_pressure_sweep_interval = Duration::from_secs(config.kv_pressure_sweep_interval_secs);
@@ -233,7 +233,7 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     );
     tracing::info!("model manager ready");
 
-    // ── OV-cache background sweep (dev/plans/ov-cache-self-management.md) ──
+    // ── OV-cache background sweep (the project's internal engineering log) ──
     // hash-precompute + prune, once at startup then every
     // `ov_cache_sweep_interval_secs`. Deliberately does NOT include
     // blob-warming (see `ModelManager::is_idle`'s doc comment) — both passes
@@ -259,7 +259,7 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
         });
     }
 
-    // ── KV-cache pressure monitor (dev/plans/kv-cache-pressure-detection.md) ──
+    // ── KV-cache pressure monitor (the project's internal engineering log) ──
     // Detect-and-flag only — never evicts, resizes, or otherwise acts. Not
     // spawned at all when disabled (the fleet-wide default), per the plan's
     // ops-review finding: no periodic cost, not just an inert per-tick check.
@@ -378,7 +378,7 @@ fn load_keys_file_for_boot(keys_path: &Path) -> anyhow::Result<(crate::AuthConfi
 /// `tokio::signal::unix` does not exist on Windows (E0433 on the MSVC
 /// target), so the SIGTERM arm is Unix-only. On Windows, ctrl-C alone covers
 /// foreground operation; the SCM stop event funnels into the same drain path
-/// when the service wrapper lands (windows-x86-compat plan, §3.3).
+/// when the service wrapper lands.
 async fn shutdown_signal() {
     // CRASH COURSE — why not `?` here: this future is handed to axum as a
     // plain `Future<Output = ()>`; it has no Result to propagate into. A

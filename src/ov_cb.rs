@@ -70,6 +70,25 @@ pub struct GenParams {
     pub top_k: Option<usize>,
 }
 
+/// The sampling seed handed to `OpenVINO`: the client's `seed`, or a fresh
+/// random one when the request has none.
+///
+/// `OpenVINO GenAI`'s `GenerationConfig::rng_seed` defaults to 0 and the
+/// sampler seeds from it per request, so passing "no seed" made every
+/// unseeded request draw the same "random" tokens — identical outputs at
+/// `temperature: 1.0`, live-verified on both the GPU CB and NPU paths
+/// (2026-09-29, 0.7.0 review item A3). Always sending a seed fixes all
+/// engines at the marshalling point.
+pub(crate) fn effective_seed(seed: Option<u64>) -> u64 {
+    // `RandomState` is randomly keyed per thread and its keys advance on every
+    // `new()`, so each call hashes to a different value — no RNG crate needed
+    // for a non-cryptographic sampling seed.
+    seed.unwrap_or_else(|| {
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(())
+    })
+}
+
 /// C-side representation of [`GenParams`]. Must EXACTLY match `OvGenParams`
 /// in `ov_bridge/ov_bridge.cpp` (field order, sizes, alignment).
 ///
@@ -78,9 +97,10 @@ pub struct GenParams {
 /// `stop_strings` and `stop_count` are NULL/0 when there are no stop strings.
 /// `json_schema` is NULL when no structured-output constraint is requested.
 ///
-/// Not `pub` — used only inside this module to cross the FFI boundary.
+/// `pub(crate)` so the NPU wrapper (`ov_pipeline.rs`) marshals through this
+/// same struct instead of a third private copy. `ov_vlm.rs` still keeps its own.
 #[repr(C)]
-struct OvGenParamsC {
+pub(crate) struct OvGenParamsC {
     max_new_tokens: usize,
     temperature: f32,
     top_p: f32,
@@ -296,7 +316,7 @@ pub fn device_property(device: &str, key: &str) -> Option<String> {
 /// Wraps `ov_get_openvino_version` in the C bridge — `ov::get_openvino_version()`
 /// is static for the process lifetime (no `Core` instance, `noexcept`), so the
 /// first call's result is cached and every later call returns it without
-/// crossing the FFI boundary again (`PLAN_image_metadata_response.md` Tier 3:
+/// crossing the FFI boundary again (the image-metadata plan Tier 3:
 /// "exposed once at server startup, not per-request").
 #[must_use]
 pub fn openvino_version() -> Option<String> {
@@ -539,7 +559,7 @@ impl OvCbEngine {
     /// struct live on this function's stack frame, so the pointer is valid for
     /// exactly the duration of `f` — both `add_request` entry points share this
     /// to keep their sampling/stop/schema marshalling byte-identical.
-    fn with_c_params<R>(
+    pub(crate) fn with_c_params<R>(
         params: &GenParams,
         num_assistant_tokens: usize,
         f: impl FnOnce(*const OvGenParamsC) -> R,
@@ -573,8 +593,8 @@ impl OvCbEngine {
             presence_penalty: params.presence_penalty.unwrap_or(f32::NAN),
             frequency_penalty: params.frequency_penalty.unwrap_or(f32::NAN),
             repetition_penalty: params.repetition_penalty.unwrap_or(f32::NAN),
-            use_rng_seed: std::ffi::c_int::from(params.seed.is_some()),
-            rng_seed: params.seed.unwrap_or(0),
+            use_rng_seed: 1,
+            rng_seed: effective_seed(params.seed),
             stop_strings: if stop_ptrs.is_empty() {
                 std::ptr::null()
             } else {
@@ -969,6 +989,16 @@ mod tests {
         finish_from_code, openvino_version, ov_gen_params_size, step_trampoline,
     };
 
+    /// A client seed passes through; no seed yields a fresh value per call
+    /// (A3: unseeded sampling must not repeat across requests).
+    #[test]
+    fn effective_seed_passes_client_seed_and_randomises_none() {
+        assert_eq!(super::effective_seed(Some(42)), 42);
+        let seeds: std::collections::HashSet<u64> =
+            (0..16).map(|_| super::effective_seed(None)).collect();
+        assert_eq!(seeds.len(), 16);
+    }
+
     /// Regression test for a real near-miss (2026-07-14): adding
     /// `repetition_penalty` to `OvGenParams` (C++) without updating BOTH of
     /// its private Rust `#[repr(C)]` mirrors (`ov_cb.rs`, `ov_vlm.rs`) silently
@@ -991,7 +1021,7 @@ mod tests {
     /// (non-empty, e.g. `"2026.2.1-..."`) and is stable across calls — the
     /// `OnceLock` cache must not re-cross the FFI boundary and must not
     /// silently start returning `None` after the first successful call
-    /// (`PLAN_image_metadata_response.md` Tier 3).
+    /// (the image-metadata plan Tier 3).
     #[test]
     fn openvino_version_is_stable_and_nonempty() {
         let a = openvino_version().expect("running OpenVINO runtime reports a version");

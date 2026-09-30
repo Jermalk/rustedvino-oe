@@ -8,6 +8,7 @@ __pycache__/
 # which holds queries.jsonl: every query you ran, with its embedding.
 /tools/semsearch/api_keys.json
 /tools/semsearch/.cache/
+/tools/livecaptions/api_keys.json
 *.blob
 .DS_Store
 .idea/

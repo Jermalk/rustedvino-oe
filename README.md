@@ -295,7 +295,19 @@ done
 
 **Speech-to-text:** [PhoWhisper](https://huggingface.co/vinai/PhoWhisper-large) (VinAI, BSD-3-Clause)
 is a Vietnamese fine-tune of Whisper and runs as an ordinary `"kind": "stt"` model once converted.
-There is no ready OpenVINO build, and the export has traps:
+
+**Ready-made OpenVINO int8 builds** (unofficial conversions, with VinAI's licence and a model card),
+download one into your models directory:
+[small](https://huggingface.co/jermalk/PhoWhisper-small-int8-ov) (243 MB; ~3× faster than real time on
+CPU; 2.4% word errors on the clips below),
+[medium](https://huggingface.co/jermalk/PhoWhisper-medium-int8-ov) (746 MB; 1.2%),
+[large](https://huggingface.co/jermalk/PhoWhisper-large-int8-ov) (1.5 GB; 1.2%).
+
+```bash
+hf download jermalk/PhoWhisper-large-int8-ov --local-dir "$MODELS_DIR/phowhisper-large-int8-ov"
+```
+
+To convert it yourself, mind the traps in the export:
 
 1. The Hub repo ships only `pytorch_model.bin`, and optimum's export calls the Hub API. Re-save it
    locally with transformers (`from_pretrained(..., use_safetensors=False)` → `save_pretrained`),

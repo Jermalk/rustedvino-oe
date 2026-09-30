@@ -8,8 +8,9 @@ semver claim). Full release notes, with measurements and download instructions, 
 
 ## [0.7.0] — 2026-09-30
 
-The NPU release: Lunar Lake's NPU becomes a fully configurable text-generation target, and several
-NPU responses that were quietly wrong are now right.
+Vietnamese speech end to end — speech-to-text, text-to-speech and voice conversation — and
+Lunar Lake's NPU as a fully configurable text-generation target, with several NPU responses that
+were quietly wrong now right.
 
 ### Added
 - **`POST /v1/audio/translations`** (OpenAI-compatible): speech in any Whisper language → English
@@ -20,6 +21,10 @@ NPU responses that were quietly wrong are now right.
   `/v1/realtime`. Phonemes come from `espeak-ng`, run as an external program the operator installs
   (GPL-3.0, never linked or shipped); a load-time self-check refuses the voice if `espeak-ng` is
   missing or produces the wrong phonemes.
+- **Vietnamese speech, end to end:** PhoWhisper (VinAI's Vietnamese Whisper fine-tune) runs as a
+  Whisper STT model once converted (README has the conversion recipe and measured error rates),
+  Piper's `vi_VN-vais1000` voice speaks, and the two combine into a Vietnamese voice conversation
+  over `/v1/realtime`.
 - **NPU `min_response_len`** (per model): the answer room the NPU's fixed cache reserves on top of
   `max_prompt_len`. Settable in config or via `PATCH /v1/admin/models/{id}`.
 - **NPU LLMs use `ov_cache_dir`**: one weightless compiled blob per model (~0.66 GB for an 8B int4

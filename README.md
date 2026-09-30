@@ -61,7 +61,7 @@ included.
 | `POST /v1/completions` — legacy raw-prompt completions | ✅ |
 | `POST /v1/embeddings` — text embeddings (bge, e5, …); per-input length checked against the model's own limit, up to 256 inputs and 32k padded tokens per request (limits in [`INTERFACE.md`](INTERFACE.md)) | ✅ |
 | `POST /v1/rerank` — cross-encoder document reranking | ✅ |
-| `POST /v1/audio/transcriptions` — STT via Whisper OpenVINO | ✅ |
+| `POST /v1/audio/transcriptions` — STT via Whisper OpenVINO, including Whisper fine-tunes such as Vietnamese PhoWhisper (see [Vietnamese speech](#vietnamese-speech-phowhisper--piper)) | ✅ |
 | `POST /v1/audio/translations` — speech in any Whisper language → English text (needs a multilingual Whisper trained for translation, e.g. `large-v3`; `large-v3-turbo` isn't) | ✅ |
 | `POST /v1/audio/speech` — TTS (Kokoro-82M, Coqui VITS, Piper VITS voices such as Vietnamese `vi_VN-vais1000`, `SpeechT5`) | ✅ |
 | `POST /v1/images/generations` — text-to-image (SDXL, FLUX.1-schnell) | ✅ |
@@ -290,6 +290,52 @@ for f in vi_VN-vais1000-medium.onnx vi_VN-vais1000-medium.onnx.json MODEL_CARD; 
   curl -sLO "https://huggingface.co/rhasspy/piper-voices/resolve/main/vi/vi_VN/vais1000/medium/$f"
 done
 ```
+
+#### Vietnamese speech (PhoWhisper + Piper)
+
+**Speech-to-text:** [PhoWhisper](https://huggingface.co/vinai/PhoWhisper-large) (VinAI, BSD-3-Clause)
+is a Vietnamese fine-tune of Whisper and runs as an ordinary `"kind": "stt"` model once converted.
+There is no ready OpenVINO build, and the export has traps:
+
+1. The Hub repo ships only `pytorch_model.bin`, and optimum's export calls the Hub API. Re-save it
+   locally with transformers (`from_pretrained(..., use_safetensors=False)` → `save_pretrained`),
+   then export offline (`HF_HUB_OFFLINE=1`).
+2. Use **Python 3.12**: on Python 3.14, optimum's Whisper export fails with
+   `NormalizedConfig.__init__() got multiple values for argument 'allow_new'`. Tested with
+   optimum-intel 2.0.0, optimum 2.2.0, transformers 4.57.6, OpenVINO 2026.2.1.
+3. Keep the working copy and `TMPDIR` on disk, not a tmpfs `/tmp` (the int8 IR write fails there).
+4. The re-save drops tokenizer files: after exporting, copy `added_tokens.json`, `merges.txt`,
+   `normalizer.json`, `special_tokens_map.json`, `tokenizer.json`, `tokenizer_config.json`,
+   `vocab.json` and `preprocessor_config.json` from the original download into the exported model
+   directory, then run `convert_tokenizer . --with-detokenizer --skip-special-tokens -o .` there.
+
+```bash
+TMPDIR=/path/on/disk HF_HUB_OFFLINE=1 optimum-cli export openvino \
+  --model ./phowhisper-large-resaved --task automatic-speech-recognition-with-past \
+  --weight-format int8 "$MODELS_DIR/phowhisper-large-int8-ov"
+```
+
+It runs on NPU, CPU and GPU. On one Lunar Lake laptop its GPU load crashed inside Intel's OpenCL
+compiler once in about ten loads (a driver-stack issue; stock `whisper-large-v3` never did), so
+the NPU is the steady choice there.
+
+Measured on that laptop — **5 synthetic clips (Piper vais1000 speech), 18.1 s, 85 words**, so
+treat it as a smoke test, not a benchmark:
+
+| Model (device) | Word error rate | Time for the 18.1 s |
+|---|---|---|
+| PhoWhisper-large (NPU) | 1.2% | 6.3 s |
+| PhoWhisper-large (CPU) | 1.2% | 28.0 s |
+| whisper-large-v3-turbo (NPU) | 3.5% | 2.5 s |
+| whisper-large-v3 (GPU) | 4.7% | 9.4 s |
+
+PhoWhisper writes lowercase with little punctuation; the stock models' misses were tone marks.
+
+**Text-to-speech:** the Piper `vi_VN-vais1000` voice above.
+
+**Voice conversation:** with PhoWhisper (NPU) → `qwen3-8b` (GPU) → vais1000 (CPU) set on a
+`/v1/realtime` session, a spoken Vietnamese question gets a spoken Vietnamese answer; on that
+laptop, **~3.2 s from the end of speech to the first reply audio** once warm.
 
 ### 4. Create config file
 

@@ -283,6 +283,25 @@ fn resolve_encoding_format(encoding_format: Option<&str>) -> Result<bool, Box<Re
 /// Routes to a `ModelKind::Embedding` model and returns one vector per input.
 /// A non-embedding model (text/vision) is rejected with 400 (`WrongKind`); an
 /// unknown model with 404; a not-ready model with 503.
+/// The 400 for an `input` the endpoint cannot take: empty, or containing a NUL byte. A NUL cannot cross the
+/// C boundary to the engine, so it used to surface as `500 inference failed` (overnight torture run: 861
+/// of them); it is the caller's mistake.
+fn reject_bad_input(texts: &[String]) -> Option<Response> {
+    let (message, code) = if texts.is_empty() {
+        ("input must not be empty", "empty_input")
+    } else if texts.iter().any(|t| t.contains('\0')) {
+        ("input must not contain NUL bytes", "invalid_input")
+    } else {
+        return None;
+    };
+    Some(openai_error(
+        StatusCode::BAD_REQUEST,
+        message,
+        "invalid_request_error",
+        Some(code),
+    ))
+}
+
 pub async fn embeddings(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<EmbeddingRequest>,
@@ -292,15 +311,10 @@ pub async fn embeddings(
     }
 
     let texts = req.input.into_vec();
-    if texts.is_empty() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "input must not be empty",
-            "invalid_request_error",
-            Some("empty_input"),
-        );
-    }
     if let Some(resp) = reject_oversized_input_array(&state, texts.len()) {
+        return resp;
+    }
+    if let Some(resp) = reject_bad_input(&texts) {
         return resp;
     }
 

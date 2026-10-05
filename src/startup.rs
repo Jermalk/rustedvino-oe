@@ -17,14 +17,34 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::app_state::AppState;
 use crate::device_inventory::DeviceInventory;
 use crate::log_ring::LogRingBuffer;
 use crate::model_manager::config::resolve_keys_file_path;
 use crate::model_manager::{Config, ModelManager};
+
+/// When this process finished starting up, set once by [`bootstrap`]. Backs the
+/// `uptime_secs` the admin `server` block reports, so `rv status` gets the PID
+/// and uptime from the server itself instead of probing the OS (the probes are
+/// Unix-only).
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Records the process start time (first call wins; later calls are no-ops).
+/// [`bootstrap`] calls it first, so a second binary linking this crate gets it
+/// for free.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.set(Instant::now());
+}
+
+/// Whole seconds since [`mark_process_start`], or `None` if it never ran
+/// (unit tests, or a binary that skipped [`bootstrap`]).
+#[must_use]
+pub fn process_uptime_secs() -> Option<u64> {
+    PROCESS_START.get().map(|t| t.elapsed().as_secs())
+}
 
 /// Compiled-in default config path for Linux production installs.
 const DEFAULT_CONFIG: &str = "/opt/rustedvino/config.json";
@@ -46,12 +66,26 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 /// window stays under 45s.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Resolves the config file path using three-level priority:
+/// The per-user config location on Windows: `%LOCALAPPDATA%\RustedVINO\config.json`
+/// (no elevation to write, survives upgrading the program folder). Takes the
+/// `LOCALAPPDATA` value as a parameter so the rule is testable on any OS; `None`
+/// when it is unset or empty. [`resolve_config_path`] only consults it on
+/// Windows, and `tools/rv` carries a copy pinned to this one by
+/// `tests/rv_keys_path_parity.rs`.
+#[must_use]
+pub fn per_user_config_path(local_app_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let base = local_app_data.filter(|v| !v.is_empty())?;
+    Some(Path::new(base).join("RustedVINO").join("config.json"))
+}
+
+/// Resolves the config file path using four-level priority:
 ///
 /// 1. `RUSTEDVINO_CONFIG` env var — explicit override, always wins.
 /// 2. The compiled-in default `/opt/rustedvino/config.json` if it exists
 ///    (Linux system install — unchanged production behaviour).
-/// 3. `{exe_dir}/config.json` — portable path for Windows bundles and any
+/// 3. Windows only: `%LOCALAPPDATA%\RustedVINO\config.json` if it exists (the
+///    per-user location an installer or `rv` setup writes to).
+/// 4. `{exe_dir}/config.json` — portable path for Windows bundles and any
 ///    install that doesn't use `/opt/rustedvino/`.
 ///
 /// # Errors
@@ -71,6 +105,12 @@ pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
     if default.exists() {
         return Ok(default.to_path_buf());
     }
+    if cfg!(windows)
+        && let Some(p) = per_user_config_path(std::env::var_os("LOCALAPPDATA").as_deref())
+        && p.exists()
+    {
+        return Ok(p);
+    }
     let exe_dir_config = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join("config.json")));
@@ -87,9 +127,171 @@ pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
         "no config file found — tried:\n  \
          • RUSTEDVINO_CONFIG env var: not set\n  \
          • {DEFAULT_CONFIG}: not found\n  \
+         • (Windows) %LOCALAPPDATA%\\RustedVINO\\config.json: not found\n  \
          • {exe_hint}: not found\n\
          \nFix: set RUSTEDVINO_CONFIG=/path/to/config.json"
     )
+}
+
+/// Exit code of a worker that stopped itself because the GPU context was
+/// poisoned (`EX_TEMPFAIL`). The supervisor recognises it in its log; any exit
+/// is respawned either way.
+pub const EXIT_GPU_POISONED: u8 = 75;
+
+/// Set by the supervisor on the worker it spawns. A worker without it has no
+/// one to restart it, so it stays up (degraded, and says so) instead of exiting.
+pub const SUPERVISED_ENV: &str = "RUSTEDVINO_SUPERVISED";
+
+/// Wakes every [`shutdown_signal`] waiter without an OS signal (the same drain
+/// path as SIGTERM). `shutdown_signal` is awaited by `serve` AND by background
+/// loops (cache sweep, KV monitor), so the request must reach all of them:
+/// `notify_one` woke only one (usually a background loop, which then quietly
+/// returned and left `serve` running - review finding). The request is a sticky
+/// flag plus `notify_waiters`; see [`wait_for_flag`].
+static SHUTDOWN_REQUEST: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Set once, never cleared: a shutdown has been requested.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by [`serve`] once the listener is bound.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the shutdown in progress was asked for by [`on_gpu_poisoned`].
+static GPU_POISON_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when the process is stopping because the GPU context was poisoned;
+/// `main` turns it into [`EXIT_GPU_POISONED`].
+#[must_use]
+pub fn gpu_poison_exit_requested() -> bool {
+    GPU_POISON_EXIT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Resolves once `flag` is set. Any number of tasks may wait on the same
+/// `notify`/`flag` pair and all of them resolve, including ones that start
+/// waiting after the flag was set. The `Notified` future is registered
+/// (`enable`) BEFORE the flag is read, so a request landing between the read
+/// and the await is not lost.
+async fn wait_for_flag(notify: &tokio::sync::Notify, flag: &std::sync::atomic::AtomicBool) {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if flag.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Sets `flag` and wakes every waiter of `notify` (see [`wait_for_flag`]).
+fn raise_flag(notify: &tokio::sync::Notify, flag: &std::sync::atomic::AtomicBool) {
+    flag.store(true, std::sync::atomic::Ordering::Release);
+    notify.notify_waiters();
+}
+
+/// Records that the server is accepting requests ([`serve`] calls it once the
+/// listener is bound). Before this, a GPU poisoning does not stop the process
+/// (see [`on_gpu_poisoned`]).
+pub fn mark_serving() {
+    SERVING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Reaction to the FIRST GPU-context poisoning. `from_serving_model` is true
+/// when a model that was already serving failed (the inference path); false
+/// when the failing operation was a model LOAD. The context is wedged for the
+/// life of the process (decisions 2026-06-02: a restart is the only proven
+/// cure), so under `--supervise` the worker drains and exits and the
+/// supervisor respawns it. It stays up, degraded, when there is no supervisor
+/// (nothing would restart it), when the poisoning happened during startup, or
+/// when a model LOAD caused it (a preload or on-demand/admin load OOM: the same
+/// load fails again after a restart, a client that retries it would turn that
+/// into a restart loop, and the CPU/NPU models can keep serving). Always logged at ERROR - an operator reading the log must be able
+/// to see why the server went away or why it did not.
+pub fn on_gpu_poisoned(model_id: &str, from_serving_model: bool) {
+    let supervised = std::env::var_os(SUPERVISED_ENV).is_some();
+    let serving = SERVING.load(std::sync::atomic::Ordering::Acquire);
+    if supervised && serving && from_serving_model {
+        tracing::error!(
+            model_id,
+            exit_code = EXIT_GPU_POISONED,
+            "GPU context poisoned - draining in-flight requests and exiting so the supervisor \
+             restarts the worker (engine teardown is skipped: a poisoned context refuses it)"
+        );
+        GPU_POISON_EXIT.store(true, std::sync::atomic::Ordering::Release);
+        raise_flag(&SHUTDOWN_REQUEST, &SHUTDOWN_REQUESTED);
+    } else if supervised && serving {
+        tracing::error!(
+            model_id,
+            "GPU context poisoned while LOADING a model - NOT exiting: the same load would fail \
+             again after a restart (usually a wrong vram_gb / KV estimate), and the CPU/NPU \
+             models keep serving; GPU models are unusable until the server is restarted"
+        );
+    } else if supervised {
+        tracing::error!(
+            model_id,
+            "GPU context poisoned during startup - NOT exiting (a restart would repeat the \
+             failure); staying up degraded, GPU models are unusable until a manual restart"
+        );
+    } else {
+        tracing::error!(
+            model_id,
+            "GPU context poisoned - NOT exiting (no --supervise parent to restart the worker); \
+             every GPU model is unusable until the server is restarted manually"
+        );
+    }
+}
+
+/// Terminates the process immediately with `code`, running no `atexit` handlers, static destructors or
+/// thread teardown. Used only for the GPU-poisoned exit, where the normal teardown crashes (see [`serve`]).
+#[cfg(unix)]
+fn exit_without_destructors(code: u8) -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` only reads an integer and ends the process; it is async-signal-safe and touches no
+    // Rust state. Skipping destructors is the intent: they would run pipeline teardown on a poisoned context.
+    unsafe { libc::_exit(i32::from(code)) }
+}
+
+/// Non-Unix fallback (the supervisor and the poison exit are Unix-only today): a normal exit.
+#[cfg(not(unix))]
+fn exit_without_destructors(code: u8) -> ! {
+    std::process::exit(i32::from(code))
+}
+
+/// Proves `dir` exists (creating it) and accepts a new file, then removes the
+/// probe. `OpenVINO` skips its compile cache without a word when it cannot write
+/// there, so an unwritable `ov_cache_dir` looks like a working server that
+/// recompiles every model on every load; this makes the cause visible at boot.
+///
+/// # Errors
+///
+/// The I/O error that stopped it (permission denied, a file in the way, ...).
+pub fn probe_cache_dir_writable(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".write-probe");
+    std::fs::write(&probe, b"x")?;
+    std::fs::remove_file(&probe)
+}
+
+/// Proves an existing file can be opened for writing, without changing it
+/// (append mode, nothing written). Used for the files `rv` and the admin API
+/// rewrite in place (`config.json`, the keys file): an ACL or read-only
+/// attribute that denies the write otherwise shows up only later, as an `rv
+/// patch` failing with "access denied". A missing file is not an error here.
+///
+/// # Errors
+///
+/// The I/O error that stopped it (permission denied, ...).
+pub fn probe_file_writable(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map(|_| ())
 }
 
 /// Result of [`bootstrap`] — everything needed to build a [`axum::Router`]
@@ -125,9 +327,51 @@ pub struct Startup {
 /// preload model fails to load).
 #[allow(clippy::too_many_lines)]
 pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
+    mark_process_start();
     let config_path = resolve_config_path()?;
     tracing::info!(path = %config_path.display(), "loading config");
     let config = Config::load(&config_path)?;
+    if let Some(dir) = config.ov_cache_dir.as_deref().filter(|d| !d.is_empty())
+        && let Err(e) = probe_cache_dir_writable(Path::new(dir))
+    {
+        tracing::warn!(
+            path = dir,
+            error = %e,
+            "ov_cache_dir is not writable — OpenVINO will silently skip its compile cache and \
+             recompile every model on every load (on Windows: check the folder's ACL and \
+             integrity level; staging it from another OS can leave it read-only to this user)"
+        );
+    }
+
+    // Dynamic KV allocation plus prefix caching: retained prefix blocks then grow
+    // outside the VRAM budget (see `Config::enable_prefix_caching`).
+    if config.cache_size_gb == 0.0 && config.enable_prefix_caching {
+        tracing::warn!(
+            "cache_size_gb is 0.0 (dynamic KV allocation) with enable_prefix_caching on - \
+             retained prefix blocks can grow without bound outside the memory budget; set a \
+             fixed cache_size_gb or turn enable_prefix_caching off"
+        );
+    }
+
+    // The compile cache's sidecar directory and the config file are written at
+    // runtime too (model-hash memo / provenance; `rv patch`, admin edits). Same
+    // Windows failure as above, different symptom, so same early warning.
+    if let Some(root) = crate::cache_manifest::manifest_root(config.ov_cache_dir.as_deref())
+        && let Err(e) = probe_cache_dir_writable(&root)
+    {
+        tracing::warn!(
+            path = %root.display(), error = %e,
+            "cache_manifest directory is not writable — model-hash memoisation and provenance \
+             records will not be saved (check the folder's ACL and integrity level)"
+        );
+    }
+    if let Err(e) = probe_file_writable(&config_path) {
+        tracing::warn!(
+            path = %config_path.display(), error = %e,
+            "config file is not writable — `rv patch` and admin config edits will fail \
+             (check the file's ACL; staging from another OS can leave it read-only)"
+        );
+    }
 
     // ── Probe the device inventory (Phase A) ────────────────────────────
     // Snapshot every OpenVINO device's kind / tier / memory-domain at startup
@@ -180,6 +424,13 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     let cors_origins = config.cors_allowed_origins.clone();
 
     let keys_path = resolve_keys_file_path(&config_path, config.keys_file.as_deref());
+    if let Err(e) = probe_file_writable(&keys_path) {
+        tracing::warn!(
+            path = %keys_path.display(), error = %e,
+            "keys file is not writable — key rotation through the CLI will fail (check the \
+             file's ACL)"
+        );
+    }
     check_no_inline_keys(&config, &keys_path)?;
     let (loaded_keys, admin_locked) = load_keys_file_for_boot(&keys_path)?;
     let api_keys = loaded_keys.api_keys.clone();
@@ -410,6 +661,7 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = sigterm => {},
+        () = wait_for_flag(&SHUTDOWN_REQUEST, &SHUTDOWN_REQUESTED) => {},
     }
 }
 
@@ -444,6 +696,7 @@ pub async fn serve(
     tracing::info!(%addr, "RustedVINO listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    mark_serving();
 
     // The oneshot tells the select below *when* the signal fired so the drain
     // deadline starts then, not at process start.
@@ -502,6 +755,17 @@ pub async fn serve(
     // normal path this is where engines drop and VRAM is released.
     teardown_engines(model_manager).await;
     tracing::info!("shutdown complete — engines drained and VRAM released");
+
+    if gpu_poison_exit_requested() {
+        // Do NOT return: returning drops the model manager, which lets every engine thread destroy its
+        // pipeline, and destroying a pipeline on a poisoned GPU context segfaults inside the GPU plugin
+        // (seen in an overnight-test rehearsal: SIGSEGV instead of exit code 75, with a crash dump each time).
+        tracing::info!(
+            exit_code = EXIT_GPU_POISONED,
+            "GPU context poisoned: leaving now without running destructors; the supervisor restarts the worker"
+        );
+        exit_without_destructors(EXIT_GPU_POISONED);
+    }
 
     Ok(())
 }
@@ -626,6 +890,94 @@ mod tests {
         assert!(
             err.contains("admin_keys") || err.contains("unknown"),
             "{err}"
+        );
+    }
+    #[test]
+    fn per_user_config_path_is_under_localappdata() {
+        let p = per_user_config_path(Some(std::ffi::OsStr::new("base"))).unwrap();
+        assert!(
+            p.ends_with(Path::new("RustedVINO").join("config.json")),
+            "{p:?}"
+        );
+        assert!(p.starts_with("base"));
+        assert_eq!(per_user_config_path(None), None);
+        assert_eq!(per_user_config_path(Some(std::ffi::OsStr::new(""))), None);
+    }
+
+    /// The probe passes on a writable directory (creating it), leaves nothing
+    /// behind, and fails where a file blocks the path.
+    #[test]
+    fn cache_dir_probe_accepts_writable_and_rejects_blocked_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("a/b/ov_cache");
+        probe_cache_dir_writable(&target).unwrap();
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "probe cleans up"
+        );
+
+        let file = d.path().join("plain_file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(probe_cache_dir_writable(&file.join("sub")).is_err());
+        assert!(probe_cache_dir_writable(&file).is_err());
+    }
+
+    /// A present, writable file passes untouched; a read-only one fails; a
+    /// missing one is not an error (an optional keys file).
+    #[test]
+    fn file_probe_accepts_writable_and_missing_and_rejects_read_only() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("config.json");
+        std::fs::write(&f, b"{}").unwrap();
+        probe_file_writable(&f).unwrap();
+        assert_eq!(
+            std::fs::read(&f).unwrap(),
+            b"{}",
+            "probe must not alter the file"
+        );
+        probe_file_writable(&d.path().join("absent.json")).unwrap();
+
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms).unwrap();
+        // Running as root bypasses the permission bit; only assert when it bites.
+        if std::fs::OpenOptions::new().append(true).open(&f).is_err() {
+            assert!(probe_file_writable(&f).is_err());
+        }
+    }
+
+    /// Several tasks wait on one shutdown request (`serve` plus the sweep and
+    /// KV-monitor loops); ALL of them must wake, and one that starts waiting
+    /// after the request must resolve at once. `notify_one` woke only the first.
+    /// Local flag/notify, so no process-global state or signal handler is touched.
+    #[tokio::test]
+    async fn shutdown_request_wakes_every_waiter_including_late_ones() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let (n, f) = (Arc::clone(&notify), Arc::clone(&flag));
+                tokio::spawn(async move { wait_for_flag(&n, &f).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "nobody wakes early"
+        );
+
+        raise_flag(&notify, &flag);
+        for w in waiters {
+            let woke = tokio::time::timeout(Duration::from_secs(5), w).await;
+            assert!(woke.is_ok(), "every waiter must wake on one request");
+        }
+        let late =
+            tokio::time::timeout(Duration::from_secs(5), wait_for_flag(&notify, &flag)).await;
+        assert!(
+            late.is_ok(),
+            "a waiter arriving after the request resolves at once"
         );
     }
 }

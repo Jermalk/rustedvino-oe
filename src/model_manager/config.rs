@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // track. `kv_pressure_monitor_enabled` pushed this over the lint's default
 // threshold; not worth restructuring the whole config type for one flag.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     /// Directory containing model subdirectories.
     ///
@@ -122,6 +122,18 @@ pub struct Config {
     /// errors during multi-model loads.
     #[serde(default = "default_vram_safety_margin")]
     pub vram_safety_margin_gb: f64,
+
+    /// Multiplier applied to a model's `vram_gb` when it is placed on the NPU,
+    /// for the memory accounting only (the figure shown for the model is
+    /// unchanged). An NPU model's real footprint is well above its weight
+    /// size: Windows pass 2 (D8) measured 7.6-8.4 GB of NPU adapter memory
+    /// for an 8B int4 model reserved at 5.5 GB, which let the GPU model next to
+    /// it take a KV pool the shared budget could not back (and the GPU context
+    /// then died, D2). On a shared-memory box that memory comes out of the
+    /// same budget as the iGPU's. Default 1.5; `1.0` charges the configured
+    /// figure as-is. Must be at least 1.0.
+    #[serde(default = "default_npu_footprint_factor")]
+    pub npu_footprint_factor: f64,
 
     /// Minimum KV cache pool size in GB.
     ///
@@ -219,15 +231,17 @@ pub struct Config {
     #[serde(default)]
     pub domain_budgets: HashMap<String, f64>,
 
-    /// Realtime voice arbitration v2
-    /// (the project's internal engineering log, D3): how long, in seconds, a model stays
-    /// hard-protected from eviction after any channel — admin load, plain
-    /// API use, or a realtime turn — last used it. Self-expiring, checked
-    /// against `last_used` on top of the always-on `pinned`/`evictable` hard
-    /// excludes. Decided 2026-08-06: 300s, uniform across every channel (no
-    /// special-cased longer window for admin loads). `0.0` disables grace
-    /// globally. A per-model [`ModelPolicy::eviction_grace_secs`] override
-    /// takes precedence when set.
+    /// How long, in seconds, a model stays hard-protected from eviction after
+    /// any channel — admin load, plain API use, or a realtime turn — last used
+    /// it. Self-expiring, checked against `last_used` on top of the always-on
+    /// `pinned`/`evictable` hard excludes. Uniform across every channel (no
+    /// special-cased longer window for admin loads); `force` on a load bypasses
+    /// it. Default 2s (was 300s until Windows pass 2, D4). A model with a
+    /// running request is NOT protected by this window: it sorts last in the
+    /// victim order, and evicting it for another model's load drains it for up
+    /// to 15 s and then aborts what is left (`rv check` lists such victims as
+    /// busy). `0.0` disables the window globally. A per-model
+    /// [`ModelPolicy::eviction_grace_secs`] override takes precedence when set.
     #[serde(default = "default_eviction_grace_secs")]
     pub eviction_grace_secs: f64,
 
@@ -491,8 +505,9 @@ pub struct Config {
     /// **NPU:** NPU LLMs use it too (since 2026-09-28): `ov_pipeline_create`
     /// sets `CACHE_DIR`, storing one weightless compiled `.blob` per model
     /// (~0.66 GB for an 8B int4 model) — measured ~6 s cached load vs 30.7 s
-    /// cold. The NPU *Whisper* pipeline is deliberately excluded (it hangs with
-    /// a cache dir; see the `Stt` arm in `lifecycle.rs`).
+    /// cold. The NPU *Whisper* pipeline uses it as well (since 2026-10-02; the
+    /// earlier hang does not reproduce on the current stack; see the `Stt` arm
+    /// in `lifecycle.rs`).
     #[serde(default)]
     pub ov_cache_dir: Option<String>,
 
@@ -594,7 +609,7 @@ fn default_kv_cache_precision() -> String {
 /// ([`crate::supervisor`], Unix only). A worker crash restarts it after an
 /// increasing backoff; a rolling window bounds total restarts so a
 /// deterministic crash cannot loop forever against a slow cold GPU init.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SupervisorConfig {
     /// Delay before the first respawn attempt, doubling each subsequent
     /// attempt up to [`backoff_max_secs`](Self::backoff_max_secs). Default 5s.
@@ -676,10 +691,14 @@ fn default_kv_resize_cooldown_secs() -> u64 {
     30
 }
 
-/// Realtime voice arbitration v2 default eviction-grace window: 300s,
-/// matching `voice_pin::VOICE_FLOW_TTL`'s existing scale (decided 2026-08-06).
-fn default_eviction_grace_secs() -> f64 {
-    300.0
+/// Default eviction-grace window: 2s. It only has to cover the race between a
+/// load finishing and its first request arriving; a model with a running
+/// request is protected separately (`ModelRecord::has_in_flight`) and so is the
+/// realtime serving set. Was 300s (decided 2026-08-06, realtime arbitration v2)
+/// until Windows pass 2 (D4) showed it blocking ordinary model switches for
+/// five minutes; a box that wants the long window sets `eviction_grace_secs`.
+pub(crate) fn default_eviction_grace_secs() -> f64 {
+    2.0
 }
 
 /// Known realtime-capability labels (`ModelPolicy::capabilities`,
@@ -696,7 +715,7 @@ pub(crate) const KNOWN_CAPABILITIES: &[&str] = &["tool_calling"];
 /// shape, but read by `resolve_realtime_llm` instead of startup loading.
 /// Every field independently optional: a node can set only `llm_model` and
 /// leave STT/TTS to today's discovery behavior.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RealtimeDefaults {
     /// Default STT model for a realtime session that doesn't request one.
     #[serde(default)]
@@ -719,7 +738,7 @@ pub struct RealtimeDefaults {
 
 /// Realtime voice arbitration v2 (D4): the "viable minimum" capability
 /// floor a model must clear to serve the realtime LLM slot.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct RealtimeViableMinimum {
     /// The LLM/VLM floor. `None` ⇒ no floor configured for this node (every
     /// `text_gen`/`vision` model is viable, today's de-facto behavior).
@@ -731,7 +750,7 @@ pub struct RealtimeViableMinimum {
 /// floor** iff its kind is in `kinds`, its context length clears
 /// `min_context_tokens`, and its declared [`ModelPolicy::capabilities`]
 /// is a superset of `require_capabilities`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ViableMinimumLlm {
     /// `ModelKind` labels a model must have one of to be viable. Default:
     /// `["text_gen", "vision"]` — today's de-facto realtime-LLM kind set.
@@ -1116,7 +1135,7 @@ pub struct ModelEntry {
     pub vram_gb: f64,
 
     /// Model kind hint. Valid values: `"embedding"`, `"text_gen"`,
-    /// `"vision"`, `"stt"`, `"tts"`, `"image_gen"`, `"reranking"`.
+    /// `"vision"`, `"stt"`, `"tts"`, `"image_gen"`, `"reranking"`, `"decision"`.
     /// When absent, the manager auto-detects from the model directory layout;
     /// explicit values win. An embedding model MUST declare `"kind":
     /// "embedding"` — it ships the same file layout as a plain LLM.
@@ -1374,6 +1393,66 @@ impl ModelEntryPatch {
     }
 }
 
+/// Reads a JSON file as text, dropping a leading UTF-8 byte-order mark.
+/// Windows PowerShell 5.1 (`Set-Content -Encoding utf8`) and Notepad write one,
+/// and `serde_json` rejects it with a bare "expected value at line 1 column 1"
+/// (Windows pass 2, D12). Used for every JSON file the operator edits by hand:
+/// the config and the keys file.
+///
+/// # Errors
+///
+/// The I/O error from reading the file, or `InvalidData` if it is not UTF-8.
+pub fn read_json_text(path: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_owned(),
+        None => text,
+    })
+}
+
+/// The JSON stanza to persist for `merged` under `models.<id>`: its non-default
+/// fields plus any field the file's existing stanza (`old`) already spelled
+/// out, and always `vram_gb`. Serialising the whole entry wrote every default
+/// (`kind: null`, `pinned: false`, ...) into a hand-written stanza on the first
+/// `rv patch` (Windows pass 2, D13); a field at its default that the operator
+/// never wrote stays unwritten, and one they did write keeps its place.
+///
+/// # Errors
+///
+/// A serialisation failure (not expected for a plain data struct).
+pub fn minimal_stanza(
+    old: Option<&serde_json::Value>,
+    merged: &ModelEntry,
+) -> serde_json::Result<serde_json::Value> {
+    let full = serde_json::to_value(merged)?;
+    let defaults = serde_json::to_value(ModelEntry {
+        vram_gb: merged.vram_gb,
+        ..ModelEntry::default()
+    })?;
+    let (Some(full_map), Some(default_map)) = (full.as_object(), defaults.as_object()) else {
+        return Ok(full);
+    };
+    // Start from the stanza as written: its key ORDER and any key this build
+    // does not model stay exactly where they are; only changed or new fields
+    // are touched (`Map::insert` keeps an existing key's position).
+    let mut out = old
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (k, v) in full_map {
+        if k == "vram_gb" || out.contains_key(k) || default_map.get(k) != Some(v) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// Default for [`Config::npu_footprint_factor`]: the measured adapter/reserved
+/// ratio on the Windows pass-2 box (8.4 / 5.5 = 1.5).
+pub(crate) fn default_npu_footprint_factor() -> f64 {
+    1.5
+}
+
 fn default_vram_safety_margin() -> f64 {
     1.0 // 1 GB — observed headroom for the OV/OpenCL runtime on Battlemage
 }
@@ -1459,6 +1538,44 @@ fn default_port() -> u16 {
 }
 
 impl Config {
+    /// Setting names deliberately left out of [`default_template`](Self::default_template):
+    /// the two deprecated inline key lists (a non-empty value is a startup
+    /// error; keys live in the keys file) and the catch-all for unknown keys.
+    pub const UNTEMPLATED: [&str; 3] = ["api_keys", "admin_api_keys", "unknown_fields"];
+
+    /// Every global setting an operator can write in `config.json`, with the
+    /// value the server uses when it is absent, in `Config` field order. `models_dir`, `device` and `total_vram_gb` have no default:
+    /// they carry placeholders. This is what `--print-default-config` prints
+    /// and what the shipped configs and `CONFIG.md` are checked
+    /// against, so a setting added to [`Config`] cannot stay out of them.
+    ///
+    /// # Errors
+    ///
+    /// A serialisation failure (not expected for these plain data types).
+    pub fn default_template() -> anyhow::Result<serde_json::Value> {
+        let base: Self = serde_json::from_str(
+            r#"{"models_dir":"/path/to/models","device":"GPU","total_vram_gb":0.0}"#,
+        )?;
+        let mut value = serde_json::to_value(&base)?;
+        if let Some(map) = value.as_object_mut() {
+            for k in Self::UNTEMPLATED {
+                map.shift_remove(k);
+            }
+        }
+        Ok(value)
+    }
+
+    /// One model stanza with every per-model setting at its default (the
+    /// `models.<id>` object): `vram_gb` and `kind` first, then the policy
+    /// fields. What `--print-default-model` prints.
+    ///
+    /// # Errors
+    ///
+    /// A serialisation failure (not expected for these plain data types).
+    pub fn default_model_template() -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(ModelEntry::default())?)
+    }
+
     /// Load and deserialise configuration from a JSON file on disk.
     ///
     /// # Errors
@@ -1469,7 +1586,7 @@ impl Config {
     /// - A numeric VRAM/cache knob is non-finite, negative, or the margins are
     ///   inconsistent (see [`validate`](Self::validate)).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
+        let content = read_json_text(path)
             .map_err(|e| anyhow::anyhow!("cannot read config {}: {e}", path.display()))?;
         let config: Self = serde_json::from_str(&content)
             .map_err(|e| anyhow::anyhow!("invalid config {}: {e}", path.display()))?;
@@ -1514,6 +1631,11 @@ impl Config {
             );
             anyhow::ensure!(v >= 0.0, "config {name} must be non-negative, got {v}");
         }
+        anyhow::ensure!(
+            self.npu_footprint_factor.is_finite() && self.npu_footprint_factor >= 1.0,
+            "config npu_footprint_factor must be a finite number >= 1.0, got {}",
+            self.npu_footprint_factor
+        );
         anyhow::ensure!(
             self.kv_pressure_threshold_pct <= 100.0,
             "config kv_pressure_threshold_pct must be a percentage (0-100), got {}",
@@ -1899,7 +2021,7 @@ define_globals_not_applied! {
     exempt: [models, api_keys, admin_api_keys, keys_file, unknown_fields],
     diffed: [
         models_dir, device, preload, total_vram_gb, max_num_seqs, cache_size_gb,
-        default_kv_cache_gb, vram_safety_margin_gb, min_kv_cache_gb,
+        default_kv_cache_gb, vram_safety_margin_gb, npu_footprint_factor, min_kv_cache_gb,
         system_ram_reservation_gb, system_ram_budget_gb, light_model_max_gb,
         light_stt_max_gb, dgpu_size_ceiling_fraction, domain_budgets,
         eviction_grace_secs, realtime_defaults, realtime_viable_minimum,
@@ -1920,6 +2042,85 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Windows pass 2 D12: a config written with a UTF-8 BOM (PowerShell 5.1
+    /// `Set-Content -Encoding utf8`, Notepad) loads exactly like one without.
+    #[test]
+    fn config_with_a_utf8_bom_loads_like_one_without() {
+        let d = tempfile::tempdir().unwrap();
+        let body = r#"{"models_dir":"/m","device":"GPU","total_vram_gb":22.5}"#;
+        let plain = d.path().join("plain.json");
+        let bom = d.path().join("bom.json");
+        std::fs::write(&plain, body).unwrap();
+        std::fs::write(&bom, format!("\u{feff}{body}")).unwrap();
+        let a = Config::load(&plain).unwrap();
+        let b = Config::load(&bom).unwrap();
+        assert!((a.total_vram_gb - b.total_vram_gb).abs() < f64::EPSILON);
+        assert_eq!(a.models_dir, b.models_dir);
+        assert_eq!(read_json_text(&bom).unwrap(), body);
+    }
+
+    /// Windows pass 2 D13: persisting a patched model keeps the operator's
+    /// stanza as written — it gains the patched field, not every default.
+    #[test]
+    fn minimal_stanza_adds_only_the_patched_field() {
+        let old: serde_json::Value =
+            serde_json::from_str(r#"{"vram_gb":2.5,"pinned":true}"#).unwrap();
+        let mut merged: ModelEntry = serde_json::from_value(old.clone()).unwrap();
+        merged.policy.priority = 1;
+        let out = minimal_stanza(Some(&old), &merged).unwrap();
+        let keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["vram_gb", "pinned", "priority"], "{out}");
+        assert_eq!(out["priority"], 1);
+        assert_eq!(out["pinned"], true);
+        assert!(out.get("kind").is_none(), "no `kind: null` written: {out}");
+    }
+
+    /// A field the operator wrote stays even when patched back to its default;
+    /// a brand-new stanza (`add_model`) carries only non-defaults.
+    #[test]
+    fn minimal_stanza_keeps_written_fields_and_omits_untouched_defaults() {
+        let old: serde_json::Value =
+            serde_json::from_str(r#"{"vram_gb":2.5,"pinned":true}"#).unwrap();
+        let mut merged: ModelEntry = serde_json::from_value(old.clone()).unwrap();
+        merged.policy.pinned = false;
+        let out = minimal_stanza(Some(&old), &merged).unwrap();
+        assert_eq!(out["pinned"], false, "{out}");
+
+        let fresh = minimal_stanza(
+            None,
+            &ModelEntry {
+                vram_gb: 3.0,
+                ..ModelEntry::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.as_object().unwrap().len(), 1, "only vram_gb: {fresh}");
+    }
+
+    /// The operator's key order and a key this build does not model survive a
+    /// patch (a stanza hand-written as `device` before `vram_gb`).
+    #[test]
+    fn minimal_stanza_keeps_key_order_and_unknown_keys() {
+        let old: serde_json::Value =
+            serde_json::from_str(r#"{"device":"NPU","note":"keep me","vram_gb":5.5}"#).unwrap();
+        let mut merged: ModelEntry = serde_json::from_value(old.clone()).unwrap();
+        merged.policy.priority = 2;
+        let out = minimal_stanza(Some(&old), &merged).unwrap();
+        let keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["device", "note", "vram_gb", "priority"], "{out}");
+        assert_eq!(out["note"], "keep me");
+    }
 
     /// An unchanged file reports nothing — the common path must stay quiet, so
     /// the new field never adds noise to a routine model-only reload.

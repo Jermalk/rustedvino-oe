@@ -49,6 +49,9 @@ pub enum WorkClass {
     /// The realtime voice turn's atomic up-front multi-device lease (step 3;
     /// wired in `run_response`, `src/handlers/realtime.rs`).
     RealtimeTurn,
+    /// `/v1/systemone` decisions: one lease per request, held across all of its questions'
+    /// prefills (up to 64 × 8K tokens on the decision model's device).
+    Decide,
 }
 
 impl WorkClass {
@@ -61,6 +64,7 @@ impl WorkClass {
             Self::Stt => "stt",
             Self::Tts => "tts",
             Self::RealtimeTurn => "realtime_turn",
+            Self::Decide => "decide",
         }
     }
 }
@@ -170,6 +174,18 @@ impl DeviceBudgets {
             config.device_budgets.clone(),
             Duration::from_millis(config.device_admission_queue_timeout_ms),
         )
+    }
+
+    /// Whether `device` has a configured budget (otherwise `admit` is a pass-through).
+    #[must_use]
+    pub fn is_budgeted(&self, device: &str) -> bool {
+        self.devices.contains_key(device)
+    }
+
+    /// The queue timeout one `admit()` call (and a serial engine's turn gate) may wait.
+    #[must_use]
+    pub fn queue_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Acquire `cost` tokens on each `(device, cost)` pair, in sorted-device

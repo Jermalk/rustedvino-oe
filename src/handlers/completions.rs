@@ -331,7 +331,7 @@ pub async fn completions(
     let gen_params = GenParams {
         max_new_tokens: clamp_max_tokens(req.max_tokens, 16, max_tokens_cap),
         temperature,
-        top_p,
+        top_p: super::chat::clamp_top_p(top_p),
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
         repetition_penalty: resolve_repetition_penalty(req.repetition_penalty),

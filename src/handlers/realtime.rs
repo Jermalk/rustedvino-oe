@@ -3706,6 +3706,7 @@ mod tests {
             cache_size_gb: 0.0,
             default_kv_cache_gb: 0.0,
             vram_safety_margin_gb: 0.0,
+            npu_footprint_factor: 1.0,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,

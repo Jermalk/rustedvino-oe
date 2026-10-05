@@ -8,6 +8,34 @@ per-model policy overrides — there is no separate `vram_gb`/`model_kinds`/`mod
 map. A model ID not listed here is unknown (404 everywhere), even if its directory exists
 under `models_dir`.
 
+## Every setting is written out
+
+`config.json` is plain JSON, so it cannot carry comments: the file holds the **values** and this
+document holds the **meaning**. A setting left out of the file silently takes a built-in default,
+and a setting you cannot see is one you forget you have, so every shipped config under
+`scripts/` (and the starter `dist.example.config.json`) lists **all** global settings and **all**
+per-model settings, each at the value in effect. Writing the default out changes nothing about how
+the server behaves (checked when this was done: every shipped config that loaded before parsed to
+the identical configuration afterwards; the co-residency example used an obsolete schema and had
+never loaded, so it was rewritten instead). `null` means "not set / automatic" for that setting; the rows below say what automatic is.
+
+- `rustedvino --print-default-config` prints every global setting with its default (`models_dir`,
+  `device` and `total_vram_gb` carry placeholders: they have no default). `rustedvino
+  --print-default-model` prints one `models.<id>` stanza the same way.
+- `scripts/fill-config-defaults.py CONFIG...` adds whatever your file is missing, using exactly
+  those defaults. It never changes a value you set, keeps keys it does not know, and rewrites the
+  file in a fixed order (globals in the order `--print-default-config` prints them, which is the
+  order of the `Config` struct and not the order of the tables below; `models` last; per model
+  `vram_gb`, `kind`, then the policy fields). `--check` writes nothing and exits 1 if something is missing - run it after
+  an upgrade to see which settings the new version added.
+- The placeholders `--print-default-config` prints are not safe defaults to run with: `total_vram_gb: 0.0` switches memory gating OFF (every load is admitted without a capacity check), so set it to your device's real budget.
+- `api_keys` / `admin_api_keys` are deliberately not in the files: they are deprecated and a
+  non-empty value is a startup error (keys live in the keys file, see `keys_file`).
+- When a new version changes what a setting does by default, its release notes say so, and the
+  shipped configs name the value explicitly, so an upgrade never changes behaviour behind your
+  back for a setting you wrote down. `tests/shipped_configs.rs` and `tests/config_reference.rs`
+  fail `cargo test` if a setting is missing from a shipped config or from this document.
+
 **`Config` fields** (see `src/model_manager/config.rs` for full doc comments):
 
 | Field | Type / default | Description |
@@ -18,9 +46,10 @@ under `models_dir`.
 | `models` | `{}` | Map of model ID → `{vram_gb, kind, ...per-model policy}` — see `ModelEntry`/`ModelPolicy` below |
 | `total_vram_gb` | required | Usable VRAM (GB) on the inference device; `0.0` disables VRAM gating |
 | `max_num_seqs` | `16` | CB scheduler concurrency cap and the HTTP 429 admission gate; `0` = OV default (256) |
-| `cache_size_gb` | `0.0` | Cap on the KV cache pool; `0.0` = uncapped (model grabs all remaining VRAM) |
+| `cache_size_gb` | `0.0` | Cap on the KV cache pool; `0.0` = uncapped (model grabs all remaining VRAM). Do not combine `0.0` with `enable_prefix_caching: true`: retained prefix blocks then grow outside the memory budget (the server warns at boot). The starter `dist.example.config.json` sets `2.0` |
 | `default_kv_cache_gb` | `0.0` | Global default bounded KV-pool target (GB) per model; `0.0` = unbounded |
 | `vram_safety_margin_gb` | `1.0` | VRAM held back for driver/runtime overhead |
+| `npu_footprint_factor` | `1.5` | Multiplier on a model's `vram_gb` when it runs on the NPU, for admission only (the listed figure is unchanged). An NPU model's real footprint exceeds its weights: Windows measured 7.6-8.4 GB of NPU adapter memory for an 8B int4 model reserved at 5.5 GB, which let a GPU model next to it take a KV pool the shared budget could not back. Linux's per-process DRM accounting measures the same model at ~5.2 GB, so a Linux box can set `1.0`. Must be >= 1.0 |
 | `min_kv_cache_gb` | `1.0` | Minimum KV pool GB; a load that would leave less is refused |
 | `system_ram_reservation_gb` | `null` | System RAM (GB) held back from the shared "system" domain budget; `null` = per-OS default |
 | `system_ram_budget_gb` | `null` | **UMA boxes only.** System RAM (GB) the server may treat as its own — the unified-memory twin of `total_vram_gb`. `null` keeps the historical live gate (`MemAvailable` alone). When set, the gate uses `min(MemAvailable + reclaimable GPU page cache, this)`, because `MemAvailable` **omits** the DRM/TTM page pool — freed GPU pages the kernel holds for reuse, counted as `used`. Measured 2026-09-07: that pool held ~8.8 GB and a 12 GB model was refused on a 30 GB box as "can never fit". Opt-in because crediting reclaimable cache is the less conservative direction; `system_ram_reservation_gb` still applies as an OS floor on top |
@@ -28,16 +57,16 @@ under `models_dir`.
 | `light_stt_max_gb` | `1.0` | Size threshold (GB) below which a Whisper model is "light" for auto placement |
 | `dgpu_size_ceiling_fraction` | `0.8` | Default-placement guard: a model whose `vram_gb` exceeds this fraction of a discrete GPU's usable VRAM is skipped for that device in *default* tier preference; explicit `device`/`tier_preference` sidesteps it. `>= 1.0` disables |
 | `domain_budgets` | `{}` | Per-memory-domain VRAM budget overrides, keyed by domain id (GPU name or `"system"`) |
-| `device_budgets` | `{}` | Cross-pipeline device admission caps, keyed by live OV device string; empty = passthrough |
+| `device_budgets` | `{}` | Cross-pipeline device admission caps, keyed by live OV device string; empty = passthrough. Covers chat, VLM, embeddings, STT, TTS, realtime and `/v1/systemone` (one lease per request) — a budget counts every in-flight request, and a chat stream holds its slot for its whole stream, so it caps continuous batching: size it at or above the chat model's `max_num_seqs` plus headroom (one decision turn, embeddings, rerank) — e.g. `{"GPU.1": 20}` for a 16-sequence chat model. On a B70, 4 refused 64% of a 12-stream chat load and cut throughput by two thirds; a decision model no longer needs a small budget to avoid starving chat, because its requests take one lease at a time |
 | `device_admission_queue_timeout_ms` | `5000` | Queue timeout for `device_budgets` (separate from `admission_queue_timeout_ms`) |
 | `kv_cache_precision` | `"u8"` | `"u8"` compresses the KV cache 8-bit, roughly doubling context capacity for a given VRAM budget, small quality cost; `""` keeps the plugin's native precision (f16 on Intel GPU); `"f16"`/`"f32"` explicit |
 | `enable_prefix_caching` | `true` | Reuse KV blocks across CB requests sharing an identical prompt prefix. Side effect on seeded sampling: a reused-prefix prefill rounds slightly differently from a full one, so the first request for a prompt can differ from its later identical repeats (the repeats match each other). Set `false` when exact reproducibility of the first answer matters |
-| `cors_allowed_origins` | `["*"]` | CORS allowed origins |
+| `cors_allowed_origins` | `["*"]` | CORS allowed origins. The default allows any origin (methods and headers too, no credentials), which suits browser tools but means that on a server with **no API keys**, any web page you open in a browser on the same machine can call it. List your front-end origins explicitly, or configure keys, anywhere the host also runs a browser |
 | `api_keys` | `[]` | **Deprecated, migration tripwire only — never read for auth.** A non-empty value is a hard startup error naming where to move the keys. Real inference-scope keys live in `keys_file` |
 | `admin_api_keys` | `[]` | **Deprecated, same tripwire as `api_keys`.** Real admin-scope keys live in `keys_file` |
 | `keys_file` | `null` | Path to the real Bearer-key file (`{"api_keys": [...], "admin_api_keys": [...]}`), never `config.json` itself. `null` resolves to `<config-dir>/<config-stem>.keys.json` (e.g. `config.json` → `config.keys.json`); a relative value resolves against the config file's own directory. Never git-tracked (`.gitignore`: `*.keys.json`); should be mode `0600`. **If no keys file exists at boot, every `/v1/admin/*` route and `/metrics` return a permanent `503 admin_not_configured` for that process's lifetime** — creating the file afterward needs a restart (or `POST /v1/admin/keys/reload` once admin is unlocked some other way). An existing-but-empty keys file (`{}`) is valid and unlocks admin with no auth required |
 | `admission_queue_timeout_ms` | `5000` | How long to queue a request before returning 429 |
-| `eviction_grace_secs` | `300.0` | Window (seconds) after a model finishes serving before it becomes eviction-eligible; `0.0` disables the grace window. Per-model `eviction_grace_secs` overrides this |
+| `eviction_grace_secs` | `2.0` | Window (seconds) after a model was last used or loaded before it becomes eviction-eligible; `0.0` disables the grace window. A model with a request running sorts last in the victim order and is drained before it is evicted; `rv load --force` skips the window only. Was `300.0` before 0.8.0; set it back on a box where voice clients must not displace an operator-loaded model. Every shipped config (`scripts/*.config.json`) states it explicitly, so it is visible and editable in the file rather than a default you have to remember (pinned by `tests/shipped_configs.rs`). Per-model `eviction_grace_secs` overrides this |
 | `realtime_defaults` | `null` | Default `{stt_model, llm_model, tts_model, embed_model}` seeded into new realtime voice sessions |
 | `realtime_viable_minimum` | `null` | Minimum LLM viability for realtime voice sessions: `{llm: {kinds, min_context_tokens, require_capabilities}}`; `kinds` defaults to `["text_gen","vision"]` |
 | `embedding_device` | `null` | OpenVINO device for embedding models; `null` = auto-select |
@@ -51,7 +80,7 @@ under `models_dir`.
 | `bind_addr` | `"127.0.0.1"` | Bind address. For LAN access set `"0.0.0.0"` **and** populate the keys file (the safe way); `allow_insecure_public_bind: true` is needed only to run a non-loopback bind with no keys at all (an open server) |
 | `port` | `11437` | HTTP port |
 | `allow_insecure_public_bind` | `false` | Explicit opt-in to a non-loopback bind while no keys file is configured (open server, no credentials at all). Not required for a LAN bind that already has a populated keys file |
-| `ov_cache_dir` | `null` | Directory for the OpenVINO compiled-blob cache (GPU kernels, and NPU LLMs' weightless compiled blob: ~6 s cached load vs ~30 s cold, measured on one Lunar Lake laptop). **NPU Whisper never uses it** (it hangs with a cache dir). Each NPU `max_prompt_len`/`min_response_len` combination adds its own blob (~0.66 GB for an 8B int4 model); blobs from earlier combinations stay attributed to the model, so the `ov_cache_max_gb` sweep won't prune them while it is loaded (and never with `ov_cache_max_gb: 0`) — after experimenting with shapes, stop the server and clear the cache dir (the next load recompiles, ~30 s). Once unloaded, a model's blobs become prunable, but the sweep then runs only every `ov_cache_sweep_interval_secs` and deletes oldest-first until under the cap, not stale shapes specifically. RustedVINO also maintains a `cache_manifest/` directory — one JSON file per model, recording OV blob attribution and (independent of `ov_cache_dir`) image-gen `model_hash` memoization across restarts. Placed alongside `ov_cache_dir` as its sibling when `ov_cache_dir` is set, otherwise `$XDG_CACHE_HOME/rustedvino/cache_manifest` or `~/.cache/rustedvino/cache_manifest` — not separately configurable |
+| `ov_cache_dir` | `null` | Directory for the OpenVINO compiled-blob cache (GPU kernels, and NPU LLMs' weightless compiled blob: ~6 s cached load vs ~30 s cold, measured on one Lunar Lake laptop). NPU Whisper uses it too (a load with a cache dir completes on the current stack; cold ~4 s, warm ~0.3 s). Each NPU `max_prompt_len`/`min_response_len` combination adds its own blob (~0.66 GB for an 8B int4 model); blobs from earlier combinations stay attributed to the model, so the `ov_cache_max_gb` sweep won't prune them while it is loaded (and never with `ov_cache_max_gb: 0`) — after experimenting with shapes, stop the server and clear the cache dir (the next load recompiles, ~30 s). Once unloaded, a model's blobs become prunable, but the sweep then runs only every `ov_cache_sweep_interval_secs` and deletes oldest-first until under the cap, not stale shapes specifically. RustedVINO also maintains a `cache_manifest/` directory — one JSON file per model, recording OV blob attribution and (independent of `ov_cache_dir`) image-gen `model_hash` memoization across restarts. Placed alongside `ov_cache_dir` as its sibling when `ov_cache_dir` is set, otherwise `$XDG_CACHE_HOME/rustedvino/cache_manifest`, `~/.cache/rustedvino/cache_manifest` or (Windows, where neither is set) `%LOCALAPPDATA%\rustedvino\cache_manifest` — not separately configurable |
 | `ov_cache_max_gb` | `0.0` | Ceiling on `ov_cache_dir`'s total on-disk size (GB); `0.0` = unbounded. Enforced by a sweep that runs once at startup and then on `ov_cache_sweep_interval_secs`, pruning once the cap is exceeded — blobs for models no longer in your config go first, then configured-but-not-resident ones, then unattributed files, oldest-modified first within each group. Blobs of `Ready` or `Loading` models are never deleted. `0.0` still reports the cache size every sweep; set a non-zero value only if you want files deleted |
 | `ov_cache_sweep_interval_secs` | `21600` (6h) | How often the cache-management sweep re-runs after its startup pass |
 | `kv_pressure_monitor_enabled` | `false` | Enables the KV-cache pressure monitor: samples every `Ready` model's live pool occupancy and flags one that stays at/above `kv_pressure_threshold_pct` continuously for `kv_pressure_sustained_secs`. **Detect-and-flag only** — it never evicts, resizes or otherwise acts, and it is deliberately excluded from `/health` (pressure is a live-load signal, not a fault). **Enabling it requires setting both knobs below: the server refuses to boot otherwise** (see the note under this table) |
@@ -79,7 +108,7 @@ under `models_dir`.
 | Field | Type / default | Description |
 |---|---|---|
 | `vram_gb` | required | VRAM estimate (GB); `0.0` skips VRAM gating for this model. On Linux, `GET /v1/admin/models` shows what a loaded model really uses (`gpu_memory_estimate_gb`), and the server logs a warning when that's more than `vram_gb` — use it to size this value. An embedding model's figure includes its batch cache |
-| `kind` | `null` | `"text_gen"`, `"vision"`, `"embedding"`, `"stt"`, `"tts"`, `"image_gen"`, `"reranking"` — auto-detected if absent |
+| `kind` | `null` | `"text_gen"`, `"vision"`, `"embedding"`, `"stt"`, `"tts"`, `"image_gen"`, `"reranking"`, `"decision"` — auto-detected if absent, except `"decision"`, which must be set explicitly (a decision IR looks like a plain LLM on disk; see [Decision models](#decision-models-v1systemone)) |
 | `pinned` | `false` | Never chosen as an eviction victim |
 | `priority` | `0` | Soft eviction-order weight; higher = evicted later |
 | `kv_cache_gb` | `null` | Per-model bounded KV pool target (GB), overriding `default_kv_cache_gb` |
@@ -87,7 +116,7 @@ under `models_dir`.
 | `max_concurrent_streams` | `null` | Per-model concurrency cap, overriding `max_num_seqs` for this model |
 | `load` | `"eager"` | What a chat request for this model does while it isn't loaded. `"eager"`: fails with a plain `503` — the model loads only via `preload` or the admin API. `"on_demand"`: starts a background load and answers `503` + `Retry-After` until it's ready (same on every device, NPU included). Neither value loads the model at startup; only `preload` does |
 | `evictable` | `true` | When `false`, never chosen as an eviction victim (separate hard-exclude from `pinned`) |
-| `device` | `null` | Explicit per-model OpenVINO device override (e.g. `"GPU.0"`) |
+| `device` | `null` | Explicit per-model OpenVINO device override (e.g. `"GPU.0"`). A `decision` model refuses any device naming the NPU |
 | `tier_preference` | `[]` | Ordered capability-tier labels: `"heavy"`, `"strong-igpu"`, `"weak-igpu"`, `"npu"`, `"fallback"` |
 | `reasoning_parser` | `null` | `"qwen3"`, `"gpt_oss"`, `"mistral"`, `"phi"`. If absent, only `"qwen3"` is auto-detected (from a chat template that reads `enable_thinking`); `"gpt_oss"`, `"mistral"` and `"phi"` must be set explicitly |
 | `max_prompt_len` | `null` | **NPU-only**: compile-time `MAX_PROMPT_LEN` ceiling for the static `LLMPipeline`; must be `≥ 1` when set |
@@ -105,6 +134,45 @@ under `models_dir`.
 to poll `GET /v1/admin/health/watchdog` once the worker is healthy, `watchdog_hang_ceiling_secs`
 (600) — age past which an in-flight generation is treated as hung and killed; `0` disables the
 generation watchdog entirely.
+
+## Decision models (`/v1/systemone`)
+
+A decision model answers typed questions by scoring the answer tokens after one prefill — see
+[`INTERFACE.md`](INTERFACE.md#post-v1systemone). Register it with an explicit kind:
+
+```json
+"models": { "nimble": { "vram_gb": 9.5, "kind": "decision", "device": "GPU.1" } }
+```
+
+The model directory must contain:
+- a **text-only** OpenVINO IR (`openvino_model.xml/.bin`) whose `logits` output is gathered to the
+  last position — shape `[batch, 1, vocab]`, f32. A plain export gives `[batch, seq, vocab]`; it
+  is refused at load, because 8K-token prompts would produce ~8 GB of logits per question;
+- the OpenVINO tokenizer IRs (`openvino_tokenizer.xml/.bin`);
+- a `decision.json` sidecar:
+
+```json
+{
+  "prompt_format": "ollama",
+  "system_prompt": "Classify the context using the supplied schema. The schema defines each field, …",
+  "candidate_ids": [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+  "context_length": 8194,
+  "licence": "Apache-2.0"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `prompt_format` | Prompt builder; only `"ollama"` (Ollama v0.35's System One format) is supported |
+| `system_prompt` | The model's system prompt (Ollama: the Modelfile `SYSTEM`) |
+| `candidate_ids` | Token id of each answer letter, `A` first, at least 26 (the list above is Qwen3.5's tokenizer). Checked at load: each letter must encode to exactly its id and append exactly one token to a rendered prompt |
+| `context_length` | Context the length rule is checked against (Ollama's `num_ctx`); `8194` = 8192 prompt tokens + 2 scoring positions |
+| `licence` | Reported in the registry; optional |
+
+Dynamic activation quantisation is always off for decision models (it shifts probabilities), and
+any NPU device is refused (the NPU's LLM mode corrupts this model family's recurrent state).
+Like any model, a decision model loads at boot only if it is in `preload`; with `load:
+"on_demand"` the first request starts the load and gets `503` + `Retry-After`.
 
 ## Speculative decoding (draft-model assisted generation)
 

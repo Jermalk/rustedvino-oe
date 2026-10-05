@@ -185,6 +185,14 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(8);
 /// a symptom of anything wedged, which `JOIN_DEADLINE` guards separately.
 const EVICT_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
+/// The drain bound for an eviction made to make room for ANOTHER model's load
+/// (`ensure_vram_for`). Much shorter than [`EVICT_DRAIN_DEADLINE`]: the load
+/// holds `load_lock`, so every other load queues behind it, and a client that
+/// keeps one model busy must not be able to stall them for minutes. A
+/// generation still running after this is aborted. `rv check` marks such
+/// victims as busy beforehand (`busy_victims`).
+const LOAD_EVICT_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Poll interval while waiting out [`EVICT_DRAIN_DEADLINE`]. Cheap (an atomic
 /// read via [`ManagedEngine::active`](crate::model_manager::engine::ManagedEngine::active)),
 /// so a short interval costs nothing and keeps eviction latency close to the
@@ -245,6 +253,11 @@ pub enum ModelError {
     /// `/tokenize` or `/v1/completions`). The message names the mismatch.
     /// → HTTP 400
     WrongKind(String),
+    /// The load was refused before anything was evicted because the model can never
+    /// fit (system RAM floor or VRAM budget); the message names the numbers. A
+    /// predictable capacity refusal, not a server fault.
+    /// → HTTP 503
+    InsufficientMemory(String),
 }
 
 impl std::fmt::Display for ModelError {
@@ -267,7 +280,7 @@ impl std::fmt::Display for ModelError {
                 f,
                 "GPU context poisoned by a previous failed load — process restart required"
             ),
-            Self::WrongKind(msg) => write!(f, "{msg}"),
+            Self::WrongKind(msg) | Self::InsufficientMemory(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -471,6 +484,19 @@ impl ModelRecord {
         }
     }
 
+    /// A request is running on this model right now (read live through the
+    /// `ManagedEngine` facade). A SOFT signal only: it sorts the model last in
+    /// the victim order ([`eviction_sort_key`](Self::eviction_sort_key)). It is
+    /// deliberately not a hard exclusion - that starved other models' loads for
+    /// as long as a client kept the busy model occupied, and made a wedged
+    /// generation un-evictable. Evicting a busy model drains it first
+    /// (`evict_model_inner`), so its in-flight requests finish.
+    fn has_in_flight(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| h.as_managed().active() > 0)
+    }
+
     /// The victim-ordering sort key for a Ready eviction candidate:
     /// `(busy, priority, last_used)`, ascending. A busy model (in-flight `> 0`,
     /// read live through the `ManagedEngine` facade) sorts LAST; then the
@@ -484,11 +510,7 @@ impl ModelRecord {
     /// rank by this, so the "what would evict" preview can never disagree with
     /// the model actually evicted.
     fn eviction_sort_key(&self) -> (bool, i32, Instant) {
-        let busy = self
-            .handle
-            .as_ref()
-            .is_some_and(|h| h.as_managed().active() > 0);
-        (busy, self.priority, self.last_used)
+        (self.has_in_flight(), self.priority, self.last_used)
     }
 }
 
@@ -630,6 +652,100 @@ impl RamGate {
     }
 }
 
+/// How long [`ModelManager::await_ram_release`] waits for the OS to return an
+/// evicted model's memory.
+const RAM_RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll interval of [`poll_until_released`].
+const RAM_RELEASE_POLL: Duration = Duration::from_millis(100);
+
+/// How [`poll_until_released`] ended.
+#[derive(Debug, PartialEq)]
+enum ReleaseOutcome {
+    /// The reading satisfied the condition.
+    Released,
+    /// No reading is available (non-system domain): nothing to wait for.
+    Unavailable,
+    /// `wait` elapsed first; carries the last reading.
+    TimedOut(f64),
+}
+
+/// Reads availability every `poll` until `released(reading)` or `wait` elapses.
+/// The loop behind [`ModelManager::await_ram_release`], with the OS read and
+/// the condition injected so the timing logic is testable without an OS.
+async fn poll_until_released(
+    mut read: impl FnMut() -> Option<f64>,
+    released: impl Fn(f64) -> bool,
+    wait: Duration,
+    poll: Duration,
+) -> ReleaseOutcome {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let Some(now) = read() else {
+            return ReleaseOutcome::Unavailable;
+        };
+        if released(now) {
+            return ReleaseOutcome::Released;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return ReleaseOutcome::TimedOut(now);
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Availability the OS should show once a victim of `freed_gb` weights is gone:
+/// 80 % of the weights above the reading taken before the eviction. Weights are
+/// the floor of what an eviction frees (see [`plan_evictions`]); the margin
+/// absorbs allocator slack so a slightly short release does not stall the load.
+fn ram_release_target(avail_before: f64, freed_gb: f64) -> f64 {
+    avail_before + freed_gb * 0.8
+}
+
+/// One evictable resident, as the dry-run sees it.
+#[derive(Debug, Clone)]
+struct EvictionCandidate {
+    id: String,
+    /// What the tracker holds for it: weights **plus the reserved KV pool**.
+    allocated_gb: f64,
+    /// Its weights alone.
+    weight_gb: f64,
+}
+
+/// The dry-run's eviction plan: walk `candidates` (already in eviction order)
+/// until both gates are satisfied, and say whether they ever are.
+///
+/// The two gates are credited differently on purpose. Tracked VRAM is freed by
+/// the full `allocated_gb` (weights + reserved KV) — the tracker releases the
+/// whole reservation. Live system RAM is credited only the **weights**: a KV
+/// pool is *reserved* in the tracker but allocated lazily by the GPU plugin, so
+/// an idle model gives back far less real RAM than it holds in the tracker
+/// (measured on the Windows trip: admission counted 21.5 GB used while the
+/// driver saw 7 GB). Crediting the whole reservation made the dry-run
+/// under-predict: `rv check` said one eviction, the real load — which re-reads
+/// live RAM after every eviction — needed two. Weights are a floor on what an
+/// eviction really frees, so the plan may over-predict evictions but no longer
+/// promises a load that then evicts more than it said.
+fn plan_evictions(
+    candidates: &[EvictionCandidate],
+    free_gb: f64,
+    needed_gb: f64,
+    ram_admits: impl Fn(f64) -> bool,
+) -> (Vec<String>, bool) {
+    let (mut vram_back, mut ram_back) = (0.0, 0.0);
+    let mut would_evict = Vec::new();
+    for c in candidates {
+        if free_gb + vram_back >= needed_gb && ram_admits(ram_back) {
+            break;
+        }
+        vram_back += c.allocated_gb;
+        ram_back += c.weight_gb;
+        would_evict.push(c.id.clone());
+    }
+    let fits = free_gb + vram_back >= needed_gb && ram_admits(ram_back);
+    (would_evict, fits)
+}
+
 /// [`ModelManager::check_admission`] (co-residency Slice 1).
 ///
 /// Runs the [`ensure_vram_for`](ModelManager::ensure_vram_for) arithmetic
@@ -660,6 +776,10 @@ pub struct AdmissionCheck {
     /// model. Empty when it already fits, when gating is disabled, or when it
     /// cannot be admitted at all (`fits == false`).
     pub would_evict: Vec<String>,
+    /// The subset of `would_evict` that has a request running right now. The
+    /// eviction drains it for at most [`LOAD_EVICT_DRAIN_DEADLINE`] and then
+    /// aborts what is left, so a caller should warn before proceeding.
+    pub busy_victims: Vec<String>,
     /// Live **system-RAM** need: `weights + conservative KV + margin`, the same
     /// `live_need` [`ensure_vram_for`](ModelManager::ensure_vram_for) gates on.
     ///
@@ -1689,6 +1809,8 @@ fn system_domain_budget_gb(config: &Config) -> f64 {
 ///    disables that domain's gating),
 /// 2. the **inference** domain → `config.total_vram_gb` (the legacy knob is, by
 ///    definition, the budget for the device we run on → single-dGPU unchanged),
+///    **capped** at what the inference device itself reports
+///    ([`cap_to_device_reported`]),
 /// 3. the **system** domain → `system_budget_gb` (RAM − reservation),
 /// 4. any other (secondary discrete GPU) domain → that device's reported VRAM,
 ///    or `0.0` (disabled) when it exposed no memory figure.
@@ -1705,7 +1827,7 @@ fn assemble_domain_budgets(
         if let Some(&o) = config.domain_budgets.get(domain) {
             o
         } else if domain == inference_domain {
-            config.total_vram_gb
+            cap_to_device_reported(config, inventory)
         } else if domain == DOMAIN_SYSTEM {
             system_budget_gb
         } else {
@@ -1731,6 +1853,47 @@ fn assemble_domain_budgets(
         .or_insert_with(|| derived(inference_domain));
 
     budgets.into_iter().collect()
+}
+
+/// Bytes per "GB" in the budget tracker (decimal, like every figure the tracker
+/// and `/metrics` report) over bytes per GiB: converts what the driver reports.
+const GIB_TO_GB: f64 = 1.073_741_824;
+
+/// The inference domain's budget: `config.total_vram_gb`, but never more than the
+/// memory the inference device reports for itself.
+///
+/// Why: on Windows the Intel driver's reported figure is a WDDM budget, and going
+/// over it does not fail — the OS keeps the excess non-resident and every model
+/// sharing the GPU runs 3-7x slower (measured on a Lunar Lake laptop: 16.51 GiB
+/// reported, resident peak 17.67 GB = the same number, committed up to 22 GB).
+/// A config written for another OS (27 GB on a box that reports 17.7) otherwise
+/// admits everything and the gate never fires. Applies on every platform; it only
+/// bites when the config exceeds what the device says it has.
+///
+/// `0.0` (gating disabled) is left alone, as is a device that reports no figure
+/// (CPU/NPU) — and an explicit `domain_budgets` entry is handled by the caller
+/// before this runs, so an operator can still override the cap deliberately.
+fn cap_to_device_reported(config: &Config, inventory: &DeviceInventory) -> f64 {
+    let configured = config.total_vram_gb;
+    let Some(device_gib) = inventory
+        .get(&config.device)
+        .and_then(|d| d.total_mem_gb)
+        .filter(|g| g.is_finite() && *g > 0.0)
+    else {
+        return configured;
+    };
+    let cap_gb = device_gib * GIB_TO_GB;
+    if configured > 0.0 && configured > cap_gb {
+        tracing::warn!(
+            device = %config.device,
+            configured_gb = configured,
+            reported_gb = %format!("{cap_gb:.2}"),
+            "total_vram_gb exceeds what the device reports — admission budget capped at the \
+             reported figure (set domain_budgets to override deliberately)"
+        );
+        return cap_gb;
+    }
+    configured
 }
 
 /// Resolves the full per-domain budget list from config + inventory, computing
@@ -2013,7 +2176,7 @@ impl ModelManager {
             anyhow::ensure!(
                 ModelKind::from_label(k).is_some(),
                 "unknown kind '{k}' — valid values: \
-                 text_gen, vision, embedding, stt, tts, image_gen, reranking"
+                 text_gen, vision, embedding, stt, tts, image_gen, reranking, decision"
             );
         }
         if let Some(ref dev) = policy.device {
@@ -2272,7 +2435,8 @@ impl ModelManager {
         };
 
         Self::write_config_json(config_path, |value| {
-            value["models"][model_id] = serde_json::to_value(&merged)?;
+            let stanza = config::minimal_stanza(value["models"].get(model_id), &merged)?;
+            value["models"][model_id] = stanza;
             Ok(())
         })?;
 
@@ -2368,7 +2532,8 @@ impl ModelManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = entry.clone();
         Self::write_config_json(config_path, |value| {
-            value["models"][model_id] = serde_json::to_value(&entry)?;
+            let stanza = config::minimal_stanza(value["models"].get(model_id), &entry)?;
+            value["models"][model_id] = stanza;
             Ok(())
         })?;
 
@@ -2462,7 +2627,7 @@ impl ModelManager {
         config_path: &std::path::Path,
         mutate: impl FnOnce(&mut serde_json::Value) -> anyhow::Result<bool>,
     ) -> anyhow::Result<bool> {
-        let raw = std::fs::read_to_string(config_path)?;
+        let raw = config::read_json_text(config_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&raw)?;
 
         if !mutate(&mut value)? {
@@ -2476,7 +2641,7 @@ impl ModelManager {
             .context("patched config failed validation — nothing written")?;
 
         let tmp = config_path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&value)?)?;
+        std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&value)?))?;
         std::fs::rename(&tmp, config_path)?;
         Ok(true)
     }
@@ -3126,7 +3291,13 @@ impl ModelManager {
             // Evictable models do NOT reserve — eviction reclaims them at load, so
             // they still stack on the preferred device and are sorted at runtime.
             if is_immovable(entry) {
-                *projected.entry(domain.clone()).or_insert(0.0) += vram_estimate;
+                // Charged at the same figure admission will use (NPU footprint factor).
+                let charged = if device.starts_with("NPU") {
+                    vram_estimate * config.npu_footprint_factor
+                } else {
+                    vram_estimate
+                };
+                *projected.entry(domain.clone()).or_insert(0.0) += charged;
             }
             records.insert(
                 model_id.clone(),
@@ -3274,7 +3445,8 @@ impl ModelManager {
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — this endpoint serves text-generation models only"
             ))),
         }
@@ -3335,7 +3507,8 @@ impl ModelManager {
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — /v1/embeddings serves embedding models only"
             ))),
         }
@@ -3365,7 +3538,8 @@ impl ModelManager {
             | EngineHandleKind::Embedding(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — the speech-to-text routes (/v1/audio/transcriptions, /v1/audio/translations) serve STT models only"
             ))),
         }
@@ -3392,7 +3566,8 @@ impl ModelManager {
             | EngineHandleKind::Embedding(_)
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — /v1/audio/speech serves TTS models only"
             ))),
         }
@@ -3422,7 +3597,8 @@ impl ModelManager {
             | EngineHandleKind::Embedding(_)
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
-            | EngineHandleKind::Reranking(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — /v1/images/generations serves image models only"
             ))),
         }
@@ -3466,10 +3642,52 @@ impl ModelManager {
             | EngineHandleKind::Embedding(_)
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
-            | EngineHandleKind::ImageGen(_) => Err(ModelError::WrongKind(format!(
+            | EngineHandleKind::ImageGen(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
                 "model '{model_id}' is a {kind:?} model — /v1/rerank serves reranking models only"
             ))),
         }
+    }
+
+    /// The `/v1/systemone` analogue of [`get_reranking_handle`](Self::get_reranking_handle).
+    /// A non-decision model is [`ModelError::WrongKind`] carrying Ollama's exact message
+    /// (`server/routes.go SystemOneHandler`), which the handler returns as a 400.
+    ///
+    /// # Errors
+    /// Same as [`get_handle`](Self::get_handle), plus `WrongKind` for non-decision models.
+    pub fn get_decision_handle(
+        &self,
+        model_id: &str,
+    ) -> std::result::Result<crate::decision_engine::DecisionHandle, ModelError> {
+        // Kind first, readiness second (review R9; F3 in the B70 test): a registered non-decision
+        // model must be refused with Ollama's 400 *without* being loaded — checking
+        // readiness first returned NotLoaded, and the handler then started an on-demand load
+        // of e.g. a chat model just to reject it (an OOM risk on small boxes).
+        if let Some(kind) = self.known_model_kind(model_id)
+            && kind != ModelKind::Decision
+        {
+            return Err(Self::not_a_decision_model(model_id));
+        }
+        let ctx = self.get_chat_context(model_id)?;
+        match ctx.handle {
+            EngineHandleKind::Decision(handle) => Ok(handle),
+            EngineHandleKind::TextGen(_)
+            | EngineHandleKind::NpuTextGen(_)
+            | EngineHandleKind::Vision(_)
+            | EngineHandleKind::Embedding(_)
+            | EngineHandleKind::Stt(_)
+            | EngineHandleKind::Tts(_)
+            | EngineHandleKind::ImageGen(_)
+            | EngineHandleKind::Reranking(_) => Err(Self::not_a_decision_model(model_id)),
+        }
+    }
+
+    /// Ollama's message for a model that is not a decision model (`server/routes.go`).
+    fn not_a_decision_model(model_id: &str) -> ModelError {
+        ModelError::WrongKind(format!(
+            "model {} is not supported by System One; use a local Nimble or Tev GGUF model",
+            crate::systemone::gojson::go_quote(model_id)
+        ))
     }
 
     /// Returns the full [`ChatContext`] (handle + chat template + family) for a
@@ -4322,7 +4540,16 @@ impl ModelManager {
     /// - Model ID not in registry → error
     /// - Model is not in `Ready` state → error (cannot evict what isn't loaded)
     pub async fn evict_model(&self, model_id: &str) -> Result<()> {
-        self.evict_model_inner(model_id, false).await
+        self.evict_model_inner(model_id, false, EVICT_DRAIN_DEADLINE)
+            .await
+    }
+
+    /// Eviction as `ensure_vram_for` does it, to make room for another load:
+    /// same as [`evict_model`](Self::evict_model) but the drain is bounded by
+    /// [`LOAD_EVICT_DRAIN_DEADLINE`] because the caller holds `load_lock`.
+    async fn evict_model_for_load(&self, model_id: &str) -> Result<()> {
+        self.evict_model_inner(model_id, false, LOAD_EVICT_DRAIN_DEADLINE)
+            .await
     }
 
     /// Eviction core. When `abort_inflight` is true, flips the engine's shutdown
@@ -4331,7 +4558,12 @@ impl ModelManager {
     /// waiting out a long completion would blow the stop script's budget and
     /// provoke an operator reboot. Normal eviction passes `false` and instead
     /// polls the engine's own occupancy (see below) before dropping its handle.
-    async fn evict_model_inner(&self, model_id: &str, abort_inflight: bool) -> Result<()> {
+    async fn evict_model_inner(
+        &self,
+        model_id: &str,
+        abort_inflight: bool,
+        drain: Duration,
+    ) -> Result<()> {
         let (handle, thread) = self.begin_evict(model_id)?;
         let kind = handle.kind();
 
@@ -4356,7 +4588,7 @@ impl ModelManager {
             // Bounded by EVICT_DRAIN_DEADLINE so a pathological runaway
             // generation cannot hang eviction forever: past that point, force
             // an abort (same as the shutdown path) rather than wait indefinitely.
-            let deadline = Instant::now() + EVICT_DRAIN_DEADLINE;
+            let deadline = Instant::now() + drain;
             while handle.as_managed().active() > 0 && Instant::now() < deadline {
                 tokio::time::sleep(EVICT_DRAIN_POLL_INTERVAL).await;
             }
@@ -4365,7 +4597,7 @@ impl ModelManager {
                     model_id,
                     kind = kind.label(),
                     active = handle.as_managed().active(),
-                    deadline_s = EVICT_DRAIN_DEADLINE.as_secs(),
+                    deadline_s = drain.as_secs(),
                     "eviction drain deadline exceeded — aborting remaining in-flight request(s)"
                 );
                 handle.request_shutdown();
@@ -4452,11 +4684,23 @@ impl ModelManager {
     /// Best-effort: a failed eviction is logged and the remaining models are
     /// still evicted (shutdown must not wedge on one bad engine).
     pub async fn shutdown(&self) {
+        // A poisoned GPU context refuses every eviction (`begin_evict`: tearing a
+        // pipeline down on a broken context can `std::terminate`), so the loop
+        // below would only log one failure per model. Process exit releases the
+        // device memory; say so once instead.
+        if self.is_gpu_poisoned() {
+            tracing::info!(
+                "GPU context poisoned - skipping engine teardown; process exit releases device memory"
+            );
+            return;
+        }
         for info in self.list_models() {
             // `abort_inflight = true`: process shutdown must not wait out a long
             // in-flight generation — terminate it cleanly (T1.3) and tear down (#7).
             if info.state == ModelState::Ready
-                && let Err(e) = self.evict_model_inner(&info.id, true).await
+                && let Err(e) = self
+                    .evict_model_inner(&info.id, true, EVICT_DRAIN_DEADLINE)
+                    .await
             {
                 tracing::warn!(model_id = %info.id, error = %e, "eviction during shutdown failed");
             }
@@ -4490,7 +4734,8 @@ impl ModelManager {
                     kv_cache_usage_pct: live.map_or(0.0, ManagedEngine::cache_usage_pct),
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
                     #[allow(clippy::cast_precision_loss)]
-                    gpu_memory_estimate_gb: Self::gpu_memory_estimate_bytes(id, r)
+                    gpu_memory_estimate_gb: self
+                        .gpu_memory_estimate_bytes(id, r)
                         .map(|b| b as f64 / 1e9),
                 }
             })
@@ -4876,7 +5121,7 @@ impl ModelManager {
     /// `vram_gb`: the memory accounting charges `vram_gb`, so an under-sized
     /// value lets other loads over-commit the device. Checked whenever this
     /// runs (every `/metrics` scrape and `GET /v1/admin/models`).
-    fn gpu_memory_estimate_bytes(model_id: &str, r: &ModelRecord) -> Option<i64> {
+    fn gpu_memory_estimate_bytes(&self, model_id: &str, r: &ModelRecord) -> Option<i64> {
         if r.state != ModelState::Ready {
             return None;
         }
@@ -4890,8 +5135,12 @@ impl ModelManager {
         }
         #[allow(clippy::cast_precision_loss)]
         let estimate_gb = estimate as f64 / 1e9;
-        if r.vram_gb > 0.0
-            && estimate_gb > r.vram_gb
+        // Compare with what admission actually charges (NPU footprint factor
+        // included), not the configured figure, or an NPU model whose measured
+        // memory sits between the two would warn although it IS covered.
+        let charged_gb = self.budget_weight_gb(r);
+        if charged_gb > 0.0
+            && estimate_gb > charged_gb
             && !r
                 .gpu_over_budget_warned
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -4900,6 +5149,7 @@ impl ModelManager {
                 model_id,
                 estimate_gb,
                 vram_gb = r.vram_gb,
+                charged_gb,
                 "measured device memory exceeds the configured vram_gb — raise vram_gb so \
                  the memory accounting covers it"
             );
@@ -4940,7 +5190,8 @@ impl ModelManager {
                     load_duration_secs: r.last_load_duration_secs,
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
                     #[allow(clippy::cast_precision_loss)]
-                    gpu_memory_estimate_bytes: Self::gpu_memory_estimate_bytes(id, r)
+                    gpu_memory_estimate_bytes: self
+                        .gpu_memory_estimate_bytes(id, r)
                         .map(|b| b as f64),
                 })
             })
@@ -4968,6 +5219,21 @@ impl ModelManager {
         }
     }
 
+    /// Sets the poisoned flag; `true` only for the call that set it (the one
+    /// that triggers the exit reaction exactly once).
+    fn set_gpu_poisoned(&self) -> bool {
+        !self.gpu_poisoned.swap(true, Ordering::AcqRel)
+    }
+
+    /// True once an OOM-class failure has wedged the GPU `OpenCL` context
+    /// ([`Self::mark_gpu_poisoned`]). Permanent for the process: loads and
+    /// evictions are refused and only a restart clears it. Surfaced by the
+    /// admin `server.gpu_poisoned` field so `rv` can say so instead of
+    /// listing a dead model as healthy.
+    pub fn is_gpu_poisoned(&self) -> bool {
+        self.gpu_poisoned.load(Ordering::Acquire)
+    }
+
     /// Flag the GPU `OpenCL` context as poisoned after an OOM-class failure and
     /// log the raw diagnostics server-side (T6.2).
     ///
@@ -4979,12 +5245,31 @@ impl ModelManager {
     /// takes any `Display` so both the load path (`&anyhow::Error`) and the
     /// streaming path (a raw `&str` from `StreamEvent::Error`) reuse it.
     pub(crate) fn mark_gpu_poisoned(&self, model_id: &str, err: impl std::fmt::Display) {
-        self.gpu_poisoned.store(true, Ordering::Release);
+        self.mark_gpu_poisoned_inner(model_id, err, true);
+    }
+
+    /// Same as [`mark_gpu_poisoned`](Self::mark_gpu_poisoned) for a failure
+    /// raised while LOADING a model: the context is poisoned just the same, but
+    /// the supervised worker does not restart itself (see `startup::on_gpu_poisoned`).
+    fn mark_gpu_poisoned_during_load(&self, model_id: &str, err: impl std::fmt::Display) {
+        self.mark_gpu_poisoned_inner(model_id, err, false);
+    }
+
+    fn mark_gpu_poisoned_inner(
+        &self,
+        model_id: &str,
+        err: impl std::fmt::Display,
+        from_serving_model: bool,
+    ) {
+        let first = self.set_gpu_poisoned();
         tracing::error!(
             model_id,
             error = %err,
             "GPU OpenCL context poisoned — process restart required before loading any model"
         );
+        if first {
+            crate::startup::on_gpu_poisoned(model_id, from_serving_model);
+        }
     }
 
     /// Detect → Ratchet → Reload for a KV-admission wedge — originally built
@@ -5154,7 +5439,20 @@ impl ModelManager {
             }
             ModelState::NotLoaded => record.state = ModelState::Loading,
         }
-        Ok(record.vram_gb)
+        Ok(self.budget_weight_gb(record))
+    }
+
+    /// What the memory accounting charges for `r`'s weights: its `vram_gb`,
+    /// times [`Config::npu_footprint_factor`] when it runs on the NPU (whose
+    /// real footprint exceeds the weight size — Windows pass 2, D8). The one
+    /// place the factor is applied, shared by the real load, the dry-run and
+    /// the eviction plan so they cannot disagree.
+    fn budget_weight_gb(&self, r: &ModelRecord) -> f64 {
+        if r.device.starts_with("NPU") {
+            r.vram_gb * self.config.npu_footprint_factor
+        } else {
+            r.vram_gb
+        }
     }
 
     /// Conservative haircut applied to the raw K+V byte-math estimate in
@@ -5448,7 +5746,7 @@ impl ModelManager {
                 // L3: detect GPU context poisoning. Once set, gpu_poisoned blocks
                 // all future load attempts with a 503 until a process restart.
                 if is_gpu_poison_error(&e.to_string()) {
-                    self.mark_gpu_poisoned(model_id, &e);
+                    self.mark_gpu_poisoned_during_load(model_id, &e);
                 }
 
                 // Defence-in-depth: free VRAM allocation on engine failure.
@@ -5535,6 +5833,17 @@ impl ModelManager {
     /// # Errors
     /// [`ModelError::NotFound`] if `model_id` is not a registered model.
     pub fn check_admission(&self, model_id: &str) -> Result<AdmissionCheck> {
+        self.check_admission_with(model_id, false)
+    }
+
+    /// [`check_admission`](Self::check_admission) as a load with the given
+    /// `force` would see it: `force` bypasses the eviction-grace window only
+    /// (never pins, `evictable: false` or the realtime serving set), so the
+    /// preview matches `load_model_with_overrides(.., force = true)`.
+    ///
+    /// # Errors
+    /// [`ModelError::NotFound`] if `model_id` is not a registered model.
+    pub fn check_admission_with(&self, model_id: &str, force: bool) -> Result<AdmissionCheck> {
         // Model weight + already-resident check + its domain, under the models
         // lock only. Phase C1: the dry-run mirrors `ensure_vram_for` — it must
         // answer against the *target model's* domain, not the primary one.
@@ -5544,7 +5853,7 @@ impl ModelManager {
                 .get(model_id)
                 .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
             (
-                record.vram_gb,
+                self.budget_weight_gb(record),
                 record.state == ModelState::Ready,
                 record.domain.clone(),
                 // Same method as `load_model_with_overrides`, so the dry-run
@@ -5578,30 +5887,14 @@ impl ModelManager {
                 needed_gb,
                 free_gb,
                 would_evict: Vec::new(),
+                busy_victims: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
                 already_loaded: true,
             });
         }
 
-        // Snapshot evictable Ready candidates in eviction order — the SAME
-        // ordering select_eviction_victim uses. Taken under the models lock and
-        // released here, before the vram lock is acquired (no nested hold).
-        let candidates: Vec<String> = {
-            let guard = self.read_models("check_admission:candidates");
-            let mut ranked: Vec<((bool, i32, Instant), String)> = guard
-                .iter()
-                .filter(|(id, r)| {
-                    id.as_str() != model_id
-                        && r.state == ModelState::Ready
-                        && r.domain == domain
-                        && !self.eviction_protected(id, r, false)
-                })
-                .map(|(id, r)| (r.eviction_sort_key(), id.clone()))
-                .collect();
-            ranked.sort_by_key(|(key, _)| *key);
-            ranked.into_iter().map(|(_, id)| id).collect()
-        };
+        let candidates = self.eviction_candidates(model_id, &domain, force);
 
         let vram = self
             .vram
@@ -5617,6 +5910,7 @@ impl ModelManager {
                 needed_gb,
                 free_gb,
                 would_evict: Vec::new(),
+                busy_victims: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
                 already_loaded: false,
@@ -5624,28 +5918,65 @@ impl ModelManager {
         }
 
         // Greedily evict candidates in order until BOTH gates are satisfied (or
-        // we run out). Eviction frees real RAM as well as tracked VRAM — the
-        // reason `ensure_vram_for` re-reads `live_system_avail_gb` on every
-        // retry — so the same reclaimed total is credited to both.
-        let mut freed = 0.0;
-        let mut would_evict = Vec::new();
-        for id in candidates {
-            if free_gb + freed >= needed_gb && ram_admits(freed) {
-                break;
-            }
-            freed += vram.allocated_gb(&id);
-            would_evict.push(id);
-        }
+        // we run out) — see [`plan_evictions`] for what each eviction is credited.
+        let alloc: HashMap<&str, f64> = candidates
+            .iter()
+            .map(|(id, _, _)| (id.as_str(), vram.allocated_gb(id)))
+            .collect();
+        let plan: Vec<EvictionCandidate> = candidates
+            .iter()
+            .map(|(id, weight_gb, _)| EvictionCandidate {
+                id: id.clone(),
+                allocated_gb: alloc.get(id.as_str()).copied().unwrap_or(0.0),
+                weight_gb: *weight_gb,
+            })
+            .collect();
+        let (would_evict, fits) = plan_evictions(&plan, free_gb, needed_gb, ram_admits);
+        let busy_victims: Vec<String> = candidates
+            .iter()
+            .filter(|(id, _, busy)| *busy && would_evict.contains(id))
+            .map(|(id, _, _)| id.clone())
+            .collect();
 
         Ok(AdmissionCheck {
-            fits: free_gb + freed >= needed_gb && ram_admits(freed),
+            fits,
             needed_gb,
             free_gb,
             would_evict,
+            busy_victims,
             ram_needed_gb,
             ram_avail_gb,
             already_loaded: false,
         })
+    }
+
+    /// Evictable Ready residents of `domain` in eviction order, each with its
+    /// charged weight and whether it has a request running - the SAME filter
+    /// and ordering `select_eviction_victim` uses, so the dry-run preview and
+    /// the real picker agree. Taken under the models lock and released before
+    /// the caller takes the vram lock (no nested hold).
+    fn eviction_candidates(
+        &self,
+        loading_id: &str,
+        domain: &str,
+        force: bool,
+    ) -> Vec<(String, f64, bool)> {
+        let guard = self.read_models("check_admission:candidates");
+        let mut ranked: Vec<((bool, i32, Instant), String, f64)> = guard
+            .iter()
+            .filter(|(id, r)| {
+                id.as_str() != loading_id
+                    && r.state == ModelState::Ready
+                    && r.domain == domain
+                    && !self.eviction_protected(id, r, force)
+            })
+            .map(|(id, r)| (r.eviction_sort_key(), id.clone(), self.budget_weight_gb(r)))
+            .collect();
+        ranked.sort_by_key(|(key, _, _)| *key);
+        ranked
+            .into_iter()
+            .map(|(key, id, w)| (id, w, key.0))
+            .collect()
     }
 
     /// Evict LRU models until `weight_gb + min_kv + safety_margin` of VRAM is
@@ -5733,13 +6064,14 @@ impl ModelManager {
             if let Some(avail) = live_avail {
                 let max_avail = avail + reclaimable_gb;
                 if !os_memory::ram_floor_admits(max_avail, live_need, ram_floor) {
-                    return Err(anyhow::anyhow!(
+                    return Err(ModelError::InsufficientMemory(format!(
                         "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
                          (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}), but even \
                          evicting every evictable model in this domain would leave only \
                          ~{max_avail:.1} GB system RAM available and {ram_floor:.1} GB must stay \
                          free for the OS — this load can never fit, nothing was evicted"
-                    ));
+                    ))
+                    .into());
                 }
             }
 
@@ -5750,14 +6082,20 @@ impl ModelManager {
                     "not enough even after evicting every evictable model in this domain — \
                      free more VRAM or load a smaller model"
                 };
-                return Err(anyhow::anyhow!(
+                return Err(ModelError::InsufficientMemory(format!(
                     "insufficient VRAM: need {total_minimum:.1} GB \
                      (weights {weight_gb:.1} + min KV {min_kv:.1} + margin {margin:.1}), at most \
                      {max_capacity:.1} GB could ever be freed in this domain, {tail} — this load \
                      can never fit, nothing was evicted"
-                ));
+                ))
+                .into());
             }
         }
+
+        // D3 bookkeeping: what the dry-run said it would evict (computed lazily,
+        // just before the first eviction) vs what this load actually evicts.
+        let mut predicted: Option<Vec<String>> = None;
+        let mut evicted: Vec<String> = Vec::new();
 
         loop {
             // Live system-RAM check: `None` unless this is the gated system domain
@@ -5807,6 +6145,16 @@ impl ModelManager {
                     kv_gb,
                     "VRAM reservation: weight + KV pool"
                 );
+                if let Some(predicted) = predicted.as_ref()
+                    && evicted.iter().any(|e| !predicted.contains(e))
+                {
+                    tracing::warn!(
+                        loading = model_id,
+                        predicted = ?predicted,
+                        evicted = ?evicted,
+                        "load evicted a model the dry-run had not predicted"
+                    );
+                }
                 return Ok(kv_gb);
             }
 
@@ -5823,12 +6171,12 @@ impl ModelManager {
                     if let Some(avail) = live_avail
                         && !ram_ok
                     {
-                        return Err(anyhow::anyhow!(
+                        return Err(ModelError::InsufficientMemory(format!(
                             "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
                              (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}), but only \
                              {avail:.1} GB system RAM is available and {ram_floor:.1} GB must stay free \
                              for the OS — free memory or load a smaller model"
-                        ));
+                        )).into());
                     }
                     let free = self
                         .vram
@@ -5836,17 +6184,81 @@ impl ModelManager {
                         .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?
                         .free_gb(&domain);
                     let tail = self.eviction_blocked_tail(model_id, &domain, force);
-                    return Err(anyhow::anyhow!(
+                    return Err(ModelError::InsufficientMemory(format!(
                         "insufficient VRAM: need {total_minimum:.1} GB \
                          (weights {weight_gb:.1} + min KV {min_kv:.1} + margin {margin:.1}), \
                          only {free:.1} GB free, {tail}"
-                    ));
+                    ))
+                    .into());
                 }
                 Some(id) => {
-                    tracing::info!(evicting = %id, loading = model_id, "LRU eviction for VRAM");
-                    self.evict_model(&id).await?;
+                    // Name the gate that is actually binding: on a UMA box it is
+                    // often live system RAM, and "for VRAM" sent an operator
+                    // looking at the wrong budget (seen on the Windows trip).
+                    tracing::info!(
+                        evicting = %id,
+                        loading = model_id,
+                        constraint = if ram_ok { "vram" } else { "system_ram" },
+                        "LRU eviction to make room"
+                    );
+                    if predicted.is_none() {
+                        predicted = Some(
+                            self.check_admission_with(model_id, force)
+                                .map(|c| c.would_evict)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    let victim_gb = self
+                        .read_models("ensure_vram:victim_weight")
+                        .get(&id)
+                        .map_or(0.0, |r| self.budget_weight_gb(r));
+                    self.evict_model_for_load(&id).await?;
+                    evicted.push(id);
+                    if !ram_ok {
+                        self.await_ram_release(
+                            &domain, live_avail, victim_gb, live_need, ram_floor,
+                        )
+                        .await;
+                    }
                 }
             }
+        }
+    }
+
+    /// After an eviction made for the live system-RAM gate, wait (bounded) for
+    /// the OS to hand the freed memory back before the caller re-reads
+    /// availability. Windows (and the GPU page pool on Linux) return pages some
+    /// time after the engine is dropped; re-reading 50 ms later saw no change
+    /// and evicted the next model too, so a load evicted three models where
+    /// the dry-run said one (Windows pass 2, D3). Returns once availability
+    /// has risen by [`ram_release_target`] or the gate admits the load; gives
+    /// up after [`RAM_RELEASE_WAIT`] and carries on (the old behaviour).
+    async fn await_ram_release(
+        &self,
+        domain: &str,
+        avail_before: Option<f64>,
+        freed_gb: f64,
+        live_need: f64,
+        ram_floor: f64,
+    ) {
+        let Some(before) = avail_before else {
+            return;
+        };
+        let target = ram_release_target(before, freed_gb);
+        let outcome = poll_until_released(
+            || self.live_system_avail_gb(domain),
+            |now| now >= target || os_memory::ram_floor_admits(now, live_need, ram_floor),
+            RAM_RELEASE_WAIT,
+            RAM_RELEASE_POLL,
+        )
+        .await;
+        if let ReleaseOutcome::TimedOut(now) = outcome {
+            tracing::warn!(
+                avail_gb = now,
+                expected_gb = target,
+                waited_ms = RAM_RELEASE_WAIT.as_millis(),
+                "evicted model's memory was not returned in time - continuing"
+            );
         }
     }
 
@@ -6914,7 +7326,9 @@ mod tests {
         let mut cfg = make_config(&[], 22.5);
         cfg.device = "GPU.1".to_owned();
         let inv = DeviceInventory::from_devices(vec![
-            dev_mem("GPU.1", DeviceKind::DiscreteGpu, 16.0),
+            // 24 GiB reported, as on the B60 this models: above the 22.5 GB
+            // config, so the inference budget is the config (see the cap test).
+            dev_mem("GPU.1", DeviceKind::DiscreteGpu, 24.0),
             dev_mem("GPU.0", DeviceKind::DiscreteGpu, 8.0),
         ]);
         let b = assemble_domain_budgets(&cfg, &inv, "GPU.1", 99.0);
@@ -6952,6 +7366,102 @@ mod tests {
             budget_of(&b, DOMAIN_SYSTEM),
             Some(5.0),
             "override beats RAM budget"
+        );
+    }
+
+    /// A config larger than what the iGPU reports is capped at the reported
+    /// figure, converted from GiB to the tracker's decimal GB (16.51 GiB =
+    /// 17.73 GB); a smaller one, a disabled one (0.0) and a device with no
+    /// reported memory are left alone. The Windows trip's case: config 27.
+    fn cand(id: &str, allocated: f64, weight: f64) -> EvictionCandidate {
+        EvictionCandidate {
+            id: id.to_owned(),
+            allocated_gb: allocated,
+            weight_gb: weight,
+        }
+    }
+
+    /// The Windows-trip case: VRAM is satisfied after one eviction, but the live
+    /// RAM gate needs 3 GB back and each resident is 2 GB of weights + a 6 GB
+    /// reserved (lazily allocated) KV pool. Crediting the reservation to RAM said
+    /// "evict one"; the real load evicted two. The plan must say two.
+    #[test]
+    fn plan_evictions_credits_ram_with_weights_not_reserved_kv() {
+        let residents = [
+            cand("a", 8.0, 2.0),
+            cand("b", 8.0, 2.0),
+            cand("c", 8.0, 2.0),
+        ];
+        let ram_needs_3gb_back = |freed: f64| freed >= 3.0;
+        let (evict, fits) = plan_evictions(&residents, 0.0, 6.0, ram_needs_3gb_back);
+        assert_eq!(evict, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(fits);
+    }
+
+    #[test]
+    fn plan_evictions_stops_at_once_both_gates_are_met_and_reports_a_miss() {
+        let residents = [cand("a", 8.0, 2.0), cand("b", 8.0, 2.0)];
+        // Nothing needed: no eviction.
+        let (none, fits) = plan_evictions(&residents, 10.0, 6.0, |_| true);
+        assert!(none.is_empty() && fits);
+        // VRAM-bound only: one eviction is enough.
+        let (one, fits) = plan_evictions(&residents, 0.0, 6.0, |_| true);
+        assert_eq!(one, vec!["a".to_owned()]);
+        assert!(fits);
+        // Even evicting everything cannot satisfy the RAM gate: fits is false.
+        let (all, fits) = plan_evictions(&residents, 0.0, 6.0, |freed| freed >= 99.0);
+        assert_eq!(all.len(), 2);
+        assert!(!fits);
+    }
+
+    #[test]
+    fn assemble_inference_budget_is_capped_at_the_devices_reported_memory() {
+        let inv = DeviceInventory::from_devices(vec![
+            dev("CPU", DeviceKind::Cpu),
+            dev_mem("GPU", DeviceKind::IntegratedGpu, 16.51),
+        ]);
+        let mut cfg = make_config(&[], 27.0);
+        cfg.device = "GPU".to_owned();
+        let b = assemble_domain_budgets(&cfg, &inv, DOMAIN_SYSTEM, 99.0);
+        let got = budget_of(&b, DOMAIN_SYSTEM).expect("system domain");
+        assert!((got - 16.51 * GIB_TO_GB).abs() < 1e-9, "{got}");
+        assert!(got > 17.7 && got < 17.8, "{got}");
+
+        // Config already below the device figure: unchanged.
+        cfg.total_vram_gb = 12.0;
+        let b = assemble_domain_budgets(&cfg, &inv, DOMAIN_SYSTEM, 99.0);
+        assert_eq!(budget_of(&b, DOMAIN_SYSTEM), Some(12.0));
+
+        // Gating disabled stays disabled.
+        cfg.total_vram_gb = 0.0;
+        let b = assemble_domain_budgets(&cfg, &inv, DOMAIN_SYSTEM, 99.0);
+        assert_eq!(budget_of(&b, DOMAIN_SYSTEM), Some(0.0));
+    }
+
+    /// The cap needs the *inference device's own* reported memory: a CPU
+    /// inference device (no figure) is never capped by the iGPU sharing its
+    /// domain, and an explicit `domain_budgets` entry beats the cap.
+    #[test]
+    fn assemble_cap_ignores_other_devices_and_yields_to_an_explicit_override() {
+        let inv = DeviceInventory::from_devices(vec![
+            dev("CPU", DeviceKind::Cpu),
+            dev_mem("GPU", DeviceKind::IntegratedGpu, 16.51),
+        ]);
+        let mut cpu_cfg = make_config(&[], 27.0);
+        cpu_cfg.device = "CPU".to_owned();
+        let b = assemble_domain_budgets(&cpu_cfg, &inv, DOMAIN_SYSTEM, 99.0);
+        assert_eq!(budget_of(&b, DOMAIN_SYSTEM), Some(27.0));
+
+        let mut gpu_cfg = make_config(&[], 27.0);
+        gpu_cfg.device = "GPU".to_owned();
+        gpu_cfg
+            .domain_budgets
+            .insert(DOMAIN_SYSTEM.to_owned(), 25.0);
+        let b = assemble_domain_budgets(&gpu_cfg, &inv, DOMAIN_SYSTEM, 99.0);
+        assert_eq!(
+            budget_of(&b, DOMAIN_SYSTEM),
+            Some(25.0),
+            "operator override wins"
         );
     }
 
@@ -7009,6 +7519,7 @@ mod tests {
             cache_size_gb: 0.0, // no cap — use full dynamic sizing
             default_kv_cache_gb: 0.0, // unbounded — pre-Slice-2 grab-all
             vram_safety_margin_gb: 0.0, // no margin — keeps existing LRU test math simple
+            npu_footprint_factor: 1.0,
             min_kv_cache_gb: 0.0, // no minimum — allows any KV size including 0
             light_model_max_gb: 2.0, // C2 default; placement engine unused with empty inventory
             light_stt_max_gb: 1.0, // STT light/heavy threshold; engine unused with empty inventory
@@ -7565,6 +8076,15 @@ mod tests {
         assert!(
             err.to_string().contains("insufficient VRAM"),
             "must fail on VRAM, not some earlier validation: {err}"
+        );
+        // ADM-500: the refusal is typed, so the admin handlers can answer 503 (capacity),
+        // not the generic 500 they used to fall through to.
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::InsufficientMemory(_))
+            ),
+            "capacity refusal must be ModelError::InsufficientMemory: {err:?}"
         );
         assert!(
             mm.list_models()
@@ -9337,6 +9857,64 @@ mod tests {
         assert!(kv("cb-llm") > 0.0, "CB LLM must still get a KV pool");
     }
 
+    /// Windows pass 2 D8: an NPU-placed model is charged `vram_gb ×
+    /// npu_footprint_factor` by the dry-run, the real load and the tracker,
+    /// while the figure shown for it stays the configured `vram_gb`; the same
+    /// model on a GPU is charged as configured.
+    #[tokio::test]
+    async fn npu_model_is_charged_the_footprint_factor() {
+        let mut config = make_config(&[("gpu-m", 5.0), ("npu-m", 5.0)], 64.0);
+        config.npu_footprint_factor = 1.5;
+        config.models.entry("npu-m".to_owned()).or_default().policy = config::ModelPolicy {
+            device: Some("NPU".to_owned()),
+            ..Default::default()
+        };
+        let margin = config.vram_safety_margin_gb;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+
+        let npu = mm.check_admission("npu-m").unwrap();
+        assert!(
+            (npu.needed_gb - (7.5 + margin)).abs() < 1e-9,
+            "NPU needs 5.0 x 1.5 + margin: {}",
+            npu.needed_gb
+        );
+        let min_kv = mm.config.min_kv_cache_gb;
+        let gpu = mm.check_admission("gpu-m").unwrap();
+        assert!(
+            (gpu.needed_gb - (5.0 + min_kv + margin)).abs() < 1e-9,
+            "a GPU model is charged as configured: {}",
+            gpu.needed_gb
+        );
+
+        mm.load_model("npu-m").await.unwrap();
+        let domain = mm.record_domain("npu-m");
+        let used = mm.vram.read().unwrap().domain_gb(&domain).1;
+        assert!((used - 7.5).abs() < 0.1, "tracker holds 7.5 GB, got {used}");
+        let shown = mm
+            .list_models()
+            .into_iter()
+            .find(|i| i.id == "npu-m")
+            .unwrap();
+        assert!(
+            (shown.vram_gb - 5.0).abs() < 1e-9,
+            "configured figure is unchanged"
+        );
+    }
+
+    /// `npu_footprint_factor` below 1.0 (or non-finite) is a config error.
+    #[test]
+    fn npu_footprint_factor_below_one_is_rejected() {
+        let mut cfg = make_config(&[("m", 1.0)], 8.0);
+        cfg.npu_footprint_factor = 0.5;
+        assert!(cfg.validate().is_err());
+        cfg.npu_footprint_factor = f64::NAN;
+        assert!(cfg.validate().is_err());
+        cfg.npu_footprint_factor = 1.0;
+        assert!(cfg.validate().is_ok());
+    }
+
     /// Plan item 14: the measured estimate is the load delta (+ engine runtime
     /// growth), reported only while `Ready`; exceeding `vram_gb` sets the
     /// once-per-load warning flag, and a new load re-arms it.
@@ -10136,6 +10714,107 @@ mod tests {
             ModelState::NotLoaded,
             "no grace configured — model-a is a normal LRU victim"
         );
+    }
+
+    /// Windows pass 2 D5: the dry-run answers for the load the caller will run.
+    /// Inside the grace window `check_admission` says "does not fit" while
+    /// `check_admission_with(.., force = true)` previews the eviction — so
+    /// `rv load --force` is no longer refused by its own pre-check.
+    #[tokio::test]
+    async fn check_admission_with_force_previews_a_grace_bypass() {
+        let mut config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 10.0);
+        config.eviction_grace_secs = 300.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+
+        let plain = mm.check_admission("model-b").unwrap();
+        assert!(!plain.fits, "model-a is inside its grace window");
+        let forced = mm.check_admission_with("model-b", true).unwrap();
+        assert!(forced.fits, "force bypasses the grace window");
+        assert_eq!(forced.would_evict, vec!["model-a".to_owned()]);
+    }
+
+    /// With the short default grace a busy model is NOT hard-protected: when it
+    /// is the only candidate a load still makes progress (the eviction drains
+    /// it), so continuous traffic on one model cannot starve another's load.
+    /// Preferring an idle victim is covered by `test_lru_spares_busy_model_for_idle_one`.
+    #[tokio::test]
+    async fn busy_model_is_still_a_victim_when_it_is_the_only_candidate() {
+        let mut config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 10.0);
+        config.eviction_grace_secs = 0.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        let _permit = {
+            let guard = mm.read_models("test");
+            match guard.get("model-a").unwrap().handle.as_ref().unwrap() {
+                EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+                other => panic!("model-a must be a TextGen mock, got {other:?}"),
+            }
+        };
+
+        let check = mm.check_admission("model-b").unwrap();
+        assert!(check.fits, "a busy sole resident must not block the load");
+        assert_eq!(check.would_evict, vec!["model-a".to_owned()]);
+        assert_eq!(
+            check.busy_victims,
+            vec!["model-a".to_owned()],
+            "the dry-run must say the victim has a request running"
+        );
+    }
+
+    /// The wait after a RAM-driven eviction (D3): it returns as soon as the OS
+    /// reading rises, gives up (with the last reading) when it never does, and
+    /// does not wait at all when there is no reading.
+    #[tokio::test]
+    async fn poll_until_released_waits_for_the_reading_then_stops() {
+        let ms = Duration::from_millis;
+        let mut calls = 0;
+        let rising = poll_until_released(
+            || {
+                calls += 1;
+                Some(f64::from(calls))
+            },
+            |now| now >= 3.0,
+            ms(500),
+            ms(5),
+        )
+        .await;
+        assert_eq!(rising, ReleaseOutcome::Released);
+        assert_eq!(calls, 3, "stops at the first satisfying reading");
+
+        let flat = poll_until_released(|| Some(1.0), |now| now >= 3.0, ms(40), ms(5)).await;
+        assert_eq!(flat, ReleaseOutcome::TimedOut(1.0));
+
+        let none = poll_until_released(|| None, |_| false, ms(500), ms(5)).await;
+        assert_eq!(none, ReleaseOutcome::Unavailable);
+    }
+
+    /// Only the FIRST poisoning reports `first`, so the exit reaction cannot
+    /// fire twice.
+    #[tokio::test]
+    async fn only_the_first_poisoning_reports_first() {
+        let mm = make_mm(&[("m", 1.0)], 8.0).await;
+        assert!(mm.set_gpu_poisoned());
+        assert!(!mm.set_gpu_poisoned());
+        assert!(mm.is_gpu_poisoned());
+    }
+
+    /// Windows pass 2 D3: the wait after a RAM-driven eviction expects 80 % of
+    /// the victim's weights back.
+    #[test]
+    fn ram_release_target_is_eighty_percent_of_the_weights() {
+        assert!((ram_release_target(10.0, 5.0) - 14.0).abs() < 1e-9);
+        assert!((ram_release_target(10.0, 0.0) - 10.0).abs() < 1e-9);
+    }
+
+    /// The default grace window is the short one (Windows pass 2 D4).
+    #[test]
+    fn default_eviction_grace_is_two_seconds() {
+        assert!((config::default_eviction_grace_secs() - 2.0).abs() < f64::EPSILON);
     }
 
     /// D2: a model registered in the realtime serving set (an active
@@ -11000,6 +11679,7 @@ mod tests {
 
         mm.mark_gpu_poisoned("m", anyhow::anyhow!("CL_OUT_OF_RESOURCES (-5)"));
         assert!(mm.gpu_poisoned.load(Ordering::Acquire));
+        assert!(mm.is_gpu_poisoned());
 
         let err = mm.load_model("m").await.unwrap_err();
         let model_err = err

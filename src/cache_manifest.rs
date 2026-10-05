@@ -74,7 +74,7 @@ pub struct ManifestFile {
 /// set `ov_cache_dir` yet still hit the multi-second hash recompute on every
 /// load that motivated this cache.
 ///
-/// Returns `None` only when neither `XDG_CACHE_HOME` nor `HOME` is set and
+/// Returns `None` only when none of `XDG_CACHE_HOME`, `HOME` and `LOCALAPPDATA` is set and
 /// `ov_cache_dir` is also absent — no location to root the manifest under.
 /// Never a panic.
 #[must_use]
@@ -88,10 +88,30 @@ pub fn manifest_root(ov_cache_dir: Option<&str>) -> Option<PathBuf> {
 }
 
 fn default_cache_root() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .map(|base| base.join("rustedvino"))
+    user_cache_base(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+    )
+    .map(|base| base.join("rustedvino"))
+}
+
+/// The per-user cache directory the server's small caches live under:
+/// `$XDG_CACHE_HOME`, else `~/.cache`, else `%LOCALAPPDATA%` (Windows sets
+/// neither of the first two, so the device-tier cache and the model-hash
+/// memo silently never worked there - Windows pass 2, D14). Pure, with the
+/// environment passed in, so the order is testable on any OS; empty values
+/// count as unset. Shared with `device_inventory`'s tier cache.
+#[must_use]
+pub(crate) fn user_cache_base(
+    xdg_cache_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let set = |v: Option<&std::ffi::OsStr>| v.filter(|s| !s.is_empty()).map(PathBuf::from);
+    set(xdg_cache_home)
+        .or_else(|| set(home).map(|h| h.join(".cache")))
+        .or_else(|| set(local_app_data))
 }
 
 fn manifest_path(root: &Path, model_id: &str) -> PathBuf {
@@ -268,6 +288,31 @@ mod tests {
             mtime_unix: 456,
             sha256: "sha256:deadbeef".to_owned(),
         }
+    }
+
+    /// D14: Windows has no `HOME`/`XDG_CACHE_HOME`; `%LOCALAPPDATA%` is the
+    /// last resort, and the Linux order is untouched.
+    #[test]
+    fn user_cache_base_order_is_xdg_then_home_then_local_app_data() {
+        use std::ffi::OsStr;
+        let o = |s: &'static str| Some(OsStr::new(s));
+        assert_eq!(
+            user_cache_base(o("/x"), o("/h"), o("/l")),
+            Some(PathBuf::from("/x"))
+        );
+        assert_eq!(
+            user_cache_base(None, o("/h"), o("/l")),
+            Some(PathBuf::from("/h/.cache"))
+        );
+        assert_eq!(
+            user_cache_base(None, None, o("/l")),
+            Some(PathBuf::from("/l"))
+        );
+        assert_eq!(
+            user_cache_base(o(""), o(""), o("/l")),
+            Some(PathBuf::from("/l"))
+        );
+        assert_eq!(user_cache_base(None, None, None), None);
     }
 
     /// `None`/empty `ov_cache_dir` falls back to the `~/.cache/rustedvino`

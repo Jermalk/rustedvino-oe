@@ -102,6 +102,7 @@ pub fn check(model_dir: &Path, kind: ModelKind) -> CompletenessReport {
         ModelKind::Stt => check_stt(model_dir, &mut report),
         ModelKind::Tts => check_tts(model_dir, &mut report),
         ModelKind::ImageGen => check_image_gen(model_dir, &mut report),
+        ModelKind::Decision => check_decision(model_dir, &mut report),
     }
     report
 }
@@ -195,6 +196,19 @@ fn check_encode_only(model_dir: &Path, report: &mut CompletenessReport) {
         "openvino_detokenizer",
         &mut report.advisory_missing,
     );
+}
+
+/// Decision (`/v1/systemone`): encode-only like embedding — it scores candidate tokens and
+/// never detokenises — plus the `decision.json` sidecar (system prompt, candidate ids,
+/// context length), without which the model cannot be served. Whether the IR is gathered
+/// to the last position is checked when the engine compiles it (`ov_decide_create`).
+fn check_decision(model_dir: &Path, report: &mut CompletenessReport) {
+    check_encode_only(model_dir, report);
+    if !model_dir.join(crate::decision_engine::SIDECAR).is_file() {
+        report
+            .blocking_missing
+            .push(crate::decision_engine::SIDECAR.to_owned());
+    }
 }
 
 /// Whisper: encoder/decoder split (no single `openvino_model.*`), and it

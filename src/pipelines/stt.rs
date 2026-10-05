@@ -428,13 +428,43 @@ fn run_transcribe(
 
 // ── Audio decode + resample (pure Rust, no GPU) ───────────────────────────────
 
+/// The uploaded audio could not be decoded (garbage, unsupported container,
+/// no track, zero samples). The text is one of this module's own fixed
+/// phrases — never any of the caller's bytes — so it is safe to show.
+/// Carried inside the `anyhow::Error` so the handler can `downcast_ref` it.
+#[derive(Debug)]
+pub struct BadAudio(pub String);
+
+impl std::fmt::Display for BadAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadAudio {}
+
 /// Decode an uploaded audio file and resample it to Whisper's 16 kHz mono f32.
 ///
 /// # Errors
 /// Returns an error if the container/codec is unsupported, the bytes are
 /// malformed, or no audio track is present.
 pub fn prepare_samples(audio_bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    let (samples, sample_rate) = decode_to_mono(audio_bytes)?;
+    // Every decode failure is a property of the upload, not of the server:
+    // typed so the HTTP layer answers 400, not 500 (Windows pass 2, D9).
+    //
+    // A malformed header can also make the demuxer PANIC (a WAV declaring sample rate 0 panics in
+    // symphonia's `TimeBase::new`). On the engine thread that kills the thread and with it every later
+    // transcription (503 "engine unavailable" until the model is reloaded) - found by the overnight
+    // torture run. Treat a panic in the decoder exactly like any other undecodable upload.
+    let decoded = std::panic::catch_unwind(|| decode_to_mono(audio_bytes));
+    let (samples, sample_rate) = match decoded {
+        Ok(result) => result.map_err(|e| anyhow::Error::new(BadAudio(e.to_string())))?,
+        Err(_) => {
+            return Err(anyhow::Error::new(BadAudio(
+                "audio file has a malformed header".to_owned(),
+            )));
+        }
+    };
     resample_to_16k(&samples, sample_rate)
 }
 
@@ -826,10 +856,26 @@ mod tests {
         assert!((1.8..2.2).contains(&ratio), "8k→16k ~doubles, got {ratio}");
     }
 
+    /// A WAV that declares sample rate 0 made symphonia panic inside the demuxer, which killed the STT
+    /// engine thread (overnight torture run). It must now come back as a typed `BadAudio` error.
+    #[test]
+    fn wav_with_sample_rate_zero_is_bad_audio_not_a_panic() {
+        let wav = wav_mono_i16(0, &[0.1_f32; 64]);
+        let err = prepare_samples(&wav).expect_err("sample rate 0 must be rejected");
+        assert!(
+            err.downcast_ref::<BadAudio>().is_some(),
+            "typed, so the API answers 400: {err}"
+        );
+    }
+
     /// Garbage bytes are rejected with an error, not a panic.
     #[test]
     fn prepare_samples_rejects_garbage() {
         let err = prepare_samples(b"not audio at all");
-        assert!(err.is_err(), "non-audio bytes must error");
+        let err = err.expect_err("non-audio bytes must error");
+        assert!(
+            err.downcast_ref::<BadAudio>().is_some(),
+            "typed, so the API answers 400: {err}"
+        );
     }
 }

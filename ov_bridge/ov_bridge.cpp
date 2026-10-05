@@ -1270,7 +1270,14 @@ struct OvVlmState {
         // (ov_cb_create, above) always threads this through from
         // Config::enable_prefix_caching explicitly for exactly this reason —
         // the VLM path simply never did.
-        if (cache_size_gb > 0.0) {
+        // NPU: the VLM pipeline there is the static (non-continuous-batching)
+        // implementation, which REJECTS the scheduler_config property outright
+        // (`Check 'it == properties.end()'` in visual_language/pipeline.cpp,
+        // seen live on Windows with a VLM routed to the NPU). A KV budget and
+        // prefix cache are CB concepts; on the NPU they have nothing to apply to,
+        // so the property is simply not passed.
+        const bool vlm_on_npu = std::string(device).rfind("NPU", 0) == 0;
+        if (cache_size_gb > 0.0 && !vlm_on_npu) {
             ov::genai::SchedulerConfig sched;
             // round UP, never truncate — see the matching comment in
             // ov_cb_create above; same landmine, same fix.
@@ -1887,22 +1894,61 @@ size_t ov_rerank_count_tokens(OvRerankHandle handle, const char* query, const ch
 namespace {
 
 // OvWhisperState bundles a heap-allocated WhisperPipeline.
+//
+// NPU workaround (OpenVINO GenAI 2026.2.1, reproduced with plain
+// openvino_genai Python, no RustedVINO code involved): on the NPU's static
+// Whisper pipeline the FIRST generate() with automatic language detection is
+// correct, and every later one misdetects (English audio comes back as
+// German) — the pipeline carries state between calls that detection reads. An
+// explicit language is unaffected.
+//
+// The first workaround rebuilt the NPU pipeline before each repeat auto-detect
+// call. Windows pass 2 (D1) found that this leaks: constructing and destroying
+// an NPU WhisperPipeline leaks 3 threads + 5 handles every time (upstream; plain
+// Python shows +3 threads per cycle, with or without generate()). So the NPU
+// pipeline is now built ONCE and never rebuilt: an auto-language request is
+// answered by detecting the language on a CPU WhisperPipeline over the same
+// model (max_new_tokens=1: the encoder + one decoder step, ~0.2 s for tiny) and
+// passing it to the NPU explicitly. The detector is built lazily on the first
+// auto-language NPU request, so clients that always send `language` pay nothing.
+// Its CPU copy of the weights is NOT charged to the memory accounting (it lives
+// until the model is evicted); for a large Whisper that is a few GB of RAM.
+// CPU/GPU pipelines are deterministic and use no detector.
 struct OvWhisperState {
     ov::genai::WhisperPipeline* pipe = nullptr;
+    ov::genai::WhisperPipeline* detector = nullptr;  // CPU, NPU only, lazy
+    std::string model_path;
+    std::string device;
+    ov::AnyMap props;
+    bool is_npu = false;
 
-    OvWhisperState(const char* model_path, const char* device, const char* ov_cache_dir) {
-        ov::AnyMap props;
+    OvWhisperState(const char* model_path_, const char* device_, const char* ov_cache_dir)
+        : model_path(model_path_), device(device_) {
         if (ov_cache_dir && ov_cache_dir[0] != '\0') {
             props.emplace(ov::cache_dir(std::string(ov_cache_dir)));
         }
-        pipe = new ov::genai::WhisperPipeline(
-            std::filesystem::path(model_path),
-            std::string(device),
-            props
-        );
+        is_npu = device.rfind("NPU", 0) == 0;
+        pipe = new ov::genai::WhisperPipeline(std::filesystem::path(model_path), device, props);
+    }
+
+    // Language token for `raw`, e.g. "<|en|>", or "" when detection yields none.
+    std::string detect_language(const ov::genai::RawSpeechInput& raw) {
+        if (!detector) {
+            // Same cache_dir as the main pipeline: without it every server start
+            // recompiles the CPU copy on the first auto-language request.
+            detector = new ov::genai::WhisperPipeline(std::filesystem::path(model_path), "CPU", props);
+        }
+        ov::genai::WhisperGenerationConfig cfg = detector->get_generation_config();
+        cfg.max_new_tokens = 1;
+        cfg.return_timestamps = false;
+        const std::string lang = detector->generate(raw, cfg).language;
+        if (lang.empty()) { return {}; }
+        return lang.rfind("<|", 0) == 0 ? lang : "<|" + lang + "|>";
     }
 
     ~OvWhisperState() {
+        delete detector;
+        detector = nullptr;
         delete pipe;
         pipe = nullptr;
     }
@@ -1995,8 +2041,20 @@ int ov_whisper_generate(
 
     // Start from the model's own generation config (decoder-start tokens, etc.).
     ov::genai::WhisperGenerationConfig cfg = state->pipe->get_generation_config();
-    if (language && language[0] != '\0') {
-        cfg.language = std::string("<|") + language + "|>";
+    try {
+        if (language && language[0] != '\0') {
+            cfg.language = std::string("<|") + language + "|>";
+        } else if (state->is_npu) {
+            // See OvWhisperState: detect on the CPU, hand the NPU an explicit language.
+            const std::string detected = state->detect_language(raw);
+            if (!detected.empty()) { cfg.language = detected; }
+        }
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception detecting the whisper language");
+        return -1;
     }
     cfg.return_timestamps = (return_timestamps != 0);
     if (translate != 0) {
@@ -2501,3 +2559,241 @@ int ov_tts_generate(OvTtsHandle handle, const char* text,
 }
 
 } // extern "C" (TTS section)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Decision C-API (System One, /v1/systemone) — v1
+// ─────────────────────────────────────────────────────────────────────────────
+// A direct ov::Core → CompiledModel → InferRequest path (no GenAI pipeline):
+// one fresh prefill per question on a text-only decision IR whose `logits`
+// output was gathered to the last position ([B, 1, V]: a Gather of the last
+// position before the lm_head MatMul), returning only the k candidate logits.
+// v1: five calls, no shared-prefix priming. The handle is
+// owned by one engine thread; the InferRequest is not shared.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct OvDecideState {
+    ov::Core             core;
+    ov::CompiledModel    compiled;
+    ov::InferRequest     req;
+    ov::genai::Tokenizer tok;
+    size_t               vocab      = 0;
+    size_t               max_tokens = 0;
+    bool                 has_mask   = false;
+    bool                 has_pos    = false;
+    ov::element::Type    ids_type   = ov::element::i64;
+    ov::element::Type    mask_type  = ov::element::i64;
+    ov::element::Type    pos_type   = ov::element::i64;
+
+    OvDecideState(const std::string& dir, const std::string& device,
+                  const std::string& cache_dir, size_t max_tokens_)
+        : tok(std::filesystem::path(dir)), max_tokens(max_tokens_)
+    {
+        auto model = core.read_model(dir + "/openvino_model.xml");
+        bool has_logits = false, has_ids = false;
+        for (const auto& out : model->outputs()) {
+            if (out.get_names().count("logits")) has_logits = true;
+        }
+        for (const auto& in : model->inputs()) {
+            const auto& names = in.get_names();
+            if (names.count("input_ids"))      { has_ids = true; ids_type = in.get_element_type(); }
+            if (names.count("attention_mask")) { has_mask = true; mask_type = in.get_element_type(); }
+            if (names.count("position_ids"))   { has_pos = true; pos_type = in.get_element_type(); }
+        }
+        if (!has_logits) throw std::runtime_error("decision IR has no `logits` output");
+        if (!has_ids)    throw std::runtime_error("decision IR has no `input_ids` input");
+        const auto logits = model->output("logits");
+        const auto shape  = logits.get_partial_shape();
+        if (shape.rank().is_dynamic() || shape.rank().get_length() != 3 ||
+            shape[1].is_dynamic() || shape[1].get_length() != 1) {
+            throw std::runtime_error(
+                "decision IR logits are not gathered to the last position (want [B,1,V], got " +
+                shape.to_string() + "); gather the last position before the lm_head MatMul");
+        }
+        if (shape[2].is_dynamic()) throw std::runtime_error("decision IR vocabulary dim is dynamic");
+        if (logits.get_element_type() != ov::element::f32) {
+            throw std::runtime_error("decision IR logits are not f32");
+        }
+        if (ids_type != ov::element::i64 && ids_type != ov::element::i32) {
+            throw std::runtime_error("decision IR input_ids are not i32/i64");
+        }
+        for (auto et : {mask_type, pos_type}) {
+            if (et != ov::element::i64 && et != ov::element::i32) {
+                throw std::runtime_error("decision IR attention_mask/position_ids are not i32/i64");
+            }
+        }
+        vocab = static_cast<size_t>(shape[2].get_length());
+
+        // Dynamic activation quantisation off, always: it moves probabilities 1.6–4x more
+        // than int8 weights do (measured). No other properties are exposed.
+        ov::AnyMap cfg{ov::hint::dynamic_quantization_group_size(0)};
+        if (!cache_dir.empty()) cfg.emplace(ov::cache_dir(cache_dir));
+        compiled = core.compile_model(model, device, cfg);
+        req      = compiled.create_infer_request();
+
+        // beam_idx is set once: the request keeps the last tensor set on an input.
+        for (const auto& in : compiled.inputs()) {
+            if (in.get_names().count("beam_idx")) {
+                ov::Tensor beam(in.get_element_type(), {1});
+                if (in.get_element_type() == ov::element::i64) beam.data<int64_t>()[0] = 0;
+                else beam.data<int32_t>()[0] = 0;
+                req.set_tensor("beam_idx", beam);
+            }
+        }
+    }
+};
+
+// Owned tensor [1, n] filled by `fill(i)` — OpenVINO-owned memory, never a view of the
+// caller's buffer (the request keeps the tensor after infer returns; FFI_DESIGN F7).
+template <typename F>
+ov::Tensor row_tensor(ov::element::Type et, size_t n, F fill) {
+    ov::Tensor t(et, {1, n});
+    if (et == ov::element::i64) {
+        auto* p = t.data<int64_t>();
+        for (size_t i = 0; i < n; ++i) p[i] = fill(i);
+    } else {
+        auto* p = t.data<int32_t>();
+        for (size_t i = 0; i < n; ++i) p[i] = static_cast<int32_t>(fill(i));
+    }
+    return t;
+}
+
+} // anonymous namespace
+
+extern "C" {
+
+typedef void* OvDecideHandle;
+
+/// Load and compile a gathered decision IR from `model_dir` on `device`.
+/// `ov_cache_dir` may be NULL or empty (no cache). `max_tokens` bounds every prefill.
+/// Returns NULL on error (call ov_last_error()); refuses ungathered or non-f32 IRs.
+OvDecideHandle ov_decide_create(const char* model_dir, const char* device,
+                                const char* ov_cache_dir, size_t max_tokens) {
+    s_last_error[0] = '\0';
+    if (!model_dir || !device) { set_error("ov_decide_create: null model_dir or device"); return nullptr; }
+    if (max_tokens == 0)       { set_error("ov_decide_create: max_tokens must be >= 1"); return nullptr; }
+    try {
+        return new OvDecideState(model_dir, device, ov_cache_dir ? ov_cache_dir : "", max_tokens);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("unknown exception in ov_decide_create");
+        return nullptr;
+    }
+}
+
+/// Destroy a decision handle. NULL is a no-op.
+void ov_decide_free(OvDecideHandle handle) {
+    s_last_error[0] = '\0';
+    if (!handle) return;
+    try {
+        delete static_cast<OvDecideState*>(handle);
+    } catch (...) {
+        set_error("unknown exception in ov_decide_free");
+    }
+}
+
+/// Tokenise `text` (`len` bytes, not NUL-terminated) without adding special tokens.
+/// Two-pass contract of ov_pipeline_encode: always writes `*out_count`; copies up to `cap`
+/// ids when `out_ids` is non-NULL. Returns 0, or -1 on error.
+int ov_decide_encode(OvDecideHandle handle, const char* text, size_t len,
+                     int64_t* out_ids, size_t cap, size_t* out_count) {
+    s_last_error[0] = '\0';
+    if (!handle)      { set_error("ov_decide_encode: null handle"); return -1; }
+    if (!text && len) { set_error("ov_decide_encode: null text with non-zero len"); return -1; }
+    if (!out_count)   { set_error("ov_decide_encode: null out_count"); return -1; }
+    auto* s = static_cast<OvDecideState*>(handle);
+    try {
+        auto enc = s->tok.encode(std::string(text ? text : "", len), {{"add_special_tokens", false}});
+        const ov::Tensor& ids = enc.input_ids;
+        *out_count = ids.get_size();
+        if (out_ids && cap > 0) {
+            const size_t to_copy = (*out_count < cap) ? *out_count : cap;
+            const auto   et      = ids.get_element_type();
+            if (et == ov::element::i64) {
+                std::memcpy(out_ids, ids.data<int64_t>(), to_copy * sizeof(int64_t));
+            } else if (et == ov::element::i32) {
+                const int32_t* src = ids.data<int32_t>();
+                for (size_t i = 0; i < to_copy; ++i) out_ids[i] = static_cast<int64_t>(src[i]);
+            } else {
+                set_error("ov_decide_encode: unexpected input_ids element type (not i32/i64)");
+                return -1;
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_decide_encode");
+        return -1;
+    }
+}
+
+/// One fresh prefill of `ids` (n tokens): reset every state, run, and write the logits of
+/// the `k` candidate token ids `cand` at the last position into `out_logits` (k floats).
+/// Returns 0, or -1 on error (arguments are validated before the request is touched).
+int ov_decide_prefill(OvDecideHandle handle, const int64_t* ids, size_t n,
+                      const int64_t* cand, size_t k, float* out_logits) {
+    s_last_error[0] = '\0';
+    if (!handle)              { set_error("ov_decide_prefill: null handle"); return -1; }
+    auto* s = static_cast<OvDecideState*>(handle);
+    if (!ids || n == 0)       { set_error("ov_decide_prefill: n must be >= 1"); return -1; }
+    // Validation builds std::string messages, so it runs inside the try: nothing may throw
+    // across the extern "C" boundary (bad_alloc there would be std::terminate).
+    try {
+        if (n > s->max_tokens) {
+            std::string m = "ov_decide_prefill: n = " + std::to_string(n) + " exceeds max_tokens = " +
+                            std::to_string(s->max_tokens);
+            set_error(m.c_str());
+            return -1;
+        }
+        if (!cand || k == 0)      { set_error("ov_decide_prefill: k must be >= 1"); return -1; }
+        if (!out_logits)          { set_error("ov_decide_prefill: null out_logits"); return -1; }
+        for (size_t i = 0; i < k; ++i) {
+            if (cand[i] < 0 || static_cast<uint64_t>(cand[i]) >= s->vocab) {
+                std::string m = "ov_decide_prefill: cand[" + std::to_string(i) + "] = " +
+                                std::to_string(cand[i]) + " outside the vocabulary [0, " +
+                                std::to_string(s->vocab) + ")";
+                set_error(m.c_str());
+                return -1;
+            }
+        }
+        s->req.reset_state();
+        s->req.set_tensor("input_ids", row_tensor(s->ids_type, n, [&](size_t i) { return ids[i]; }));
+        if (s->has_mask) {
+            s->req.set_tensor("attention_mask", row_tensor(s->mask_type, n, [](size_t) { return int64_t{1}; }));
+        }
+        if (s->has_pos) {
+            s->req.set_tensor("position_ids", row_tensor(s->pos_type, n, [](size_t i) { return static_cast<int64_t>(i); }));
+        }
+        s->req.infer();
+        const ov::Tensor logits = s->req.get_tensor("logits");
+        const auto shape = logits.get_shape();
+        if (shape.size() != 3 || shape[1] != 1 || shape[2] != s->vocab) {
+            set_error("ov_decide_prefill: unexpected logits shape after infer");
+            return -1;
+        }
+        const float* row = logits.data<float>();
+        for (size_t i = 0; i < k; ++i) out_logits[i] = row[cand[i]];
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_decide_prefill");
+        return -1;
+    }
+}
+
+/// Vocabulary size V (static logits dim 2), for registration-time candidate checks.
+int ov_decide_vocab_size(OvDecideHandle handle, size_t* out_vocab) {
+    s_last_error[0] = '\0';
+    if (!handle || !out_vocab) { set_error("ov_decide_vocab_size: null argument"); return -1; }
+    *out_vocab = static_cast<OvDecideState*>(handle)->vocab;
+    return 0;
+}
+
+} // extern "C" (decision section)

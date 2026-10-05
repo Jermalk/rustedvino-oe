@@ -30,6 +30,15 @@ spec — same convention other OpenAI-compatible servers (vLLM, Ollama, llama.cp
 `enable_thinking`. (`max_prompt_len` is a per-model, NPU-only **config** field, not a request
 field — see [`CONFIG.md`](CONFIG.md).)
 
+### Ollama-compatible endpoints
+
+Same request/response shape and error envelope as Ollama v0.35 (`{"error": "<string>"}`), so
+Ollama clients and TypeSafe's System One SDK work unmodified.
+
+| Method | Route | Description |
+|---|---|---|
+| `POST` | `/v1/systemone` | Typed decisions (choice / yes-no / ordinal score) with probabilities from one prefill per question — no text generation. Needs a `kind: "decision"` model (see [`CONFIG.md`](CONFIG.md)) |
+
 ### RustedVINO extensions
 
 Not part of OpenAI's API — server-specific infra, admin/lifecycle control, and endpoints
@@ -51,7 +60,7 @@ of OpenAI's actual Realtime API event schema.
 | `GET` | `/v1/admin/models/completeness` | Report which registered models are missing required directory/tokenizer files |
 | `POST` | `/v1/admin/models/add` | Register a new model at runtime and load it immediately; persists to `config.json` — `model_id`/`vram_gb` required, `kind` and every `ModelPolicy` field (device, co-residency knobs, image-gen provenance, …) optional, same shape as a static config stanza |
 | `POST` | `/v1/admin/models/{id}/load` | Load model into VRAM (blocks until ready; evicts LRU if needed) |
-| `POST` | `/v1/admin/models/{id}/check` | Check model state without loading |
+| `POST` | `/v1/admin/models/{id}/check` | Dry-run admission check: does it fit, which models would be evicted. `?force=true` previews a load that bypasses the eviction-grace window (nothing else) |
 | `POST` | `/v1/admin/models/{id}/resize` | Resize a **resident** model's KV-cache pool — evicts (draining in-flight requests) then reloads at the new size. Body `{"kv_cache_gb": <f64 > 0>}`; every other resolved override (`max_concurrent_streams`, …) is carried forward from the model's record, so the caller states only the delta. Deliberately **not** idempotent-when-`Ready` — that is exactly why it exists, since a repeated `/load` silently ignores a new `kv_cache_gb` on an already-loaded model |
 | `DELETE` | `/v1/admin/models/{id}` | Evict model from VRAM (drains in-flight requests, then joins engine thread) |
 | `PATCH` | `/v1/admin/models/{id}` | Update fields of an already-registered model — persisted always, live immediately for most fields, next-load for `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`min_response_len`/`speculative`; `device`/`tier_preference` need the model `NotLoaded` first. `kind` is immutable |
@@ -77,6 +86,17 @@ A request body may be at most **50 MiB**. That is a fixed server limit, not a co
 larger request gets `413` with error code `request_too_large`, whether it is a JSON body (a chat
 request with a large inline image, say) or a multipart upload (audio, images).
 
+### Error responses
+
+Rejections use the OpenAI error envelope, `{"error": {"message", "type", "param", "code"}}`, with a
+stable `code`: for example `invalid_body` (malformed or incomplete JSON), `invalid_multipart` (a
+multipart route called without a multipart body), `invalid_audio` (an upload that cannot be decoded
+as audio), `invalid_query` (a bad query string such as `?force=maybe`), `method_not_allowed` (405, with the `Allow` header), `context_length_exceeded` (a prompt
+that can never fit this model: retrying is pointless) and `pool_capacity_exceeded` (the prompt fits
+alone but not beside the requests already running: retry shortly). Requests to a path the server
+does not have, and to routes added by an extension, are answered by the framework and are not
+guaranteed to carry the envelope.
+
 ### `POST /v1/audio/transcriptions`
 
 - **Fields:**
@@ -87,6 +107,8 @@ request with a large inline image, say) or a multipart upload (audio, images).
     is unreliable.
   - `response_format`: `json` (default), `text`, `srt` or `verbose_json`.
   - Other OpenAI fields (`prompt`, `temperature`, …) are accepted and ignored.
+- **Undecodable audio** (garbage, truncated, an unsupported container) returns `400` with code
+  `invalid_audio`.
 - **Long audio:** one request transcribes the whole file, including audio longer than Whisper's
   30-second window. For example, an 87.6-second file came back complete, with `verbose_json`
   segments to the end. In practice the length limit is the 50 MiB upload cap: about 27 minutes
@@ -122,6 +144,46 @@ request with a large inline image, say) or a multipart upload (audio, images).
   inputs × the longest input's token count), else `400` `batch_too_large`. See
   [`CONFIG.md`](CONFIG.md).
 
+### `POST /v1/systemone`
+
+Ollama v0.35's System One wire format. Request: `model`, `state` (a string, or a JSON object/array
+used as compact JSON), and `questions`, an object of named questions in the order they should be
+answered:
+
+```json
+{"model": "nimble", "state": "Our checkout has returned 500 errors since 9am.",
+ "questions": {
+   "label":   {"type": "choice", "instructions": "Which label fits this ticket?",
+               "criteria": {"billing": "Payments and refunds", "bug": "Software errors", "account": null}},
+   "refund":  {"type": "noul",   "instructions": "Is the customer asking for a refund?"},
+   "urgency": {"type": "score",  "instructions": "How urgent is this?", "criteria": ["Routine", "Soon", "Urgent"]}}}
+```
+
+Each answer carries its probabilities: `choice` → `choice` + `probabilities` + `confidence`;
+`noul` → `noul` (P(yes)); `score` → `score` (expected level, 0…n−1) + `legend` + `probabilities` +
+`confidence`, where confidence is 1 − normalised entropy. `usage.input_tokens` is the sum of the
+per-question prompts. The model never generates text, so an answer is always one of the allowed
+options.
+
+Limits and checks, in Ollama's order (status, then Ollama's exact message):
+
+| Check | Status |
+|---|---|
+| The first JSON value runs past 64 KiB (trailing bytes after it are ignored, as in Ollama) | 413 |
+| Not decodable as a request (wording differs from Ollama's Go decoder; status matches) | 400 |
+| Invalid request: 1–64 questions, 2–26 candidates per question, `instructions` required on every type, non-empty `state`, etc. | 400 |
+| Unknown model | 404 |
+| Model is not a decision model (a non-decision model is never loaded just to be refused) | 400 |
+| Model loading / evicting | 503 + `Retry-After: 5` |
+| Device budget busy, or the model's turn gate stays busy for the whole queue timeout (only when `device_budgets` is configured for the model's device; requests queue at the gate holding no slot) | 429 |
+| A prompt longer than the model's context (`prompt %d has %d tokens; expected 1–%d…`, or `…requires %d context tokens for scoring…` for the last two positions) — every prompt is checked before any inference | 400 |
+| Inference failed; if the engine also failed to reload, the model is unloaded so it can be loaded again (503 on the next call) | 500 |
+
+Differences from Ollama: Ollama makes the first request wait while a model loads, whereas
+RustedVINO answers 503 + `Retry-After`. `usage.output_tokens` is one per question; Ollama adds 1
+when it reuses a shared prompt prefix. Response numbers are equal, but JSON number formatting
+differs (`1` vs `1.0`). A client that disconnects stops the request before its next question.
+
 ### `GET /v1/realtime` (WebSocket)
 
 - **Audio in:** binary frames of 16 kHz mono PCM, 16-bit little-endian.
@@ -152,7 +214,7 @@ credential presented.
 | 405 | Wrong HTTP method |
 | 409 | Conflict — e.g. DELETE on a NotLoaded model, `models/add` on an already-registered ID, `PATCH` on a Loading/Evicting model, `PATCH`'ing `device`/`tier_preference` while the model is Ready (evict first), or `models/{id}/resize` on a model that is not currently `Ready` (use `/load` for one that isn't resident) |
 | 429 | Too many requests — all slots busy, admission timeout expired, or `models/{id}/resize` called again within `kv_resize_cooldown_secs` of that model's last resize |
-| 503 | Transient — model is Loading/Evicting, GPU context poisoned (restart required), or no keys file was ever configured (`admin_not_configured`) |
+| 503 | Transient or capacity — model is Loading/Evicting; a load refused because the model can never fit in system RAM or VRAM even after evicting everything evictable (`insufficient_memory`, nothing was evicted); GPU context poisoned (restart required: `GET /v1/admin/models` reports `server.gpu_poisoned: true`, and a server run under `--supervise` restarts its worker by itself when a model that was already serving fails this way; a poisoning during startup or while loading a model leaves it up and degraded); or no keys file was ever configured (`admin_not_configured`) |
 | 500 | Internal error (engine factory failure, I/O) |
 
 ### `POST /v1/admin/models/{id}/resize` — the failure mode to plan for

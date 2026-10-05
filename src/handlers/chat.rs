@@ -182,6 +182,39 @@ fn pool_capacity_exceeded_response(model_id: &str, token_estimate: usize) -> Res
     )
 }
 
+/// The two byte-length-only checks that run before the engine is asked to
+/// tokenize, in the order that matters: FIRST the L0 byte gate (a prompt with
+/// more bytes than the model's whole prompt ceiling allows under the most
+/// generous tokenizer can never fit: permanent 400 `context_length_exceeded`),
+/// THEN the pool pre-check (the prompt could fit alone but not beside what is
+/// already admitted: transient 429). With the order reversed a 20 MB prompt got
+/// the 429 "retry shortly" and clients retried forever (Windows pass 2, D10).
+/// `0` for either capacity disables that check. `None` = continue.
+fn prompt_precheck(
+    model_id: &str,
+    prompt: &str,
+    max_prompt_tokens: usize,
+    pool_capacity_tokens: usize,
+    already_admitted: usize,
+) -> Option<Response> {
+    if max_prompt_tokens > 0
+        && let Err(resp) = gate_prompt_bytes(model_id, "cb", prompt, max_prompt_tokens)
+    {
+        return Some(*resp);
+    }
+    if pool_capacity_tokens > 0 {
+        let min_possible_tokens = prompt.len() / MAX_BYTES_PER_TOKEN.max(1);
+        if already_admitted.saturating_add(min_possible_tokens) > pool_capacity_tokens {
+            crate::metrics::record_pool_capacity_rejected(model_id);
+            return Some(pool_capacity_exceeded_response(
+                model_id,
+                min_possible_tokens,
+            ));
+        }
+    }
+    None
+}
+
 /// Same shape as [`pool_capacity_exceeded_response`], but a different cause:
 /// a single-slot model (`max_concurrent_streams == 1`) rejecting a request
 /// whose own `prompt_tokens + max_tokens` can't fit the pool, with no other
@@ -1402,6 +1435,17 @@ pub(crate) fn resolve_repetition_penalty(requested: Option<f32>) -> Option<f32> 
 /// doc comment for the full rationale.
 pub(crate) const TOOLS_ACTIVE_TEMPERATURE: f32 = 0.0;
 
+/// Smallest `top_p` the engine accepts (`top_p > 0` is checked inside the CB pipeline).
+pub(crate) const MIN_TOP_P: f32 = 1e-6;
+
+/// `top_p: 0` is inside the documented range (0..=1) but the engine rejects it with a 500
+/// (`Check 'top_p > 0 && top_p <= 1.0f' failed`, seen by the overnight fuzz). A nucleus of probability 0
+/// keeps only the most likely token, i.e. greedy decoding, so clamp to the smallest accepted value, which
+/// behaves the same and is what clients that send `top_p: 0` mean.
+pub(crate) fn clamp_top_p(top_p: Option<f32>) -> Option<f32> {
+    top_p.map(|p| p.max(MIN_TOP_P))
+}
+
 /// Resolve the final `(temperature, top_p, top_k)` for one request, composing
 /// client-explicit values, `tools_active`, and a model's own shipped
 /// [`GenerationDefaults`] (`generation_config.json`) into one decision:
@@ -1475,7 +1519,7 @@ fn gen_params_from_chat(
     GenParams {
         max_new_tokens: clamp_max_tokens(token_budget, 0, max_tokens_cap),
         temperature,
-        top_p,
+        top_p: clamp_top_p(top_p),
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
         repetition_penalty: resolve_repetition_penalty(req.repetition_penalty),
@@ -2182,7 +2226,8 @@ pub async fn chat_completions(
             EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Reranking(_) => {
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => {
                 return openai_error(
                     StatusCode::NOT_IMPLEMENTED,
                     format!(
@@ -2252,13 +2297,15 @@ pub async fn chat_completions(
         // would too — this can only ever short-circuit a REJECTION, never an
         // acceptance (a prompt that passes this still goes through the exact
         // check below with the real tokenized count).
-        if ctx.pool_capacity_tokens > 0 {
-            let already_admitted = handle.admitted_prompt_tokens();
-            let min_possible_tokens = prompt.len() / MAX_BYTES_PER_TOKEN.max(1);
-            if already_admitted.saturating_add(min_possible_tokens) > ctx.pool_capacity_tokens {
-                crate::metrics::record_pool_capacity_rejected(&req.model);
-                return pool_capacity_exceeded_response(&req.model, min_possible_tokens);
-            }
+        //
+        if let Some(resp) = prompt_precheck(
+            &req.model,
+            &prompt,
+            ctx.max_prompt_tokens,
+            ctx.pool_capacity_tokens,
+            handle.admitted_prompt_tokens(),
+        ) {
+            return resp;
         }
 
         // L0: prompt-length gate (shared with /v1/completions — see gate_prompt).
@@ -3057,6 +3104,78 @@ mod tests {
 
     use super::*;
 
+    /// `top_p: 0` is in range for the API but the engine rejects it with a 500; it is clamped to the smallest
+    /// accepted value (effectively greedy). Other values and `None` are untouched.
+    #[test]
+    fn top_p_zero_is_clamped_to_the_engine_minimum() {
+        assert_eq!(clamp_top_p(Some(0.0)), Some(MIN_TOP_P));
+        assert_eq!(clamp_top_p(Some(-0.0)), Some(MIN_TOP_P));
+        assert_eq!(clamp_top_p(Some(0.9)), Some(0.9));
+        assert_eq!(clamp_top_p(Some(1.0)), Some(1.0));
+        assert_eq!(clamp_top_p(None), None);
+        const { assert!(MIN_TOP_P > 0.0) } // the engine requires top_p > 0
+    }
+
+    // ---- D10: byte gate before the pool pre-check ---------------------------
+
+    fn precheck_status_and_code(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = futures_util_block_on_body(resp);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            status,
+            v["error"]["code"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    fn futures_util_block_on_body(resp: Response) -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        })
+    }
+
+    /// A prompt far beyond the model's whole ceiling is a permanent 400 even
+    /// though it ALSO overflows the pool: moving the pool pre-check above the
+    /// byte gate would make this a 429.
+    #[test]
+    fn never_fitting_prompt_is_a_400_not_a_retryable_429() {
+        let prompt = "x".repeat(20 * 1024 * 1024);
+        let resp = prompt_precheck("m", &prompt, 15_915, 15_915, 0).unwrap();
+        assert_eq!(
+            precheck_status_and_code(resp),
+            (
+                StatusCode::BAD_REQUEST,
+                "context_length_exceeded".to_owned()
+            )
+        );
+    }
+
+    /// A prompt that fits the ceiling but not beside what is already admitted
+    /// stays the transient 429; one that fits everywhere passes.
+    #[test]
+    fn contended_prompt_is_429_and_a_fitting_one_passes() {
+        let prompt = "x".repeat(32 * 1000); // ~1000 tokens by the byte bound
+        let resp = prompt_precheck("m", &prompt, 15_915, 15_915, 15_000).unwrap();
+        assert_eq!(
+            precheck_status_and_code(resp),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "pool_capacity_exceeded".to_owned()
+            )
+        );
+        assert!(prompt_precheck("m", &prompt, 15_915, 15_915, 0).is_none());
+        assert!(
+            prompt_precheck("m", &prompt, 0, 0, 0).is_none(),
+            "gates off"
+        );
+    }
+
     // ---- R1 capability-routing harness ------------------------------------
     //
     // Builds an `AppState` backed by a `MockEngineFactory` ModelManager (no
@@ -3785,6 +3904,7 @@ mod tests {
             cache_size_gb: 0.0,
             default_kv_cache_gb: 0.0,
             vram_safety_margin_gb: 0.0,
+            npu_footprint_factor: 1.0,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,

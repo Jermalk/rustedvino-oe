@@ -14,7 +14,9 @@ use axum::{Json, extract::State, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
-use crate::handlers::error::{model_error_response, openai_error};
+use crate::handlers::error::{
+    JsonBody, inference_error_response, model_error_response, openai_error,
+};
 use crate::model_manager::{ModelError, ModelManager, OnDemandLoad};
 use crate::rerank_engine::RerankingHandle;
 
@@ -70,6 +72,68 @@ pub struct RerankUsage {
 
 // ── Handler ────────────────────────────────────────────────────────────────────
 
+/// True if `s` has at least one character that is not whitespace, a control character or an invisible
+/// format character (zero-width space/joiners, bidi marks and overrides, word joiner, byte-order mark,
+/// soft hyphen). The tokenizer drops all of these, so a query AND a document made only of them reach the
+/// model as empty sequences and the CPU plugin fails (`Input shape dimension equal 0 cannot be
+/// broadcasted`): 221 `500`s in the verification fuzz, where the input was a lone U+202E, U+FEFF or U+200B.
+fn has_visible_text(s: &str) -> bool {
+    s.chars().any(|c| {
+        !(c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{FEFF}'
+            ))
+    })
+}
+
+/// Rejects text the model cannot take, BEFORE it reaches the engine: a NUL byte (cannot cross the C
+/// boundary) or a document with no characters (the cross-encoder fails on an empty sequence). These are
+/// the caller's mistakes, and as engine failures they cost a pipeline rebuild each (overnight torture
+/// run: 1,143 rebuilds, one of which crashed the worker) and surfaced as `500 inference failed`.
+fn reject_unusable_text(req: &RerankRequest) -> Option<Response> {
+    let bad = |message: String, code: &'static str| {
+        Some(openai_error(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            Some(code),
+        ))
+    };
+    if req.query.contains('\0') {
+        return bad(
+            "Field 'query' must not contain NUL bytes.".to_owned(),
+            "invalid_input",
+        );
+    }
+    if !has_visible_text(&req.query) {
+        return bad(
+            "Field 'query' has no visible text.".to_owned(),
+            "invalid_input",
+        );
+    }
+    for (i, d) in req.documents.iter().enumerate() {
+        if d.contains('\0') {
+            return bad(
+                format!("documents[{i}] must not contain NUL bytes."),
+                "invalid_input",
+            );
+        }
+        if !has_visible_text(d) {
+            return bad(
+                format!("documents[{i}] has no visible text."),
+                "invalid_input",
+            );
+        }
+    }
+    None
+}
+
 /// `POST /v1/rerank` — rerank documents against a query.
 ///
 /// Returns results sorted by relevance score descending, trimmed to `top_n`.
@@ -77,7 +141,7 @@ pub struct RerankUsage {
 /// expose per-request token counts).
 pub async fn rerank(
     State(state): State<AppState>,
-    Json(req): Json<RerankRequest>,
+    JsonBody(req): JsonBody<RerankRequest>,
 ) -> impl IntoResponse {
     if req.query.is_empty() {
         return openai_error(
@@ -94,6 +158,9 @@ pub async fn rerank(
             "invalid_request_error",
             None,
         );
+    }
+    if let Some(resp) = reject_unusable_text(&req) {
+        return resp;
     }
 
     let n_docs = req.documents.len();
@@ -125,13 +192,9 @@ pub async fn rerank(
     let raw_results = match handle.rerank(query, documents).await {
         Ok(r) => r,
         Err(e) => {
+            // T6.2: raw engine text stays in the log, never in the body.
             tracing::error!(model = %req.model, err = %e, "reranking failed");
-            return openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Reranking failed: {e}"),
-                "server_error",
-                None,
-            );
+            return inference_error_response(Some(mm), &req.model, &e);
         }
     };
 
@@ -251,12 +314,8 @@ fn resolve_rerank_handle(
 ) -> Result<RerankingHandle, Box<Response>> {
     match mm.get_reranking_handle(model) {
         Ok(h) => Ok(h),
-        Err(ModelError::NotFound(_)) => Err(Box::new(openai_error(
-            StatusCode::NOT_FOUND,
-            format!("Model '{model}' not found. Load it first via /v1/admin/models."),
-            "invalid_request_error",
-            Some("model_not_found"),
-        ))),
+        // The same body every other route gives an unknown model.
+        Err(e @ ModelError::NotFound(_)) => Err(Box::new(model_error_response(e))),
         Err(ModelError::WrongKind(msg)) => Err(Box::new(openai_error(
             StatusCode::BAD_REQUEST,
             msg,
@@ -321,6 +380,7 @@ mod tests {
             cache_size_gb: 0.0,
             default_kv_cache_gb: 0.0,
             vram_safety_margin_gb: 0.0,
+            npu_footprint_factor: 1.0,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -409,6 +469,7 @@ mod tests {
                 cache_size_gb: 0.0,
                 default_kv_cache_gb: 0.0,
                 vram_safety_margin_gb: 0.0,
+                npu_footprint_factor: 1.0,
                 min_kv_cache_gb: 0.0,
                 light_model_max_gb: 2.0,
                 light_stt_max_gb: 1.0,
@@ -676,5 +737,26 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// Invisible-only text is not text: it tokenizes to nothing (torture fuzz: 221 engine failures).
+    #[test]
+    fn has_visible_text_ignores_whitespace_controls_and_format_characters() {
+        for invisible in [
+            "",
+            " ",
+            "\n\t",
+            "\u{202E}",
+            "\u{FEFF}",
+            "\u{200B}",
+            " \u{200B} \u{200D}",
+            "\u{00AD}",
+            "\u{0007}",
+        ] {
+            assert!(!super::has_visible_text(invisible), "{invisible:?}");
+        }
+        for visible in ["a", "ż", "😀", ".", "\u{200B}x", "%00", "../x"] {
+            assert!(super::has_visible_text(visible), "{visible:?}");
+        }
     }
 }

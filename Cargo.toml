@@ -1,4 +1,13 @@
-[lints.clippy]
+[workspace]
+resolver = "2"
+members = ["tools/rv"]
+# default-members: bare `cargo build`/`test`/`clippy` (no -p/--workspace) only
+# targets the main server crate, so the existing pass/fail baseline (tests,
+# clippy) stays unambiguous. Build/test the other members explicitly with `-p <name>`.
+default-members = ["."]
+# Phase 6: add "crates/infergate" to members when the routing crate is created
+
+[workspace.lints.clippy]
 # Hard lints — enforced across the whole crate
 # CRASH COURSE — priority = -1:
 #   Cargo lint tables have a priority system. Without it, `pedantic`
@@ -13,7 +22,7 @@ expect_used = "deny"
 
 [package]
 name = "rustedvino"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -41,7 +50,7 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object key order through parse→render so the chat
 # template emits tool schemas in the order the client sent them — required to
 # byte-match HF `apply_chat_template` (which preserves insertion order).
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
 # Structured logging — axum and tokio emit native tracing spans
 # RUST_LOG=debug cargo run  →  verbose output
@@ -185,4 +194,9 @@ cc = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+# Parity test only (tests/rv_keys_path_parity.rs): pins rv's copy of the keys-file
+# path rule to the server's. rv itself never depends on this crate.
+rv = { path = "tools/rv" }
 
+[lints]
+workspace = true

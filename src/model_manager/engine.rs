@@ -27,6 +27,7 @@
 // ============================================================
 
 use crate::cb_engine::EngineHandle;
+use crate::decision_engine::DecisionHandle;
 use crate::embed_engine::EmbeddingHandle;
 use crate::npu_engine::NpuHandle;
 use crate::pipelines::image::ImageHandle;
@@ -59,6 +60,8 @@ pub enum ModelKind {
     ImageGen,
     /// Cross-encoder reranking (`/v1/rerank`).
     Reranking,
+    /// Typed decisions (`/v1/systemone`): one prefill per question, candidate logits.
+    Decision,
 }
 
 impl ModelKind {
@@ -76,6 +79,7 @@ impl ModelKind {
             Self::Tts => "tts",
             Self::ImageGen => "image_gen",
             Self::Reranking => "reranking",
+            Self::Decision => "decision",
         }
     }
 
@@ -92,6 +96,7 @@ impl ModelKind {
             "tts" => Some(Self::Tts),
             "image_gen" => Some(Self::ImageGen),
             "reranking" => Some(Self::Reranking),
+            "decision" => Some(Self::Decision),
             _ => None,
         }
     }
@@ -215,6 +220,8 @@ pub enum EngineHandleKind {
     ImageGen(ImageHandle),
     /// Cross-encoder reranking engine (`/v1/rerank`).
     Reranking(RerankingHandle),
+    /// Decision engine (`/v1/systemone`).
+    Decision(DecisionHandle),
 }
 
 impl EngineHandleKind {
@@ -233,6 +240,7 @@ impl EngineHandleKind {
             Self::Tts(_) => ModelKind::Tts,
             Self::ImageGen(_) => ModelKind::ImageGen,
             Self::Reranking(_) => ModelKind::Reranking,
+            Self::Decision(_) => ModelKind::Decision,
         }
     }
 
@@ -264,6 +272,7 @@ impl EngineHandleKind {
             Self::Tts(h) => h,
             Self::ImageGen(h) => h,
             Self::Reranking(h) => h,
+            Self::Decision(h) => h,
         }
     }
 }
@@ -295,6 +304,8 @@ mod tests {
         assert_eq!(ModelKind::Tts.label(), "tts");
         assert_eq!(ModelKind::ImageGen.label(), "image_gen");
         assert_eq!(ModelKind::Reranking.label(), "reranking");
+        assert_eq!(ModelKind::Decision.label(), "decision");
+        assert_eq!(ModelKind::from_label("decision"), Some(ModelKind::Decision));
 
         let labels = [
             ModelKind::TextGen.label(),
@@ -304,6 +315,7 @@ mod tests {
             ModelKind::Tts.label(),
             ModelKind::ImageGen.label(),
             ModelKind::Reranking.label(),
+            ModelKind::Decision.label(),
         ];
         let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
         assert_eq!(unique.len(), labels.len(), "labels must all be distinct");

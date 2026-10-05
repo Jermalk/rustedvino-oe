@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use super::chat::unix_now;
 use super::error::{
-    JsonBody, device_admission_error_response, inference_error_response, model_error_response,
-    openai_error,
+    JsonBody, MultipartBody, device_admission_error_response, inference_error_response,
+    model_error_response, openai_error,
 };
 use crate::Authenticated;
 use crate::app_state::AppState;
@@ -118,7 +118,10 @@ struct VerboseSegment<'a> {
 /// the real Whisper pipeline (audio decode + resample + transcription) before
 /// rendering the requested `response_format`. With no model manager attached
 /// (the no-GPU integration-test path) it renders a canned transcription.
-pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart) -> Response {
+pub async fn transcriptions(
+    State(state): State<AppState>,
+    MultipartBody(multipart): MultipartBody,
+) -> Response {
     speech_to_text(&state, multipart, SttTask::Transcribe).await
 }
 
@@ -130,7 +133,10 @@ pub async fn transcriptions(State(state): State<AppState>, multipart: Multipart)
 /// for this route, is accepted as a hint for the *spoken* language. A model
 /// known not to translate (English-only, from its `generation_config.json`)
 /// is refused with 400 `model_cannot_translate` before any work.
-pub async fn translations(State(state): State<AppState>, multipart: Multipart) -> Response {
+pub async fn translations(
+    State(state): State<AppState>,
+    MultipartBody(multipart): MultipartBody,
+) -> Response {
     speech_to_text(&state, multipart, SttTask::Translate).await
 }
 
@@ -220,6 +226,11 @@ async fn speech_to_text(state: &AppState, multipart: Multipart, task: SttTask) -
             // T6.2: never reflect raw C++ diagnostics into the body — an OOM-class
             // error becomes a retryable 503, anything else an opaque 500.
             Err(crate::cb_engine::AdmitError::Failed(e)) => {
+                // The upload itself is undecodable: the caller's fault, and
+                // retrying cannot help (D9). Anything else stays an engine error.
+                if let Some(resp) = bad_audio_response(&e) {
+                    return resp;
+                }
                 return inference_error_response(Some(mm), handle.model_id(), &e);
             }
         }
@@ -389,6 +400,42 @@ fn mock_transcription(language: Option<&str>) -> Transcription {
     }
 }
 
+/// Longest text `POST /v1/audio/speech` accepts, in characters (the same limit as the `OpenAI` API).
+const MAX_SPEECH_INPUT_CHARS: usize = 4096;
+
+/// The 400 for text the speech endpoint cannot take: empty, containing a NUL byte, or longer than
+/// [`MAX_SPEECH_INPUT_CHARS`]. The text encoder's attention is quadratic in the input: 70,000 characters
+/// asked ONNX Runtime for a 78 GB allocation (70,000^2 x 4 B x 4 heads) in the overnight torture run.
+fn speech_input_error(input: &str) -> Option<Response> {
+    if input.trim().is_empty() {
+        return Some(bad_request("input must not be empty", "missing_input"));
+    }
+    if input.contains('\0') {
+        return Some(bad_request(
+            "input must not contain NUL bytes",
+            "invalid_input",
+        ));
+    }
+    if input.chars().count() > MAX_SPEECH_INPUT_CHARS {
+        return Some(bad_request(
+            "input is too long: at most 4096 characters per request",
+            "input_too_long",
+        ));
+    }
+    None
+}
+
+/// The 400 for an upload that could not be decoded as audio, or `None` when
+/// `e` is any other (engine) failure. Retrying the same bytes cannot help, so
+/// this is the caller's error, not a 500.
+fn bad_audio_response(e: &anyhow::Error) -> Option<Response> {
+    let bad = e.downcast_ref::<crate::pipelines::stt::BadAudio>()?;
+    Some(bad_request_owned(
+        format!("the uploaded file is not usable audio: {bad}"),
+        "invalid_audio",
+    ))
+}
+
 /// Build a 400 `invalid_request_error` with the shared `OpenAI` envelope.
 /// A multipart read error as a response. Exceeding the server's request-body
 /// limit is an honest 413 that names the limit — it used to surface as a 400
@@ -503,8 +550,8 @@ pub async fn speech(
         return bad_request("speed must be between 0.25 and 4.0", "invalid_speed");
     }
 
-    if req.input.trim().is_empty() {
-        return bad_request("input must not be empty", "missing_input");
+    if let Some(resp) = speech_input_error(&req.input) {
+        return resp;
     }
 
     // `sample_rate` is split from `samples` so the WAV header uses the correct rate
@@ -1090,7 +1137,7 @@ struct ImageEditMultipart {
 pub async fn image_edits(
     State(state): State<AppState>,
     authenticated: Option<Extension<Authenticated>>,
-    multipart: Multipart,
+    MultipartBody(multipart): MultipartBody,
 ) -> Response {
     let req = match parse_edit_request(multipart).await {
         Ok(r) => r,
@@ -1460,6 +1507,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Windows pass 2 D9: an undecodable upload maps to 400 `invalid_audio`; an
+    /// engine failure does not (it stays a 500/503 via `inference_error_response`).
+    #[test]
+    fn bad_audio_is_a_400_and_engine_errors_are_not() {
+        let bad = anyhow::Error::new(crate::pipelines::stt::BadAudio(
+            "unsupported or malformed audio container".to_owned(),
+        ));
+        let resp = bad_audio_response(&bad).expect("typed bad audio maps");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(bad_audio_response(&anyhow::anyhow!("npu compile failed")).is_none());
+    }
 
     #[test]
     fn response_format_parses_default_and_variants() {

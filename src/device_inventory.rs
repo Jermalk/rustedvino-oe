@@ -481,12 +481,15 @@ impl TierCache {
     }
 }
 
-/// `$XDG_CACHE_HOME/rustedvino/device_tiers.json`, or `~/.cache/...` as the
-/// fallback. `None` if neither environment variable is set.
+/// `$XDG_CACHE_HOME/rustedvino/device_tiers.json`, or `~/.cache/...`, or
+/// `%LOCALAPPDATA%\rustedvino\...` (see `cache_manifest::user_cache_base`).
+/// `None` if none of those environment variables is set.
 fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let base = crate::cache_manifest::user_cache_base(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+    )?;
     Some(base.join("rustedvino").join("device_tiers.json"))
 }
 

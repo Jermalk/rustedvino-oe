@@ -72,6 +72,52 @@ where
     }
 }
 
+/// Body for a request whose method the route does not accept (installed with
+/// `Router::method_not_allowed_fallback`). axum still adds the `Allow` header
+/// (checked live: `Allow: POST`); this only supplies the body.
+pub(crate) async fn method_not_allowed() -> Response {
+    openai_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed for this route",
+        "invalid_request_error",
+        Some("method_not_allowed"),
+    )
+}
+
+// ── MultipartBody extractor ───────────────────────────────────────────────────
+
+/// `axum::extract::Multipart`, but a request that is not valid
+/// `multipart/form-data` (wrong `Content-Type`, missing boundary) is rejected
+/// with the same OpenAI-style JSON error every other route gives, instead of
+/// axum's plain-text "Invalid `boundary` for `multipart/form-data` request"
+/// (Windows pass 2, D11). Use it in place of `Multipart` in handler signatures.
+pub(crate) struct MultipartBody(pub(crate) axum::extract::Multipart);
+
+impl<S> axum::extract::FromRequest<S> for MultipartBody
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Multipart::from_request(req, state).await {
+            Ok(m) => Ok(Self(m)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(request_too_large())
+            }
+            Err(rejection) => {
+                tracing::debug!(detail = %rejection.body_text(), "rejected non-multipart request");
+                Err(openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "expected a multipart/form-data body (Content-Type: multipart/form-data; boundary=...)",
+                    "invalid_request_error",
+                    Some("invalid_multipart"),
+                ))
+            }
+        }
+    }
+}
+
 /// 413 for a request body over the server's limit (`MAX_REQUEST_BODY`),
 /// naming the limit. Shared by the JSON extractor and the multipart
 /// (audio/image upload) parsers, which used to answer 400 "malformed body" /
@@ -182,8 +228,12 @@ pub(crate) fn sse_inference_error_event(
             "kv_capacity_wedge",
         ),
         InferenceErrorKind::GpuPoisoned => sse_error_frame(
-            "model temporarily unavailable — the GPU is recovering; retry shortly",
+            "model unavailable — the GPU context failed (out of resources) and the server must be restarted; retrying will not help",
             "model_unavailable",
+        ),
+        InferenceErrorKind::ModelUnloading => sse_error_frame(
+            "the model was unloaded while this request was running — retry shortly",
+            "model_unloading",
         ),
         InferenceErrorKind::Opaque => sse_error_frame("inference failed", "mid_stream_error"),
     }
@@ -251,7 +301,8 @@ pub(crate) fn device_admission_error_response(e: &crate::admission::AdmitError) 
 /// `Retry-After` (seconds) advertised on a 503 for a *transient* model state
 /// (`Loading`/`Evicting`): the state will change on its own, so a client should
 /// retry rather than fail over. A small constant — model JIT load is seconds.
-const RETRY_AFTER_TRANSIENT: HeaderValue = HeaderValue::from_static("5");
+/// `Retry-After` for transient not-ready states (loading / evicting), seconds.
+pub(crate) const RETRY_AFTER_TRANSIENT: HeaderValue = HeaderValue::from_static("5");
 
 /// Map a [`ModelError`] to its OpenAI-shaped HTTP response.
 ///
@@ -317,6 +368,12 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             ),
             "server_error",
             Some("gpu_poisoned"),
+        ),
+        ModelError::InsufficientMemory(msg) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            msg,
+            "server_error",
+            Some("insufficient_memory"),
         ),
         ModelError::WrongKind(msg) => openai_error(
             StatusCode::BAD_REQUEST,
@@ -385,10 +442,23 @@ pub(crate) fn inference_error_from_text(
         ),
         InferenceErrorKind::GpuPoisoned => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "model temporarily unavailable — the GPU is recovering; retry shortly",
+            "model unavailable — the GPU context failed (out of resources) and the server must be restarted; retrying will not help",
             "server_error",
             Some("model_unavailable"),
         ),
+        InferenceErrorKind::ModelUnloading => {
+            let mut resp = openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the model was unloaded while this request was running — retry shortly",
+                "server_error",
+                Some("model_unloading"),
+            );
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            resp
+        }
         InferenceErrorKind::Opaque => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "inference failed",
@@ -397,6 +467,10 @@ pub(crate) fn inference_error_from_text(
         ),
     }
 }
+
+/// Prefix of the terminal error the CB engine sends to requests still live when its loop exits
+/// (`cb_engine.rs`); maps to a retryable 503 rather than an opaque 500.
+pub(crate) const ENGINE_SHUTDOWN_MARKER: &str = "engine shutting down";
 
 /// Which class of inference failure `raw` represents, after applying its
 /// side effect (poisoning the GPU context, spawning VLM-wedge recovery, or
@@ -422,6 +496,9 @@ enum InferenceErrorKind {
     /// Whole-`OpenCL`-context OOM (`is_gpu_poison_error`) — every model on
     /// this device is affected, not just this one.
     GpuPoisoned,
+    /// The engine was stopped under a live request (eviction drain deadline,
+    /// shutdown) — the request is fine, the model went away; retryable 503.
+    ModelUnloading,
     /// Anything else — an opaque 500, raw text logged server-side only.
     Opaque,
 }
@@ -488,6 +565,10 @@ fn classify_inference_error(
             mm.mark_gpu_poisoned(model_id, raw);
         }
         return InferenceErrorKind::GpuPoisoned;
+    }
+    if raw.contains(ENGINE_SHUTDOWN_MARKER) {
+        tracing::warn!(model_id, error = %raw, "request aborted: its engine was stopped (eviction or shutdown)");
+        return InferenceErrorKind::ModelUnloading;
     }
     tracing::error!(model_id, error = %raw, "inference failed");
     InferenceErrorKind::Opaque
@@ -562,6 +643,21 @@ mod tests {
         let msg = json["error"]["message"].as_str().unwrap();
         assert_eq!(msg, "inference failed");
         assert!(!msg.contains("ragged batch"), "raw error leaked: {msg}");
+    }
+
+    /// An engine stopped under a live request (eviction drain deadline) is a retryable 503
+    /// with `Retry-After`, not an opaque 500.
+    #[tokio::test]
+    async fn engine_shutdown_is_retryable_503() {
+        let raw = anyhow::anyhow!("engine shutting down — request aborted before completion");
+        let resp = inference_error_response(None, "bielik", &raw);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "model_unloading");
     }
 
     /// T6.2b: an OOM-class mid-stream error produces a scrubbed SSE frame — the

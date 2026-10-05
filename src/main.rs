@@ -43,6 +43,10 @@ const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 ///   none enumerate — a driver/runtime failure).
 /// - `--device-info`: prints the full Phase-A device inventory (name, kind,
 ///   tier, memory domain, memory size) — the device-probe diagnostic view.
+/// - `--print-default-config`: prints every global setting with its default
+///   as JSON (`models_dir`/`device`/`total_vram_gb` are placeholders), ready to
+///   paste into a `config.json`. `--print-default-model` does the same for one
+///   `models.<id>` stanza. See `CONFIG.md`.
 fn handle_device_query_flags() -> bool {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list-devices") {
@@ -57,11 +61,37 @@ fn handle_device_query_flags() -> bool {
         }
         return true;
     }
+    if args.iter().any(|a| a == "--print-default-config") {
+        print_template(rustedvino::model_manager::Config::default_template());
+        return true;
+    }
+    if args.iter().any(|a| a == "--print-default-model") {
+        print_template(rustedvino::model_manager::Config::default_model_template());
+        return true;
+    }
     if args.iter().any(|a| a == "--device-info") {
         rustedvino::device_inventory::DeviceInventory::probe().print_report();
         return true;
     }
     false
+}
+
+/// Marker that `scripts/fill-config-defaults.py` looks for in a binary before
+/// running it: only a build that has `--print-default-config` contains it. (The
+/// flag's own text is not reliable for this: the optimiser splits short string
+/// comparisons.) An older server ignores unknown flags and would start for real.
+#[used]
+static TEMPLATE_FLAGS_MARKER: [u8; 31] = *b"RUSTEDVINO-TEMPLATE-FLAGS-V1-OK";
+
+/// Prints a settings template as pretty JSON, or the error and exit code 1.
+fn print_template(template: anyhow::Result<serde_json::Value>) {
+    match template.and_then(|v| Ok(serde_json::to_string_pretty(&v)?)) {
+        Ok(text) => println!("{text}"),
+        Err(e) => {
+            eprintln!("could not build the settings template: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Real process entry point. Builds the Tokio runtime explicitly (instead of
@@ -87,6 +117,9 @@ fn main() -> std::process::ExitCode {
     rt.shutdown_timeout(PROCESS_EXIT_TIMEOUT);
 
     match result {
+        Ok(()) if rustedvino::startup::gpu_poison_exit_requested() => {
+            std::process::ExitCode::from(rustedvino::startup::EXIT_GPU_POISONED)
+        }
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e:?}");

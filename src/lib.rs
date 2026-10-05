@@ -12,6 +12,7 @@ pub mod cache_manifest;
 pub mod cb_engine;
 #[cfg(unix)]
 pub mod crash_handler;
+pub mod decision_engine;
 pub mod device_inventory;
 pub mod embed_engine;
 pub mod gpu_memory;
@@ -25,6 +26,7 @@ pub mod model_manager;
 pub mod npu_engine;
 pub mod os_memory;
 pub mod ov_cb;
+pub mod ov_decide;
 pub mod ov_embed;
 pub mod ov_image;
 pub mod ov_pipeline;
@@ -40,6 +42,7 @@ pub mod startup;
 pub mod streaming;
 #[cfg(unix)]
 pub mod supervisor;
+pub mod systemone;
 pub mod tts_normalize;
 pub mod vlm_engine;
 pub mod voice_pin;
@@ -71,6 +74,7 @@ use handlers::error::openai_error;
 use handlers::media::{image_edits, image_generations, speech, transcriptions, translations};
 use handlers::realtime::realtime_handler;
 use handlers::reranking::rerank;
+use handlers::systemone::systemone;
 use handlers::tokenize::{detokenize, tokenize};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -188,6 +192,8 @@ pub fn create_router_with_extension(
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))
+        // Ollama-compatible typed decisions (System One, Ollama v0.35.0 wire format).
+        .route("/v1/systemone", post(systemone))
         // ── Media endpoints (Phase 5) ─────────────────────────────────
         // 5.1a: /v1/audio/transcriptions (Whisper STT) — live
         // 5.2a: /v1/audio/speech (SpeechT5 TTS) — live
@@ -239,6 +245,15 @@ pub fn create_router_with_extension(
             "/v1/admin/realtime/sessions/{id}",
             get(admin_realtime_session_by_id).delete(admin_kill_realtime_session),
         )
+        // A wrong method gets the same JSON error envelope as every other
+        // rejection, not an empty body (Windows pass 2, D11). It MUST be
+        // installed before the auth layer below: axum swaps a default 405 for
+        // this handler in an UNLAYERED route, so installed after the auth layer
+        // it answered keyless wrong-method requests with 405 instead of 401
+        // (a route/method oracle for `/v1/admin/*`). Only routes registered
+        // above this line get it; an extension router merged later keeps axum's
+        // plain 405.
+        .method_not_allowed_fallback(handlers::error::method_not_allowed)
         // ── Middleware ─────────────────────────────────────────────────
         // Applied to every route above. axum runs layers outermost-first,
         // and the OUTERMOST layer is the one added LAST. We add auth first
@@ -469,7 +484,7 @@ impl AuthConfig {
     /// is visible at its own call site rather than buried in a shared
     /// error-kind check.
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let raw = model_manager::config::read_json_text(path)
             .map_err(|e| anyhow::anyhow!("reading keys file {}: {e}", path.display()))?;
         #[cfg(unix)]
         {
@@ -752,7 +767,19 @@ fn missing_api_key() -> Response {
 
 #[cfg(test)]
 mod key_suffix_tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
+
+    /// Windows pass 2 D12: a keys file saved with a UTF-8 BOM loads.
+    #[test]
+    fn keys_file_with_a_utf8_bom_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("keys.json");
+        std::fs::write(&f, "\u{feff}{\"api_keys\":[\"k-aaaaaaaaaaaaaaaa\"]}").unwrap();
+        let keys = AuthConfig::load_from_file(&f).unwrap();
+        assert_eq!(keys.api_keys, ["k-aaaaaaaaaaaaaaaa"]);
+    }
 
     /// A key exactly at the 12-character floor is kept — the boundary is
     /// "under 12," not "under or equal to."

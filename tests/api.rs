@@ -2731,3 +2731,262 @@ async fn image_edit_metadata_host_only_for_valid_key() {
         rustedvino::os_memory::host_name().unwrap()
     );
 }
+
+// ------------------------------------------------------------------
+// Windows pass 2 D11: every rejection is the OpenAI-style JSON envelope
+// ------------------------------------------------------------------
+
+/// A wrong method used to answer 405 with an empty body.
+#[tokio::test]
+async fn wrong_method_is_a_json_405() {
+    let app = rustedvino::create_router(AppState::mock());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "method_not_allowed");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+}
+
+/// The 405 fallback must not break composing an extension router (Bear
+/// Edition does exactly this): its routes stay reachable.
+#[tokio::test]
+async fn extension_router_still_merges_with_the_405_fallback() {
+    let ext = axum::Router::new().route("/ext/ping", axum::routing::get(|| async { "pong" }));
+    let app = rustedvino::create_router_with_extension(
+        AppState::mock(),
+        &["*".to_owned()],
+        &[],
+        &[],
+        Some(ext),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ext/ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response.into_body()).await, "pong");
+}
+
+/// `/v1/audio/transcriptions` with a non-multipart body: JSON 400, not
+/// axum's plain "Invalid `boundary`" text.
+#[tokio::test]
+async fn transcription_with_wrong_content_type_is_a_json_400() {
+    let app = rustedvino::create_router(AppState::mock());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "invalid_multipart");
+}
+
+/// `/v1/rerank` rejections match the other routes: JSON 400 for a malformed
+/// body and for a missing field (it answered plain text and 422).
+#[tokio::test]
+async fn rerank_rejections_are_json_400() {
+    for body in ["{not json", r#"{"query":"q","documents":["d"]}"#] {
+        let app = rustedvino::create_router(AppState::mock());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/rerank")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let json = body_json(response.into_body()).await;
+        assert_eq!(json["error"]["code"], "invalid_body", "{body}");
+    }
+}
+
+/// A wrong method on a keyed server must hit the auth layer first: keyless
+/// callers get 401 (not a 405 that tells them which routes exist), and a keyed
+/// caller gets the JSON 405 with the `Allow` header axum computes.
+#[tokio::test]
+async fn wrong_method_on_a_keyed_server_is_401_without_a_key_and_json_405_with_one() {
+    let keys = vec!["inference-key-aaaaaaaaaaaa".to_owned()];
+    let admin = vec!["admin-key-bbbbbbbbbbbbbbbb".to_owned()];
+    let router =
+        || rustedvino::create_router_with_auth(AppState::mock(), &["*".to_owned()], &keys, &admin);
+
+    let keyless = router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/admin/models/some-model/check")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(keyless.status(), StatusCode::UNAUTHORIZED, "no 405 oracle");
+
+    let keyed = router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/admin/models/some-model/check")
+                .header("authorization", "Bearer admin-key-bbbbbbbbbbbbbbbb")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(keyed.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(keyed.headers().get("allow").unwrap(), "POST");
+    let json = body_json(keyed.into_body()).await;
+    assert_eq!(json["error"]["code"], "method_not_allowed");
+}
+
+/// `?force=` on the dry-run check: a bad value is a JSON 400, a good one parses
+/// (the mock server has no model manager, so it then answers 503, not 400).
+#[tokio::test]
+async fn check_force_query_is_validated_as_json() {
+    let admin = vec!["admin-key-bbbbbbbbbbbbbbbb".to_owned()];
+    for (query, want, code) in [
+        (
+            "force=maybe",
+            StatusCode::BAD_REQUEST,
+            Some("invalid_query"),
+        ),
+        ("force=true", StatusCode::SERVICE_UNAVAILABLE, None),
+        ("", StatusCode::SERVICE_UNAVAILABLE, None),
+    ] {
+        let app =
+            rustedvino::create_router_with_auth(AppState::mock(), &["*".to_owned()], &[], &admin);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/admin/models/m/check?{query}"))
+                    .header("authorization", "Bearer admin-key-bbbbbbbbbbbbbbbb")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), want, "query {query:?}");
+        if let Some(code) = code {
+            let json = body_json(response.into_body()).await;
+            assert_eq!(json["error"]["code"], code);
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Overnight torture run findings: bad input is a 400 BEFORE it reaches an engine
+// ------------------------------------------------------------------
+
+async fn post_json_error_code(path: &str, body: serde_json::Value) -> (StatusCode, String) {
+    let app = rustedvino::create_router(AppState::mock());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    (
+        status,
+        json["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// 70,000 characters made the speech engine ask for a 78 GB allocation; NUL cannot reach the engine.
+#[tokio::test]
+async fn speech_rejects_oversized_and_nul_input_with_a_400() {
+    let long = "a".repeat(4097);
+    for (input, code) in [
+        (long.as_str(), "input_too_long"),
+        ("ab\u{0}cd", "invalid_input"),
+    ] {
+        let (st, c) = post_json_error_code(
+            "/v1/audio/speech",
+            serde_json::json!({"model": "m", "input": input}),
+        )
+        .await;
+        assert_eq!(
+            (st, c.as_str()),
+            (StatusCode::BAD_REQUEST, code),
+            "input {:?}",
+            &input[..input.len().min(8)]
+        );
+    }
+    // The limit itself passes the length check (the mock server has no model, so it answers 503/404 instead).
+    let ok = "a".repeat(4096);
+    let (_st, c) = post_json_error_code(
+        "/v1/audio/speech",
+        serde_json::json!({"model": "m", "input": ok}),
+    )
+    .await;
+    assert_ne!(
+        c, "input_too_long",
+        "exactly 4096 characters must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn embeddings_reject_nul_bytes_with_a_400() {
+    let (st, c) = post_json_error_code(
+        "/v1/embeddings",
+        serde_json::json!({"model": "m", "input": ["fine", "bad\u{0}byte"]}),
+    )
+    .await;
+    assert_eq!((st, c.as_str()), (StatusCode::BAD_REQUEST, "invalid_input"));
+}
+
+/// A NUL byte or an empty document in a rerank request used to be an engine failure that rebuilt the
+/// pipeline (1,143 times in the torture run; one rebuild crashed the worker) and answered 500.
+#[tokio::test]
+async fn rerank_rejects_nul_and_empty_documents_with_a_400() {
+    for body in [
+        serde_json::json!({"model": "m", "query": "q\u{0}", "documents": ["d"]}),
+        serde_json::json!({"model": "m", "query": "q", "documents": ["ok", "d\u{0}"]}),
+        serde_json::json!({"model": "m", "query": "q", "documents": ["ok", "   "]}),
+        serde_json::json!({"model": "m", "query": "\u{FEFF}", "documents": ["\u{FEFF}"]}),
+        serde_json::json!({"model": "m", "query": "q", "documents": ["\u{200B}\u{202E}"]}),
+    ] {
+        let (st, c) = post_json_error_code("/v1/rerank", body.clone()).await;
+        assert_eq!(
+            (st, c.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_input"),
+            "{body}"
+        );
+    }
+}

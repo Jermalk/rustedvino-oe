@@ -38,6 +38,15 @@ const REQUESTS_WAITING: &str = "rustedvino_requests_waiting";
 const MODEL_LOADED: &str = "rustedvino_model_loaded";
 const VRAM_TOTAL_BYTES: &str = "rustedvino_vram_total_bytes";
 const VRAM_USED_BYTES: &str = "rustedvino_vram_used_bytes";
+
+/// GB (decimal, as the memory tracker counts) to a whole number of bytes for
+/// the `*_bytes` gauges. Rounded so accumulated float error shows up as
+/// `16722654720`, not `16722654720.000002`, and clamped so an idle tracker
+/// reads `0`, not `-0` (Windows pass 2, D14).
+fn gb_to_bytes(gb: f64) -> f64 {
+    let bytes = (gb * 1e9).round();
+    if bytes > 0.0 { bytes } else { 0.0 }
+}
 const PROCESS_GPU_MEMORY_BYTES: &str = "rustedvino_process_gpu_memory_bytes";
 const MODEL_GPU_MEMORY_ESTIMATE_BYTES: &str = "rustedvino_model_gpu_memory_estimate_bytes";
 
@@ -621,8 +630,8 @@ pub fn record_state(snap: &MetricsSnapshot) {
     }
     // Box-level aggregate VRAM gauges (backward-compat, single-domain view).
     let primary = snap.device.as_str();
-    gauge!(VRAM_TOTAL_BYTES, "device" => primary.to_owned()).set(snap.total_vram_gb * 1e9);
-    gauge!(VRAM_USED_BYTES, "device" => primary.to_owned()).set(snap.used_vram_gb * 1e9);
+    gauge!(VRAM_TOTAL_BYTES, "device" => primary.to_owned()).set(gb_to_bytes(snap.total_vram_gb));
+    gauge!(VRAM_USED_BYTES, "device" => primary.to_owned()).set(gb_to_bytes(snap.used_vram_gb));
     // Measured process-wide device memory, read live at scrape time.
     for ((driver, pdev, region), bytes) in crate::gpu_memory::read_process().unwrap_or_default() {
         #[allow(clippy::cast_precision_loss)]
@@ -631,8 +640,8 @@ pub fn record_state(snap: &MetricsSnapshot) {
     }
     // Per-domain gauges (multi-GPU: each domain gets its own labelled series).
     for (domain, total_gb, used_gb) in &snap.domain_vram {
-        gauge!(VRAM_TOTAL_BYTES, "domain" => domain.clone()).set(*total_gb * 1e9);
-        gauge!(VRAM_USED_BYTES, "domain" => domain.clone()).set(*used_gb * 1e9);
+        gauge!(VRAM_TOTAL_BYTES, "domain" => domain.clone()).set(gb_to_bytes(*total_gb));
+        gauge!(VRAM_USED_BYTES, "domain" => domain.clone()).set(gb_to_bytes(*used_gb));
     }
 }
 
@@ -702,6 +711,24 @@ pub(crate) fn record_ov_cache_pruned(freed_bytes: u64, deleted_files: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D14: byte gauges are whole, non-negative numbers.
+    #[test]
+    fn gb_to_bytes_rounds_and_never_goes_negative_zero() {
+        // 16722654720 bytes expressed as GB with accumulated float error.
+        let noisy_gb = 16_722_654_720.0_f64 / 1e9 + 2e-15;
+        assert!((gb_to_bytes(noisy_gb) - 16_722_654_720.0).abs() < f64::EPSILON);
+        assert!(
+            (gb_to_bytes(noisy_gb).fract()).abs() < f64::EPSILON,
+            "whole bytes"
+        );
+        let zero = gb_to_bytes(-0.0);
+        assert!(
+            zero == 0.0 && zero.is_sign_positive(),
+            "idle reads +0, got {zero:?}"
+        );
+        assert!(gb_to_bytes(-1e-12).is_sign_positive());
+    }
 
     /// Constructing `HotMetrics` and emitting through every handle must be safe
     /// with **no global recorder installed** — the engine thread always builds

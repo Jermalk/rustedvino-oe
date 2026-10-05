@@ -233,7 +233,16 @@ pub fn spawn_rerank_engine(
                         // load would otherwise fail identically until an admin
                         // manually evicts and reloads the model. Reload immediately
                         // instead, so only this one request is lost.
-                        if result.is_err() {
+                        //
+                        // BUT most failures are the CALLER's input, which leaves the pipeline fine, and every
+                        // reload destroys and rebuilds the pipeline (1,143 of them in one torture run; one
+                        // destructor segfaulted and took the worker down). So probe with a tiny known-good
+                        // call first and rebuild only if that fails too.
+                        if result.is_err()
+                            && engine
+                                .rerank("probe", &["probe".to_owned()])
+                                .is_err()
+                        {
                             if let Err(reload_err) = engine.reload() {
                                 tracing::error!(
                                     model_id = model_id_owned,

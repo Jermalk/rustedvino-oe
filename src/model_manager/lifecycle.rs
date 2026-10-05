@@ -698,21 +698,19 @@ impl EngineFactory for OvEngineFactory {
                 // registration and threaded in as `device` — same contract as the
                 // embedding arm; the factory loads on exactly that device.
                 //
-                // NPU never gets `ov::cache_dir`: the Level Zero NPU driver
-                // already persists its own compiled blob to
-                // `~/.cache/ze_intel_npu_cache/`, independent of this setting
-                // (the project's internal engineering log 2026-07-11 follow-up) — and live-verified
-                // (2026-08-27) that passing a non-empty `ov_cache_dir` into an
-                // NPU-targeted `WhisperPipeline` hangs the load past the
-                // supervisor's 90s health timeout. The NPU *LLM* pipeline (TextGen
-                // arm above) does get `CACHE_DIR` since 2026-09-28 — measured to
-                // cache cleanly; this Whisper exclusion stays (upstream
-                // openvino.genai#1992 is the same Whisper-only symptom).
-                let cache_dir = if device == "NPU" {
-                    ""
-                } else {
-                    self.ov_cache_dir.as_deref().unwrap_or("")
-                };
+                // NPU Whisper gets `CACHE_DIR` like every other pipeline. It did NOT
+                // until 2026-10-02: a live test on 2026-08-27 saw an NPU-targeted
+                // `WhisperPipeline` with a non-empty `ov_cache_dir` hang the load
+                // past the supervisor's 90 s health timeout (upstream
+                // openvino.genai#1992). On the current stack (GenAI 2026.2.1, this
+                // NPU driver) that no longer reproduces: three cold loads with both
+                // caches cleared took 3.5-4.1 s, a warm load 0.33 s, and the blob
+                // lands in `ov_cache_dir`. Auto-language requests on the NPU are
+                // answered by a lazily built CPU detector plus an explicit language
+                // for the NPU pipeline, which is built once and never rebuilt (see
+                // `OvWhisperState` in the bridge: rebuilding leaks 3 threads + 5
+                // handles per cycle, Windows pass 2 D1). Not yet verified on Windows.
+                let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
                 let engine = crate::ov_whisper::OvWhisperEngine::new(path_str, device, cache_dir)?;
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
@@ -768,6 +766,26 @@ impl EngineFactory for OvEngineFactory {
                     max_seq_len,
                 )?;
                 Ok((EngineHandleKind::Reranking(handle), thread))
+            }
+            ModelKind::Decision => {
+                // System One (/v1/systemone): direct InferRequest on a gathered decision
+                // IR. The sidecar supplies the system prompt,
+                // candidate ids and context length; the ids are verified against the
+                // tokenizer before the engine is handed out. Only an explicit
+                // `kind: "decision"` gets here — the IR looks like a plain LLM on disk.
+                crate::decision_engine::check_device(device)?;
+                let meta = crate::decision_engine::DecisionMeta::load(model_path)?;
+                let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
+                let engine = crate::ov_decide::OvDecideEngine::new(
+                    path_str,
+                    device,
+                    cache_dir,
+                    meta.context_length,
+                )?;
+                meta.verify(&engine)?;
+                let (handle, thread) =
+                    crate::decision_engine::spawn_decision_engine(engine, meta, model_id, device)?;
+                Ok((EngineHandleKind::Decision(handle), thread))
             }
             ModelKind::Tts => match detect_tts_backend(model_path)? {
                 TtsBackend::Kokoro {
@@ -1176,6 +1194,7 @@ impl EngineFactory for MockEngineFactory {
         const KINDS: &[(&str, ModelKind)] = &[
             ("embed", ModelKind::Embedding),
             ("rerank", ModelKind::Reranking),
+            ("decide", ModelKind::Decision),
             ("stt", ModelKind::Stt),
             ("tts", ModelKind::Tts),
             ("imagegen", ModelKind::ImageGen),
@@ -1310,6 +1329,16 @@ impl EngineFactory for MockEngineFactory {
                     .unwrap_or("mock-rerank");
                 let (handle, thread) = crate::rerank_engine::spawn_mock_rerank(leaf);
                 Ok((EngineHandleKind::Reranking(handle), thread))
+            }
+            ModelKind::Decision => {
+                // GPU-free mock decision engine: one token per prompt character (so tests
+                // hit the length boundaries exactly) and logit j for candidate j.
+                let leaf = model_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("mock-decide");
+                let (handle, thread) = crate::decision_engine::spawn_mock_decision(leaf);
+                Ok((EngineHandleKind::Decision(handle), thread))
             }
         }
     }

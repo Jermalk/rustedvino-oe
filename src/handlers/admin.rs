@@ -249,7 +249,8 @@ async fn submit_health_probe(
         | EngineHandleKind::Stt(_)
         | EngineHandleKind::Tts(_)
         | EngineHandleKind::ImageGen(_)
-        | EngineHandleKind::Reranking(_) => Err(hg_err(
+        | EngineHandleKind::Reranking(_)
+        | EngineHandleKind::Decision(_) => Err(hg_err(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "deep-health probe not implemented for {} models",
@@ -460,19 +461,33 @@ struct AdminModelsResponse {
 /// process lifetime, not per-request — an admin poll is the right cadence.
 /// `host`/`openvino_version` are individually omitted (never `null`) when
 /// unavailable, matching the same convention `generation_metadata` uses.
+///
+/// `pid`/`uptime_secs` let `rv status` identify the process that is *actually
+/// answering* without OS-specific probing (`/proc`, `pgrep`, PID files) — the
+/// probes it used to rely on do not exist on Windows. Like `host`, they go
+/// only to key-validated callers.
 #[derive(Serialize)]
 struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     openvino_version: Option<String>,
     engine: &'static str,
     engine_version: &'static str,
+    /// The GPU `OpenCL` context is wedged (an earlier `CL_OUT_OF_RESOURCES`);
+    /// every GPU model is unusable and only a process restart clears it.
+    /// Always present, to every caller: it is state an operator must not miss.
+    gpu_poisoned: bool,
 }
 
 impl ServerInfo {
-    /// `with_host`: whether the caller was key-validated — the hostname goes
-    /// only to those (see [`crate::Authenticated`]), never on a keyless server.
+    /// `with_host`: whether the caller was key-validated — the hostname, PID and
+    /// uptime go only to those (see [`crate::Authenticated`]), never on a
+    /// keyless server.
     fn current(with_host: bool) -> Self {
         Self {
             host: if with_host {
@@ -480,9 +495,16 @@ impl ServerInfo {
             } else {
                 None
             },
+            pid: with_host.then(std::process::id),
+            uptime_secs: if with_host {
+                crate::startup::process_uptime_secs()
+            } else {
+                None
+            },
             openvino_version: crate::ov_cb::openvino_version(),
             engine: "RustedVINO",
             engine_version: env!("CARGO_PKG_VERSION"),
+            gpu_poisoned: false,
         }
     }
 }
@@ -547,11 +569,9 @@ pub async fn admin_list_models(
         })
         .collect();
 
-    Json(AdminModelsResponse {
-        models,
-        server: ServerInfo::current(authenticated.is_some()),
-    })
-    .into_response()
+    let mut server = ServerInfo::current(authenticated.is_some());
+    server.gpu_poisoned = mm.is_gpu_poisoned();
+    Json(AdminModelsResponse { models, server }).into_response()
 }
 
 /// One model's entry in the `GET /v1/admin/models/completeness` audit.
@@ -903,6 +923,10 @@ pub async fn admin_load_model(
                     ModelError::Loading | ModelError::Evicting => {
                         return (StatusCode::CONFLICT, e.to_string()).into_response();
                     }
+                    ModelError::InsufficientMemory(_) => {
+                        // A predictable capacity refusal (nothing was evicted), not a fault.
+                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                    }
                     ModelError::GpuPoisoned => {
                         // L3: OpenCL context poisoned by a prior OOM — operator must
                         // restart the process; no retry will succeed. The restart
@@ -1032,6 +1056,10 @@ pub async fn admin_resize_model(
                     ModelError::NotLoaded | ModelError::Loading | ModelError::Evicting => {
                         return (StatusCode::CONFLICT, e.to_string()).into_response();
                     }
+                    ModelError::InsufficientMemory(_) => {
+                        // A predictable capacity refusal (nothing was evicted), not a fault.
+                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                    }
                     ModelError::GpuPoisoned => {
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -1095,7 +1123,8 @@ pub async fn admin_unload_model(
                     // begin_evict now refuses eviction while the GPU context is
                     // poisoned, so this arm is reachable — mapped the same way
                     // model_error_response maps it for the load path.
-                    ModelError::GpuPoisoned => {
+                    // InsufficientMemory: a predictable capacity refusal, not a fault.
+                    ModelError::GpuPoisoned | ModelError::InsufficientMemory(_) => {
                         return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
                     }
                     // WrongKind/FilesMissing/FilesIncomplete never originate
@@ -1147,6 +1176,10 @@ pub async fn admin_deregister_model(
                     }
                     ModelError::Loading | ModelError::Evicting => {
                         return (StatusCode::CONFLICT, e.to_string()).into_response();
+                    }
+                    ModelError::InsufficientMemory(_) => {
+                        // A predictable capacity refusal (nothing was evicted), not a fault.
+                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
                     }
                     ModelError::GpuPoisoned => {
                         return (
@@ -1257,6 +1290,10 @@ pub async fn admin_patch_model(
                     ModelError::Loading | ModelError::Evicting => {
                         return (StatusCode::CONFLICT, e.to_string()).into_response();
                     }
+                    ModelError::InsufficientMemory(_) => {
+                        // A predictable capacity refusal (nothing was evicted), not a fault.
+                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                    }
                     ModelError::GpuPoisoned
                     | ModelError::NotLoaded
                     | ModelError::WrongKind(_)
@@ -1313,6 +1350,9 @@ struct AdmissionCheckResponse {
     /// Residents that would be evicted (in eviction order) to admit the model.
     /// Empty when it already fits or cannot be admitted at all.
     would_evict: Vec<String>,
+    /// Members of `would_evict` with a request running now: the load drains
+    /// each for at most 15 s and then aborts what is left.
+    busy_victims: Vec<String>,
     /// Live system-RAM the load needs (`weights + conservative KV + margin`), GB.
     /// Present **only on the shared UMA `system` domain**, where a live-RAM gate
     /// applies on top of the VRAM arithmetic; omitted entirely on discrete-GPU
@@ -1328,6 +1368,15 @@ struct AdmissionCheckResponse {
     already_loaded: bool,
 }
 
+/// Query string of `POST /v1/admin/models/{id}/check`.
+#[derive(serde::Deserialize, Default)]
+pub struct CheckQuery {
+    /// Preview the load as `force: true` would run it: bypass the
+    /// eviction-grace window (nothing else). Default `false`.
+    #[serde(default)]
+    force: bool,
+}
+
 #[allow(clippy::doc_markdown)]
 /// POST /v1/admin/models/{model_id}/check — dry-run admission check.
 ///
@@ -1340,10 +1389,28 @@ struct AdmissionCheckResponse {
 /// - 200 OK        — JSON [`AdmissionCheckResponse`]
 /// - 404 Not Found  — model ID is not in the registry
 /// - 503 Service Unavailable — model manager not initialised
+///
+/// `?force=true` previews the load as `force: true` would run it (grace window
+/// bypassed, nothing else).
 pub async fn admin_check_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    query: Result<axum::extract::Query<CheckQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    // A bad query string (`?force=maybe`) gets the shared JSON envelope, not
+    // axum's plain-text rejection.
+    let q = match query {
+        Ok(axum::extract::Query(q)) => q,
+        Err(rejection) => {
+            tracing::debug!(detail = %rejection.body_text(), "rejected malformed query string");
+            return super::error::openai_error(
+                StatusCode::BAD_REQUEST,
+                "malformed query string: `force` must be true or false",
+                "invalid_request_error",
+                Some("invalid_query"),
+            );
+        }
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1352,7 +1419,7 @@ pub async fn admin_check_model(
             .into_response();
     };
 
-    match mm.check_admission(&model_id) {
+    match mm.check_admission_with(&model_id, q.force) {
         Ok(check) => (
             StatusCode::OK,
             Json(AdmissionCheckResponse {
@@ -1361,6 +1428,7 @@ pub async fn admin_check_model(
                 needed_gb: check.needed_gb,
                 free_gb: check.free_gb,
                 would_evict: check.would_evict,
+                busy_victims: check.busy_victims,
                 ram_needed_gb: check.ram_needed_gb,
                 ram_avail_gb: check.ram_avail_gb,
                 already_loaded: check.already_loaded,
@@ -1491,7 +1559,7 @@ pub struct AddModelRequest {
     /// VRAM estimate in GB. Use `0.0` to skip VRAM gating (CPU-only).
     pub vram_gb: f64,
     /// Kind hint: `"text_gen"`, `"vision"`, `"embedding"`, `"stt"`,
-    /// `"tts"`, `"image_gen"`, `"reranking"`. Omit for auto-detection.
+    /// `"tts"`, `"image_gen"`, `"reranking"`, `"decision"` (never auto-detected). Omit for auto-detection.
     #[serde(default)]
     pub kind: Option<String>,
     /// The full per-model policy (device override, co-residency knobs,
@@ -2049,9 +2117,12 @@ mod tests {
     fn server_info_omits_unavailable_optional_fields() {
         let info = ServerInfo {
             host: None,
+            pid: None,
+            uptime_secs: None,
             openvino_version: None,
             engine: "RustedVINO",
             engine_version: "1.2.3",
+            gpu_poisoned: false,
         };
         let value = serde_json::to_value(info).unwrap();
         let obj = value.as_object().unwrap();
@@ -2059,8 +2130,8 @@ mod tests {
             obj.keys().map(std::string::String::as_str).collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["engine", "engine_version"]),
-            "host/openvino_version must be absent when None, never null: {obj:?}"
+            std::collections::BTreeSet::from(["engine", "engine_version", "gpu_poisoned"]),
+            "host/openvino_version must be absent when None, never null; gpu_poisoned is always present: {obj:?}"
         );
     }
 
@@ -2081,7 +2152,19 @@ mod tests {
     fn server_info_without_auth_omits_host() {
         let value = serde_json::to_value(ServerInfo::current(false)).unwrap();
         assert!(value.get("host").is_none(), "{value}");
+        assert!(value.get("pid").is_none(), "{value}");
+        assert!(value.get("uptime_secs").is_none(), "{value}");
         assert_eq!(value["engine"], "RustedVINO");
+    }
+
+    /// A key-validated caller gets the process's own PID, and `uptime_secs`
+    /// once startup has marked the process start.
+    #[test]
+    fn server_info_with_auth_reports_pid_and_uptime() {
+        crate::startup::mark_process_start();
+        let value = serde_json::to_value(ServerInfo::current(true)).unwrap();
+        assert_eq!(value["pid"], std::process::id());
+        assert!(value["uptime_secs"].is_u64(), "{value}");
     }
 
     /// `ModelsResponse` with one entry serialises to the `OpenAI` envelope shape.
@@ -2273,6 +2356,7 @@ mod tests {
             needed_gb: 6.5,
             free_gb: 3.0,
             would_evict: vec!["embed".to_owned()],
+            busy_victims: Vec::new(),
             ram_needed_gb: None,
             ram_avail_gb: None,
             already_loaded: false,
@@ -2300,6 +2384,7 @@ mod tests {
             needed_gb: 22.0,
             free_gb: 27.0,
             would_evict: Vec::new(),
+            busy_victims: Vec::new(),
             ram_needed_gb: Some(24.0),
             ram_avail_gb: Some(23.0),
             already_loaded: false,

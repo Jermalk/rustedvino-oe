@@ -129,6 +129,10 @@ pub(crate) fn default_tier_preference(
         // unserveable on any NPU box. Whisper (STT, below) keeps `Npu` because
         // `WhisperPipeline` *does* static-shape and compiles clean on the NPU.
         ModelKind::Embedding | ModelKind::Reranking => vec![WeakIgpu, StrongIgpu, Heavy, Fallback],
+        // Decision (/v1/systemone): a full LLM-sized prefill per question, so the strongest
+        // GPU first — and never the NPU: NPUW's LLM mode corrupts the hybrid model's conv/SSM
+        // states (measured), and a static prefill-only NPU graph is still unproven.
+        ModelKind::Decision => vec![Heavy, StrongIgpu, WeakIgpu, Fallback],
         // STT is size-aware like LLMs, but with a *separate* threshold
         // (`light_stt_max_gb`, smaller because Whisper models are smaller).
         // A *thin* STT model (whisper-base/small) is bandwidth-bound → offload

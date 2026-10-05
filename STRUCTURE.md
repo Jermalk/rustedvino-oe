@@ -76,9 +76,10 @@ ov_bridge/
 
 scripts/
   rv-cargo.sh                — run any cargo command with the OpenVINO build/runtime env wired in (auto-detects the OV install, or set RV_OV_VENV)
-  rv                         — Ollama-shaped admin CLI (status/list/ps/check/add/load/unload/deregister/logs); stdlib-only Python, no venv needed
+  rv                         — the original Ollama-shaped admin CLI (stdlib-only Python); kept as a reference and alternative — the native port is tools/rv
 
-tools/                       — stdlib-only Python clients of the server's API
+tools/
+  rv/                        — the admin CLI (Rust port of scripts/rv, plus resize/completeness/reload-keys/voice-pin/sessions); a separate crate with no OpenVINO dependency, shipped in the release bundles
   semsearch/                 — semantic search over Markdown notes (/v1/embeddings, /v1/rerank)
   livecaptions/              — live captions + optional translation (/v1/audio/transcriptions, /v1/chat/completions)
 

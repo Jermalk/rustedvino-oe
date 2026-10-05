@@ -204,11 +204,18 @@ fn build_linux() {
     //   2. absolute dev paths — dev build fallback when lib/ is absent.
     println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_genai_lib}");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_base_lib}");
-    // tokenizers extension: loaded at runtime by libopenvino_genai via
-    // the OV extension mechanism (not a direct NEEDED dep of our binary)
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_tokenizers_lib}");
+    // RV_BUNDLE_RPATH_ONLY=1 (set by the release packagers) leaves only
+    // $ORIGIN/lib: the absolute paths below are the build machine's own OpenVINO
+    // install, which a downloadable binary must not carry (they name the build
+    // user's home directory) and which mean nothing on the target anyway.
+    println!("cargo:rerun-if-env-changed=RV_BUNDLE_RPATH_ONLY");
+    if std::env::var_os("RV_BUNDLE_RPATH_ONLY").is_none() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_genai_lib}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_base_lib}");
+        // tokenizers extension: loaded at runtime by libopenvino_genai via
+        // the OV extension mechanism (not a direct NEEDED dep of our binary)
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{ov_tokenizers_lib}");
+    }
 
     // Ensure the tokenizer .so is findable at its default location — the
     // same directory as libopenvino_genai.so — so the binary works without

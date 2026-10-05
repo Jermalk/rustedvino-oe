@@ -43,8 +43,8 @@ configuration under test, not a free variable.
 
 ## Current state — full OpenAI-compatible API, plus extensions
 
-RustedVINO serves chat, legacy completions, embeddings, reranking, STT, TTS, image
-generation/editing, and a realtime voice pipeline. The cross-pipeline device admission
+RustedVINO serves chat, legacy completions, embeddings, reranking, typed decisions (Ollama's
+System One API), STT, TTS, image generation/editing, and a realtime voice pipeline. The cross-pipeline device admission
 middleware is implemented and live-verified across every work class, the realtime voice turn
 included.
 
@@ -61,6 +61,7 @@ included.
 | `POST /v1/completions` — legacy raw-prompt completions | ✅ |
 | `POST /v1/embeddings` — text embeddings (bge, e5, …); per-input length checked against the model's own limit, up to 256 inputs and 32k padded tokens per request (limits in [`INTERFACE.md`](INTERFACE.md)) | ✅ |
 | `POST /v1/rerank` — cross-encoder document reranking | ✅ |
+| `POST /v1/systemone` — Ollama-compatible typed decisions (choice / yes-no / score) with probabilities from one prefill per question, no text generation; wire format pinned to Ollama v0.35 by fixtures generated from Ollama's own code. Needs a `kind: "decision"` model (Bespoke-Nimble-9B converted to OpenVINO; [`CONFIG.md`](CONFIG.md#decision-models-v1systemone)) | ✅ |
 | `POST /v1/audio/transcriptions` — STT via Whisper OpenVINO, including Whisper fine-tunes such as Vietnamese PhoWhisper (see [Vietnamese speech](#vietnamese-speech-phowhisper--piper)) | ✅ |
 | `POST /v1/audio/translations` — speech in any Whisper language → English text (needs a multilingual Whisper trained for translation, e.g. `large-v3`; `large-v3-turbo` isn't) | ✅ |
 | `POST /v1/audio/speech` — TTS (Kokoro-82M, Coqui VITS, Piper VITS voices such as Vietnamese `vi_VN-vais1000`, `SpeechT5`) | ✅ |
@@ -137,7 +138,7 @@ included.
 | Prometheus push metrics: tokens/sec EMA, TTFT histogram, request duration histogram | ✅ |
 | Image-gen `generation_metadata` (`/v1/images/generations`/`/edits`) — `model_family`, `device`, `host` (valid-key callers only, like `x-ruvi-host`), `model_hash`, `sampler`/`scheduler_config`, `openvino_version`, `precision`/`model_source`/`model_revision` | ✅ |
 | Chat completions — `model_family` + effective `sampling` (`temperature`/`top_p`/`top_k` actually used) on every response | ✅ |
-| `GET /v1/admin/models` — `server{host, openvino_version, engine, engine_version}` block (`host` only for a valid-key caller) | ✅ |
+| `GET /v1/admin/models` — `server{host, pid, uptime_secs, openvino_version, engine, engine_version}` block (`host`, `pid` and `uptime_secs` only for a valid-key caller) | ✅ |
 | OV compile-cache metrics — `rustedvino_ov_cache_bytes` (current on-disk size), `rustedvino_ov_cache_pruned_bytes_total`/`_pruned_files_total` (cumulative, from the `ov_cache_max_gb` sweep) | ✅ |
 | KV-cache pressure metrics — `rustedvino_kv_cache_usage_percent` + `rustedvino_kv_cache_usage_supported` (per model; `supported=0` means the value is structurally unqueryable for that engine kind, **not** an empty pool) and `rustedvino_kv_cache_pressure_flagged` (1/0, set by the optional monitor — see [`CONFIG.md`](CONFIG.md)) | ✅ |
 | `GET /v1/admin/models` — per-model `kv_cache_usage_pct` + `kv_pressure_flagged`, so the pressure signal is readable without Prometheus | ✅ |
@@ -195,8 +196,9 @@ included.
 
 ## Route table
 
-Every endpoint — OpenAI-compatible surface plus RustedVINO's own extensions (admin/lifecycle
-control, rerank, tokenize/detokenize, realtime voice WS) — is listed with method and
+Every endpoint — OpenAI-compatible surface, the Ollama-compatible `/v1/systemone`, plus
+RustedVINO's own extensions (admin/lifecycle control, rerank, tokenize/detokenize, realtime voice
+WS) — is listed with method and
 description in **[`INTERFACE.md`](INTERFACE.md)**.
 
 ---
@@ -380,6 +382,13 @@ unknown (404 everywhere), even if its directory exists under `models_dir`.
 Full field-by-field reference (all `Config` fields, per-model fields, `supervisor` sub-fields):
 **[`CONFIG.md`](CONFIG.md)**.
 
+Leaving a setting out silently takes its built-in default, and JSON cannot carry comments, so the
+shipped example configs write **every** setting out at its default and `CONFIG.md` explains each.
+To do the same for your file: `./target/release/rustedvino --print-default-config` prints all
+settings with their defaults (`--print-default-model` does it for one model stanza), and
+`scripts/fill-config-defaults.py config.json` adds whatever your file is missing without changing
+your values (`--check` after an upgrade shows what is new).
+
 Override the config path at runtime:
 ```bash
 RUSTEDVINO_CONFIG=/path/to/config.json ./target/release/rustedvino
@@ -480,56 +489,62 @@ key lists.)
 Route list and status codes: **[`INTERFACE.md`](INTERFACE.md)**. Auth is gated by the keys
 file, not `config.json` — see step 5 above and [`CONFIG.md`](CONFIG.md)'s `keys_file` entry.
 
-### `scripts/rv` — Ollama-shaped admin CLI
+### `rv` — Ollama-shaped admin CLI
 
 An ergonomic wrapper over the admin API above — one command instead of hand-building `curl`
-calls for everyday model lifecycle work.
+calls for everyday model lifecycle work. The release bundles ship it as `rv` (`rv.exe` on Windows):
+a small native binary with no Python and no OpenVINO libraries, so it still answers when the
+runtime is broken. From a source checkout, `cargo build --release -p rv` builds it (no OpenVINO
+install needed); `scripts/rv` is the original single-file Python version, kept as a reference and an
+alternative (Python 3.8+, stdlib only).
 
 ```bash
-scripts/rv status                  # process/health/auth/models/VRAM in one report
-scripts/rv list                    # registered models, plus on-disk-but-unregistered ones
-scripts/rv ps                      # loaded models only, with live KV%/in-flight counts
-scripts/rv check qwen3-8b-int4-ov  # dry-run admission check — what would loading it evict?
-scripts/rv add MODEL --vram-gb 5.5 -y   # register an on-disk model and load it
-scripts/rv load MODEL              # load an already-registered model
-scripts/rv unload MODEL            # evict from VRAM, stays registered
-scripts/rv deregister MODEL -y     # remove from the registry + config.json
-scripts/rv patch MODEL --pinned true --priority 5  # update fields of an already-registered model
-scripts/rv preload --from-live -y  # snapshot the currently-loaded set as the new boot default
-scripts/rv logs -n 200             # tail recent server log lines
-scripts/rv reload-config           # pick up config.json edits — registers changes, loads/evicts nothing
+rv status                  # process/health/auth/models/VRAM in one report
+rv list                    # registered models, plus on-disk-but-unregistered ones
+rv ps                      # loaded models only, with live KV%/in-flight counts
+rv check qwen3-8b-int4-ov  # dry-run admission check — what would loading it evict?
+rv add MODEL --vram-gb 5.5 -y   # register an on-disk model and load it
+rv load MODEL              # load an already-registered model
+rv unload MODEL            # evict from VRAM, stays registered
+rv deregister MODEL -y     # remove from the registry + config.json
+rv patch MODEL --pinned true --priority 5  # update fields of an already-registered model
+rv preload --from-live -y  # snapshot the currently-loaded set as the new boot default
+rv logs -n 200             # tail recent server log lines
+rv reload-config           # pick up config.json edits — registers changes, loads/evicts nothing
+rv resize MODEL --kv-cache-gb 4 -y   # evict + reload a loaded model with a new KV-cache size
+rv completeness            # every registered model's file-completeness report (exit 1 on a gap)
+rv reload-keys             # re-read the keys file and hot-swap the API/admin keys
+rv voice-pin               # the realtime voice-flow model pin
+rv sessions                # live realtime sessions   (also: rv session ID, rv session-kill ID -y)
 ```
 
-**Requirements:** Python 3.8+, stdlib only (`argparse`, `json`, `urllib`, …) — no `pip install`,
-no venv. `--json` gives machine-readable output on `status`, `list`, `ps`, `check`,
-`reload-config`, `patch` and `preload`; the other commands accept the flag but ignore it, and
-`help` does not take it.
+`resize`, `completeness`, `reload-keys`, `voice-pin`, `sessions`, `session` and `session-kill` exist
+only in the native `rv`. Commands that evict, deregister, resize or close something ask for
+confirmation; `-y` skips the prompt, and without a terminal they refuse (exit 2) instead of guessing.
+`--json` gives machine-readable output where it makes sense (`status`, `list`, `ps`, `check`,
+`reload-config`, `patch`, `preload`, `completeness`, `reload-keys`, `voice-pin`, `sessions`); other
+commands accept the flag and ignore it.
 
-**Config resolution:** `RUSTEDVINO_CONFIG`, else a `config.json` next to the script (the
-release-bundle layout), else `/opt/rustedvino/config.json`. The
-bundle-local step is `rv`'s own convenience — it does **not** resolve identically to the server,
-which knows only the env var and the default. Keys come from that config's `keys_file` field, resolved
-the same way the server resolves it. Admin key: auto-loaded from the resolved keys file, or set
-`RV_ADMIN_KEY` / pass `--admin-key`.
+**Config resolution:** `RUSTEDVINO_CONFIG`, else a `config.json` next to the executable (the
+release-bundle layout), else the platform default: `/opt/rustedvino/config.json` on Linux,
+`%LOCALAPPDATA%\RustedVINO\config.json` on Windows. The server's own order puts
+the platform default (`/opt/rustedvino/config.json`, or on Windows the per-user file if it exists)
+before the executable's directory, so if both exist `rv` can read a
+different config than the server it talks to — set `RUSTEDVINO_CONFIG` to remove the doubt. Keys come
+from that config's `keys_file` field, resolved the way the server resolves it. Admin key:
+auto-loaded from the resolved keys file, or set `RV_ADMIN_KEY` / pass `--admin-key`. A config the
+server would reject (unknown fields, bad values) does not stop `rv`: it reads only `port`,
+`models_dir`, `keys_file` and the model policies, and tolerates a UTF-8 BOM.
 
 **Port:** taken from the resolved config's own `port`, else `11437`; override with `--port` or
-`RV_PORT`. The host is always `localhost` and is not configurable — `rv` reads the PID file, the
-log file and `models_dir` directly off the machine it runs on, so it only ever describes a local
-server.
+`RV_PORT`. The target is always `127.0.0.1` — `rv` reads the models directory and keys directly off
+the machine it runs on, so it only ever describes a local server.
 
-**Optional external tools, both degrade gracefully if absent:** `rv status` shells out to `ps`
-(process uptime) and `pgrep` (the worker PID under the supervisor process) for two display
-fields only — neither is required for `rv` to run or for any other command. Both are standard
-on Linux and macOS; on Windows (or a minimal container without them) those two fields just show
-"unknown"/blank instead of erroring — `rv` itself is pure Python and has no other OS-specific
-calls.
-
-**Not wrapped yet** (use `curl` directly, or ask for it to be added):
-`POST /v1/admin/models/{id}/resize`, `GET /v1/admin/models/completeness`,
-`POST /v1/admin/keys/reload`, `GET /v1/admin/voice-pin`,
-`GET /v1/admin/realtime/sessions`, `GET /v1/admin/realtime/sessions/{id}`,
-`DELETE /v1/admin/realtime/sessions/{id}`.
-The router in `src/lib.rs` is the source of truth for this list.
+**Process info:** `rv status` takes the server's PID and uptime from the server itself (the admin
+`server` block of `GET /v1/admin/models`, 0.8.0+, valid-key callers only). For an older server, or
+when none is reported, it falls back to OS probing on Linux (`/proc`, the supervisor PID file,
+`ps` for uptime); elsewhere it reports "PID unknown" rather than "not running". Under a supervisor
+the reported uptime is the worker's, which the line says.
 
 ---
 

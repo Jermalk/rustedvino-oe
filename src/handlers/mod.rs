@@ -39,3 +39,5 @@ pub mod realtime;
 
 /// Reranking handler (`POST /v1/rerank`).
 pub mod reranking;
+/// System One decisions (`POST /v1/systemone`, Ollama-compatible).
+pub mod systemone;

@@ -105,7 +105,10 @@ pub async fn run_supervised(
             }
         }
 
-        let mut child = Command::new(exe).args(args).spawn()?;
+        let mut child = Command::new(exe)
+            .args(args)
+            .env(crate::startup::SUPERVISED_ENV, "1")
+            .spawn()?;
         tracing::info!(pid = child.id().unwrap_or(0), "worker spawned");
 
         match run_one_attempt(&mut child, health_addr, cfg, &mut sigterm).await {
@@ -313,8 +316,20 @@ fn send_signal(child: &Child, sig: libc::c_int) {
     }
 }
 
+/// Whether a worker exit code is the deliberate GPU-poisoned exit.
+fn is_poison_exit(code: Option<i32>) -> bool {
+    code == Some(i32::from(crate::startup::EXIT_GPU_POISONED))
+}
+
 fn log_exit(status: std::io::Result<ExitStatus>) {
     match status {
+        Ok(status) if is_poison_exit(status.code()) => {
+            tracing::error!(
+                code = ?status.code(),
+                "worker exited on purpose: its GPU context was poisoned (out of resources) — \
+                 restarting it"
+            );
+        }
         Ok(status) => {
             tracing::error!(code = ?status.code(), signal = ?status.signal(), "worker exited");
         }
@@ -344,7 +359,17 @@ fn backoff_delay(prior_failures: usize, cfg: &SupervisorConfig) -> Option<Durati
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_delay, prune_old_attempts};
+    use super::{backoff_delay, is_poison_exit, prune_old_attempts};
+
+    /// The supervisor recognises the worker's deliberate GPU-poisoned exit (75)
+    /// and nothing else (a crash, a signal kill, a clean 0).
+    #[test]
+    fn only_exit_code_75_is_the_poison_exit() {
+        assert!(is_poison_exit(Some(75)));
+        assert!(!is_poison_exit(Some(0)));
+        assert!(!is_poison_exit(Some(1)));
+        assert!(!is_poison_exit(None), "killed by a signal has no code");
+    }
     use crate::model_manager::SupervisorConfig;
     use std::time::{Duration, Instant};
 

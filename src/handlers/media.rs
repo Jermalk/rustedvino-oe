@@ -215,6 +215,9 @@ async fn speech_to_text(state: &AppState, multipart: Multipart, task: SttTask) -
                     Some("server_overloaded"),
                 );
             }
+            Err(crate::cb_engine::AdmitError::Closing) => {
+                return super::error::model_closing_response();
+            }
             Err(crate::cb_engine::AdmitError::EngineDead) => {
                 return openai_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -484,6 +487,41 @@ pub struct SpeechRequest {
     /// checkpoint's own trained default pace, not a fixed absolute rate.
     #[serde(default = "default_speed")]
     speed: f32,
+    /// Language of `input` (`"en"`, `"pl"`, `"vi"`; a region suffix such as
+    /// `"pl-PL"` is fine). Not in `OpenAI`'s spec: clients that omit it get the
+    /// language the model speaks. Selects the number words used when
+    /// `normalize` is on; an unsupported language leaves digits untouched.
+    #[serde(default)]
+    language: Option<String>,
+    /// Expand digits and symbols (`%`, `&`, `$`, ...) into spoken words before
+    /// synthesis. Default `true`; send `false` if the text is already
+    /// speakable. Not in `OpenAI`'s spec.
+    #[serde(default = "default_true")]
+    normalize: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The text to synthesise: `input` with digits and symbols spoken out, unless
+/// the request opted out or names a language with no number words. The
+/// request's `language` wins over `model_language` (what the loaded model
+/// speaks); with neither, English (as realtime does).
+fn speech_text(
+    input: String,
+    normalize: bool,
+    request_language: Option<&str>,
+    model_language: Option<&str>,
+) -> String {
+    if !normalize {
+        return input;
+    }
+    let language = request_language.or(model_language);
+    if language.is_some_and(|l| !crate::tts_normalize::supports_language(l)) {
+        return input;
+    }
+    crate::tts_normalize::normalize_for_speech(&input, language)
 }
 
 fn default_speed() -> f32 {
@@ -528,6 +566,7 @@ fn encode_wav_i16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// 5.2a: validates the JSON request, resolves the `model` through the manager
 /// (404 if absent / 400 `WrongKind` if not a TTS model), runs the real
 /// `Text2SpeechPipeline`, and returns 16-bit PCM WAV (or raw PCM) bytes.
+#[allow(clippy::too_many_lines)]
 pub async fn speech(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<SpeechRequest>,
@@ -596,7 +635,13 @@ pub async fn speech(
             Err(e) => return device_admission_error_response(&e),
         };
 
-        match handle.synthesize(req.input, req.voice, req.speed).await {
+        let text = speech_text(
+            req.input,
+            req.normalize,
+            req.language.as_deref(),
+            handle.language(),
+        );
+        match handle.synthesize(text, req.voice, req.speed).await {
             Ok(s) => s,
             Err(crate::cb_engine::AdmitError::AtCapacity) => {
                 return openai_error(
@@ -605,6 +650,9 @@ pub async fn speech(
                     "rate_limit_error",
                     Some("server_overloaded"),
                 );
+            }
+            Err(crate::cb_engine::AdmitError::Closing) => {
+                return super::error::model_closing_response();
             }
             Err(crate::cb_engine::AdmitError::EngineDead) => {
                 return openai_error(
@@ -1505,6 +1553,59 @@ fn bad_request_owned(message: String, code: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    // ── speech_text: number handling on /v1/audio/speech ──────────────────
+
+    #[test]
+    fn speech_text_uses_the_model_language_by_default() {
+        assert_eq!(
+            speech_text("5%".into(), true, None, Some("pl")),
+            "pięć procent"
+        );
+        assert_eq!(
+            speech_text("5%".into(), true, None, Some("en")),
+            "five percent"
+        );
+        // No language anywhere: English, as realtime does.
+        assert_eq!(speech_text("5%".into(), true, None, None), "five percent");
+    }
+
+    #[test]
+    fn speech_text_request_language_wins_over_the_model() {
+        assert_eq!(
+            speech_text("5".into(), true, Some("pl-PL"), Some("en")),
+            "pięć"
+        );
+    }
+
+    #[test]
+    fn speech_text_opt_out_leaves_the_input_alone() {
+        assert_eq!(
+            speech_text("W 1948 roku 5%".into(), false, Some("pl"), None),
+            "W 1948 roku 5%"
+        );
+    }
+
+    #[test]
+    fn speech_text_unsupported_language_is_not_guessed() {
+        // German digits must not be read as English words.
+        assert_eq!(
+            speech_text("Es sind 5 Äpfel".into(), true, Some("de"), Some("en")),
+            "Es sind 5 Äpfel"
+        );
+    }
+
+    #[test]
+    fn speech_request_defaults_normalize_on_and_language_unset() {
+        let r: SpeechRequest = serde_json::from_str(r#"{"model":"m","input":"hi"}"#).unwrap();
+        assert!(r.normalize);
+        assert!(r.language.is_none());
+        let r: SpeechRequest =
+            serde_json::from_str(r#"{"model":"m","input":"hi","normalize":false,"language":"pl"}"#)
+                .unwrap();
+        assert!(!r.normalize);
+        assert_eq!(r.language.as_deref(), Some("pl"));
+    }
 
     use super::*;
 

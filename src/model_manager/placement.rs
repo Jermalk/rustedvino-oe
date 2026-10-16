@@ -116,56 +116,60 @@ pub(crate) fn default_tier_preference(
     size_gb: f64,
     light_max_gb: f64,
 ) -> Vec<DeviceTier> {
-    use DeviceTier::{Fallback, Heavy, Npu, StrongIgpu, WeakIgpu};
+    use DeviceTier::{Fallback, Heavy, StrongIgpu, WeakIgpu};
+    // **An integrated GPU is a last resort, after the CPU, in every default order below.** The earlier
+    // orders put it first for all light work; that came from one machine (a Lunar Lake Arc 140V, an
+    // unusually capable iGPU). Measured on an Acer ConceptD's UHD iGPU (i7-11800H): every light model
+    // ran 20-45 % SLOWER than on the CPU, SpeechT5 ran at RTF 16-100 (unusable), and the vision model's
+    // GPU kernel build never finished. Most machines have an iGPU like that one, so the CPU wins by
+    // default; an operator who owns a good iGPU names it (`device`) or lists the tier (`tier_preference`).
+    // A later tier is only reached when an earlier one is absent or has no room for the model.
     match kind {
-        // Light + frequent + latency-tolerant: offload first — but **NOT to the
-        // NPU**. The embedding pipeline (`ov::genai::TextEmbeddingPipeline`) does
-        // not static-shape for the NPU, and the BERT encoder's attention nodes
-        // trip the NPU plugin's `check_sdpa_nodes` gate → the load *throws*
-        // (proven on a Lunar Lake NPU box: NPU ❌ `check_sdpa_nodes failed`,
-        // GPU/CPU ✅ 768-dim).
-        // `place()` returns the first *present* tier and does not fall through on
-        // a load-time failure, so leaving `Npu` here would make embeddings
-        // unserveable on any NPU box. Whisper (STT, below) keeps `Npu` because
-        // `WhisperPipeline` *does* static-shape and compiles clean on the NPU.
-        ModelKind::Embedding | ModelKind::Reranking => vec![WeakIgpu, StrongIgpu, Heavy, Fallback],
-        // Decision (/v1/systemone): a full LLM-sized prefill per question, so the strongest
-        // GPU first — and never the NPU: NPUW's LLM mode corrupts the hybrid model's conv/SSM
-        // states (measured), and a static prefill-only NPU graph is still unproven.
-        ModelKind::Decision => vec![Heavy, StrongIgpu, WeakIgpu, Fallback],
-        // STT is size-aware like LLMs, but with a *separate* threshold
-        // (`light_stt_max_gb`, smaller because Whisper models are smaller).
-        // A *thin* STT model (whisper-base/small) is bandwidth-bound → offload
-        // first (NPU-first here is fine — Whisper compiles on the NPU, unlike the
-        // embedding encoder above). A *heavy* one (whisper-large, encoder-bound)
-        // is pessimal on a **weak** iGPU (measured: 6.87 s vs CPU 4.98 s vs dGPU
-        // 0.39 s on 8 s audio), so it demotes a weak iGPU *below* the CPU fallback
-        // while keeping a **strong** iGPU offload-first. One static order encodes
-        // both: `StrongIgpu` above `Fallback` (strong iGPU stays the offload
-        // target) and `WeakIgpu` last (CPU wins on a weak-iGPU box). `Heavy`
-        // (dGPU) sits after the CPU so heavy STT still frees the dGPU for the LLM.
-        ModelKind::Stt => {
+        // Light + frequent + latency-tolerant: a discrete GPU first when there is one (an Arc Pro B50 embedded 727
+        // inputs/s against 39 on its CPU and 20 on its UHD iGPU), else the CPU - and **never the NPU**. The embedding pipeline
+        // (`ov::genai::TextEmbeddingPipeline`) does not static-shape for the NPU, and the BERT encoder's
+        // attention nodes trip the NPU plugin's `check_sdpa_nodes` gate -> the load *throws* (proven on a
+        // Lunar Lake NPU box: NPU fails `check_sdpa_nodes`, GPU/CPU give 768-dim). `place()` returns the
+        // first *present* tier and does not fall through on a load-time failure, so `Npu` here would
+        // make embeddings unserveable on any NPU box.
+        // Decision (/v1/systemone): a full LLM-sized prefill per question, so the strongest device first
+        // (a dGPU) - and never the NPU: NPUW's LLM mode corrupts the hybrid model's conv/SSM states
+        // (measured), and a static prefill-only NPU graph is still unproven.
+        ModelKind::Embedding | ModelKind::Reranking | ModelKind::Decision => {
+            vec![Heavy, Fallback, StrongIgpu, WeakIgpu]
+        }
+        // STT: the CPU first, then the dGPU (`Heavy` sits after the CPU so STT leaves the dGPU to the LLM -
+        // Whisper next to an LLM on one Arc driver is the pattern that wedges it), an iGPU only as a last
+        // resort. **Never the NPU by default** (owner decision, 2026-10-13): whisper-large-v3-turbo hung the
+        // NPU on a clip over ~60 s, forever, and nothing in the server bounds a request - a small Whisper
+        // on the NPU is something the operator asks for with `device`. A heavy encoder-bound model was
+        // measured pessimal on a weak iGPU (6.87 s vs CPU 4.98 s vs dGPU 0.39 s on 8 s audio), and
+        // whisper-turbo ran at RTF 1.39 on the Acer's UHD against 0.93 on its CPU.
+        ModelKind::Stt => vec![Fallback, Heavy, StrongIgpu, WeakIgpu],
+        // Chat LLMs go to a discrete GPU when there is one - even thin ones: on an Arc Pro B50 a 1.7B int4 model
+        // decoded at 114 tok/s against 35 on its CPU and 26 on its UHD iGPU. Without a dGPU the CPU wins and an iGPU is
+        // the last resort. (A GPU that runs out of room falls through to the CPU via `place_with_fit`.)
+        ModelKind::TextGen => vec![Heavy, Fallback, StrongIgpu, WeakIgpu],
+        // Vision keeps the size split: a *thin* VLM is light work and parks on the CPU; a heavy one goes dGPU-first.
+        // The hybrid linear-attention Qwen3.5 models cannot load on a GPU with the prefix-cache guard in
+        // force; `resolve_model_device` strips the GPU tiers for them (D-01, 0.8.3), so this order is
+        // not the whole story for those models.
+        ModelKind::Vision => {
             if size_gb <= light_max_gb {
-                vec![Npu, WeakIgpu, StrongIgpu, Heavy, Fallback]
+                vec![Fallback, Heavy, StrongIgpu, WeakIgpu]
             } else {
-                vec![Npu, StrongIgpu, Fallback, Heavy, WeakIgpu]
+                vec![Heavy, Fallback, StrongIgpu]
             }
         }
-        // Heavy interactive decode — but a *thin* LLM/VLM is light work and gets
-        // the offload-first order so it parks off the dGPU.
-        ModelKind::TextGen | ModelKind::Vision => {
-            if size_gb <= light_max_gb {
-                vec![WeakIgpu, StrongIgpu, Heavy, Fallback]
-            } else {
-                vec![Heavy, StrongIgpu, Fallback]
-            }
-        }
-        // Bursty heavy: strongest device (load/evict handled elsewhere).
+        // Bursty heavy: the strongest device. Unlike the other kinds this keeps a capable iGPU BEFORE
+        // the CPU: FLUX.1-schnell int4 needs > 19 GB of host RAM on the CPU and never finished a
+        // 512x512 image, but took 9.5 GB and 11.6 s on a strong iGPU. Revisit with `forbidden_devices`
+        // (0.8.2 plan), which can ban the CPU for exactly that model instead of ordering by kind.
         ModelKind::ImageGen => vec![Heavy, StrongIgpu, Fallback],
-        // SpeechT5 is a real OV GenAI device model (small, ~0.25 GB) — offload-first
-        // like STT. No NPU (Text2SpeechPipeline unverified on NPU); no Heavy dGPU
-        // (too small to benefit; keep the dGPU free for LLMs).
-        ModelKind::Tts => vec![StrongIgpu, WeakIgpu, Fallback],
+        // SpeechT5: CPU only. It misbehaves on every GPU class it was tried on - 3x slower than the CPU on an Arc 140V
+        // iGPU, RTF 16-100 on an Acer UHD iGPU, and a ~10 minute stall ending in HTTP 503 on an Arc Pro B50 - so no GPU
+        // tier is listed: if the CPU domain has no room the load fails loudly instead of landing on a GPU that stalls.
+        ModelKind::Tts => vec![Fallback],
     }
 }
 
@@ -205,35 +209,70 @@ mod tests {
     }
 
     #[test]
-    fn thin_llm_offloads_to_weak_igpu() {
-        // 0.6B int4 (~0.34 GB weights, vram_gb estimate well under 2 GB) is light
-        // work → offload-first order picks the iGPU off the dGPU.
+    fn thin_llm_uses_the_dgpu_when_there_is_one_else_the_cpu() {
+        // A 0.6B int4 model decodes 3x faster on an Arc Pro B50 than on the CPU of the same box, and an
+        // iGPU measured slower than that CPU: dGPU first, never the iGPU while a CPU exists.
         let pref = default_tier_preference(ModelKind::TextGen, 1.0, 2.0);
-        assert_eq!(place("qwen3-0.6b", &pref, &arc_box()).unwrap(), "GPU.0");
+        assert_eq!(place("qwen3-0.6b", &pref, &arc_box()).unwrap(), "GPU.1");
+        let igpu_box = DeviceInventory::from_devices(vec![
+            dev("GPU.0", DeviceKind::IntegratedGpu, DeviceTier::WeakIgpu),
+            dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
+        ]);
+        assert_eq!(place("qwen3-0.6b", &pref, &igpu_box).unwrap(), "CPU");
+    }
+
+    /// The new rule in one place: for EVERY kind except image generation, no iGPU tier comes before
+    /// the CPU fallback in the default order.
+    #[test]
+    fn igpu_is_a_last_resort_in_every_default_order_but_image_gen() {
+        for kind in [
+            ModelKind::TextGen,
+            ModelKind::Vision,
+            ModelKind::Embedding,
+            ModelKind::Reranking,
+            ModelKind::Decision,
+            ModelKind::Stt,
+            ModelKind::Tts,
+        ] {
+            for size in [0.25_f64, 1.0, 5.0] {
+                let pref = default_tier_preference(kind, size, 2.0);
+                let cpu = pref.iter().position(|&t| t == DeviceTier::Fallback);
+                for igpu in [DeviceTier::StrongIgpu, DeviceTier::WeakIgpu] {
+                    if let Some(i) = pref.iter().position(|&t| t == igpu) {
+                        assert!(
+                            cpu.is_some_and(|c| c < i),
+                            "{kind:?} ({size} GB): {igpu:?} must come after the CPU in {pref:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn size_threshold_boundary_is_inclusive_light() {
         // Exactly at the threshold counts as light (<=).
-        let pref = default_tier_preference(ModelKind::TextGen, 2.0, 2.0);
-        assert_eq!(pref.first(), Some(&DeviceTier::WeakIgpu));
+        let pref = default_tier_preference(ModelKind::Vision, 2.0, 2.0);
+        assert_eq!(pref.first(), Some(&DeviceTier::Fallback));
+        // ...and just above it a vision model is heavy: dGPU first.
+        let pref = default_tier_preference(ModelKind::Vision, 2.1, 2.0);
+        assert_eq!(pref.first(), Some(&DeviceTier::Heavy));
     }
 
     #[test]
-    fn embedding_prefers_weak_igpu_over_dgpu() {
+    fn embedding_prefers_the_dgpu_then_the_cpu_never_the_igpu() {
         let pref = default_tier_preference(ModelKind::Embedding, 0.5, 2.0);
-        assert_eq!(place("e5", &pref, &arc_box()).unwrap(), "GPU.0");
+        assert_eq!(place("e5", &pref, &arc_box()).unwrap(), "GPU.1");
     }
 
     #[test]
-    fn embedding_falls_to_cpu_when_no_igpu() {
+    fn embedding_uses_the_cpu_when_there_is_no_dgpu() {
         let inv = DeviceInventory::from_devices(vec![
-            dev("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy),
+            dev("GPU.0", DeviceKind::IntegratedGpu, DeviceTier::WeakIgpu),
             dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
         ]);
-        // No weak/strong iGPU, no NPU → next satisfiable tier is heavy (dGPU).
         let pref = default_tier_preference(ModelKind::Embedding, 0.5, 2.0);
-        assert_eq!(place("e5", &pref, &inv).unwrap(), "GPU.1");
+        assert_eq!(place("e5", &pref, &inv).unwrap(), "CPU");
     }
 
     /// A box with an NPU + CPU and no GPU (e.g. a GPU-less Lunar Lake part). An
@@ -255,25 +294,27 @@ mod tests {
         assert_eq!(place("e5", &pref, &npu_cpu_box).unwrap(), "CPU");
     }
 
-    /// The asymmetric counterpart: STT *keeps* the NPU (Whisper compiles there).
-    /// On the same NPU + CPU box a light STT model lands on the NPU.
+    /// STT never lands on the NPU by default (owner decision 2026-10-13: whisper-turbo hung the NPU on
+    /// a clip over 60 s and nothing bounds a request): even on an NPU + CPU box, the CPU wins.
     #[test]
-    fn light_stt_keeps_npu_when_present() {
+    fn stt_never_defaults_to_the_npu() {
         let npu_cpu_box = DeviceInventory::from_devices(vec![
             dev("NPU", DeviceKind::Npu, DeviceTier::Npu),
             dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
         ]);
-        let pref = default_tier_preference(ModelKind::Stt, 0.25, 1.0);
-        assert_eq!(place("whisper-small", &pref, &npu_cpu_box).unwrap(), "NPU");
+        for size in [0.25, 0.8, 1.5] {
+            let pref = default_tier_preference(ModelKind::Stt, size, 1.0);
+            assert!(!pref.contains(&DeviceTier::Npu), "{pref:?}");
+            assert_eq!(place("whisper", &pref, &npu_cpu_box).unwrap(), "CPU");
+        }
     }
 
-    /// Light STT (whisper-base/small, ≤ `light_stt_max_gb`) keeps the
-    /// embedding-style offload-first order → lands on the weak iGPU.
+    /// Light STT (whisper-base/small) lands on the CPU, not on the weak iGPU.
     #[test]
-    fn light_stt_offloads_to_weak_igpu() {
+    fn light_stt_lands_on_the_cpu() {
         let pref = default_tier_preference(ModelKind::Stt, 0.25, 1.0);
-        assert_eq!(pref.first(), Some(&DeviceTier::Npu));
-        assert_eq!(place("whisper-small", &pref, &arc_box()).unwrap(), "GPU.0");
+        assert_eq!(pref.first(), Some(&DeviceTier::Fallback));
+        assert_eq!(place("whisper-small", &pref, &arc_box()).unwrap(), "CPU");
     }
 
     /// Heavy STT (whisper-large, > `light_stt_max_gb`) on a box whose only iGPU
@@ -288,34 +329,32 @@ mod tests {
         assert_eq!(place("whisper-large", &pref, &arc_box()).unwrap(), "CPU");
     }
 
-    /// Heavy STT on a *strong*-iGPU box keeps offload-first — the strong iGPU
-    /// still outranks the CPU. (Same heavy preference list; first-present wins.)
+    /// Even a *strong* iGPU (an Arc 140V) is no longer chosen by default for heavy STT: the CPU
+    /// outranks it. An operator who owns one names it with `device` / `tier_preference`.
     #[test]
-    fn heavy_stt_keeps_strong_igpu_offload_first() {
+    fn heavy_stt_prefers_cpu_even_over_a_strong_igpu() {
         let strong_box = DeviceInventory::from_devices(vec![
             dev("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy),
             dev("GPU.0", DeviceKind::IntegratedGpu, DeviceTier::StrongIgpu),
             dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
         ]);
         let pref = default_tier_preference(ModelKind::Stt, 1.5, 1.0);
-        assert_eq!(place("whisper-large", &pref, &strong_box).unwrap(), "GPU.0");
+        assert_eq!(place("whisper-large", &pref, &strong_box).unwrap(), "CPU");
+        // ...but it is still reachable on purpose.
+        let on_purpose = [DeviceTier::StrongIgpu];
+        assert_eq!(
+            place("whisper-large", &on_purpose, &strong_box).unwrap(),
+            "GPU.0"
+        );
     }
 
     #[test]
-    fn tts_offloads_to_igpu_first() {
-        // SpeechT5 is a real OV GenAI device model — offload-first like STT.
-        // On an Arc dGPU box (arc_box: GPU.1=Heavy, GPU.0=WeakIgpu, CPU=Fallback)
-        // a small TTS model should land on GPU.0 (WeakIgpu), not the dGPU or CPU.
+    fn tts_is_cpu_only_by_default() {
+        // SpeechT5 stalls or crawls on every GPU class it was tried on (Arc 140V iGPU 3x slower than the CPU,
+        // UHD iGPU RTF 16-100, Arc Pro B50 a 10 minute stall then 503), so no GPU tier is listed at all.
         let pref = default_tier_preference(ModelKind::Tts, 0.25, 2.0);
-        assert_eq!(
-            pref,
-            vec![
-                DeviceTier::StrongIgpu,
-                DeviceTier::WeakIgpu,
-                DeviceTier::Fallback
-            ]
-        );
-        assert_eq!(place("speecht5-tts", &pref, &arc_box()).unwrap(), "GPU.0");
+        assert_eq!(pref, vec![DeviceTier::Fallback]);
+        assert_eq!(place("speecht5-tts", &pref, &arc_box()).unwrap(), "CPU");
     }
 
     #[test]

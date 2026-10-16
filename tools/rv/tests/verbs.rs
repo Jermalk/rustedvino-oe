@@ -15,6 +15,10 @@ type Routes = Vec<(&'static str, u16, &'static str)>;
 struct Stub {
     port: u16,
     hits: Arc<Mutex<Vec<String>>>,
+    /// Every request as `(METHOD /path?query, body)`: what `hits` leaves out.
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+    /// Whether each request (arrival order) carried an `Authorization` header.
+    authed: Arc<Mutex<Vec<bool>>>,
 }
 
 fn serve(routes: Routes) -> Stub {
@@ -22,11 +26,17 @@ fn serve(routes: Routes) -> Stub {
     let port = listener.local_addr().expect("addr").port();
     let hits = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&hits);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let full_log = Arc::clone(&requests);
+    let authed = Arc::new(Mutex::new(Vec::new()));
+    let auth_log = Arc::clone(&authed);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
             let routes = routes.clone();
             let log = Arc::clone(&log);
+            let full_log = Arc::clone(&full_log);
+            let auth_log = Arc::clone(&auth_log);
             std::thread::spawn(move || {
                 let mut rd = BufReader::new(sock.try_clone().expect("clone"));
                 let mut first = String::new();
@@ -34,10 +44,14 @@ fn serve(routes: Routes) -> Stub {
                     return;
                 }
                 let mut len = 0usize;
+                let mut has_auth = false;
                 loop {
                     let mut h = String::new();
                     if rd.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
                         break;
+                    }
+                    if h.to_ascii_lowercase().starts_with("authorization:") {
+                        has_auth = true;
                     }
                     if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
                         len = v.trim().parse().unwrap_or(0);
@@ -51,7 +65,16 @@ fn serve(routes: Routes) -> Stub {
                     parts.next().unwrap_or(""),
                     parts.next().unwrap_or("").split('?').next().unwrap_or("")
                 );
+                auth_log.lock().expect("lock").push(has_auth);
                 log.lock().expect("lock").push(key.clone());
+                full_log.lock().expect("lock").push((
+                    format!(
+                        "{} {}",
+                        first.split_whitespace().next().unwrap_or(""),
+                        first.split_whitespace().nth(1).unwrap_or("")
+                    ),
+                    String::from_utf8_lossy(&body).into_owned(),
+                ));
                 let (status, text) = routes
                     .iter()
                     .find(|(k, _, _)| *k == key)
@@ -66,7 +89,12 @@ fn serve(routes: Routes) -> Stub {
             });
         }
     });
-    Stub { port, hits }
+    Stub {
+        port,
+        hits,
+        requests,
+        authed,
+    }
 }
 
 struct Run {
@@ -75,16 +103,24 @@ struct Run {
     err: String,
 }
 
-/// Runs `rv` with a config pointing at `port`; `admin_key` fills the keys file.
+/// Runs `rv` with a config pointing at `port`; `admin_key` fills the keys file
+/// (`None` = a keys file with empty lists, i.e. an OPEN server).
 fn rv(port: u16, admin_key: Option<&str>, args: &[&str]) -> Run {
-    let d = tempfile::tempdir().expect("tempdir");
-    let cfg = d.path().join("c.config.json");
-    std::fs::write(&cfg, format!(r#"{{"port": {port}}}"#)).expect("cfg");
     let keys = match admin_key {
         Some(k) => format!(r#"{{"api_keys": [], "admin_api_keys": ["{k}"]}}"#),
         None => r#"{"api_keys": [], "admin_api_keys": []}"#.to_owned(),
     };
-    std::fs::write(d.path().join("c.keys.json"), keys).expect("keys");
+    rv_keys_file(port, Some(&keys), args)
+}
+
+/// Like [`rv`] but with the keys file's exact text (`None` = no keys file at all).
+fn rv_keys_file(port: u16, keys: Option<&str>, args: &[&str]) -> Run {
+    let d = tempfile::tempdir().expect("tempdir");
+    let cfg = d.path().join("c.config.json");
+    std::fs::write(&cfg, format!(r#"{{"port": {port}}}"#)).expect("cfg");
+    if let Some(keys) = keys {
+        std::fs::write(d.path().join("c.keys.json"), keys).expect("keys");
+    }
     let o = Command::new(env!("CARGO_BIN_EXE_rv"))
         .args(args)
         .env("RUSTEDVINO_CONFIG", &cfg)
@@ -146,12 +182,106 @@ fn check_json_is_the_servers_object_unchanged() {
 }
 
 #[test]
-fn admin_verbs_without_a_key_refuse_with_exit_1_and_send_nothing() {
-    let s = serve(vec![]);
+fn admin_verbs_without_a_usable_key_refuse_with_exit_1_and_send_nothing() {
+    // Not open, and no admin key: no keys file at all, an unreadable one, or one that holds only an
+    // inference key. rv must refuse each and send nothing.
+    for (case, keys) in [
+        ("no keys file", None),
+        ("malformed keys file", Some("{ not json")),
+        (
+            "inference key only",
+            Some(r#"{"api_keys": ["k"], "admin_api_keys": []}"#),
+        ),
+    ] {
+        let s = serve(vec![]);
+        let r = rv_keys_file(s.port, keys, &["ps"]);
+        assert_eq!(r.code, 1, "{case}");
+        assert!(
+            r.err.contains("no admin key available"),
+            "{case}: {}",
+            r.err
+        );
+        assert!(s.hits.lock().expect("lock").is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn empty_keys_file_means_an_open_server_so_rv_proceeds_unauthenticated_and_says_so() {
+    let s = serve(vec![
+        ("GET /v1/admin/models", 200, ADMIN_MODELS),
+        ("GET /metrics", 200, METRICS),
+    ]);
+    // `rv(.., None, ..)` writes {"api_keys": [], "admin_api_keys": []}.
     let r = rv(s.port, None, &["ps"]);
-    assert_eq!(r.code, 1);
-    assert!(r.err.contains("no admin key available"), "{}", r.err);
-    assert!(s.hits.lock().expect("lock").is_empty());
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("1 model(s) loaded"), "{}", r.out);
+    assert!(
+        r.err.contains("OPEN") && r.err.contains("NOT SECURE"),
+        "the open state must be stated plainly: {}",
+        r.err
+    );
+    assert!(
+        s.authed.lock().expect("lock").iter().all(|a| !a),
+        "an open server must get no Authorization header"
+    );
+    // `{}` is the README's "minimal" keys file: same state.
+    let r = rv_keys_file(s.port, Some("{}"), &["ps"]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.err.contains("NOT SECURE"), "{}", r.err);
+}
+
+#[test]
+fn a_real_admin_key_is_sent_and_no_open_server_warning_appears() {
+    let s = serve(vec![
+        ("GET /v1/admin/models", 200, ADMIN_MODELS),
+        ("GET /metrics", 200, METRICS),
+    ]);
+    let r = rv(s.port, Some("adm"), &["ps"]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(!r.err.contains("NOT SECURE"), "{}", r.err);
+    assert!(
+        s.authed.lock().expect("lock").iter().any(|a| *a),
+        "the admin key must be sent as a bearer"
+    );
+}
+
+#[test]
+fn version_reports_the_answering_server_from_health() {
+    let s = serve(vec![(
+        "GET /health",
+        200,
+        r#"{"status":"ok","version":"9.9.9","git_hash":"abc123"}"#,
+    )]);
+    let r = rv(s.port, None, &["version"]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("rustedvino 9.9.9 (abc123)"), "{}", r.out);
+    assert!(r.out.contains(&s.port.to_string()), "{}", r.out);
+}
+
+#[test]
+fn start_refuses_a_port_the_server_would_not_listen_on() {
+    // rv_keys_file writes a config with "port": 1; --port 9000 steers rv only.
+    let r = rv(1, None, &["start", "--port", "9000"]);
+    assert_eq!(r.code, 1, "{}", r.err);
+    assert!(
+        r.err.starts_with("error: port 9000 was requested"),
+        "{}",
+        r.err
+    );
+    assert!(
+        r.err.contains("  = help:"),
+        "rustc-style help line: {}",
+        r.err
+    );
+}
+
+#[test]
+fn stop_with_nothing_on_the_port_says_so_and_touches_no_other_server() {
+    // Port 1 is never a rustedvino. Even if another server runs on this
+    // machine, `stop` must not pick it up through a command-line scan.
+    let r = rv(1, None, &["stop"]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("not running"), "{}", r.out);
 }
 
 #[test]
@@ -332,3 +462,141 @@ fn bearer_key_is_sent_to_admin_routes_and_never_printed() {
         assert!(!r.err.contains("sekrit-admin-key"), "{args:?}: {}", r.err);
     }
 }
+
+const BUSY_409: &str = r#"{"error":{"message":"model has 1 request(s) running","type":"invalid_request_error","param":null,"code":"model_busy"}}"#;
+const BUSY_503: &str =
+    r#"{"error":{"message":"model busy","type":"server_error","param":null,"code":"model_busy"}}"#;
+
+/// D3-S1.F6: `rv unload` / `rv deregister` send `?force=true` only with `--force`, and a refusal
+/// because a request is running (`model_busy`) explains itself and names the override.
+#[test]
+fn unload_and_deregister_forward_force_and_explain_a_busy_refusal() {
+    let s = serve(vec![
+        ("DELETE /v1/admin/models/a", 409, BUSY_409),
+        ("DELETE /v1/admin/models/a/register", 409, BUSY_409),
+        ("DELETE /v1/admin/models/b", 200, "model 'b' evicted"),
+        (
+            "DELETE /v1/admin/models/b/register",
+            200,
+            "model 'b' deregistered",
+        ),
+    ]);
+    let u = rv(s.port, Some("adm"), &["unload", "a"]);
+    assert_eq!(u.code, 1);
+    assert!(
+        u.err.contains("model_busy") || u.err.contains("request(s) running"),
+        "{}",
+        u.err
+    );
+    assert!(u.err.contains("rv unload a --force"), "{}", u.err);
+    let d = rv(s.port, Some("adm"), &["deregister", "a", "-y"]);
+    assert_eq!(d.code, 1);
+    assert!(d.err.contains("rv deregister a --force"), "{}", d.err);
+
+    assert_eq!(rv(s.port, Some("adm"), &["unload", "b", "--force"]).code, 0);
+    assert_eq!(
+        rv(s.port, Some("adm"), &["deregister", "b", "-y", "--force"]).code,
+        0
+    );
+    assert_eq!(rv(s.port, Some("adm"), &["unload", "b"]).code, 0);
+
+    let reqs = s.requests.lock().expect("lock").clone();
+    let lines: Vec<&str> = reqs.iter().map(|(l, _)| l.as_str()).collect();
+    assert!(lines.contains(&"DELETE /v1/admin/models/a"), "{lines:?}");
+    assert!(
+        lines.contains(&"DELETE /v1/admin/models/b?force=true"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"DELETE /v1/admin/models/b/register?force=true"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"DELETE /v1/admin/models/b"),
+        "a plain unload sends no force: {lines:?}"
+    );
+}
+
+/// D3-S1.F6: `rv resize` puts `"force": true` in the body only with `--force`.
+#[test]
+fn resize_forwards_force_in_the_body() {
+    let s = serve(vec![
+        ("POST /v1/admin/models/a/resize", 409, BUSY_409),
+        ("POST /v1/admin/models/b/resize", 200, "resized"),
+    ]);
+    let busy = rv(
+        s.port,
+        Some("adm"),
+        &["resize", "a", "--kv-cache-gb", "2", "-y"],
+    );
+    assert_eq!(busy.code, 1);
+    assert!(busy.err.contains("--force"), "{}", busy.err);
+    assert!(
+        !busy.err.contains("resize only applies to a loaded model"),
+        "a busy refusal is not the not-loaded 409: {}",
+        busy.err
+    );
+    assert_eq!(
+        rv(
+            s.port,
+            Some("adm"),
+            &["resize", "b", "--kv-cache-gb", "2", "-y", "--force"]
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        rv(
+            s.port,
+            Some("adm"),
+            &["resize", "b", "--kv-cache-gb", "2", "-y"]
+        )
+        .code,
+        0
+    );
+
+    let reqs = s.requests.lock().expect("lock").clone();
+    let bodies: Vec<&str> = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/admin/models/b/resize"))
+        .map(|(_, b)| b.as_str())
+        .collect();
+    assert_eq!(bodies.len(), 2, "{reqs:?}");
+    assert!(bodies[0].contains(r#""force":true"#), "{bodies:?}");
+    assert!(!bodies[1].contains("force"), "{bodies:?}");
+}
+
+/// D3-S1.F6: `rv add` reads a 409 as "already registered" only when the server did not say it
+/// is busy; and `rv load`'s pre-check names the busy models that hold the room.
+#[test]
+fn add_409_and_load_precheck_are_busy_aware() {
+    let s = serve(vec![
+        (
+            "POST /v1/admin/models/add",
+            409,
+            "model 'x' already registered",
+        ),
+        ("POST /v1/admin/models/big/check", 200, BLOCKED_BY_BUSY),
+        ("POST /v1/admin/models/viaload/check", 200, FITS),
+        ("POST /v1/admin/models/viaload/load", 503, BUSY_503),
+    ]);
+    let dup = rv(s.port, Some("adm"), &["add", "x", "--vram-gb", "1", "-y"]);
+    assert_eq!(dup.code, 1);
+    assert!(dup.err.contains("is already registered"), "{}", dup.err);
+
+    let big = rv(s.port, Some("adm"), &["load", "big"]);
+    assert_eq!(big.code, 1);
+    assert!(big.out.contains("has a request running"), "{}", big.out);
+    assert!(big.out.contains("bielik"), "{}", big.out);
+    assert!(big.out.contains("rv load big --force"), "{}", big.out);
+
+    let refused = rv(s.port, Some("adm"), &["load", "viaload"]);
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused.err.contains("rv load viaload --force"),
+        "{}",
+        refused.err
+    );
+}
+
+const BLOCKED_BY_BUSY: &str = r#"{"fits":false,"needed_gb":9.0,"free_gb":2.0,"would_evict":[],"busy_victims":[],"blocked_by_busy":["bielik"],"already_loaded":false}"#;

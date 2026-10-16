@@ -1,6 +1,7 @@
 {
   "models_dir": "./models",
   "device": "CPU",
+  "default_placement": "device",
   "preload": [],
   "total_vram_gb": 0.0,
   "max_num_seqs": 16,

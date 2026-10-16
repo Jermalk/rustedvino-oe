@@ -63,11 +63,21 @@ pub use engine::{EngineHandleKind, ManagedEngine, ModelKind};
 ///   `CL_OUT_OF_RESOURCES` (-5)  — allocator failed (VRAM OOM)
 ///   `CL_INVALID_EVENT`    (-58) — context already poisoned; retry also fails
 ///
-/// Shared by the load path (L3 gate) and the inference hot path so both
+/// A third form of the same failure (seen live 2026-10-08, kernel `xe ... VM worker error: -12`
+/// = ENOMEM at the same second): when the driver cannot allocate during generation, oneDNN's
+/// `CL_OUT_OF_RESOURCES` goes to its own verbose log and the exception that reaches us says only
+/// `Exception from src/plugins/intel_gpu/.../primitive_onednn_base.h:550: could not execute a
+/// primitive`. The context is broken just the same (the next request then fails with the explicit
+/// `CL_OUT_OF_RESOURCES` text), but without this the worker kept serving a dead GPU for minutes.
+/// A oneDNN primitive that cannot execute on the Intel GPU plugin is treated as OOM-class.
+///
+/// Shared by the load path (L3 gate), the inference hot path and the realtime pipeline so all
 /// classify poison identically (T6.2). Kept a plain substring match on the C++
 /// text — the bridge has no structured error code to inspect.
 pub(crate) fn is_gpu_poison_error(msg: &str) -> bool {
-    msg.contains("CL_OUT_OF_RESOURCES") || msg.contains("CL_INVALID_EVENT")
+    msg.contains("CL_OUT_OF_RESOURCES")
+        || msg.contains("CL_INVALID_EVENT")
+        || (msg.contains("intel_gpu") && msg.contains("could not execute a primitive"))
 }
 
 /// Substring marker for a CB-scheduler KV-pool-exhaustion error
@@ -176,6 +186,13 @@ pub(crate) fn is_vlm_kv_wedge_error(msg: &str) -> bool {
 /// thread, not a busy one.
 const JOIN_DEADLINE: Duration = Duration::from_secs(8);
 
+/// How long a FORCED eviction of an engine that cannot be aborted (everything but the
+/// continuous-batching text engine) waits for its thread to finish the request it is running
+/// and exit, before reporting [`ModelError::EvictionIncomplete`] (D3-S1.E5, the project's internal engineering log: a
+/// constant, 30 s). Freeing the memory tracker while that thread still holds the memory would
+/// let the next load be admitted into memory that is not free.
+const FORCED_EVICT_JOIN_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Maximum time normal (non-abort) eviction waits for an engine's real
 /// in-flight requests to reach their own natural completion before giving up
 /// and forcing an abort (2026-07-18 drain fix). Generous relative to
@@ -186,11 +203,11 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(8);
 const EVICT_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
 /// The drain bound for an eviction made to make room for ANOTHER model's load
-/// (`ensure_vram_for`). Much shorter than [`EVICT_DRAIN_DEADLINE`]: the load
-/// holds `load_lock`, so every other load queues behind it, and a client that
-/// keeps one model busy must not be able to stall them for minutes. A
-/// generation still running after this is aborted. `rv check` marks such
-/// victims as busy beforehand (`busy_victims`).
+/// (`ensure_vram_for`) when that load is FORCED — a plain load never evicts a model with
+/// a request running, so this only bounds the drain of a victim the operator chose to
+/// abort. Much shorter than [`EVICT_DRAIN_DEADLINE`]: the load holds `load_lock`, so
+/// every other load queues behind it. A generation still running after this is aborted.
+/// `rv check --force` marks such victims as busy beforehand (`busy_victims`).
 const LOAD_EVICT_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Poll interval while waiting out [`EVICT_DRAIN_DEADLINE`]. Cheap (an atomic
@@ -258,6 +275,25 @@ pub enum ModelError {
     /// predictable capacity refusal, not a server fault.
     /// → HTTP 503
     InsufficientMemory(String),
+    /// A **non-forced** eviction of this model was refused because it has that many
+    /// requests running: in-flight work blocks eviction (D3, the project's internal engineering log). The
+    /// operator can retry when the work ends, or evict with `force`.
+    /// Not produced yet — wired in by the policy flip (D3-S1.E2).
+    /// → admin 409 / inference 503 `model_busy`
+    TargetBusy(usize),
+    /// A load was refused, before anything was evicted, because the models whose
+    /// eviction would make room are all busy (requests running): retry shortly, or
+    /// load with `force`. Carries the blocking model ids. Distinct from
+    /// [`Self::InsufficientMemory`], which means the load can never fit.
+    /// Not produced yet — wired in by D3-S1.E1/E2.
+    /// → HTTP 503 `model_busy` + `Retry-After`
+    BlockedByBusy(Vec<String>),
+    /// A forced eviction could not finish: the engine thread was still running the request it
+    /// had already started when the join deadline ([`FORCED_EVICT_JOIN_DEADLINE`]) passed, so
+    /// its memory is NOT free and the tracker still holds the reservation. The record stays
+    /// `Evicting`; a detached waiter reconciles it when the thread finally exits. Retry later.
+    /// Carries the model id. → HTTP 503 `eviction_incomplete` + `Retry-After`
+    EvictionIncomplete(String),
 }
 
 impl std::fmt::Display for ModelError {
@@ -281,6 +317,22 @@ impl std::fmt::Display for ModelError {
                 "GPU context poisoned by a previous failed load — process restart required"
             ),
             Self::WrongKind(msg) | Self::InsufficientMemory(msg) => write!(f, "{msg}"),
+            Self::EvictionIncomplete(id) => write!(
+                f,
+                "model '{id}' is still finishing the request it was running, so its memory is \
+                 not free yet — it will be released when that request ends; retry shortly"
+            ),
+            Self::TargetBusy(n) => write!(
+                f,
+                "model has {n} request(s) running — retry when they finish, or evict with force"
+            ),
+            Self::BlockedByBusy(ids) => write!(
+                f,
+                "not enough free memory: {} would have to be evicted but {} requests running — \
+                 retry shortly, or load with force",
+                ids.join(", "),
+                if ids.len() == 1 { "has" } else { "have" }
+            ),
         }
     }
 }
@@ -297,7 +349,7 @@ impl std::error::Error for ModelError {}
 ///                                   ├──failure────────────▶ NotLoaded
 ///                                   └──cancel (future drop)▶ NotLoaded   (T5.1 LoadCancelGuard)
 /// Ready     ──evict_model─▶ Evicting ──done──────────────▶ NotLoaded
-///                                    └──thread panic/join timeout▶ NotLoaded  (T5.2 finish_evict
+///                                    └──thread panic/join timeout▶ NotLoaded  (T5.2 reconcile_evicted
 ///                                                                  always reconciles the tracker)
 /// ```
 /// Edge cases enforced in code, not drawn above:
@@ -445,7 +497,40 @@ struct ModelRecord {
     native_context_limit: Option<usize>,
 }
 
+/// True when `id` is a single path component: non-empty, not `.` or `..`, no separators, no NUL.
+fn is_plain_model_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id.contains(['/', '\\', '\0'])
+        && std::path::Path::new(id).components().count() == 1
+}
+
+/// True when a model's measured device memory is far enough above what admission charges for it to
+/// be worth a warning. Overshoots within 5 % or 0.75 GB (whichever is larger) are the noise of
+/// compile scratch and weight packing, not a mis-sized `vram_gb` (D-01: a 1.7B model measured
+/// 0.69 GB above its charge); `charged_gb <= 0` means unknown and never warns.
+fn measured_exceeds_charge(measured_gb: f64, charged_gb: f64) -> bool {
+    charged_gb > 0.0 && measured_gb > charged_gb + (0.05 * charged_gb).max(0.75)
+}
+
 impl ModelRecord {
+    /// Pick the reasoning parser from the chat template when the policy did not set one (see
+    /// [`template::auto_reasoning_parser`]) and say so in the log.
+    fn auto_detect_reasoning_parser(&mut self, model_id: &str, family: ModelFamily) {
+        if self.reasoning_parser.is_some() {
+            return;
+        }
+        self.reasoning_parser = template::auto_reasoning_parser(None, &self.template, family);
+        if let Some(parser) = self.reasoning_parser {
+            tracing::info!(
+                model_id,
+                parser = ?parser,
+                "reasoning_parser auto-detected from the chat template"
+            );
+        }
+    }
+
     /// Record the measured device-memory change across a just-finished load
     /// (`before` = the reading taken before it started) and re-arm the
     /// over-budget warning for this load. The delta is `None` (unknown) when
@@ -485,12 +570,15 @@ impl ModelRecord {
     }
 
     /// A request is running on this model right now (read live through the
-    /// `ManagedEngine` facade). A SOFT signal only: it sorts the model last in
-    /// the victim order ([`eviction_sort_key`](Self::eviction_sort_key)). It is
-    /// deliberately not a hard exclusion - that starved other models' loads for
-    /// as long as a client kept the busy model occupied, and made a wedged
-    /// generation un-evictable. Evicting a busy model drains it first
-    /// (`evict_model_inner`), so its in-flight requests finish.
+    /// `ManagedEngine` facade). Unless an eviction is forced, a busy model is never an
+    /// eviction victim ([`ModelManager::eviction_protected`]) and `begin_evict` refuses to
+    /// evict it (D3, the project's internal engineering log) — in-flight work blocks eviction. It also sorts the model
+    /// last in the victim order ([`eviction_sort_key`](Self::eviction_sort_key)), which only
+    /// matters on a forced eviction. A hard exclusion alone starved other models' loads and
+    /// made a wedged generation un-evictable (reverted 2026-10-04, the project's internal engineering log); it is viable
+    /// now because the refusal is immediate and retryable (`BlockedByBusy`), `force` (admin)
+    /// overrides it, and the automatic recovery paths (KV wedge, dead engine, shutdown) are
+    /// forced. A forced eviction drains the in-flight requests first (`evict_model_inner`).
     fn has_in_flight(&self) -> bool {
         self.handle
             .as_ref()
@@ -548,7 +636,8 @@ pub struct ChatContext {
     /// The model's own shipped sampling defaults (`generation_config.json`),
     /// resolved by [`crate::handlers::chat::resolve_sampling_defaults`]
     /// against the request's `tools_active` state and any client-explicit
-    /// values. All-`None` for media/embedding models and for any model whose
+    /// values (`top_p`/`top_k` also fill in when the client sets only a positive
+    /// `temperature`). All-`None` for media/embedding models and for any model whose
     /// `generation_config.json` didn't pass [`template::load_generation_defaults`]'s
     /// gate.
     pub generation_defaults: template::GenerationDefaults,
@@ -702,6 +791,204 @@ fn ram_release_target(avail_before: f64, freed_gb: f64) -> f64 {
     avail_before + freed_gb * 0.8
 }
 
+/// D3: may `victim` be evicted now, given the dry-run's `plan` and what this load has already
+/// evicted? A load executes the plan it previewed and never evicts outside it (a model that was
+/// not predicted — one that left its grace window, say — is not a victim of this load). An empty
+/// plan is the dry-run saying "nothing to evict": if the live gate still disagrees, the plan was
+/// wrong rather than the victim, so the normal least-recently-used victim is allowed.
+fn plan_permits(plan: &[String], evicted: &[String], victim: &str) -> bool {
+    plan.is_empty() || (plan.iter().any(|p| p == victim) && !evicted.iter().any(|e| e == victim))
+}
+
+/// D3: the initial value of [`ModelManager::busy_protects`]. `true` since the policy flip
+/// (D3-S1.E2, the project's internal engineering log): a model with requests running is never chosen as an eviction
+/// victim, and a non-forced eviction of it is refused, unless the eviction is `force`d. To back
+/// the policy out, revert the commit that set this to `true`.
+const BUSY_PROTECTS_DEFAULT: bool = true;
+
+/// What the tail of an eviction owns, so it can finish on a plain thread no matter what happens
+/// to the future that started it (D3-S1.E4): the engine thread to join, and the shared state to
+/// reconcile afterwards. All `Arc`s, `Send + 'static`.
+struct EvictionTail {
+    model_id: String,
+    thread: std::thread::JoinHandle<()>,
+    models: Arc<RwLock<HashMap<String, ModelRecord>>>,
+    vram: Arc<RwLock<MemoryTracker>>,
+    /// What to do if the engine thread has not exited when the deadline passes.
+    policy: JoinPolicy,
+    /// How long to wait for it.
+    deadline: Duration,
+}
+
+/// What an eviction does when the engine thread outlives the join deadline (D3-S1.E5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinPolicy {
+    /// Give up on the thread (#36: a wedged FFI step must not hang eviction, and so process
+    /// shutdown, forever) and reconcile now. The tracker is freed while the thread may still
+    /// hold memory — acceptable when the thread is normally gone in milliseconds (an idle model,
+    /// or an engine that aborts promptly) and mandatory at process shutdown.
+    Abandon,
+    /// A forced eviction of an engine that cannot be aborted: do NOT free the tracker until
+    /// the thread has really exited. Past the deadline report [`TailOutcome::Incomplete`]; the
+    /// join helper thread reconciles whenever the engine finally exits.
+    HoldUntilJoined,
+}
+
+/// How an [`EvictionTail`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailOutcome {
+    /// The thread exited cleanly; record and tracker reconciled.
+    Clean,
+    /// The thread panicked or the join was abandoned; record and tracker reconciled anyway.
+    Unclean,
+    /// [`JoinPolicy::HoldUntilJoined`] and the thread is still running: nothing reconciled yet.
+    Incomplete,
+}
+
+impl EvictionTail {
+    /// Join the engine thread, bounded by the tail's deadline, then reconcile the record and the
+    /// tracker (T5.2, committee finding 38: REGARDLESS of how the thread exited — a panicked
+    /// thread still unwound and freed its memory, and without the reconcile it would wedge the
+    /// record in `Evicting` with the reservation over-counting). With
+    /// [`JoinPolicy::HoldUntilJoined`] the reconcile happens only once the thread has really
+    /// exited — on the join helper thread, even if this call has already given up waiting.
+    /// Blocking: call it from a plain thread, never from the runtime.
+    fn run(self) -> TailOutcome {
+        let Self {
+            model_id,
+            thread,
+            models,
+            vram,
+            policy,
+            deadline,
+        } = self;
+        let hold = policy == JoinPolicy::HoldUntilJoined;
+        // `JoinHandle::join` has no timeout: join on a helper thread and wait on a channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (helper_models, helper_vram, helper_id) =
+            (Arc::clone(&models), Arc::clone(&vram), model_id.clone());
+        std::thread::spawn(move || {
+            let clean = thread.join().is_ok();
+            if hold {
+                ModelManager::reconcile_evicted(&helper_models, &helper_vram, &helper_id);
+                crate::gpu_memory::note_release_event();
+                tracing::info!(
+                    model_id = %helper_id,
+                    "engine thread finally exited — evicted model's memory released"
+                );
+            }
+            let _ = tx.send(clean);
+        });
+        match rx.recv_timeout(deadline) {
+            Ok(clean) => {
+                if !hold {
+                    ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                    crate::gpu_memory::note_release_event();
+                }
+                if clean {
+                    TailOutcome::Clean
+                } else {
+                    TailOutcome::Unclean
+                }
+            }
+            Err(_) if hold => {
+                tracing::error!(
+                    model_id,
+                    deadline_s = deadline.as_secs_f64(),
+                    "forced eviction: the engine thread is still running its request — memory \
+                     stays reserved until it exits"
+                );
+                TailOutcome::Incomplete
+            }
+            Err(_) => {
+                tracing::error!(
+                    model_id,
+                    deadline_s = deadline.as_secs(),
+                    "engine thread did not exit within join deadline — abandoning join"
+                );
+                ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                // The kernel releases the engine's device memory seconds later — mark it so
+                // per-model memory measurements don't absorb the drop.
+                crate::gpu_memory::note_release_event();
+                TailOutcome::Unclean
+            }
+        }
+    }
+}
+
+/// Owns an eviction's engine handle and tail while the (cancellable) drain runs. If the future
+/// that started the eviction is dropped there — an admin client disconnected, a handler timed
+/// out — `Drop` finishes the eviction on a detached thread (wait out the drain, close the
+/// channel, join, reconcile), so the record never stays `Evicting` with its VRAM reserved
+/// forever (D3-S1.E4). The normal path takes the parts out and disarms it.
+struct EvictGuard {
+    handle: Option<EngineHandleKind>,
+    tail: Option<EvictionTail>,
+    drain_until: Instant,
+}
+
+impl EvictGuard {
+    /// Hand the engine handle and the tail to the normal path; the guard no longer acts.
+    fn disarm(&mut self) -> Option<(EngineHandleKind, EvictionTail)> {
+        Some((self.handle.take()?, self.tail.take()?))
+    }
+}
+
+impl Drop for EvictGuard {
+    fn drop(&mut self) {
+        let (Some(handle), Some(tail)) = (self.handle.take(), self.tail.take()) else {
+            return;
+        };
+        tracing::warn!(
+            model_id = %tail.model_id,
+            "eviction was cancelled while draining — finishing it in the background"
+        );
+        let drain_until = self.drain_until;
+        std::thread::spawn(move || {
+            // Same drain the caller would have done: let running work finish, bounded; past the
+            // deadline abort what is left.
+            while handle.as_managed().active() > 0 && Instant::now() < drain_until {
+                std::thread::sleep(EVICT_DRAIN_POLL_INTERVAL);
+            }
+            if handle.as_managed().active() > 0 {
+                handle.request_shutdown();
+            }
+            drop(handle);
+            tail.run();
+        });
+    }
+}
+
+/// A model that is excluded from eviction *only* because it has requests running (not pinned,
+/// evictable, out of grace, outside the realtime serving set). What the busy-aware refusal
+/// names, and what the memory arithmetic would gain if it could be evicted.
+#[derive(Debug, Clone)]
+struct BusyExcluded {
+    id: String,
+    /// Weights plus reserved KV pool (what the VRAM tracker releases).
+    allocated_gb: f64,
+    /// Weights alone (what live system RAM is credited).
+    weight_gb: f64,
+}
+
+/// D3: would the RELOAD of a resized model be admitted, once the model's own memory is freed by
+/// its eviction? The same two gates `ensure_vram_for` applies, on what a full sweep of the OTHER
+/// evictable residents could add on top: tracked VRAM must cover `total_minimum` (skipped when
+/// the domain is ungated), and on the gated UMA system domain live RAM must clear the floor for
+/// `live_need`. `None` for `live_ram` = the RAM gate does not apply.
+fn resize_reload_admits(
+    vram_capacity_gb: f64,
+    total_minimum_gb: f64,
+    gating_disabled: bool,
+    live_ram: Option<(f64, f64, f64)>,
+) -> bool {
+    let vram_ok = gating_disabled || vram_capacity_gb >= total_minimum_gb;
+    // (available RAM incl. what the sweep frees, RAM the load needs, OS floor)
+    let ram_ok =
+        live_ram.is_none_or(|(avail, need, floor)| os_memory::ram_floor_admits(avail, need, floor));
+    vram_ok && ram_ok
+}
+
 /// One evictable resident, as the dry-run sees it.
 #[derive(Debug, Clone)]
 struct EvictionCandidate {
@@ -771,15 +1058,24 @@ pub struct AdmissionCheck {
     /// VRAM currently unreserved in the model's inference domain, before any
     /// simulated eviction. `0.0` when gating is disabled for the domain.
     pub free_gb: f64,
+    /// `true` when the model's domain has a VRAM budget; `false` when its gate is off
+    /// (`total_vram_gb: 0.0`, the release bundle) and `free_gb` is therefore a meaningless `0.0`.
+    pub vram_gated: bool,
     /// *Non-protected* residents — not pinned and `evictable` (co-residency
     /// Slices 1/3) — that would be evicted (in eviction order) to admit this
     /// model. Empty when it already fits, when gating is disabled, or when it
     /// cannot be admitted at all (`fits == false`).
     pub would_evict: Vec<String>,
-    /// The subset of `would_evict` that has a request running right now. The
-    /// eviction drains it for at most [`LOAD_EVICT_DRAIN_DEADLINE`] and then
-    /// aborts what is left, so a caller should warn before proceeding.
+    /// The subset of `would_evict` that has a request running right now. Non-empty only
+    /// for a **forced** check (`force`): a non-forced load never evicts a busy model (see
+    /// [`Self::blocked_by_busy`]). A forced eviction drains it for at most
+    /// [`LOAD_EVICT_DRAIN_DEADLINE`] and then aborts what is left, so a caller should warn
+    /// before proceeding.
     pub busy_victims: Vec<String>,
+    /// Models that are *not* being evicted only because they have a request running (busy
+    /// models are never victims of a non-forced load, D3) and whose eviction would have made
+    /// the load fit. Non-empty only when `fits == false`; `load` with `force` would use them.
+    pub blocked_by_busy: Vec<String>,
     /// Live **system-RAM** need: `weights + conservative KV + margin`, the same
     /// `live_need` [`ensure_vram_for`](ModelManager::ensure_vram_for) gates on.
     ///
@@ -1426,6 +1722,13 @@ pub struct ModelManager {
     /// poisoned, `load_model` refuses any new loads with `ModelError::GpuPoisoned`
     /// (HTTP 503) rather than attempting a doomed GPU call.
     gpu_poisoned: AtomicBool,
+    /// D3: whether a model with requests running is a hard-excluded eviction victim (unless
+    /// the eviction is forced). Built from [`BUSY_PROTECTS_DEFAULT`]; D3-S1.E2 turns that on,
+    /// tests flip it with `set_busy_protects_for_test`. An internal switch, not a setting.
+    busy_protects: AtomicBool,
+    /// How long a forced eviction waits for a non-abortable engine thread, in milliseconds.
+    /// [`FORCED_EVICT_JOIN_DEADLINE`]; an internal value (tests shorten it), not a setting.
+    forced_join_deadline_ms: AtomicU64,
     /// Serialises the `load_model` critical section (T5.2, committee findings
     /// 20/38). Without it, two concurrent loads of different models can both
     /// pick the same LRU victim — the loser's `begin_evict` then races to
@@ -1640,6 +1943,62 @@ fn fits_projected(
     }
 }
 
+fn apply_dgpu_size_ceiling(
+    pref: &mut Vec<DeviceTier>,
+    vram_estimate: f64,
+    config: &Config,
+    inventory: &DeviceInventory,
+) {
+    // A model whose declared size alone is this close to the *entire* dGPU
+    // budget can never safely coexist with anything else there — exclude
+    // the dGPU tier outright rather than let per-registration VRAM budget
+    // contention (which depends on registration order and what else
+    // happens to be pinned) route it away only after the fact.
+    // The budget is `total_vram_gb`; `0.0` means "gating disabled" (the bundle default), and
+    // then the dGPU's own reported memory is the yardstick. With neither there is no ceiling.
+    // (A zero budget used as the yardstick put EVERY model over the ceiling and kept every
+    // model off the dGPU - found on a B70 host, 2026-10-13.)
+    let dgpu_budget_gb = if config.total_vram_gb > 0.0 {
+        Some(config.total_vram_gb)
+    } else {
+        inventory
+            .devices()
+            .iter()
+            .filter(|d| d.tier == DeviceTier::Heavy)
+            .filter_map(|d| d.total_mem_gb)
+            .reduce(f64::max)
+            .map(|gib| gib * GIB_TO_GB)
+    };
+    if config.dgpu_size_ceiling_fraction < 1.0
+        && let Some(budget) = dgpu_budget_gb
+        && vram_estimate >= budget * config.dgpu_size_ceiling_fraction
+    {
+        pref.retain(|t| *t != DeviceTier::Heavy);
+    }
+}
+
+/// D-01 (0.8.3): a hybrid linear-attention model cannot load on a GPU with the
+/// prefix-cache guard in force (see `resolve_prefix_caching`), so `auto` must not
+/// hand it a GPU. The model's own `enable_prefix_caching: true` lifts the ban.
+fn drop_gpu_tiers_for_hybrid(
+    pref: &mut Vec<DeviceTier>,
+    model_id: &str,
+    policy: Option<&config::ModelPolicy>,
+    config: &Config,
+) {
+    if lifecycle::hybrid_banned_from_gpu(
+        lifecycle::is_linear_attention_model(&config.models_dir.join(model_id)),
+        policy.and_then(|p| p.enable_prefix_caching),
+    ) {
+        tracing::debug!(
+            model_id,
+            "hybrid linear-attention model: GPU tiers excluded from automatic placement \
+             (loads on the CPU); set enable_prefix_caching=true on the model to allow a GPU"
+        );
+        pref.retain(|t| *t == DeviceTier::Fallback);
+    }
+}
+
 /// Resolve one model's device at registration via the C2 precedence chain,
 /// fit-aware (T5/F4). Pure given the `inventory` + the `projected` immovable
 /// occupancy; returns the validated device name.
@@ -1694,6 +2053,22 @@ fn resolve_model_device(
     } else if is_embedding && config.embedding_device.is_some() {
         // (4) explicit operator embedding device (keeps graceful fallback).
         lifecycle::resolve_embedding_device(config.embedding_device.as_deref(), &config.device)
+    } else if config.default_placement == config::DefaultPlacement::Device {
+        // (4b) `default_placement: "device"` - the global `device`, no engine. The bundle default
+        // (`device: CPU`); an iGPU / NPU is then used only when the operator names it.
+        if !inventory.spec_known(&config.device) {
+            let available: Vec<&str> = inventory
+                .devices()
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "device = '{}' (the global default for model '{model_id}', default_placement = \
+                 \"device\") is not an available OpenVINO device (enumerated: {available:?})",
+                config.device
+            );
+        }
+        config.device.clone()
     } else {
         // (5) size-aware built-in default for the kind. STT uses its own (smaller)
         // light/heavy threshold; everything else uses the LLM threshold.
@@ -1705,15 +2080,8 @@ fn resolve_model_device(
         };
         let mut pref =
             placement::default_tier_preference(resolved_kind, vram_estimate, light_max_gb);
-        // A model whose declared size alone is this close to the *entire* dGPU
-        // budget can never safely coexist with anything else there — exclude
-        // the dGPU tier outright rather than let per-registration VRAM budget
-        // contention (which depends on registration order and what else
-        // happens to be pinned) route it away only after the fact.
-        let dgpu_ceiling_gb = config.total_vram_gb * config.dgpu_size_ceiling_fraction;
-        if config.dgpu_size_ceiling_fraction < 1.0 && vram_estimate >= dgpu_ceiling_gb {
-            pref.retain(|t| *t != DeviceTier::Heavy);
-        }
+        drop_gpu_tiers_for_hybrid(&mut pref, model_id, policy, config);
+        apply_dgpu_size_ceiling(&mut pref, vram_estimate, config, inventory);
         let resolved = placement::place_with_fit(model_id, &pref, vram_estimate, inventory, fits)?;
         // Budget contention from an *earlier*, immovable (pinned/non-evictable)
         // model's reservation can still reroute this model to a weaker tier —
@@ -1949,6 +2317,7 @@ impl ModelManager {
             admission_queue_timeout_ms: config.admission_queue_timeout_ms,
             model_kinds: std::sync::RwLock::new(model_kinds),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
+            prefix_caching_overrides: std::sync::RwLock::new(HashMap::new()),
             max_prompt_len_hints: std::sync::RwLock::new(HashMap::new()),
             min_response_len_hints: std::sync::RwLock::new(HashMap::new()),
             draft_hints: std::sync::RwLock::new(HashMap::new()),
@@ -2165,6 +2534,14 @@ impl ModelManager {
         policy: config::ModelPolicy,
     ) -> anyhow::Result<()> {
         // ── Validate inputs ────────────────────────────────────────────────
+        // The id names a folder inside `models_dir`. A separator, `..` or an absolute path would
+        // point outside it (and turn the "directory not found" answer into a probe of the
+        // filesystem), so such an id is refused before the join.
+        anyhow::ensure!(
+            is_plain_model_id(&model_id),
+            "invalid model id '{model_id}' — it must be the name of a folder directly inside models_dir \
+             (no '/', '\\' or '..')"
+        );
         let model_dir = self.config.models_dir.join(&model_id);
         anyhow::ensure!(
             model_dir.is_dir(),
@@ -2470,6 +2847,10 @@ impl ModelManager {
             r.priority = merged.policy.priority;
             r.evictable = merged.policy.evictable;
             r.reasoning_parser = merged.policy.reasoning_parser;
+            // An auto-detected parser is never in the policy; without this a PATCH of any field
+            // would drop it until the next reload (the policy value is `None`).
+            let family = r.family;
+            r.auto_detect_reasoning_parser(model_id, family);
         }
         self.dynamic_entries
             .write()
@@ -2485,6 +2866,8 @@ impl ModelManager {
         // (found live 2026-09-28: a cleared min_response_len kept loading 512).
         self.factory
             .register_concurrent_streams_hint(model_id, merged.policy.max_concurrent_streams);
+        self.factory
+            .register_prefix_caching_hint(model_id, merged.policy.enable_prefix_caching);
         self.factory
             .register_max_prompt_len_hint(model_id, merged.policy.max_prompt_len);
         self.factory
@@ -2677,6 +3060,16 @@ impl ModelManager {
     /// - Whatever [`evict_model`](Self::evict_model) can fail with, if the
     ///   model is currently `Ready`.
     pub async fn deregister_model(&self, model_id: &str) -> Result<()> {
+        self.deregister_model_with(model_id, false).await
+    }
+
+    /// [`deregister_model`](Self::deregister_model) with the eviction forced or not (D3). A
+    /// non-forced deregistration of a model with requests running is refused with
+    /// [`ModelError::TargetBusy`]; `force` drains it first (bounded), then aborts what is left.
+    ///
+    /// # Errors
+    /// As [`deregister_model`](Self::deregister_model).
+    pub async fn deregister_model_with(&self, model_id: &str, force: bool) -> Result<()> {
         let state = self
             .read_models("deregister_model")
             .get(model_id)
@@ -2684,7 +3077,13 @@ impl ModelManager {
         match state {
             Some(ModelState::Loading) => return Err(ModelError::Loading.into()),
             Some(ModelState::Evicting) => return Err(ModelError::Evicting.into()),
-            Some(ModelState::Ready) => self.evict_model(model_id).await?,
+            Some(ModelState::Ready) => {
+                if force {
+                    self.evict_model_forced(model_id).await?;
+                } else {
+                    self.evict_model(model_id).await?;
+                }
+            }
             Some(ModelState::NotLoaded) => {}
             None => {
                 let known = self.config.models.contains_key(model_id)
@@ -3340,12 +3739,14 @@ impl ModelManager {
         // erroring here too closes the footgun for callers that bypass validation
         // (a 0.0-GB model loads uncounted, never evictable by weight → OOM risk).
         for model_id in &config.preload {
-            anyhow::ensure!(
-                records.contains_key(model_id),
-                "preload model '{model_id}' is not registered — either it's missing from \
-                 config.models, or its directory was not found under models_dir (see the \
-                 startup warning above)"
-            );
+            if !records.contains_key(model_id) {
+                // Deterministic: the supervisor must not respawn on it.
+                return Err(crate::startup::config_fatal(&anyhow::anyhow!(
+                    "preload model '{model_id}' is not registered — either it's missing from \
+                     config.models, or its directory was not found under models_dir (see the \
+                     startup warning above)"
+                )));
+            }
         }
 
         // The memory domain for each model came from the inventory above: a
@@ -3363,6 +3764,10 @@ impl ModelManager {
             next_request_id: Arc::new(AtomicU64::new(0)),
             models: Arc::new(RwLock::new(records)),
             gpu_poisoned: AtomicBool::new(false),
+            busy_protects: AtomicBool::new(BUSY_PROTECTS_DEFAULT),
+            forced_join_deadline_ms: AtomicU64::new(
+                u64::try_from(FORCED_EVICT_JOIN_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+            ),
             load_lock: tokio::sync::Mutex::new(()),
             config,
             inventory: Arc::clone(&inventory),
@@ -3416,6 +3821,34 @@ impl ModelManager {
     /// - [`ModelError::Evicting`] — model is being evicted
     pub fn get_handle(&self, model_id: &str) -> std::result::Result<EngineHandle, ModelError> {
         self.get_text_context(model_id).map(|(handle, _)| handle)
+    }
+
+    /// The tokenizer handle for `/tokenize` and `/detokenize`: text-generation and vision models
+    /// (D-09). Other kinds (NPU text, embeddings, media, ...) are rejected with
+    /// [`ModelError::WrongKind`].
+    ///
+    /// # Errors
+    /// Same as [`get_handle`](Self::get_handle).
+    pub fn get_tokenizer(
+        &self,
+        model_id: &str,
+    ) -> std::result::Result<engine::TokenizerHandle, ModelError> {
+        let ctx = self.get_chat_context(model_id)?;
+        let kind = ctx.handle.kind();
+        match ctx.handle {
+            EngineHandleKind::TextGen(h) => Ok(engine::TokenizerHandle::Text(h)),
+            EngineHandleKind::Vision(h) => Ok(engine::TokenizerHandle::Vision(h)),
+            // NpuTextGen's LLMPipeline has no standalone tokenize call in the current bridge.
+            EngineHandleKind::NpuTextGen(_)
+            | EngineHandleKind::Embedding(_)
+            | EngineHandleKind::Stt(_)
+            | EngineHandleKind::Tts(_)
+            | EngineHandleKind::ImageGen(_)
+            | EngineHandleKind::Reranking(_)
+            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model - this endpoint serves text-generation and vision models only"
+            ))),
+        }
     }
 
     /// Like [`get_handle`](Self::get_handle) but also returns the model's L0
@@ -3822,6 +4255,10 @@ impl ModelManager {
             model_id,
             entry.as_ref().and_then(|e| e.policy.max_concurrent_streams),
         );
+        self.factory.register_prefix_caching_hint(
+            model_id,
+            entry.as_ref().and_then(|e| e.policy.enable_prefix_caching),
+        );
         self.factory.register_max_prompt_len_hint(
             model_id,
             entry.as_ref().and_then(|e| e.policy.max_prompt_len),
@@ -4010,6 +4447,22 @@ impl ModelManager {
     /// `min_kv_cache_gb`. Reporting the request back would claim a success the
     /// allocator never delivered — the caller must be able to see a short pool.
     pub async fn resize_model_kv_cache(&self, model_id: &str, kv_cache_gb: f64) -> Result<f64> {
+        self.resize_model_kv_cache_with(model_id, kv_cache_gb, false)
+            .await
+    }
+
+    /// [`resize_model_kv_cache`](Self::resize_model_kv_cache) with `force` (D3): a non-forced
+    /// resize of a model with requests running is refused with [`ModelError::TargetBusy`]; a
+    /// forced one drains it (bounded), aborts what is left, and reloads with a forced load.
+    ///
+    /// # Errors
+    /// As [`resize_model_kv_cache`](Self::resize_model_kv_cache).
+    pub async fn resize_model_kv_cache_with(
+        &self,
+        model_id: &str,
+        kv_cache_gb: f64,
+        force: bool,
+    ) -> Result<f64> {
         anyhow::ensure!(
             kv_cache_gb.is_finite() && kv_cache_gb > 0.0,
             "kv_cache_gb must be a finite positive number, got {kv_cache_gb}"
@@ -4026,10 +4479,15 @@ impl ModelManager {
             record.max_concurrent_streams
         };
 
+        // Everything that can be known up front, BEFORE the cooldown is claimed: a refused resize
+        // (busy model, or a reload that would not be admitted) must not burn the cooldown, or
+        // the operator's forced retry would be answered 429 (D3-S1.F2).
+        self.resize_preflight(model_id, kv_cache_gb, force)?;
+
         // Cooldown gate, claimed (not just checked) before evicting: a
         // second call arriving mid-resize should fail fast on the cooldown
         // rather than race `evict_model`'s own Evicting-state guard.
-        {
+        let previous_resize = {
             let cooldown = Duration::from_secs(self.config.kv_resize_cooldown_secs);
             let mut tracker = self
                 .kv_pressure
@@ -4045,17 +4503,33 @@ impl ModelManager {
                     cooldown.as_secs()
                 );
             }
+            let previous = state.last_resized_at;
             state.last_resized_at = Some(Instant::now());
-        }
+            previous
+        };
 
-        self.evict_model(model_id).await?;
+        let evicted = if force {
+            self.evict_model_forced(model_id).await
+        } else {
+            self.evict_model(model_id).await
+        };
+        if let Err(e) = evicted {
+            // Nothing was resized: give the cooldown back (the model turned busy after the
+            // preflight, or the eviction was refused / incomplete).
+            if let Ok(mut tracker) = self.kv_pressure.lock()
+                && let Some(state) = tracker.get_mut(model_id)
+            {
+                state.last_resized_at = previous_resize;
+            }
+            return Err(e);
+        }
         self.load_model_with_overrides(
             model_id,
             LoadOverrides {
                 kv_cache_gb: Some(kv_cache_gb),
                 max_concurrent_streams: (max_concurrent_streams > 0)
                     .then_some(max_concurrent_streams),
-                force: false,
+                force,
             },
         )
         .await?;
@@ -4442,17 +4916,25 @@ impl ModelManager {
     /// 1. Requested model is `Ready` → grant (`source: "requested"`).
     /// 2. Requested model is loadable without evicting anything protected
     ///    (checked via the existing side-effect-free `check_admission`
-    ///    dry-run, which under D1 already accounts for the D2 serving set
-    ///    and D3 grace protection) → grant, kick a background load
+    ///    dry-run, which under D1 already accounts for the D2 serving set,
+    ///    D3 grace protection and — since the busy-eviction policy — models
+    ///    with requests running) → grant, kick a background load
     ///    (`loading: true`).
     /// 3. Requested model infeasible (or nothing requested): substitute the
     ///    best already-`Ready` floor-clearing model for `slot`
     ///    ([`best_ready_viable`](Self::best_ready_viable)) — `source:
     ///    "default"` if it's the slot's configured default, else
-    ///    `"substituted"`.
+    ///    `"substituted"`. The `reason` is `would_evict_busy` when the
+    ///    requested model's room is held by models with requests running,
+    ///    else `would_evict_protected`.
     /// 4. Nothing `Ready` clears the floor → fall back to the slot's
     ///    configured default with a background load (`loading: true`) —
-    ///    **decided**: auto-load rather than refuse (open question 5).
+    ///    **decided**: auto-load rather than refuse (open question 5) — but
+    ///    only when a dry-run says it can load (or it is already loading);
+    ///    otherwise nothing is spawned and the resolution says so
+    ///    (`loading: false`, reason `would_evict_busy` or
+    ///    `not_resident_no_headroom`) instead of leaving the client to wait
+    ///    for a load that was going to be refused.
     ///
     /// If no default is configured for `slot` and step 3 also found
     /// nothing, this reports the literal request (or an empty id when none
@@ -4475,17 +4957,25 @@ impl ModelManager {
             };
         }
 
+        // Why the requested model could not be granted (D3): the room it needs is held by models
+        // that have requests running, as opposed to ones that are protected for other reasons.
+        let mut held_by_busy = false;
         if let Some(id) = requested
             && self.known_model(id)
-            && self.check_admission(id).is_ok_and(|c| c.fits)
         {
-            self.spawn_background_load(id);
-            return RealtimeResolution {
-                model_id: id.to_owned(),
-                source: "requested",
-                reason: None,
-                loading: true,
-            };
+            match self.check_admission(id) {
+                Ok(check) if check.fits => {
+                    self.spawn_background_load(id);
+                    return RealtimeResolution {
+                        model_id: id.to_owned(),
+                        source: "requested",
+                        reason: None,
+                        loading: true,
+                    };
+                }
+                Ok(check) => held_by_busy = !check.blocked_by_busy.is_empty(),
+                Err(_) => {}
+            }
         }
 
         if let Some(id) = self.best_ready_viable(slot) {
@@ -4493,18 +4983,46 @@ impl ModelManager {
             return RealtimeResolution {
                 model_id: id,
                 source: if is_default { "default" } else { "substituted" },
-                reason: requested.is_some().then_some("would_evict_protected"),
+                reason: requested.is_some().then_some(if held_by_busy {
+                    "would_evict_busy"
+                } else {
+                    "would_evict_protected"
+                }),
                 loading: false,
             };
         }
 
         if let Some(default_id) = self.slot_default(slot) {
-            self.spawn_background_load(&default_id);
+            // Dry-run first: a load that would only be refused (the room is held by busy or
+            // protected models) must not be spawned and then awaited until the 90 s watcher
+            // gives up. A default that is already loading is simply awaited; a failed dry-run
+            // (unknown model) keeps the old try-anyway behaviour.
+            let already_loading = self
+                .read_models("resolve_realtime_slot:default_state")
+                .get(default_id.as_str())
+                .is_some_and(|r| r.state == ModelState::Loading);
+            let check = (!already_loading)
+                .then(|| self.check_admission(&default_id).ok())
+                .flatten();
+            if already_loading || check.as_ref().is_none_or(|c| c.fits) {
+                self.spawn_background_load(&default_id);
+                return RealtimeResolution {
+                    model_id: default_id,
+                    source: "default",
+                    reason: Some("not_resident_no_headroom"),
+                    loading: true,
+                };
+            }
+            let busy = check.is_some_and(|c| !c.blocked_by_busy.is_empty());
             return RealtimeResolution {
                 model_id: default_id,
                 source: "default",
-                reason: Some("not_resident_no_headroom"),
-                loading: true,
+                reason: Some(if busy {
+                    "would_evict_busy"
+                } else {
+                    "not_resident_no_headroom"
+                }),
+                loading: false,
             };
         }
 
@@ -4525,7 +5043,10 @@ impl ModelManager {
 
     /// Drains and evicts a loaded model, freeing its VRAM.
     ///
-    /// Normal (admin / LRU) eviction: drains in-flight work first, then exits.
+    /// A model with requests running is **not** evicted: this refuses with
+    /// [`ModelError::TargetBusy`] (D3, the project's internal engineering log) — retry when the work ends, or use
+    /// [`evict_model_forced`](Self::evict_model_forced). An idle model is drained (a submit
+    /// that slips in is refused, retryable — the engine's `closing` flag) and then exits.
     /// The process-shutdown path uses [`shutdown`](Self::shutdown), which aborts
     /// in-flight work so a long generation cannot delay teardown.
     ///
@@ -4540,15 +5061,34 @@ impl ModelManager {
     /// - Model ID not in registry → error
     /// - Model is not in `Ready` state → error (cannot evict what isn't loaded)
     pub async fn evict_model(&self, model_id: &str) -> Result<()> {
-        self.evict_model_inner(model_id, false, EVICT_DRAIN_DEADLINE)
+        self.evict_model_inner(model_id, false, false, EVICT_DRAIN_DEADLINE)
+            .await
+    }
+
+    /// Eviction that must succeed even when the model has work in flight: the
+    /// **automatic recovery** paths (KV-admission wedge recovery, a dead decision
+    /// engine) use it, because the busy model is the very one being recovered.
+    ///
+    /// Unlike [`evict_model`](Self::evict_model) it does not refuse a busy model: it
+    /// drains the in-flight work (bounded by `EVICT_DRAIN_DEADLINE`), then aborts what is
+    /// left (D3). It is the one eviction an operator's `force` and the automatic recovery
+    /// paths share.
+    ///
+    /// # Errors
+    /// As [`evict_model`](Self::evict_model), minus `TargetBusy`.
+    pub async fn evict_model_forced(&self, model_id: &str) -> Result<()> {
+        self.evict_model_inner(model_id, false, true, EVICT_DRAIN_DEADLINE)
             .await
     }
 
     /// Eviction as `ensure_vram_for` does it, to make room for another load:
     /// same as [`evict_model`](Self::evict_model) but the drain is bounded by
     /// [`LOAD_EVICT_DRAIN_DEADLINE`] because the caller holds `load_lock`.
-    async fn evict_model_for_load(&self, model_id: &str) -> Result<()> {
-        self.evict_model_inner(model_id, false, LOAD_EVICT_DRAIN_DEADLINE)
+    ///
+    /// `force` is the load's own `force`: a non-forced load never evicts a busy model (a victim
+    /// that turned busy since it was picked comes back as `TargetBusy`).
+    async fn evict_model_for_load(&self, model_id: &str, force: bool) -> Result<()> {
+        self.evict_model_inner(model_id, false, force, LOAD_EVICT_DRAIN_DEADLINE)
             .await
     }
 
@@ -4558,14 +5098,48 @@ impl ModelManager {
     /// waiting out a long completion would blow the stop script's budget and
     /// provoke an operator reboot. Normal eviction passes `false` and instead
     /// polls the engine's own occupancy (see below) before dropping its handle.
+    ///
+    /// `force` decides whether a model with requests running may be evicted at all (D3): a
+    /// non-forced call on a busy model fails with [`ModelError::TargetBusy`] before anything
+    /// changes. Process shutdown (`abort_inflight`) is always forced.
     async fn evict_model_inner(
         &self,
         model_id: &str,
         abort_inflight: bool,
+        force: bool,
         drain: Duration,
     ) -> Result<()> {
-        let (handle, thread) = self.begin_evict(model_id)?;
+        let (handle, thread) = self.begin_evict(model_id, force)?;
         let kind = handle.kind();
+        // From here to the join, this future can be dropped at an await; the guard then
+        // completes the eviction in the background (D3-S1.E4).
+        // A forced eviction of an engine that cannot be aborted must not free the tracker while
+        // the engine thread still runs its request (D3-S1.E5); everything else keeps the
+        // bounded, abandon-and-reconcile join (#36).
+        let hold = force && !abort_inflight && !handle.aborts_on_shutdown();
+        let mut guard = EvictGuard {
+            handle: Some(handle),
+            tail: Some(EvictionTail {
+                model_id: model_id.to_owned(),
+                thread,
+                models: Arc::clone(&self.models),
+                vram: Arc::clone(&self.vram),
+                policy: if hold {
+                    JoinPolicy::HoldUntilJoined
+                } else {
+                    JoinPolicy::Abandon
+                },
+                deadline: if hold {
+                    self.forced_join_deadline()
+                } else {
+                    JOIN_DEADLINE
+                },
+            }),
+            drain_until: Instant::now() + drain,
+        };
+        let handle = guard.handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("eviction guard lost its handle (cannot happen: just created)")
+        })?;
 
         if abort_inflight {
             // On the shutdown path, tell the engine to stop promptly BEFORE
@@ -4588,7 +5162,7 @@ impl ModelManager {
             // Bounded by EVICT_DRAIN_DEADLINE so a pathological runaway
             // generation cannot hang eviction forever: past that point, force
             // an abort (same as the shutdown path) rather than wait indefinitely.
-            let deadline = Instant::now() + drain;
+            let deadline = guard.drain_until;
             while handle.as_managed().active() > 0 && Instant::now() < deadline {
                 tokio::time::sleep(EVICT_DRAIN_POLL_INTERVAL).await;
             }
@@ -4600,6 +5174,10 @@ impl ModelManager {
                     deadline_s = drain.as_secs(),
                     "eviction drain deadline exceeded — aborting remaining in-flight request(s)"
                 );
+                crate::metrics::record_eviction_aborted_requests(
+                    kind.label(),
+                    handle.as_managed().active(),
+                );
                 handle.request_shutdown();
             }
         }
@@ -4608,40 +5186,28 @@ impl ModelManager {
         // normal path, having just drained above) or was just told to abort
         // them (shutdown, or a drain-deadline fallback) — either way it now
         // exits promptly.
+        let Some((handle, tail)) = guard.disarm() else {
+            return Err(anyhow::anyhow!("eviction guard was already disarmed"));
+        };
         drop(handle);
 
-        // Blocking join — must run off the async runtime thread. The closure
-        // collapses the join result to a bool so the panic payload
-        // (`Box<dyn Any>`, awkward to carry across the await) is dropped on the
-        // blocking thread. BOUNDED by JOIN_DEADLINE (#36): if the engine thread
-        // does not exit in time (a wedged FFI step / never-settling pipeline),
-        // abandon the wait rather than hang eviction — and therefore process
-        // shutdown — forever. The detached blocking task frees the thread's VRAM
-        // when it finally exits, or the OS reclaims it at process exit.
-        let join = tokio::task::spawn_blocking(move || thread.join().is_ok());
-        let clean_exit = if let Ok(res) = tokio::time::timeout(JOIN_DEADLINE, join).await {
-            res.unwrap_or(false)
-        } else {
-            tracing::error!(
-                model_id,
-                kind = kind.label(),
-                deadline_s = JOIN_DEADLINE.as_secs(),
-                "engine thread did not exit within join deadline — abandoning join"
-            );
-            false
-        };
-
-        // T5.2: reconcile the tracker REGARDLESS of how the engine thread exited
-        // (committee finding 38). A panicked engine thread still unwound its
-        // stack — the pipeline `Drop` ran and freed the GPU memory — but it
-        // skipped the normal exit. Without this unconditional `finish_evict`, a
-        // panic would wedge the record in `Evicting` forever AND leave the VRAM
-        // reservation in the tracker, which then permanently over-counts and
-        // spuriously rejects every later load.
-        self.finish_evict(model_id);
-        // The kernel releases the engine's device memory seconds later —
-        // mark it so per-model memory measurements don't absorb the drop.
-        crate::gpu_memory::note_release_event();
+        // The tail — a bounded join of the engine thread (#36: a wedged FFI step must not hang
+        // eviction forever) and the T5.2 reconcile of record and tracker REGARDLESS of how the
+        // thread exited (a panicked thread still unwound and freed its memory; without the
+        // unconditional reconcile it would wedge the record in `Evicting` and leave the
+        // reservation over-counting) — runs on its own thread. Awaiting its result here is
+        // cancellable, but the work is not: if this future is dropped now the reconcile still
+        // happens (D3-S1.E4).
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(tail.run());
+        });
+        let outcome = done_rx.await.unwrap_or(TailOutcome::Unclean);
+        if outcome == TailOutcome::Incomplete {
+            crate::metrics::record_eviction_refusal("incomplete");
+            return Err(ModelError::EvictionIncomplete(model_id.to_owned()).into());
+        }
+        let clean_exit = outcome == TailOutcome::Clean;
 
         if !clean_exit {
             tracing::error!(
@@ -4699,7 +5265,7 @@ impl ModelManager {
             // in-flight generation — terminate it cleanly (T1.3) and tear down (#7).
             if info.state == ModelState::Ready
                 && let Err(e) = self
-                    .evict_model_inner(&info.id, true, EVICT_DRAIN_DEADLINE)
+                    .evict_model_inner(&info.id, true, true, EVICT_DRAIN_DEADLINE)
                     .await
             {
                 tracing::warn!(model_id = %info.id, error = %e, "eviction during shutdown failed");
@@ -5138,9 +5704,12 @@ impl ModelManager {
         // Compare with what admission actually charges (NPU footprint factor
         // included), not the configured figure, or an NPU model whose measured
         // memory sits between the two would warn although it IS covered.
-        let charged_gb = self.budget_weight_gb(r);
-        if charged_gb > 0.0
-            && estimate_gb > charged_gb
+        // The measurement spans the whole load, so it holds the KV pool the load
+        // allocated as well as the weights; `vram_gb` is weights only (the load gate
+        // adds the KV floor separately). Compare like with like (D-01, B60 run: 1.7B
+        // measured 2.09 GB against 1.2 GB of weights + a ~1 GB pool).
+        let charged_gb = self.budget_weight_gb(r) + r.kv_cache_gb.max(0.0);
+        if measured_exceeds_charge(estimate_gb, charged_gb)
             && !r
                 .gpu_over_budget_warned
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -5380,7 +5949,9 @@ impl ModelManager {
         let mm = Arc::clone(self);
         let id = model_id.to_owned();
         tokio::spawn(async move {
-            match mm.evict_model(&id).await {
+            // Forced: the wedged model is busy by definition (recovery must not be refused
+            // by the busy-eviction policy, D3).
+            match mm.evict_model_forced(&id).await {
                 Ok(()) => {
                     if let Err(e) = mm.load_model(&id).await {
                         tracing::error!(
@@ -5706,19 +6277,11 @@ impl ModelManager {
                 record.template = Arc::from(template);
                 record.family = family;
                 // Auto-detect reasoning parser from the template when not set
-                // explicitly in config (gap-2). A Qwen3-style template includes
-                // `enable_thinking`; that marker is the only reliable signal we
-                // have without probing the model. Non-thinking models and those
-                // with an explicit policy override are untouched.
-                if record.reasoning_parser.is_none()
-                    && template::template_hints_thinking(&record.template)
-                {
-                    record.reasoning_parser = Some(config::ReasoningParser::Qwen3);
-                    tracing::info!(
-                        model_id,
-                        "reasoning_parser auto-detected: qwen3 (template contains enable_thinking)"
-                    );
-                }
+                // explicitly in config (gap-2): a harmony (`<|channel|>`) template is
+                // gpt-oss (D-07), a Qwen3-style template includes `enable_thinking`.
+                // Non-thinking models and those with an explicit policy override are
+                // untouched.
+                record.auto_detect_reasoning_parser(model_id, family);
                 record.eos_token = Arc::from(eos_token.as_str());
                 record.bos_token = Arc::from(bos_token.as_str());
                 record.generation_defaults = generation_defaults;
@@ -5843,6 +6406,7 @@ impl ModelManager {
     ///
     /// # Errors
     /// [`ModelError::NotFound`] if `model_id` is not a registered model.
+    #[allow(clippy::too_many_lines)] // one linear dry-run mirroring `ensure_vram_for`
     pub fn check_admission_with(&self, model_id: &str, force: bool) -> Result<AdmissionCheck> {
         // Model weight + already-resident check + its domain, under the models
         // lock only. Phase C1: the dry-run mirrors `ensure_vram_for` — it must
@@ -5877,17 +6441,21 @@ impl ModelManager {
         // Already Ready → resident now; the check is moot. Report it fits with no
         // eviction so callers get a clean "yes, it's here" answer.
         if already_loaded {
-            let free_gb = self
-                .vram
-                .read()
-                .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?
-                .free_gb(&domain);
+            let (free_gb, vram_gated) = {
+                let vram = self
+                    .vram
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
+                (vram.free_gb(&domain), !vram.fits(&domain, f64::INFINITY))
+            };
             return Ok(AdmissionCheck {
                 fits: true,
                 needed_gb,
                 free_gb,
+                vram_gated,
                 would_evict: Vec::new(),
                 busy_victims: Vec::new(),
+                blocked_by_busy: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
                 already_loaded: true,
@@ -5901,6 +6469,11 @@ impl ModelManager {
             .read()
             .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
         let free_gb = vram.free_gb(&domain);
+        // `free_gb()` is 0.0 for a domain with its gate off, which the eviction plan would read as
+        // "no room, and none can be made" (VRAM leg 0 + freed < needed): an ungated domain has no
+        // VRAM leg at all, only the live RAM gate.
+        let vram_gated = !vram.fits(&domain, f64::INFINITY);
+        let plan_free_gb = if vram_gated { free_gb } else { f64::INFINITY };
 
         // Fits as-is (covers gating-disabled / unknown domains, where fits() is
         // always true) → no eviction needed.
@@ -5909,8 +6482,10 @@ impl ModelManager {
                 fits: true,
                 needed_gb,
                 free_gb,
+                vram_gated,
                 would_evict: Vec::new(),
                 busy_victims: Vec::new(),
+                blocked_by_busy: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
                 already_loaded: false,
@@ -5931,19 +6506,33 @@ impl ModelManager {
                 weight_gb: *weight_gb,
             })
             .collect();
-        let (would_evict, fits) = plan_evictions(&plan, free_gb, needed_gb, ram_admits);
+        let (would_evict, fits) = plan_evictions(&plan, plan_free_gb, needed_gb, ram_admits);
         let busy_victims: Vec<String> = candidates
             .iter()
             .filter(|(id, _, busy)| *busy && would_evict.contains(id))
             .map(|(id, _, _)| id.clone())
             .collect();
 
+        let blocked_by_busy = if fits {
+            Vec::new()
+        } else {
+            Self::busy_blockers(
+                &plan,
+                self.busy_excluded(model_id, &domain, force),
+                plan_free_gb,
+                needed_gb,
+                ram_admits,
+            )
+        };
+
         Ok(AdmissionCheck {
             fits,
             needed_gb,
             free_gb,
+            vram_gated,
             would_evict,
             busy_victims,
+            blocked_by_busy,
             ram_needed_gb,
             ram_avail_gb,
             already_loaded: false,
@@ -6045,7 +6634,11 @@ impl ModelManager {
         // evictable victim is gone — the eviction was doomed from the start (see
         // the project's internal engineering log).
         {
-            let reclaimable_gb = self.max_reclaimable_gb(model_id, &domain, force);
+            // VRAM is credited with the whole reservation (weights + KV), live RAM with the
+            // weights only — the same split `plan_evictions` uses, so this check and the
+            // dry-run cannot disagree about what a sweep frees.
+            let (reclaimable_gb, reclaimable_weights_gb) =
+                self.max_reclaimable(model_id, &domain, force);
             // `free_gb()` reports `0.0` for a gating-disabled (`total_gb == 0.0`)
             // or never-registered domain — unlike `fits()`, it has no "ungated"
             // special case, so it must not be compared against `total_minimum`
@@ -6061,8 +6654,36 @@ impl ModelManager {
             let max_capacity = free_gb + reclaimable_gb;
 
             let live_avail = self.live_system_avail_gb(&domain);
+
+            // Models excluded from eviction only because they have requests running (D3): if
+            // evicting them too would make this load feasible, the refusal is "busy, retry or
+            // force", not "can never fit". Empty unless the busy rule is on.
+            let busy = self.busy_excluded(model_id, &domain, force);
+            let busy_rescues = !busy.is_empty() && {
+                let busy_alloc: f64 = busy.iter().map(|b| b.allocated_gb).sum();
+                let busy_weights: f64 = busy.iter().map(|b| b.weight_gb).sum();
+                (gating_disabled || free_gb + reclaimable_gb + busy_alloc >= total_minimum)
+                    && live_avail.is_none_or(|a| {
+                        os_memory::ram_floor_admits(
+                            a + reclaimable_weights_gb + busy_weights,
+                            live_need,
+                            ram_floor,
+                        )
+                    })
+            };
+            let infeasible_now = !gating_disabled && max_capacity < total_minimum
+                || live_avail.is_some_and(|a| {
+                    !os_memory::ram_floor_admits(a + reclaimable_weights_gb, live_need, ram_floor)
+                });
+            if infeasible_now && busy_rescues {
+                return Err(Self::refuse_load_busy(
+                    model_id,
+                    busy.into_iter().map(|b| b.id).collect(),
+                ));
+            }
+
             if let Some(avail) = live_avail {
-                let max_avail = avail + reclaimable_gb;
+                let max_avail = avail + reclaimable_weights_gb;
                 if !os_memory::ram_floor_admits(max_avail, live_need, ram_floor) {
                     return Err(ModelError::InsufficientMemory(format!(
                         "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
@@ -6120,8 +6741,17 @@ impl ModelManager {
                         // T5.4 seam: the KV-size policy lives in `compute_kv_pool_gb`
                         // — the single place a future bounded/co-residency policy
                         // changes, without touching this reserve/evict loop.
+                        // A domain with its gate off reports 0.0 free, which would pin every
+                        // KV pool at the floor: use what the OS has live instead (what is left
+                        // after these weights, minus the OS reservation).
+                        let free_after_weights = if vram.fits(&domain, f64::INFINITY) {
+                            live_avail
+                                .map_or(f64::INFINITY, |a| (a - weight_gb - ram_floor).max(0.0))
+                        } else {
+                            vram.free_gb(&domain)
+                        };
                         let kv_final = Self::compute_kv_pool_gb(
-                            vram.free_gb(&domain),
+                            free_after_weights,
                             kv_target_gb,
                             &self.config,
                         );
@@ -6165,6 +6795,31 @@ impl ModelManager {
 
             match lru_id {
                 None => {
+                    // Busy models (D3) are not victims: if evicting them would have made this
+                    // load fit, say so — a retryable "busy", not a capacity verdict. Only
+                    // reachable with the busy rule on.
+                    let busy = self.busy_excluded(model_id, &domain, force);
+                    if !busy.is_empty() {
+                        let busy_alloc: f64 = busy.iter().map(|b| b.allocated_gb).sum();
+                        let busy_weights: f64 = busy.iter().map(|b| b.weight_gb).sum();
+                        let vram_ok = {
+                            let vram = self
+                                .vram
+                                .read()
+                                .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
+                            vram.fits(&domain, f64::INFINITY)
+                                || vram.free_gb(&domain) + busy_alloc >= total_minimum
+                        };
+                        let ram_would_be_ok = live_avail.is_none_or(|a| {
+                            os_memory::ram_floor_admits(a + busy_weights, live_need, ram_floor)
+                        });
+                        if vram_ok && ram_would_be_ok {
+                            return Err(Self::refuse_load_busy(
+                                model_id,
+                                busy.into_iter().map(|b| b.id).collect(),
+                            ));
+                        }
+                    }
                     // M1: if the LIVE system-RAM floor is the binding constraint
                     // (not the logical budget), name it — and nothing evictable is
                     // left to free, so report honestly instead of OOMing.
@@ -6202,17 +6857,76 @@ impl ModelManager {
                         "LRU eviction to make room"
                     );
                     if predicted.is_none() {
-                        predicted = Some(
-                            self.check_admission_with(model_id, force)
-                                .map(|c| c.would_evict)
-                                .unwrap_or_default(),
-                        );
+                        // Preview once, before the first eviction, and then execute exactly
+                        // that plan. A preview that says even full eviction cannot make room
+                        // refuses now, with nothing evicted, instead of destroying idle
+                        // models and failing anyway (D3, over-eviction).
+                        let check = self.check_admission_with(model_id, force).ok();
+                        if let Some(c) = check.as_ref().filter(|c| !c.fits) {
+                            // The live system-RAM gate can be the binding one while the
+                            // logical tracker has room (a CPU-only box has a zero tracker
+                            // budget): name the figures that actually refused the load.
+                            if let (Some(need), Some(avail)) = (c.ram_needed_gb, c.ram_avail_gb)
+                                && !c.vram_gated
+                            {
+                                return Err(ModelError::InsufficientMemory(format!(
+                                    "insufficient system memory: loading {model_id} needs \
+                                     ~{need:.1} GB, but only {avail:.1} GB system RAM is \
+                                     available and {ram_floor:.1} GB must stay free for the OS, and evicting the \
+                                     models it could evict ({}) would not make enough room — \
+                                     nothing was evicted; free memory or load a smaller model",
+                                    if c.would_evict.is_empty() {
+                                        "none".to_owned()
+                                    } else {
+                                        c.would_evict.join(", ")
+                                    },
+                                ))
+                                .into());
+                            }
+                            return Err(ModelError::InsufficientMemory(format!(
+                                "insufficient memory: loading {model_id} needs {:.1} GB \
+                                 ({:.1} GB free), and evicting the models it could evict ({}) \
+                                 would still not make room — nothing was evicted; free memory \
+                                 or load a smaller model",
+                                c.needed_gb,
+                                c.free_gb,
+                                if c.would_evict.is_empty() {
+                                    "none".to_owned()
+                                } else {
+                                    c.would_evict.join(", ")
+                                },
+                            ))
+                            .into());
+                        }
+                        predicted = Some(check.map(|c| c.would_evict).unwrap_or_default());
+                    }
+                    if let Some(plan) = predicted.as_ref()
+                        && !plan_permits(plan, &evicted, &id)
+                    {
+                        return Err(ModelError::InsufficientMemory(format!(
+                            "loading {model_id} would have to evict {id}, which the preview did \
+                             not plan to ({}) — refusing to evict outside the plan; retry",
+                            plan.join(", ")
+                        ))
+                        .into());
                     }
                     let victim_gb = self
                         .read_models("ensure_vram:victim_weight")
                         .get(&id)
                         .map_or(0.0, |r| self.budget_weight_gb(r));
-                    self.evict_model_for_load(&id).await?;
+                    // The victim was idle when picked; if it turned busy since, the load is
+                    // refused (retryable) rather than aborting that request (D3).
+                    match self.evict_model_for_load(&id, force).await {
+                        Err(e)
+                            if matches!(
+                                e.downcast_ref::<ModelError>(),
+                                Some(ModelError::TargetBusy(_))
+                            ) =>
+                        {
+                            return Err(Self::refuse_load_busy(model_id, vec![id]));
+                        }
+                        other => other?,
+                    }
                     evicted.push(id);
                     if !ram_ok {
                         self.await_ram_release(
@@ -6263,31 +6977,225 @@ impl ModelManager {
     }
 
     /// True when `id`/`r` must **not** be chosen as an eviction victim.
-    /// Four independent hard excludes, any one is sufficient:
+    /// Independent hard excludes, any one is sufficient:
     /// - operator-`pinned` or declared non-`evictable` (co-residency Slices 1/3,
-    ///   the original two checks — always in force, `ignore_grace` never
+    ///   the original two checks — always in effect, `force` never
     ///   touches these);
     /// - **D2 — realtime serving set:** `id` is in the resolved `{stt, llm,
     ///   tts}` set of at least one active realtime session
-    ///   (`realtime_serving_set_contains`). Never bypassable by `force`
-    ///   (the project's internal engineering log open question 3,
-    ///   decided: `force` bypasses grace only).
+    ///   (`realtime_serving_set_contains`). Never bypassable by `force`.
     /// - **D3 — eviction grace window:** `id` was used (any channel — admin
     ///   load, plain API, realtime turn; `last_used` is bumped by all of
     ///   them identically) more recently than its grace window. Skipped when
-    ///   `ignore_grace` is `true` — the admin load endpoint's `force: true`
+    ///   `force` is `true` — the admin load endpoint's `force: true`
     ///   escape hatch (D3), and *only* that escape hatch; every other caller
     ///   passes `false`.
+    /// - **D3 — busy:** `id` has a request running. Skipped when `force` is `true` (see
+    ///   [`busy_protects`](Self::busy_protects)): in-flight work blocks a non-forced eviction.
     ///
     /// This is the single predicate every victim-selection path
-    /// (`select_eviction_victim`, `max_reclaimable_gb`, `eviction_blocked_tail`,
+    /// (`select_eviction_victim`, `max_reclaimable`, `eviction_blocked_tail`,
     /// the `check_admission` dry-run) filters on, so they stay in lockstep —
     /// the dry-run preview can never disagree with what actually gets evicted.
-    fn eviction_protected(&self, id: &str, r: &ModelRecord, ignore_grace: bool) -> bool {
+    fn eviction_protected(&self, id: &str, r: &ModelRecord, force: bool) -> bool {
+        self.eviction_protected_ex(id, r, force, self.busy_protects(force))
+    }
+
+    /// [`eviction_protected`](Self::eviction_protected) with the busy rule given explicitly:
+    /// `busy_protects == false` answers "protected for any OTHER reason", which is how the
+    /// refusal paths find the models that are excluded only because they are busy.
+    fn eviction_protected_ex(
+        &self,
+        id: &str,
+        r: &ModelRecord,
+        force: bool,
+        busy_protects: bool,
+    ) -> bool {
         r.pinned
             || !r.evictable
             || self.realtime_serving_set_contains(id)
-            || (!ignore_grace && r.last_used.elapsed() < self.eviction_grace_for(id))
+            || (!force && r.last_used.elapsed() < self.eviction_grace_for(id))
+            || (busy_protects && r.has_in_flight())
+    }
+
+    /// Everything a resize can know before it changes anything (D3-S1.F2): a busy model is
+    /// refused (`TargetBusy`, no force), and the reload at the new size must be admissible once
+    /// the model's own memory is freed — otherwise the resize would evict the model and then fail
+    /// to bring it back, which is exactly what "a growing resize leaves the model unloaded" was.
+    /// Read-only: nothing is evicted, no cooldown claimed, no flag set.
+    fn resize_preflight(&self, model_id: &str, kv_cache_gb: f64, force: bool) -> Result<()> {
+        let (weight_gb, domain, needs_kv_pool, active) = {
+            let guard = self.read_models("resize_preflight");
+            let record = guard
+                .get(model_id)
+                .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
+            let active = record
+                .handle
+                .as_ref()
+                .map_or(0, |h| h.as_managed().active());
+            (
+                self.budget_weight_gb(record),
+                record.domain.clone(),
+                record.needs_kv_pool(),
+                active,
+            )
+        };
+        if active > 0 && self.busy_protects(force) {
+            crate::metrics::record_eviction_refusal("busy");
+            return Err(ModelError::TargetBusy(active).into());
+        }
+
+        let margin = self.config.vram_safety_margin_gb;
+        let min_kv = if needs_kv_pool {
+            self.config.min_kv_cache_gb
+        } else {
+            0.0
+        };
+        let kv_need = if needs_kv_pool {
+            Self::conservative_kv_need_gb(kv_cache_gb, &self.config)
+        } else {
+            0.0
+        };
+        let (reclaim_alloc, reclaim_weights) = self.max_reclaimable(model_id, &domain, force);
+        let (capacity, gating_disabled) = {
+            let vram = self
+                .vram
+                .read()
+                .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
+            (
+                vram.free_gb(&domain) + vram.allocated_gb(model_id) + reclaim_alloc,
+                vram.fits(&domain, f64::INFINITY),
+            )
+        };
+        let floor = self
+            .config
+            .system_ram_reservation_gb
+            .unwrap_or_else(os_memory::default_reservation_gb);
+        let live_need = weight_gb + kv_need + margin;
+        let live_ram = self
+            .live_system_avail_gb(&domain)
+            .map(|avail| (avail + weight_gb + reclaim_weights, live_need, floor));
+        if resize_reload_admits(
+            capacity,
+            weight_gb + min_kv + margin,
+            gating_disabled,
+            live_ram,
+        ) {
+            return Ok(());
+        }
+        Err(ModelError::InsufficientMemory(format!(
+            "resize of {model_id} to a {kv_cache_gb:.1} GB KV cache refused before evicting \
+             anything: after it is unloaded the reload would not be admitted (needs ~{live_need:.1} \
+             GB of system RAM, weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}, or \
+             {:.1} GB of VRAM; {capacity:.1} GB tracked VRAM is reachable) — the model was left \
+             as it was",
+            weight_gb + min_kv + margin
+        ))
+        .into())
+    }
+
+    /// Models kept out of the plan only because they are busy, whose eviction (after the idle
+    /// candidates, as the last resort they used to be) would have made the load fit. Empty when
+    /// nothing is busy-excluded, or when even evicting them would not be enough. Names them so a
+    /// refusal can say "retry when they finish, or load with force" (D3).
+    fn busy_blockers(
+        plan: &[EvictionCandidate],
+        busy: Vec<BusyExcluded>,
+        free_gb: f64,
+        needed_gb: f64,
+        ram_admits: impl Fn(f64) -> bool,
+    ) -> Vec<String> {
+        if busy.is_empty() {
+            return Vec::new();
+        }
+        let mut with_busy = plan.to_vec();
+        with_busy.extend(busy.iter().map(|b| EvictionCandidate {
+            id: b.id.clone(),
+            allocated_gb: b.allocated_gb,
+            weight_gb: b.weight_gb,
+        }));
+        let (hypothetical, fits) = plan_evictions(&with_busy, free_gb, needed_gb, ram_admits);
+        if !fits {
+            return Vec::new();
+        }
+        busy.into_iter()
+            .map(|b| b.id)
+            .filter(|id| hypothetical.contains(id))
+            .collect()
+    }
+
+    /// A load refused because the room it needs is held by models with requests running (D3):
+    /// the error to return, after saying so in the log (naming the blockers) and counting it —
+    /// `rustedvino_load_refusals_total{reason="busy"}` is how an operator spots the failure mode
+    /// of this rule, a client keeping other models busy.
+    fn refuse_load_busy(model_id: &str, blockers: Vec<String>) -> anyhow::Error {
+        tracing::warn!(
+            loading = model_id,
+            blocked_by = ?blockers,
+            "load refused: the models that would have to be evicted have requests running — \
+             retry when they finish, or load with force"
+        );
+        crate::metrics::record_load_refusal("busy");
+        ModelError::BlockedByBusy(blockers).into()
+    }
+
+    /// Whether a non-forced eviction treats a model with requests running as protected (D3).
+    /// `force` always overrides it.
+    fn busy_protects(&self, force: bool) -> bool {
+        !force && self.busy_protects.load(Ordering::Relaxed)
+    }
+
+    /// The join deadline of a forced eviction of a non-abortable engine (E5).
+    fn forced_join_deadline(&self) -> Duration {
+        Duration::from_millis(self.forced_join_deadline_ms.load(Ordering::Relaxed))
+    }
+
+    /// Test seam: shorten the forced-eviction join deadline.
+    #[cfg(test)]
+    pub(crate) fn set_forced_join_deadline_for_test(&self, deadline: Duration) {
+        self.forced_join_deadline_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Test seam: switch the busy rule on or off without the policy flip.
+    #[cfg(test)]
+    pub(crate) fn set_busy_protects_for_test(&self, on: bool) {
+        self.busy_protects.store(on, Ordering::Relaxed);
+    }
+
+    /// Ready residents of `domain` that are protected from eviction *only* because they have
+    /// requests running. Empty unless the busy rule is on and the eviction is not forced.
+    fn busy_excluded(&self, loading_id: &str, domain: &str, force: bool) -> Vec<BusyExcluded> {
+        if !self.busy_protects(force) {
+            return Vec::new();
+        }
+        let found: Vec<(String, f64)> = {
+            let guard = self.read_models("ensure_vram:busy_excluded");
+            guard
+                .iter()
+                .filter(|(id, r)| {
+                    id.as_str() != loading_id
+                        && r.state == ModelState::Ready
+                        && r.domain == domain
+                        && r.has_in_flight()
+                        && !self.eviction_protected_ex(id, r, force, false)
+                })
+                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r)))
+                .collect()
+        };
+        let Ok(vram) = self.vram.read() else {
+            return Vec::new();
+        };
+        found
+            .into_iter()
+            .map(|(id, weight_gb)| BusyExcluded {
+                allocated_gb: vram.allocated_gb(&id),
+                id,
+                weight_gb,
+            })
+            .collect()
     }
 
     /// D2: `true` when `id` is in the resolved `{stt, llm, tts}` set of at
@@ -6330,25 +7238,25 @@ impl ModelManager {
     /// model out from under its clients. We sort Ready candidates by
     /// `(busy, last_used)`: a busy model (in-flight > 0, read live through the
     /// `ManagedEngine` facade) is weighted LAST, so a genuinely idle model is
-    /// always preferred. Busy models are weighted, not excluded — if *every*
-    /// candidate is busy we still pick one (oldest) so the load makes progress.
+    /// always preferred. Since D3-S1.E2 a busy model is excluded outright unless `force` is
+    /// set; the busy weighting only orders a *forced* load's candidates.
     ///
     /// Co-residency Slices 1/3 + realtime arbitration v2 (D1-D3): an
     /// eviction-*protected* model (`eviction_protected`) is hard-excluded here,
     /// and `priority` is a secondary sort key — among the remaining candidates
     /// the eviction order is `(busy, priority, last_used)`: an in-flight model
     /// is the last resort, then the lowest-priority model, then the
-    /// least-recently-used. Protection is a *hard* exclude; busy-weighting and
-    /// priority are *soft* — if every candidate is busy (or low-priority) we
-    /// still pick one so the load makes progress. If the only Ready models are
-    /// protected, this returns `None` and the load fails in [`ensure_vram_for`]
-    /// rather than evicting a protected model. `ignore_grace` is threaded from
-    /// `ensure_vram_for`'s `force` parameter (D3's admin-only escape hatch).
+    /// least-recently-used. Protection (including, unless `force`, being busy) is a
+    /// *hard* exclude; priority and the busy ordering are *soft*. If the only Ready
+    /// models are protected, this returns `None` and the load fails in
+    /// [`ensure_vram_for`] rather than evicting a protected model. `force` is
+    /// `ensure_vram_for`'s parameter (D3's admin-only escape hatch): it bypasses the
+    /// grace window and the busy rule, never pinned / non-evictable / the serving set.
     fn select_eviction_victim(
         &self,
         loading_id: &str,
         domain: &str,
-        ignore_grace: bool,
+        force: bool,
     ) -> Option<String> {
         let guard = self.read_models("ensure_vram:victim");
         guard
@@ -6357,20 +7265,27 @@ impl ModelManager {
                 id.as_str() != loading_id
                     && r.state == ModelState::Ready
                     && r.domain == domain
-                    && !self.eviction_protected(id, r, ignore_grace)
+                    && !self.eviction_protected(id, r, force)
             })
             .min_by_key(|(_, r)| r.eviction_sort_key())
             .map(|(id, _)| id.clone())
     }
 
-    /// Sum of every evictable Ready model's VRAM reservation in `domain` — the
-    /// same candidate set [`select_eviction_victim`](Self::select_eviction_victim)
-    /// draws from, but totalled rather than picked one at a time. This is the
-    /// theoretical maximum a full eviction sweep of the domain could ever
-    /// reclaim; used by [`ensure_vram_for`](Self::ensure_vram_for)'s upfront
-    /// feasibility check to predict a doomed load without evicting anything.
-    fn max_reclaimable_gb(&self, loading_id: &str, domain: &str, ignore_grace: bool) -> f64 {
-        let candidates: Vec<String> = {
+    /// What a full eviction sweep of `domain` could ever reclaim, as
+    /// `(allocated_gb, weights_gb)` over every evictable Ready model — the same
+    /// candidate set [`select_eviction_victim`](Self::select_eviction_victim)
+    /// draws from, but totalled rather than picked one at a time. Used by
+    /// [`ensure_vram_for`](Self::ensure_vram_for)'s upfront feasibility check to
+    /// predict a doomed load without evicting anything.
+    ///
+    /// The two numbers feed the two gates and must not be mixed up, exactly as in
+    /// [`plan_evictions`]: `allocated_gb` (weights **plus the reserved KV pool**,
+    /// what the tracker releases) credits tracked VRAM; `weights_gb` (what
+    /// [`budget_weight_gb`](Self::budget_weight_gb) charges) credits live system
+    /// RAM, because a KV pool is reserved in the tracker but allocated lazily, so
+    /// an idle model gives back far less real RAM than it holds in the tracker.
+    fn max_reclaimable(&self, loading_id: &str, domain: &str, force: bool) -> (f64, f64) {
+        let candidates: Vec<(String, f64)> = {
             let guard = self.read_models("ensure_vram:max_reclaimable");
             guard
                 .iter()
@@ -6378,15 +7293,17 @@ impl ModelManager {
                     id.as_str() != loading_id
                         && r.state == ModelState::Ready
                         && r.domain == domain
-                        && !self.eviction_protected(id, r, ignore_grace)
+                        && !self.eviction_protected(id, r, force)
                 })
-                .map(|(id, _)| id.clone())
+                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r)))
                 .collect()
         };
         let Ok(vram) = self.vram.read() else {
-            return 0.0;
+            return (0.0, 0.0);
         };
-        candidates.iter().map(|id| vram.allocated_gb(id)).sum()
+        let allocated = candidates.iter().map(|(id, _)| vram.allocated_gb(id)).sum();
+        let weights = candidates.iter().map(|(_, w)| w).sum();
+        (allocated, weights)
     }
 
     /// Diagnostic tail for an insufficient-VRAM error: distinguishes "nothing
@@ -6397,24 +7314,23 @@ impl ModelManager {
     /// load. Shared between [`ensure_vram_for`](Self::ensure_vram_for)'s upfront
     /// feasibility check and its loop-exhausted fallback so both report
     /// identically.
-    fn eviction_blocked_tail(
-        &self,
-        model_id: &str,
-        domain: &str,
-        ignore_grace: bool,
-    ) -> &'static str {
+    fn eviction_blocked_tail(&self, model_id: &str, domain: &str, force: bool) -> &'static str {
         let guard = self.read_models("ensure_vram:pin_diag");
         let blocked_by_protected = guard.iter().any(|(id, r)| {
             r.state == ModelState::Ready
                 && r.domain == domain
-                && self.eviction_protected(id, r, ignore_grace)
+                && self.eviction_protected(id, r, force)
         }) && !guard.iter().any(|(id, r)| {
             id.as_str() != model_id
                 && r.state == ModelState::Ready
                 && r.domain == domain
-                && !self.eviction_protected(id, r, ignore_grace)
+                && !self.eviction_protected(id, r, force)
         });
-        if blocked_by_protected {
+        let blocked_by_busy = !self.busy_excluded(model_id, domain, force).is_empty();
+        if blocked_by_busy {
+            "the models that could be evicted have requests running — retry when \
+             they finish, or load with force"
+        } else if blocked_by_protected {
             "only protected (pinned / non-evictable / in active realtime use / \
              within its eviction-grace window) models resident — unpin, mark \
              evictable, wait out the grace window, or free VRAM"
@@ -6523,15 +7439,27 @@ impl ModelManager {
         if config.cache_size_gb > 0.0 {
             kv = kv.min(config.cache_size_gb);
         }
+        // An unbounded yardstick with no target and no cap (an ungated domain whose RAM is
+        // unreadable) cannot be allocated: take the floor rather than infinity.
+        if !kv.is_finite() {
+            return config.min_kv_cache_gb;
+        }
         // Never go below the floor — ensure_vram_for guarantees this much is free.
         kv.max(config.min_kv_cache_gb)
     }
 
     /// Phase 1 of `evict_model`: validate state, transition to `Evicting`,
     /// extract the handle and thread.
+    ///
+    /// A model with requests running is refused with [`ModelError::TargetBusy`] unless `force`
+    /// (D3): the engine is closed to new work FIRST and `active()` read second, so a submit is
+    /// either counted here (and the eviction refused) or sees the closed flag (and is refused,
+    /// retryable) — never accepted unseen. On a refusal the flag is cleared again and nothing
+    /// else has changed; a submit that hit the window in between got a spurious, retryable 503.
     fn begin_evict(
         &self,
         model_id: &str,
+        force: bool,
     ) -> Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
         // L3 gate, eviction side (2026-08-04, the project's internal engineering log):
         // refuse to evict *anything* while the GPU context
@@ -6560,6 +7488,25 @@ impl ModelManager {
             ModelState::Evicting => return Err(ModelError::Evicting.into()),
         }
 
+        if self.busy_protects(force)
+            && let Some(handle) = record.handle.as_ref()
+        {
+            let engine = handle.as_managed();
+            engine.set_closing(true);
+            let active = engine.active();
+            if active > 0 {
+                engine.set_closing(false);
+                tracing::info!(
+                    model_id,
+                    active,
+                    "eviction refused: the model has requests running — retry when they finish, \
+                     or evict with force"
+                );
+                crate::metrics::record_eviction_refusal("busy");
+                return Err(ModelError::TargetBusy(active).into());
+            }
+        }
+
         record.state = ModelState::Evicting;
 
         let handle = record
@@ -6571,15 +7518,42 @@ impl ModelManager {
             .take()
             .ok_or_else(|| anyhow::anyhow!("model marked Ready but thread is missing"))?;
 
+        // D3: close the engine to new work BEFORE anyone reads `active()` (the drain in
+        // `evict_model_inner` runs after this returns). A handler that cloned the handle while
+        // the model was still Ready can still call it; with the flag set its submit is refused
+        // (retryable) instead of being accepted into an engine that is being torn down — and
+        // then drained, or aborted at the drain deadline. The flag lives on the engine, which is
+        // discarded when the eviction finishes; a reload builds a new one with it clear.
+        handle.as_managed().set_closing(true);
+
+        // A FORCED eviction that goes ahead although work is running is the one place requests
+        // can be lost on purpose: say so once, with the model and how many (D3).
+        let active = handle.as_managed().active();
+        if force && active > 0 {
+            tracing::warn!(
+                model_id,
+                kind = handle.kind().label(),
+                active,
+                "forced eviction of a busy model — its running request(s) are drained, then aborted"
+            );
+            crate::metrics::record_forced_eviction(handle.kind().label());
+        }
+
         Ok((handle, thread))
     }
 
-    /// Phase 2 of `evict_model` (post-join): update state and free VRAM.
+    /// Phase 2 of `evict_model` (post-join): update state and free VRAM. Runs on the shared
+    /// state alone, so [`EvictionTail`] can call it from a plain thread: the record becomes
+    /// `NotLoaded` and the VRAM reservation is released.
     ///
     /// Frees the full reservation (weight + KV pool) that `ensure_vram_for`
     /// allocated — `VramTracker::free` removes the whole entry regardless of size.
-    fn finish_evict(&self, model_id: &str) {
-        if let Ok(mut guard) = self.models.write()
+    fn reconcile_evicted(
+        models: &RwLock<HashMap<String, ModelRecord>>,
+        vram: &RwLock<MemoryTracker>,
+        model_id: &str,
+    ) {
+        if let Ok(mut guard) = models.write()
             && let Some(r) = guard.get_mut(model_id)
         {
             r.state = ModelState::NotLoaded;
@@ -6587,7 +7561,7 @@ impl ModelManager {
             r.max_prompt_tokens = 0;
         }
         // Always safe — no-op if the model was never allocated (e.g. vram_gb=0.0).
-        if let Ok(mut v) = self.vram.write() {
+        if let Ok(mut v) = vram.write() {
             v.free(model_id);
         }
     }
@@ -6951,13 +7925,16 @@ mod load_cancel_tests {
     /// leak or double-charge).
     #[tokio::test]
     async fn evict_and_load_racing_on_the_same_model_resolve_without_corruption() {
+        // Cap the KV pool (the pattern of the neighbouring concurrent-load test): the mock's
+        // default is "grab all remaining VRAM", so a genuine reload after the eviction would
+        // reserve 10 GB, not weight + a bounded KV, and the Ready assertion below depended on
+        // which interleaving the scheduler picked (about 4% failures under CPU contention).
+        let mut config = tests::make_config(&[("a", 4.0)], 10.0);
+        config.cache_size_gb = 1.0;
         let mm = Arc::new(
-            ModelManager::new(
-                tests::make_config(&[("a", 4.0)], 10.0),
-                Arc::new(MockEngineFactory::default()),
-            )
-            .await
-            .unwrap(),
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
         );
         mm.load_model("a").await.unwrap();
 
@@ -6992,8 +7969,8 @@ mod load_cancel_tests {
                 "NotLoaded must carry no VRAM reservation, got {used_vram}"
             ),
             ModelState::Ready => assert!(
-                (used_vram - 4.0).abs() < 1e-9,
-                "Ready must hold exactly the model's 4GB reservation, got {used_vram}"
+                (used_vram - 5.0).abs() < 1e-9,
+                "Ready must hold exactly the model's reservation (4 weight + 1 KV), got {used_vram}"
             ),
             other => panic!("model must end Ready or NotLoaded, never wedged in {other:?}"),
         }
@@ -7385,6 +8362,49 @@ mod tests {
     /// RAM gate needs 3 GB back and each resident is 2 GB of weights + a 6 GB
     /// reserved (lazily allocated) KV pool. Crediting the reservation to RAM said
     /// "evict one"; the real load evicted two. The plan must say two.
+    /// D3-S1.F2: the resize reload preflight applies both gates: tracked VRAM must cover the
+    /// minimum (unless the domain is ungated) and, on the UMA system domain, live RAM must clear
+    /// the OS floor for the new KV size.
+    #[test]
+    fn resize_reload_admits_checks_both_gates() {
+        // VRAM only (discrete GPU: no live RAM gate).
+        assert!(resize_reload_admits(10.0, 8.0, false, None));
+        assert!(!resize_reload_admits(7.0, 8.0, false, None));
+        assert!(
+            resize_reload_admits(0.0, 8.0, true, None),
+            "an ungated domain admits"
+        );
+        // UMA: 20 GB of RAM reachable, the grown pool needs 12 GB with a 4 GB OS floor.
+        assert!(resize_reload_admits(
+            10.0,
+            8.0,
+            false,
+            Some((20.0, 12.0, 4.0))
+        ));
+        // The grown KV size no longer fits the RAM gate even though VRAM does.
+        assert!(!resize_reload_admits(
+            10.0,
+            8.0,
+            false,
+            Some((15.0, 12.0, 4.0))
+        ));
+    }
+
+    /// D3-S1.C2: a load evicts only what its preview planned, each at most once; an empty plan
+    /// does not restrict (the preview was wrong, not the victim).
+    #[test]
+    fn plan_permits_only_planned_victims_once() {
+        let plan = vec!["a".to_owned(), "b".to_owned()];
+        assert!(plan_permits(&plan, &[], "a"));
+        assert!(plan_permits(&plan, &["a".to_owned()], "b"));
+        assert!(!plan_permits(&plan, &["a".to_owned()], "a"), "not twice");
+        assert!(!plan_permits(&plan, &[], "c"), "c was not planned");
+        assert!(
+            plan_permits(&[], &[], "c"),
+            "an empty plan does not restrict"
+        );
+    }
+
     #[test]
     fn plan_evictions_credits_ram_with_weights_not_reserved_kv() {
         let residents = [
@@ -7523,6 +8543,7 @@ mod tests {
             min_kv_cache_gb: 0.0, // no minimum — allows any KV size including 0
             light_model_max_gb: 2.0, // C2 default; placement engine unused with empty inventory
             light_stt_max_gb: 1.0, // STT light/heavy threshold; engine unused with empty inventory
+            default_placement: crate::model_manager::config::DefaultPlacement::Auto,
             dgpu_size_ceiling_fraction: 0.8, // production default; placement engine unused with empty inventory
             system_ram_reservation_gb: None, // per-OS default; no system domain in tests
             system_ram_budget_gb: None,      // opt-in; unset keeps the MemAvailable-only gate
@@ -8275,6 +9296,37 @@ mod tests {
         };
         let err = mm.patch_model("existing", &patch).unwrap_err();
         assert!(err.to_string().contains("evict it first"));
+    }
+
+    /// Opus review of 0.8.4: an auto-detected reasoning parser (gpt-oss, Qwen3) lives only on the
+    /// live record, never in the policy. A PATCH of an unrelated field must not wipe it, or the
+    /// raw harmony text leaks into `content` again until the next reload.
+    #[tokio::test]
+    async fn patch_model_keeps_the_auto_detected_reasoning_parser() {
+        let (mm, _dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        mm.load_model("existing").await.unwrap();
+        {
+            // What a load of a gpt-oss model leaves on the record.
+            let mut guard = mm.write_models("test setup");
+            let r = guard.get_mut("existing").unwrap();
+            r.template = Arc::from("{{ '<|start|>assistant<|channel|>final<|message|>' }}");
+            r.family = crate::prompt_builder::ModelFamily::GptOss;
+            r.reasoning_parser = Some(config::ReasoningParser::GptOss);
+        }
+        let patch = config::ModelEntryPatch {
+            pinned: Some(true),
+            ..Default::default()
+        };
+        mm.patch_model("existing", &patch).unwrap();
+        assert_eq!(
+            mm.read_models("test")
+                .get("existing")
+                .unwrap()
+                .reasoning_parser,
+            Some(config::ReasoningParser::GptOss),
+            "a PATCH of `pinned` must keep the auto-detected parser"
+        );
     }
 
     /// The same `device` change succeeds while `NotLoaded` — no engine to
@@ -9560,14 +10612,14 @@ mod tests {
         mm.config.ov_cache_dir.as_deref()
     }
 
-    /// Regression test for the eviction-drain fix (2026-07-18, live-caught on
-    /// real hardware): normal (non-abort) `evict_model` must WAIT for a real
-    /// in-flight request to finish before it drops the engine handle and joins
-    /// — it must not race ahead and reconcile the tracker while the request is
-    /// still genuinely active. Simulated here via `occupy_slot_for_test`'s held
-    /// permit (no live engine thread needed) rather than a real generation.
+    /// D3-S1.E2 (was: the 2026-07-18 eviction-drain regression test): a NON-forced eviction of a
+    /// model with a request in flight is refused at once with `TargetBusy`, before anything
+    /// changes — the model stays Ready, keeps serving (the `closing` flag the attempt set is
+    /// cleared again) and its work is untouched. Draining a busy model is the FORCED path's job
+    /// (`evict_model_forced_drains_a_busy_model_then_evicts_it`). Simulated with
+    /// `occupy_slot_for_test`'s held permit (no live engine thread needed).
     #[tokio::test]
-    async fn evict_model_waits_for_a_real_in_flight_request_before_completing() {
+    async fn evict_model_refuses_a_busy_model_and_leaves_it_serving() {
         let config = make_config(&[("model-a", 5.0)], 17.0);
         let mm = Arc::new(
             ModelManager::new(config, Arc::new(MockEngineFactory::default()))
@@ -9575,9 +10627,96 @@ mod tests {
                 .unwrap(),
         );
         mm.load_model("model-a").await.unwrap();
+        let (clone, permit) = {
+            let guard = mm.read_models("test");
+            match guard.get("model-a").unwrap().handle.as_ref().unwrap() {
+                EngineHandleKind::TextGen(h) => (h.clone(), h.occupy_slot_for_test().unwrap()),
+                other => panic!("model-a must be a TextGen mock, got {other:?}"),
+            }
+        };
 
-        // Hold a permit — model-a looks genuinely busy (active() == 1) —
-        // exactly as a real in-flight streaming request would.
+        let err = mm.evict_model("model-a").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ModelError>(),
+            Some(&ModelError::TargetBusy(1)),
+            "{err}"
+        );
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::Ready,
+            "a refused eviction changes nothing"
+        );
+
+        // The attempt closed the engine first and reopened it on the refusal: still serving.
+        let (tx, _rx) = crate::streaming::stream_channel();
+        let result = clone
+            .add_request(
+                1,
+                "p".to_owned(),
+                None,
+                crate::ov_cb::GenParams::default(),
+                tx,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(result, crate::cb_engine::SubmitResult::Submitted);
+
+        // Once idle (the mock engine finishes the request just submitted a moment later), the
+        // same non-forced eviction succeeds.
+        drop(permit);
+        for _ in 0..200 {
+            if crate::model_manager::engine::ManagedEngine::active(&clone) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(clone);
+        mm.evict_model("model-a").await.unwrap();
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::NotLoaded
+        );
+    }
+
+    /// D3-S1.C1: the upfront feasibility check credits live RAM with weights only, like
+    /// `plan_evictions`: `max_reclaimable` reports the reserved KV pool in the allocated total
+    /// (the VRAM credit) but not in the weights total (the RAM credit).
+    #[tokio::test]
+    async fn max_reclaimable_credits_ram_with_weights_and_vram_with_the_reservation() {
+        let config = make_config(&[("model-a", 5.0), ("incoming", 5.0)], 17.0);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
+        let domain = mm.record_domain("model-a");
+
+        let (allocated, weights) = mm.max_reclaimable("incoming", &domain, true);
+        assert!(
+            (weights - 5.0).abs() < 1e-9,
+            "weights credit is the model's weights, got {weights}"
+        );
+        assert!(
+            allocated > weights + 0.5,
+            "the VRAM credit includes the reserved KV pool: allocated {allocated} vs weights {weights}"
+        );
+        // The loading model itself is never a candidate.
+        assert_eq!(mm.max_reclaimable("model-a", &domain, true), (0.0, 0.0));
+    }
+
+    /// D3-S1.B3: the automatic-recovery eviction behaves like `evict_model` today — it drains a
+    /// genuinely busy model first, then evicts. It is the variant that stays allowed once
+    /// `evict_model` refuses busy models (policy flip, D3-S1.E2).
+    #[tokio::test]
+    async fn evict_model_forced_drains_a_busy_model_then_evicts_it() {
+        let config = make_config(&[("model-a", 5.0)], 17.0);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
         let permit = {
             let guard = mm.read_models("test");
             let handle = guard.get("model-a").unwrap().handle.as_ref().unwrap();
@@ -9589,35 +10728,551 @@ mod tests {
 
         let evicted = tokio::spawn({
             let mm = Arc::clone(&mm);
-            async move { mm.evict_model("model-a").await }
+            async move { mm.evict_model_forced("model-a").await }
         });
-
-        // Give the eviction task a moment to reach (and start polling in) the
-        // drain wait, then confirm it has NOT completed — it must still be
-        // waiting on the held permit, not racing ahead.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !evicted.is_finished(),
-            "eviction must still be draining while the permit is held"
-        );
-        assert_eq!(
-            mm.read_models("test").get("model-a").unwrap().state,
-            ModelState::Evicting,
-            "model must be marked Evicting (not yet NotLoaded) while genuinely busy"
+            "still draining while the permit is held"
         );
 
-        // Release the simulated in-flight request — eviction should now
-        // complete promptly (well within one EVICT_DRAIN_POLL_INTERVAL or two).
         drop(permit);
         evicted
             .await
-            .expect("eviction task must not panic")
-            .expect("eviction must succeed once the request finishes");
-
+            .unwrap()
+            .expect("forced eviction succeeds once the request finishes");
         assert_eq!(
             mm.read_models("test").get("model-a").unwrap().state,
-            ModelState::NotLoaded,
-            "model must be evicted once genuinely idle"
+            ModelState::NotLoaded
+        );
+    }
+
+    /// Three models on a tight budget: `a` and `b` resident (6 GB each with a 1 GB KV cap),
+    /// `incoming` (8 GB) needs one of them evicted. Grace is off so only busyness matters.
+    async fn busy_rule_fixture() -> Arc<ModelManager> {
+        busy_rule_fixture_with(|_| {}).await
+    }
+
+    /// [`busy_rule_fixture`] with a last chance to adjust the config.
+    async fn busy_rule_fixture_with(tweak: impl FnOnce(&mut Config)) -> Arc<ModelManager> {
+        let mut config = make_config(&[("a", 5.0), ("b", 5.0), ("incoming", 8.0)], 17.0);
+        config.cache_size_gb = 1.0;
+        config.eviction_grace_secs = 0.0;
+        tweak(&mut config);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("a").await.unwrap();
+        mm.load_model("b").await.unwrap();
+        mm
+    }
+
+    /// A held admission permit makes `id` look genuinely busy (`active() == 1`).
+    fn hold_busy(mm: &ModelManager, id: &str) -> tokio::sync::OwnedSemaphorePermit {
+        let guard = mm.read_models("test");
+        match guard.get(id).unwrap().handle.as_ref().unwrap() {
+            EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+            other => panic!("{id} must be a TextGen mock, got {other:?}"),
+        }
+    }
+
+    /// D3-S1.F4, step 3: a realtime client that asks for a model whose room is held by busy models
+    /// is not granted it, is not given an eviction of someone's running request, and is told why
+    /// (`would_evict_busy`, not the generic `would_evict_protected`) while it is served by a
+    /// ready model. With no busy blocker the reason is the generic one.
+    #[tokio::test]
+    async fn realtime_request_blocked_by_busy_models_is_substituted_with_a_busy_reason() {
+        let mm = busy_rule_fixture().await;
+        let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+
+        let r = mm.resolve_realtime_slot(RealtimeSlot::Llm, Some("incoming"));
+        assert_eq!(r.source, "substituted");
+        assert!(["a", "b"].contains(&r.model_id.as_str()), "{r:?}");
+        assert_eq!(r.reason, Some("would_evict_busy"));
+        assert!(!r.loading);
+        for id in ["a", "b"] {
+            assert_eq!(
+                mm.read_models("test").get(id).unwrap().state,
+                ModelState::Ready,
+                "{id} must not have been evicted for a realtime client"
+            );
+        }
+
+        // Nothing busy: the same request is simply grantable (a victim is idle).
+        drop((pa, pb));
+        let r = mm.resolve_realtime_slot(RealtimeSlot::Llm, Some("incoming"));
+        assert_eq!(r.source, "requested");
+        assert!(r.loading, "{r:?}");
+    }
+
+    /// D3-S1.F4, step 4: with nothing ready that clears the floor, the configured default is
+    /// loaded in the background only if a dry-run says it can be. Held by busy models it is NOT
+    /// spawned, and the resolution says so at once (`would_evict_busy`, `loading: false`) instead
+    /// of leaving the client to wait out a load that was going to be refused; once the blockers
+    /// are idle the default is loaded as before.
+    #[tokio::test]
+    async fn realtime_default_fallback_is_not_spawned_when_busy_models_hold_the_room() {
+        let mm = busy_rule_fixture_with(|c| {
+            c.realtime_defaults = Some(config::RealtimeDefaults {
+                stt_model: None,
+                llm_model: Some("incoming".to_owned()),
+                tts_model: None,
+                embed_model: None,
+            });
+            // a and b do not clear the floor (they declare no tool_calling capability), so the
+            // resolver reaches the default-load step.
+            c.realtime_viable_minimum = Some(config::RealtimeViableMinimum {
+                llm: Some(config::ViableMinimumLlm {
+                    kinds: vec!["text_gen".to_owned()],
+                    min_context_tokens: 0,
+                    require_capabilities: vec!["tool_calling".to_owned()],
+                }),
+            });
+        })
+        .await;
+        let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+
+        let r = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert_eq!(r.model_id, "incoming");
+        assert_eq!(r.source, "default");
+        assert_eq!(r.reason, Some("would_evict_busy"));
+        assert!(!r.loading, "nothing was spawned: {r:?}");
+        assert_eq!(
+            mm.read_models("test").get("incoming").unwrap().state,
+            ModelState::NotLoaded
+        );
+
+        drop((pa, pb));
+        let r = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert_eq!(r.source, "default");
+        assert_eq!(r.reason, Some("not_resident_no_headroom"));
+        assert!(
+            r.loading,
+            "an admissible default is still auto-loaded: {r:?}"
+        );
+    }
+
+    /// D3-S1.E1/E2: with the busy rule on (the default since the flip), busy models are not
+    /// victims. The dry-run reports `fits: false` with nothing to evict and names the busy
+    /// models that WOULD have made it fit; `force` bypasses the rule; with the rule switched
+    /// off (the pre-flip behaviour, via the test seam) they are the old last-resort victims.
+    #[tokio::test]
+    async fn dry_run_names_the_busy_models_that_block_a_load() {
+        let mm = busy_rule_fixture().await;
+        let (_pa, _pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+
+        // Rule off: the pre-flip behaviour, a busy model is a victim (and reported as busy).
+        mm.set_busy_protects_for_test(false);
+        let off = mm.check_admission("incoming").unwrap();
+        assert!(off.fits && !off.would_evict.is_empty() && !off.busy_victims.is_empty());
+        assert!(off.blocked_by_busy.is_empty());
+
+        mm.set_busy_protects_for_test(true);
+        let on = mm.check_admission("incoming").unwrap();
+        assert!(!on.fits, "no idle model to evict");
+        assert!(on.would_evict.is_empty() && on.busy_victims.is_empty());
+        assert_eq!(
+            on.blocked_by_busy.len(),
+            1,
+            "one eviction would have been enough: {on:?}"
+        );
+        assert!(["a", "b"].contains(&on.blocked_by_busy[0].as_str()));
+
+        let forced = mm.check_admission_with("incoming", true).unwrap();
+        assert!(forced.fits && forced.blocked_by_busy.is_empty());
+        assert_eq!(forced.busy_victims.len(), 1, "force may evict a busy model");
+    }
+
+    /// D3-S1.E1 (dormant until the flip): a load that could only be satisfied by evicting busy
+    /// models is refused with `BlockedByBusy` (retryable), nothing is evicted, and it succeeds
+    /// once a model is idle.
+    #[tokio::test]
+    async fn load_is_refused_as_blocked_by_busy_and_evicts_nothing() {
+        let mm = busy_rule_fixture().await;
+        let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+        mm.set_busy_protects_for_test(true);
+
+        let err = mm.load_model("incoming").await.unwrap_err();
+        match err.downcast_ref::<ModelError>() {
+            Some(ModelError::BlockedByBusy(ids)) => assert_eq!(ids.len(), 2, "{ids:?}"),
+            other => panic!("expected BlockedByBusy, got {other:?} ({err})"),
+        }
+        for id in ["a", "b"] {
+            assert_eq!(
+                mm.read_models("test").get(id).unwrap().state,
+                ModelState::Ready,
+                "{id} must not have been evicted"
+            );
+        }
+
+        // One model goes idle: it is the victim, the busy one stays.
+        drop(pa);
+        mm.load_model("incoming").await.unwrap();
+        let state = |id: &str| mm.read_models("test").get(id).unwrap().state;
+        assert_eq!(state("a"), ModelState::NotLoaded);
+        assert_eq!(state("b"), ModelState::Ready);
+        assert_eq!(state("incoming"), ModelState::Ready);
+        drop(pb);
+    }
+
+    /// D3-S1.E5: a FORCED eviction of an engine that cannot be aborted (here a speech-to-text
+    /// engine whose thread is kept alive by a stale handle clone, as a request still running
+    /// would) does not free the memory tracker while the thread runs. Past the join deadline it
+    /// reports `EvictionIncomplete` (retryable), leaves the record `Evicting` and the
+    /// reservation held — so no load can be admitted into memory that is not free — and a
+    /// detached waiter releases both the moment the thread finally exits.
+    #[tokio::test]
+    async fn forced_eviction_of_a_non_abortable_engine_holds_the_reservation_until_it_exits() {
+        let mm = make_mm(&[("whisper-stt-ov", 1.5)], 22.5).await;
+        mm.load_model("whisper-stt-ov").await.unwrap();
+        mm.set_forced_join_deadline_for_test(Duration::from_millis(300));
+        let clone = {
+            let guard = mm.read_models("test");
+            match guard
+                .get("whisper-stt-ov")
+                .unwrap()
+                .handle
+                .as_ref()
+                .unwrap()
+            {
+                EngineHandleKind::Stt(h) => h.clone(),
+                other => panic!("must be an STT mock, got {other:?}"),
+            }
+        };
+        let reserved = mm.metrics_snapshot().used_vram_gb;
+        assert!(reserved > 0.0);
+
+        let started = Instant::now();
+        let err = mm.evict_model_forced("whisper-stt-ov").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::EvictionIncomplete(id)) if id == "whisper-stt-ov"
+            ),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "it waited for the thread"
+        );
+        assert_eq!(
+            mm.read_models("test").get("whisper-stt-ov").unwrap().state,
+            ModelState::Evicting,
+            "the record stays Evicting while the thread runs"
+        );
+        assert!(
+            (mm.metrics_snapshot().used_vram_gb - reserved).abs() < 1e-9,
+            "the tracker still holds the reservation: that memory is not free"
+        );
+
+        // The engine finishes (its last handle goes away): the waiter releases everything.
+        drop(clone);
+        let mut done = false;
+        for _ in 0..300 {
+            if mm.read_models("test").get("whisper-stt-ov").unwrap().state == ModelState::NotLoaded
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            done,
+            "the detached waiter must reconcile once the thread exits"
+        );
+        assert!(mm.metrics_snapshot().used_vram_gb.abs() < 1e-9);
+        mm.load_model("whisper-stt-ov").await.unwrap();
+    }
+
+    /// D3-S1.E5: when the thread exits within the deadline a forced eviction of such an engine
+    /// completes normally (the hold only matters for a thread that is really still running).
+    #[tokio::test]
+    async fn forced_eviction_of_a_non_abortable_engine_completes_when_it_exits_in_time() {
+        let mm = make_mm(&[("whisper-stt-ov", 1.5)], 22.5).await;
+        mm.load_model("whisper-stt-ov").await.unwrap();
+        mm.evict_model_forced("whisper-stt-ov").await.unwrap();
+        assert_eq!(
+            mm.read_models("test").get("whisper-stt-ov").unwrap().state,
+            ModelState::NotLoaded
+        );
+        assert!(mm.metrics_snapshot().used_vram_gb.abs() < 1e-9);
+    }
+
+    /// D3-S1.E4: an eviction whose future is dropped while it drains (an admin client
+    /// disconnected) is still finished: the record does not stay `Evicting` with its VRAM
+    /// reserved forever. The work that was running is drained first, exactly as the caller would
+    /// have, and only then is the model torn down and its reservation released.
+    #[tokio::test]
+    async fn a_cancelled_eviction_still_completes_in_the_background() {
+        let config = make_config(&[("model-a", 5.0)], 17.0);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
+        let permit = {
+            let guard = mm.read_models("test");
+            match guard.get("model-a").unwrap().handle.as_ref().unwrap() {
+                EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+                other => panic!("model-a must be a TextGen mock, got {other:?}"),
+            }
+        };
+        assert!(mm.metrics_snapshot().used_vram_gb > 0.0);
+
+        // A forced eviction starts draining the busy model, then its caller goes away.
+        let evicting = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move { mm.evict_model_forced("model-a").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::Evicting
+        );
+        evicting.abort();
+        let _ = evicting.await;
+
+        // The abandoned eviction is not finished while the work it is draining still runs...
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::Evicting,
+            "still draining the running request"
+        );
+        assert!(
+            mm.metrics_snapshot().used_vram_gb > 0.0,
+            "reservation held until then"
+        );
+
+        // ...and completes once it ends: record reset, reservation released.
+        drop(permit);
+        let mut done = false;
+        for _ in 0..300 {
+            if mm.read_models("test").get("model-a").unwrap().state == ModelState::NotLoaded {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(done, "the cancelled eviction must still finish");
+        assert!(mm.metrics_snapshot().used_vram_gb.abs() < f64::EPSILON);
+
+        // The model can be loaded again afterwards.
+        mm.load_model("model-a").await.unwrap();
+    }
+
+    /// D3-S1.F5: the policy is observable. A load refused because of busy models, an eviction
+    /// refused because the target is busy, and a forced eviction of a busy model each move their
+    /// counter (and log) — so the failure mode of the busy rule shows up in `/metrics`.
+    #[test]
+    fn eviction_policy_events_are_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let mm = busy_rule_fixture().await;
+                let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+
+                // A load that could only be satisfied by evicting busy models is refused...
+                assert!(mm.load_model("incoming").await.is_err());
+                // ...and so is an unload of a busy model.
+                assert!(mm.evict_model("a").await.is_err());
+                // A forced eviction goes ahead (after the drain), and is counted as such.
+                let forced = tokio::spawn({
+                    let mm = Arc::clone(&mm);
+                    async move { mm.evict_model_forced("a").await }
+                });
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop((pa, pb));
+                forced.await.unwrap().unwrap();
+            });
+        });
+        let out = handle.render();
+        let value = |needle: &str| -> f64 {
+            out.lines()
+                .find(|l| l.starts_with(needle))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no series `{needle}` in:\n{out}"))
+        };
+        assert!((value("rustedvino_load_refusals_total{reason=\"busy\"}") - 1.0).abs() < 1e-9);
+        assert!((value("rustedvino_eviction_refusals_total{reason=\"busy\"}") - 1.0).abs() < 1e-9);
+        assert!((value("rustedvino_forced_evictions_total{kind=\"text_gen\"}") - 1.0).abs() < 1e-9);
+    }
+
+    /// D3-S1.E2: the eviction a load makes for a victim honours the load's own `force`: a
+    /// non-forced one refuses a busy model (`TargetBusy`, which `ensure_vram_for` turns into
+    /// `BlockedByBusy` when a victim picked while idle has turned busy since), a forced one gets
+    /// past it.
+    #[tokio::test]
+    async fn eviction_made_for_a_load_follows_the_loads_force() {
+        let mm = busy_rule_fixture().await;
+        let permit = hold_busy(&mm, "a");
+
+        let err = mm.evict_model_for_load("a", false).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::TargetBusy(1))
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            mm.read_models("test").get("a").unwrap().state,
+            ModelState::Ready
+        );
+
+        // Forced: drains the running request, then evicts.
+        let forced = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move { mm.evict_model_for_load("a", true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !forced.is_finished(),
+            "a forced eviction drains the busy model first"
+        );
+        drop(permit);
+        forced.await.unwrap().unwrap();
+        assert_eq!(
+            mm.read_models("test").get("a").unwrap().state,
+            ModelState::NotLoaded
+        );
+    }
+
+    /// D3-S1.E2: a forced load evicts a busy model (after draining it) where a plain load is
+    /// refused — the admin `force` escape hatch end to end.
+    #[tokio::test]
+    async fn forced_load_evicts_a_busy_model_after_draining_it() {
+        let mm = busy_rule_fixture().await;
+        let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+
+        let plain = mm.load_model("incoming").await.unwrap_err();
+        assert!(matches!(
+            plain.downcast_ref::<ModelError>(),
+            Some(ModelError::BlockedByBusy(_))
+        ));
+
+        let load = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move {
+                mm.load_model_with_overrides(
+                    "incoming",
+                    LoadOverrides {
+                        force: true,
+                        ..LoadOverrides::default()
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !load.is_finished(),
+            "the forced load drains its busy victim first"
+        );
+        drop((pa, pb));
+        load.await.unwrap().unwrap();
+        let state = |id: &str| mm.read_models("test").get(id).unwrap().state;
+        assert_eq!(state("incoming"), ModelState::Ready);
+        assert!(
+            [state("a"), state("b")].contains(&ModelState::NotLoaded),
+            "one busy model was evicted by the forced load"
+        );
+    }
+
+    /// D3-S1.D4: a submit on a handle cloned before the eviction began is refused (retryable
+    /// `Closing`) once the eviction has started, instead of being accepted into the engine that
+    /// is being drained — and the work that was already running is still drained, not aborted.
+    #[tokio::test]
+    async fn eviction_closes_the_engine_to_late_submits_on_a_cloned_handle() {
+        let config = make_config(&[("model-a", 5.0)], 17.0);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
+
+        // A handler's view: it cloned the handle while the model was Ready.
+        let (clone, permit) = {
+            let guard = mm.read_models("test");
+            let handle = guard.get("model-a").unwrap().handle.as_ref().unwrap();
+            match handle {
+                EngineHandleKind::TextGen(h) => (h.clone(), h.occupy_slot_for_test().unwrap()),
+                other => panic!("model-a must be a TextGen mock, got {other:?}"),
+            }
+        };
+        let submit = |h: crate::cb_engine::EngineHandle| async move {
+            let (tx, _rx) = crate::streaming::stream_channel();
+            h.add_request(
+                1,
+                "p".to_owned(),
+                None,
+                crate::ov_cb::GenParams::default(),
+                tx,
+                Instant::now(),
+            )
+            .await
+        };
+
+        // Before the eviction the clone is accepted.
+        assert_eq!(
+            submit(clone.clone()).await,
+            crate::cb_engine::SubmitResult::Submitted
+        );
+
+        // Start evicting while a request still holds a permit: the drain waits for it.
+        let evicted = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move { mm.evict_model_forced("model-a").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::Evicting
+        );
+
+        // The late submit on the stale clone is refused, retryably.
+        assert_eq!(
+            submit(clone.clone()).await,
+            crate::cb_engine::SubmitResult::Closing
+        );
+
+        // The in-flight work is drained, not aborted: eviction completes only once it ends.
+        // (The stale clone must go too: a live clone keeps the engine's command channel open,
+        // so the engine thread could not exit and the join would time out.)
+        assert!(!evicted.is_finished(), "still draining the running request");
+        drop(clone);
+        drop(permit);
+        evicted
+            .await
+            .unwrap()
+            .expect("eviction completes after the drain");
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::NotLoaded
+        );
+
+        // A reload builds a fresh engine: the flag does not carry over.
+        mm.load_model("model-a").await.unwrap();
+        let fresh = {
+            let guard = mm.read_models("test");
+            match guard.get("model-a").unwrap().handle.as_ref().unwrap() {
+                EngineHandleKind::TextGen(h) => h.clone(),
+                other => panic!("model-a must be a TextGen mock, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            submit(fresh).await,
+            crate::cb_engine::SubmitResult::Submitted
         );
     }
 
@@ -9946,12 +11601,14 @@ mod tests {
             .gpu_load_delta_bytes = None;
         assert_eq!(estimate(&mm), None, "unknown load delta");
         assert!(!warned(&mm), "no warning without a real figure");
-        mm.write_models("t")
-            .get_mut("m")
-            .unwrap()
-            .gpu_load_delta_bytes = Some(3_900_000_000);
-        assert!((estimate(&mm).unwrap() - 3.9).abs() < 1e-9);
-        assert!(warned(&mm), "3.9 GB measured > vram_gb 2.5");
+        {
+            let mut guard = mm.write_models("t");
+            let r = guard.get_mut("m").unwrap();
+            r.kv_cache_gb = 1.0; // pin the pool: the charge is weights + pool
+            r.gpu_load_delta_bytes = Some(9_900_000_000);
+        }
+        assert!((estimate(&mm).unwrap() - 9.9).abs() < 1e-9);
+        assert!(warned(&mm), "9.9 GB measured > vram_gb 2.5 + its KV pool");
 
         mm.evict_model("m").await.unwrap();
         assert_eq!(estimate(&mm), None, "evicted");
@@ -10736,12 +12393,14 @@ mod tests {
         assert_eq!(forced.would_evict, vec!["model-a".to_owned()]);
     }
 
-    /// With the short default grace a busy model is NOT hard-protected: when it
-    /// is the only candidate a load still makes progress (the eviction drains
-    /// it), so continuous traffic on one model cannot starve another's load.
-    /// Preferring an idle victim is covered by `test_lru_spares_busy_model_for_idle_one`.
+    /// D3-S1.E2: a busy model is NOT a victim of a non-forced load, even when it is the only
+    /// candidate: the dry-run says it does not fit and names it (`blocked_by_busy`), and a
+    /// *forced* check evicts it (reporting it in `busy_victims`). The refusal is immediate and
+    /// retryable, so a load is never held up behind a client that keeps a model busy (the
+    /// 2026-10-04 revert), and `force` always gets through. Preferring an idle victim is covered
+    /// by `test_lru_spares_busy_model_for_idle_one`.
     #[tokio::test]
-    async fn busy_model_is_still_a_victim_when_it_is_the_only_candidate() {
+    async fn busy_model_is_not_a_victim_unless_forced() {
         let mut config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 10.0);
         config.eviction_grace_secs = 0.0;
         let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
@@ -10757,13 +12416,19 @@ mod tests {
         };
 
         let check = mm.check_admission("model-b").unwrap();
-        assert!(check.fits, "a busy sole resident must not block the load");
-        assert_eq!(check.would_evict, vec!["model-a".to_owned()]);
+        assert!(!check.fits, "a busy sole resident is not evicted");
+        assert!(check.would_evict.is_empty() && check.busy_victims.is_empty());
+        assert_eq!(check.blocked_by_busy, vec!["model-a".to_owned()]);
+
+        let forced = mm.check_admission_with("model-b", true).unwrap();
+        assert!(forced.fits, "force may evict a busy model");
+        assert_eq!(forced.would_evict, vec!["model-a".to_owned()]);
         assert_eq!(
-            check.busy_victims,
+            forced.busy_victims,
             vec!["model-a".to_owned()],
-            "the dry-run must say the victim has a request running"
+            "a forced dry-run must say the victim has a request running"
         );
+        assert!(forced.blocked_by_busy.is_empty());
     }
 
     /// The wait after a RAM-driven eviction (D3): it returns as soon as the OS
@@ -11372,13 +13037,19 @@ mod tests {
         let mut config = make_config(&[("known", 5.0)], 22.5);
         config.preload = vec!["ghost".to_owned()];
         // `unwrap_err` would require `ModelManager: Debug` (it isn't) — match.
-        let err = match ModelManager::new(config, Arc::new(MockEngineFactory::default())).await {
-            Ok(_) => panic!("expected error for an unsized preload model"),
-            Err(e) => e.to_string(),
+        let Err(err) = ModelManager::new(config, Arc::new(MockEngineFactory::default())).await
+        else {
+            panic!("expected error for an unsized preload model")
         };
         assert!(
-            err.contains("ghost"),
+            err.to_string().contains("ghost"),
             "must name the unsized preload model: {err}"
+        );
+        // Deterministic config error: `main` maps this to EXIT_CONFIG_FATAL (78),
+        // which the supervisor does not respawn.
+        assert!(
+            err.downcast_ref::<crate::startup::ConfigFatal>().is_some(),
+            "an unregistered preload must be tagged ConfigFatal: {err:?}"
         );
     }
 
@@ -11506,6 +13177,18 @@ mod tests {
             "context wedged: CL_INVALID_EVENT (-58)"
         ));
         assert!(!is_gpu_poison_error("ov_embed_documents failed: bad input"));
+        // The oneDNN form that reached the panel on 2026-10-08 (the explicit CL_OUT_OF_RESOURCES
+        // text was only in oneDNN's own log, not in the exception).
+        assert!(is_gpu_poison_error(
+            "ov_cb_step failed: Exception from src/inference/src/cpp/infer_request.cpp:224:\n\
+             Exception from src/plugins/intel_gpu/src/graph/impls/onednn/primitive_onednn_base.h:550:\n\
+             could not execute a primitive\n"
+        ));
+        // A CPU-plugin error with similar words is not a GPU OOM, and neither is a bare phrase.
+        assert!(!is_gpu_poison_error(
+            "Exception from src/plugins/intel_cpu/src/node.cpp:12: could not execute a primitive"
+        ));
+        assert!(!is_gpu_poison_error("could not execute a primitive"));
         assert!(!is_gpu_poison_error(""));
     }
 
@@ -11918,6 +13601,129 @@ mod tests {
     // `MockEngineFactory` classifies any model id containing "vlm" as a Vision
     // model, so a single manager can hold mixed kinds with no GPU.
 
+    /// `add_model` takes an id that names a folder inside `models_dir`, nothing else.
+    #[test]
+    fn model_id_must_be_a_plain_folder_name() {
+        for ok in ["qwen3-8b-int4-ov", "a.b", "Model_1"] {
+            assert!(is_plain_model_id(ok), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/b", "/etc", "a\\b", "x\0y", "..\\x",
+        ] {
+            assert!(!is_plain_model_id(bad), "{bad:?}");
+        }
+    }
+
+    /// D-03/D-01: the "measured memory exceeds `vram_gb`" warning ignores overshoots that are within
+    /// the noise of compile scratch (5 % or 0.75 GB, whichever is larger) and fires beyond that.
+    #[test]
+    fn over_budget_warning_has_a_tolerance() {
+        // D-01: a 1.7B charged 1.4 GB that measured 2.09 GB (+0.69) no longer warns.
+        assert!(!measured_exceeds_charge(2.09, 1.4));
+        // Within 5 % on a big model: 20.7 vs 20.0 (+0.7, 3.5 %) is fine.
+        assert!(!measured_exceeds_charge(20.73, 20.0));
+        // The Intel 14B export: charged 9.7, measured 10.8 (+1.1) still warns.
+        assert!(measured_exceeds_charge(10.8, 9.7));
+        // 5 % of a large charge is larger than 0.75 GB: 30.0 charged tolerates up to 31.5.
+        assert!(!measured_exceeds_charge(31.4, 30.0));
+        assert!(measured_exceeds_charge(31.6, 30.0));
+        // No charge (unknown) never warns; measuring less than charged never warns.
+        assert!(!measured_exceeds_charge(5.0, 0.0));
+        assert!(!measured_exceeds_charge(1.0, 2.0));
+        // D-01 on the B60: the charge is weights + the KV pool the load allocated (1 GB here),
+        // because the measurement holds both. 1.7B: 2.09 vs 1.2 + 1; 8B: 5.90 vs 4.9 + 1.
+        assert!(!measured_exceeds_charge(2.09, 1.2 + 1.0));
+        assert!(!measured_exceeds_charge(5.90, 4.9 + 1.0));
+        // A genuinely under-sized vram_gb (weights 9.7 + pool 1, measured 12.5) still warns.
+        assert!(measured_exceeds_charge(12.5, 9.7 + 1.0));
+    }
+
+    /// D-09: `/tokenize` and `/detokenize` serve a Vision model (its text path uses the same
+    /// tokenizer) and still refuse kinds that own no usable tokenizer.
+    #[tokio::test]
+    async fn tokenizer_is_served_for_vision_models() {
+        use crate::handlers::error::JsonBody;
+        use crate::handlers::tokenize::{DetokenizeRequest, TokenizeRequest, detokenize, tokenize};
+        use axum::extract::State;
+
+        // One manager per model: loading a second model into the mock manager evicts the first.
+        let mm = Arc::new(make_mm(&[("qwen-vlm-8b", 5.5)], 22.5).await);
+        mm.load_model("qwen-vlm-8b").await.unwrap();
+        let vision = mm.get_tokenizer("qwen-vlm-8b");
+        assert!(
+            matches!(vision, Ok(engine::TokenizerHandle::Vision(_))),
+            "{vision:?}"
+        );
+        let plain = make_mm(&[("plain-8b", 5.5)], 22.5).await;
+        plain.load_model("plain-8b").await.unwrap();
+        let text = plain.get_tokenizer("plain-8b");
+        assert!(
+            matches!(text, Ok(engine::TokenizerHandle::Text(_))),
+            "{text:?}"
+        );
+        assert!(matches!(
+            mm.get_tokenizer("nope"),
+            Err(ModelError::NotFound(_))
+        ));
+
+        let state = crate::app_state::AppState::mock().with_model_manager(Arc::clone(&mm));
+        let resp = tokenize(
+            State(state.clone()),
+            JsonBody(TokenizeRequest {
+                model: "qwen-vlm-8b".to_owned(),
+                prompt: "Hi".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["tokens"], serde_json::json!([72, 105]));
+        assert_eq!(json["count"], 2);
+
+        let resp = detokenize(
+            State(state.clone()),
+            JsonBody(DetokenizeRequest {
+                model: "qwen-vlm-8b".to_owned(),
+                tokens: vec![72, 105],
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["text"], "Hi");
+
+        // Out-of-range ids are a 400 naming the problem, not a 200 with empty text.
+        for bad in [vec![72, -5], vec![72, 0x0011_0000]] {
+            let resp = detokenize(
+                State(state.clone()),
+                JsonBody(DetokenizeRequest {
+                    model: "qwen-vlm-8b".to_owned(),
+                    tokens: bad,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["code"], "invalid_value");
+            assert_eq!(json["error"]["param"], "tokens");
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("tokens[1]")),
+                "{json}"
+            );
+        }
+    }
+
     /// A VLM loads through the manager like any model and reports `Vision`.
     #[tokio::test]
     async fn test_load_vision_model_ready_and_reports_kind() {
@@ -12090,6 +13896,56 @@ mod tests {
         ])
     }
 
+    /// D-01: a hybrid linear-attention model is never auto-placed on a GPU (it cannot
+    /// load there with the prefix-cache guard in force); an explicit
+    /// `enable_prefix_caching: true` lifts the ban; a plain model still goes to the dGPU.
+    #[test]
+    fn hybrid_model_auto_places_on_cpu_not_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, cfg) in [
+            (
+                "hybrid",
+                r#"{"text_config":{"layer_types":["linear_attention","full_attention"]}}"#,
+            ),
+            ("plain", r#"{"layer_types":["full_attention"]}"#),
+        ] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("config.json"), cfg).unwrap();
+        }
+        let mut config = make_config(&[], 0.0);
+        config.models_dir = dir.path().to_path_buf();
+        config.default_placement = config::DefaultPlacement::Auto;
+        let tiered = |name: &str, kind, tier| DeviceInfo {
+            tier,
+            ..dev(name, kind)
+        };
+        let inv = DeviceInventory::from_devices(vec![
+            tiered("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy),
+            tiered("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
+        ]);
+        let none = HashMap::new();
+        let place = |id: &str, policy: Option<&config::ModelPolicy>| {
+            resolve_model_device(
+                id,
+                3.0,
+                Some(ModelKind::Vision),
+                policy,
+                &config,
+                &inv,
+                &none,
+                &none,
+            )
+            .unwrap()
+        };
+        assert_eq!(place("hybrid", None), "CPU");
+        assert_eq!(place("plain", None), "GPU.1");
+        let allow = config::ModelPolicy {
+            enable_prefix_caching: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(place("hybrid", Some(&allow)), "GPU.1");
+    }
+
     /// `resolve_device_domain` maps any device to its domain: a discrete GPU to
     /// its own name, an iGPU/CPU to the shared system domain, an unknown device
     /// to its own name (the discrete-fleet fallback).
@@ -12253,30 +14109,151 @@ mod tests {
         .expect("tiered manager build")
     }
 
-    /// A heavy LLM (no policy, no kind hint → treated as a heavy LLM) auto-places
-    /// on the dGPU; a thin LLM (≤ `light_model_max_gb`) offloads to the weak iGPU.
+    /// A chat LLM auto-places on the dGPU, thin or heavy: a thin one decodes ~3x faster there than on the
+    /// CPU, and the weak iGPU (`GPU.0`) is a last resort that no LLM reaches while a CPU exists.
     #[tokio::test]
-    async fn auto_places_heavy_on_dgpu_thin_on_igpu() {
+    async fn auto_places_chat_llms_on_the_dgpu_never_the_igpu() {
         let mut cfg = make_config(&[("qwen3-8b", 8.0), ("qwen3-0.6b", 1.0)], 16.0);
         cfg.device = "GPU.1".to_owned();
         let mm = tiered_mm(cfg).await;
         assert_eq!(mm.record_device("qwen3-8b"), "GPU.1");
         assert_eq!(
             mm.record_device("qwen3-0.6b"),
-            "GPU.0",
-            "a sub-threshold LLM offloads to the weak iGPU off the dGPU"
+            "GPU.1",
+            "a sub-threshold LLM also takes the dGPU: faster than the CPU, and never the iGPU"
         );
     }
 
-    /// An embedding model (kind-hinted) with no explicit `embedding_device`
-    /// auto-routes to the weak iGPU via the engine's embedding default.
+    /// The bundle ships `total_vram_gb: 0.0` (VRAM gating off). That zero must not become the dGPU
+    /// "size ceiling" (0 x 0.8 = 0): it kept EVERY model off the dGPU on a B70 host (2026-10-13).
     #[tokio::test]
-    async fn auto_places_embedding_on_weak_igpu() {
+    async fn auto_uses_the_dgpu_when_vram_gating_is_off() {
+        let mut cfg = make_config(&[("qwen3-14b", 10.5), ("qwen3-1.7b", 1.3)], 16.0);
+        cfg.total_vram_gb = 0.0;
+        cfg.device = "CPU".to_owned();
+        let mm = tiered_mm(cfg).await;
+        assert_eq!(mm.record_device("qwen3-14b"), "GPU.1");
+        assert_eq!(mm.record_device("qwen3-1.7b"), "GPU.1");
+    }
+
+    /// The config the release bundle ACTUALLY ships (`scripts/dist.example.config.json`), parsed as the
+    /// server parses it. The 2026-10-13 bugs (a `0.0` that means "gate off" used as a number) all lived
+    /// in this configuration and none was reachable from `make_config`'s tidy numbers.
+    fn shipped_config(models: &[(&str, f64)]) -> Config {
+        let mut cfg: Config =
+            serde_json::from_str(include_str!("../../scripts/dist.example.config.json"))
+                .expect("the shipped example config must parse");
+        cfg.models = models
+            .iter()
+            .map(|(id, gb)| {
+                (
+                    (*id).to_owned(),
+                    config::ModelEntry {
+                        vram_gb: *gb,
+                        kind: None,
+                        policy: config::ModelPolicy::default(),
+                    },
+                )
+            })
+            .collect();
+        cfg
+    }
+
+    /// Shipped config + a discrete GPU that reports its memory (as the B70 does): `device`
+    /// placement keeps everything on the CPU; `auto` sends chat and the 14B model to the card.
+    #[tokio::test]
+    async fn shipped_config_places_on_the_cpu_and_auto_uses_the_reported_dgpu() {
+        let fleet = || {
+            let mut dgpu = tiered_dev("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy);
+            dgpu.total_mem_gb = Some(30.3);
+            Arc::new(DeviceInventory::from_devices(vec![
+                dgpu,
+                tiered_dev("GPU.0", DeviceKind::IntegratedGpu, DeviceTier::WeakIgpu),
+                tiered_dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
+            ]))
+        };
+        let models = [("qwen3-14b", 10.5), ("qwen3-1.7b", 1.3)];
+        let mm = ModelManager::new_with_inventory(
+            shipped_config(&models),
+            Arc::new(MockEngineFactory::default()),
+            fleet(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mm.record_device("qwen3-14b"), "CPU");
+        assert_eq!(mm.record_device("qwen3-1.7b"), "CPU");
+        let mut auto = shipped_config(&models);
+        auto.default_placement = config::DefaultPlacement::Auto;
+        let mm =
+            ModelManager::new_with_inventory(auto, Arc::new(MockEngineFactory::default()), fleet())
+                .await
+                .unwrap();
+        assert_eq!(mm.record_device("qwen3-14b"), "GPU.1");
+        assert_eq!(mm.record_device("qwen3-1.7b"), "GPU.1");
+    }
+
+    /// On the shipped config's ungated CPU domain a chat model gets the KV pool the config asks for
+    /// (`cache_size_gb` 2.0), not the 1.0 GB floor that a `0.0` "free" used to pin it to. (Needs a
+    /// few GB of free RAM on the machine running the test, as any load test of this size does.)
+    #[tokio::test]
+    async fn ungated_cpu_domain_gets_the_configured_kv_pool() {
+        let cpu_only = Arc::new(DeviceInventory::from_devices(vec![tiered_dev(
+            "CPU",
+            DeviceKind::Cpu,
+            DeviceTier::Fallback,
+        )]));
+        let mm = ModelManager::new_with_inventory(
+            shipped_config(&[("qwen3-1.7b", 1.3)]),
+            Arc::new(MockEngineFactory::default()),
+            cpu_only,
+        )
+        .await
+        .unwrap();
+        mm.load_model("qwen3-1.7b").await.unwrap();
+        let kv = mm
+            .read_models("t")
+            .get("qwen3-1.7b")
+            .map(|r| r.kv_cache_gb)
+            .unwrap();
+        assert!(
+            (kv - 2.0).abs() < 1e-9,
+            "kv pool {kv} GB, wanted cache_size_gb = 2.0"
+        );
+    }
+
+    #[test]
+    fn kv_pool_helper_never_returns_a_non_finite_size() {
+        let mut cfg = make_config(&[], 0.0);
+        cfg.min_kv_cache_gb = 1.0;
+        cfg.cache_size_gb = 0.0;
+        assert!((ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg) - 1.0).abs() < 1e-9);
+        cfg.cache_size_gb = 2.0;
+        assert!((ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg) - 2.0).abs() < 1e-9);
+    }
+
+    /// An ungated domain reports 0.0 free; the eviction plan must treat that as "no VRAM leg", or no
+    /// amount of eviction ever admits the load (a CPU install with the memory gate off).
+    #[test]
+    fn plan_evictions_with_an_unbounded_vram_leg_depends_on_the_ram_gate_only() {
+        let residents = [cand("a", 1.3, 1.2)];
+        let (evict, fits) = plan_evictions(&residents, f64::INFINITY, 5.8, |freed| freed >= 1.0);
+        assert_eq!(evict, vec!["a".to_owned()]);
+        assert!(fits);
+        let (evict, fits) = plan_evictions(&residents, f64::INFINITY, 5.8, |_| true);
+        assert!(evict.is_empty() && fits);
+        let (_, fits) = plan_evictions(&residents, f64::INFINITY, 5.8, |_| false);
+        assert!(!fits);
+    }
+
+    /// An embedding model (kind-hinted) with no explicit `embedding_device`
+    /// auto-routes to the dGPU via the engine's embedding default (never the iGPU).
+    #[tokio::test]
+    async fn auto_places_embedding_on_the_dgpu() {
         let mut cfg = make_config(&[("e5", 0.5)], 16.0);
         cfg.device = "GPU.1".to_owned();
         cfg.models.entry("e5".to_owned()).or_default().kind = Some("embedding".to_owned());
         let mm = tiered_mm(cfg).await;
-        assert_eq!(mm.record_device("e5"), "GPU.0");
+        assert_eq!(mm.record_device("e5"), "GPU.1");
     }
 
     /// An explicit `config.embedding_device` still wins over the engine default
@@ -12289,6 +14266,72 @@ mod tests {
         cfg.models.entry("e5".to_owned()).or_default().kind = Some("embedding".to_owned());
         let mm = tiered_mm(cfg).await;
         assert_eq!(mm.record_device("e5"), "CPU");
+    }
+
+    /// `default_placement: "device"` (the bundle default): with `device: CPU` every model without its
+    /// own `device` loads on the CPU - the thin LLM and the embedding that `auto` would offload to the
+    /// iGPU, and the heavy LLM that `auto` would put on the dGPU.
+    #[tokio::test]
+    async fn default_placement_device_keeps_everything_on_the_global_device() {
+        let mut cfg = make_config(&[("qwen3-8b", 8.0), ("qwen3-0.6b", 1.0), ("e5", 0.5)], 16.0);
+        cfg.device = "CPU".to_owned();
+        cfg.default_placement = config::DefaultPlacement::Device;
+        cfg.models.entry("e5".to_owned()).or_default().kind = Some("embedding".to_owned());
+        let mm = tiered_mm(cfg).await;
+        for id in ["qwen3-8b", "qwen3-0.6b", "e5"] {
+            assert_eq!(
+                mm.record_device(id),
+                "CPU",
+                "{id} must stay on the global device"
+            );
+        }
+    }
+
+    /// The global `device` can name a GPU on purpose: `default_placement: "device"` is "use this device",
+    /// not "use the CPU".
+    #[tokio::test]
+    async fn default_placement_device_honours_a_gpu_global_device() {
+        let mut cfg = make_config(&[("qwen3-0.6b", 1.0)], 16.0);
+        cfg.device = "GPU.0".to_owned();
+        cfg.default_placement = config::DefaultPlacement::Device;
+        let mm = tiered_mm(cfg).await;
+        assert_eq!(mm.record_device("qwen3-0.6b"), "GPU.0");
+    }
+
+    /// A per-model `device` or `tier_preference` still outranks `default_placement: "device"`, and the
+    /// global `device` itself must be a device the runtime enumerated.
+    #[tokio::test]
+    async fn default_placement_device_yields_to_explicit_settings_and_validates_the_device() {
+        let mut cfg = make_config(&[("pinned-gpu", 1.0), ("tiered", 1.0)], 16.0);
+        cfg.device = "CPU".to_owned();
+        cfg.default_placement = config::DefaultPlacement::Device;
+        cfg.models
+            .entry("pinned-gpu".to_owned())
+            .or_default()
+            .policy
+            .device = Some("GPU.1".to_owned());
+        cfg.models
+            .entry("tiered".to_owned())
+            .or_default()
+            .policy
+            .tier_preference = vec!["heavy".to_owned()];
+        let mm = tiered_mm(cfg).await;
+        assert_eq!(mm.record_device("pinned-gpu"), "GPU.1");
+        assert_eq!(mm.record_device("tiered"), "GPU.1");
+
+        let mut bad = make_config(&[("m", 1.0)], 16.0);
+        bad.device = "GPU".to_owned(); // the multi-GPU case: only GPU.0 / GPU.1 / CPU exist
+        bad.default_placement = config::DefaultPlacement::Device;
+        let err = ModelManager::new_with_inventory(
+            bad,
+            Arc::new(MockEngineFactory::default()),
+            Arc::new(tiered_fleet()),
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("not an available OpenVINO device"), "{err}");
     }
 
     /// A per-model `tier_preference` override is honoured by the engine and wins

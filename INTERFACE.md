@@ -15,6 +15,7 @@ error envelope. A client written against OpenAI's SDK works against these unmodi
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/v1/models` | Model list |
+| `GET` | `/v1/models/{id}` | One model (OpenAI retrieve-model); 404 `model_not_found` unless loaded and ready |
 | `POST` | `/v1/chat/completions` | Chat completions — streaming (`stream:true`) + non-streaming; VLM image input **or** text-only |
 | `POST` | `/v1/completions` | Legacy raw-prompt completions |
 | `POST` | `/v1/embeddings` | Text embeddings |
@@ -53,18 +54,18 @@ of OpenAI's actual Realtime API event schema.
 | `GET` | `/health_generate` | Deep readiness probe — runs 1-token GPU inference pass |
 | `GET` | `/metrics` | Prometheus metrics (tokens/s EMA, TTFT, request duration) — full reference in [`METRICS.md`](METRICS.md). Gated exactly like an admin route despite the URL |
 | `POST` | `/v1/rerank` | Cross-encoder document reranking |
-| `POST` | `/tokenize` | Encode text to token IDs via the loaded model's tokenizer |
+| `POST` | `/tokenize` | Encode text to token IDs via the loaded model's tokenizer (text and vision models) — see [`POST /tokenize` and `POST /detokenize`](#post-tokenize-and-post-detokenize) |
 | `POST` | `/detokenize` | Decode token IDs back to text |
 | `GET` | `/v1/realtime` | WebSocket upgrade — realtime STT → LLM → TTS voice flow (bespoke protocol) |
 | `GET` | `/v1/admin/models` | List all registered models + state (`ready`/`not_loaded`/`loading`/`evicting`) |
 | `GET` | `/v1/admin/models/completeness` | Report which registered models are missing required directory/tokenizer files |
 | `POST` | `/v1/admin/models/add` | Register a new model at runtime and load it immediately; persists to `config.json` — `model_id`/`vram_gb` required, `kind` and every `ModelPolicy` field (device, co-residency knobs, image-gen provenance, …) optional, same shape as a static config stanza |
-| `POST` | `/v1/admin/models/{id}/load` | Load model into VRAM (blocks until ready; evicts LRU if needed) |
-| `POST` | `/v1/admin/models/{id}/check` | Dry-run admission check: does it fit, which models would be evicted. `?force=true` previews a load that bypasses the eviction-grace window (nothing else) |
-| `POST` | `/v1/admin/models/{id}/resize` | Resize a **resident** model's KV-cache pool — evicts (draining in-flight requests) then reloads at the new size. Body `{"kv_cache_gb": <f64 > 0>}`; every other resolved override (`max_concurrent_streams`, …) is carried forward from the model's record, so the caller states only the delta. Deliberately **not** idempotent-when-`Ready` — that is exactly why it exists, since a repeated `/load` silently ignores a new `kv_cache_gb` on an already-loaded model |
-| `DELETE` | `/v1/admin/models/{id}` | Evict model from VRAM (drains in-flight requests, then joins engine thread) |
-| `PATCH` | `/v1/admin/models/{id}` | Update fields of an already-registered model — persisted always, live immediately for most fields, next-load for `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`max_prompt_len`/`min_response_len`/`speculative`; `device`/`tier_preference` need the model `NotLoaded` first. `kind` is immutable |
-| `DELETE` | `/v1/admin/models/{id}/register` | Deregister a model entirely (removed from `GET /v1/admin/models` until next restart/reload) |
+| `POST` | `/v1/admin/models/{id}/load` | Load model into VRAM (blocks until ready; evicts idle least-recently-used models if needed). A model with a request running is never evicted to make room: the load is refused with `503 model_busy` (+ `Retry-After`) unless the body carries `"force": true`, which also bypasses the eviction-grace window (the busy model is drained for up to 15 s, then what is left is aborted) |
+| `POST` | `/v1/admin/models/{id}/check` | Dry-run admission check: does it fit, which models would be evicted. `?force=true` previews a load that bypasses the eviction-grace window and the busy rule (never `pinned`, non-`evictable` or a live realtime session's models). Response fields include `would_evict`, `busy_victims` (members of `would_evict` with a request running — non-empty only for a forced check) and `blocked_by_busy` (models left alone only because a request is running on them, whose eviction would have made the load fit) |
+| `POST` | `/v1/admin/models/{id}/resize` | Resize a **resident** model's KV-cache pool — evicts (draining in-flight requests) then reloads at the new size. Body `{"kv_cache_gb": <f64 > 0>, "force": <bool, default false>}`; a model with a request running is refused with `409 model_busy` unless `force` is `true`, and a resize whose reload could not be admitted is refused before anything is evicted; every other resolved override (`max_concurrent_streams`, …) is carried forward from the model's record, so the caller states only the delta. Deliberately **not** idempotent-when-`Ready` — that is exactly why it exists, since a repeated `/load` silently ignores a new `kv_cache_gb` on an already-loaded model |
+| `DELETE` | `/v1/admin/models/{id}` | Evict model from VRAM. A model with a request running is refused with `409 model_busy` (+ `Retry-After`); `?force=true` drains it (up to 2 minutes), aborts what is left, then joins the engine thread. For every engine except the continuous-batching text engine a forced eviction waits up to 30 s for the engine thread to finish its request and otherwise answers `503 eviction_incomplete` (the memory is released when the thread exits) |
+| `PATCH` | `/v1/admin/models/{id}` | Update fields of an already-registered model — persisted always, live immediately for most fields, next-load for `vram_gb`/`kv_cache_gb`/`max_concurrent_streams`/`enable_prefix_caching`/`max_prompt_len`/`min_response_len`/`speculative`; `device`/`tier_preference` need the model `NotLoaded` first. `kind` is immutable |
+| `DELETE` | `/v1/admin/models/{id}/register` | Deregister a model entirely (removed from `GET /v1/admin/models` until next restart/reload). Evicts it first if loaded: a model with a request running is refused with `409 model_busy` unless `?force=true` |
 | `POST` | `/v1/admin/config/reload` | Diff `config.json` against the live registry — add new entries, refresh changed fields, skip disruptive ones |
 | `POST` | `/v1/admin/config/preload` | Replace the persisted `preload` list — `{"model_ids": [...]}` explicitly, or `{"from_live": true}` to snapshot the currently-`Ready` set |
 | `POST` | `/v1/admin/keys/reload` | Hot-reload the keys file (`keys_file`) — rotate/add/revoke Bearer keys with no restart |
@@ -91,11 +92,37 @@ request with a large inline image, say) or a multipart upload (audio, images).
 Rejections use the OpenAI error envelope, `{"error": {"message", "type", "param", "code"}}`, with a
 stable `code`: for example `invalid_body` (malformed or incomplete JSON), `invalid_multipart` (a
 multipart route called without a multipart body), `invalid_audio` (an upload that cannot be decoded
-as audio), `invalid_query` (a bad query string such as `?force=maybe`), `method_not_allowed` (405, with the `Allow` header), `context_length_exceeded` (a prompt
+as audio), `invalid_query` (a bad query string such as `?force=maybe`), `model_busy` (409 or 503, with `Retry-After`: a model with a request running was not evicted — an unload, deregister or resize refused with 409, or a load refused with 503 because the only room is held by such models; retry when the request ends, or repeat the call with `force`), `eviction_incomplete` (503, with `Retry-After`: a forced eviction's engine is still finishing its request, so its memory is not free yet), `method_not_allowed` (405, with the `Allow` header), `context_length_exceeded` (a prompt
 that can never fit this model: retrying is pointless) and `pool_capacity_exceeded` (the prompt fits
-alone but not beside the requests already running: retry shortly). Requests to a path the server
-does not have, and to routes added by an extension, are answered by the framework and are not
-guaranteed to carry the envelope.
+alone but not beside the requests already running: retry shortly), `invalid_value` (a value out of
+range, or a chat message whose `role` is not `system`, `developer`, `user`, `assistant`, `tool` or
+`function`; `param` names the field, for example `messages[1].role`) and `unknown_url` (404, a path
+the server does not have, as OpenAI answers it). Routes added by an extension answer as the extension defines them.
+
+### `POST /v1/audio/speech`
+
+- **Fields:** `model` and `input` (required; at most 4096 characters), `voice`, `response_format`
+  (`wav` default, or `pcm`) and `speed` (0.25-4.0), as in OpenAI's API, plus two extensions:
+  - `language` (optional, e.g. `en`, `pl`, `vi`; a region suffix such as `pl-PL` is fine): the
+    language of `input`. Omit it and the server uses the language the model speaks (SpeechT5 and
+    Kokoro: English, the Polish VITS voice: Polish, a Piper voice: its eSpeak language).
+  - `normalize` (optional, default `true`): speak digits and symbols (`%`, `&`, `$`, ...) as
+    words before synthesis. Speech models drop or garble raw digits ("Cena wzrosła o 15%" came
+    back as "Cena wzrosła o"). Send `false` if the text is already speakable.
+- **What normalisation covers:** English, Polish and Vietnamese number words; decimals, negative
+  numbers and thousands separators; English years read in pairs ("nineteen ninety"), except a
+  4-digit number before a currency word or a plural noun ("1250 dollars", "1500 people"), which is a
+  quantity ("one thousand two hundred fifty") unless a year preposition precedes it ("in 1990 tensions
+  rose"). Polish
+  additionally gets scale-word agreement ("dwa tysiące", "pięć tysięcy"), `zł` / `kg` / `km`
+  agreeing with the number ("trzy złote"), and a four-digit year followed by "roku" or "r."
+  read as an ordinal in the right case ("w 1948 roku" → "w tysiąc dziewięćset czterdziestym
+  ósmym roku"; "od 1948 roku" → "… czterdziestego ósmego roku"). Polish does not decline
+  quantities by case or gender ("dwa", never "dwie"), and a bare "w 1948" with no "roku" stays
+  a plain number.
+- **An unsupported `language`** (e.g. `de`) leaves the text untouched rather than reading the
+  digits as English.
+- The same normaliser runs in the realtime flow.
 
 ### `POST /v1/audio/transcriptions`
 
@@ -143,6 +170,38 @@ guaranteed to carry the envelope.
 - **Batch size:** at most `max_embedding_batch_tokens` padded tokens per request (default 32768;
   inputs × the longest input's token count), else `400` `batch_too_large`. See
   [`CONFIG.md`](CONFIG.md).
+
+### `POST /tokenize` and `POST /detokenize`
+
+Direct access to a loaded model's own tokenizer. Use it to size a prompt before sending it (the
+usable context of a large model can be far below the advertised one) and to turn token ids back
+into text without generating. Not part of OpenAI's API; similar to vLLM's routes (the `/detokenize` reply is `{"text": ...}`, vLLM's is `{"prompt": ...}`).
+
+| Route | Request | Response |
+|---|---|---|
+| `/tokenize` | `{"model": "<id>", "prompt": "<text>"}` | `{"tokens": [...], "count": N}` |
+| `/detokenize` | `{"model": "<id>", "tokens": [...]}` | `{"text": "<text>"}` |
+
+```bash
+curl -s http://localhost:11437/tokenize -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.5-4b-int8-ov", "prompt": "Hello world"}'
+# {"tokens":[9419,1814],"count":2}
+```
+
+- The prompt is encoded as given. No chat template is applied, so a chat request costs more
+  tokens than its message texts add up to. Build the full prompt yourself if you need that count.
+- Works for loaded text-generation and vision models. Other kinds (embeddings, speech, image,
+  rerank) and text models placed on the NPU get `400` `unsupported_operation`. An unknown model
+  is `404` `model_not_found`; a model that is not ready is `503`.
+- `/detokenize` needs ids inside the model's vocabulary. An id that is negative or at or above
+  the vocabulary size gets `400` `invalid_value` with `param: "tokens"`. A model whose detokenizer has no vocabulary table (SentencePiece-style, for example InternVL2.5) can only reject negative ids; an id above its vocabulary is decoded or fails with a `500`. Special tokens (for
+  example `<|im_end|>`) decode to empty text.
+- Neither route uses a generation slot, so neither is turned away with `429` when generation is
+  saturated. Latency: a vision model with its own tokenizer answers in a few milliseconds even
+  during a generation; a text model's call is served by the engine thread between steps, so it can
+  wait behind a long prefill (up to about a second measured).
+- Both follow the same API-key rule as the other inference routes: when API keys are configured, no
+  key or a wrong key is a `401`.
 
 ### `POST /v1/systemone`
 

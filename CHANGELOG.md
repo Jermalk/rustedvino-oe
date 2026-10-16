@@ -6,6 +6,202 @@ All notable changes to RustedVINO are recorded here. The format follows
 semver claim). Full release notes, with measurements and download instructions, are on each
 [GitHub release](https://github.com/Jermalk/rustedvino-oe/releases).
 
+## [0.8.4] — 2026-10-16
+
+The release after 0.8.0. Versions 0.8.1, 0.8.2 and 0.8.3 were internal test builds and were never published; everything they
+contain is folded into this release (their entries are kept below for the record). Fixes the defects found by the 0.8.3 test run
+and an engine comparison on an Arc Pro B60 (D-01 to D-12, plus D-13 found while fixing D-09), and makes the sampling default
+cheaper (K-02a). Tested on an Arc Pro B60 (60 of 60 checks pass, no GPU wedge in a 12-step overlap ladder). The GenAI 2026.3
+migration and the hybrid-model capacity rework are 0.9.0. (D-, K- and F- numbers in these entries refer to the project's internal test reports.)
+
+### Security
+- A server with no keys at all (empty `api_keys` and `admin_api_keys`) refuses requests with an `Origin` header (a browser) on `/v1/admin/*` and `/metrics`: 403 `browser_origin_refused`. Before, any web page open on the same machine could, with the default permissive CORS policy, send a body-less POST to `127.0.0.1` and add, unload or delete models. curl, `rv` and Prometheus send no `Origin` and are unaffected; with admin keys configured nothing changes.
+- `POST /v1/admin/models` refuses a `model_id` that is not a single folder name (`/`, `\`, `..`, absolute paths), so the "directory not found" answer can no longer probe the filesystem.
+
+### Packaging
+- The Linux bundle now carries its licences: `LICENSE`, `THIRD-PARTY.md`, `licenses/openvino/` (Intel's licence and third-party notices for the OpenVINO libraries it redistributes, including oneTBB, oneDNN and hwloc) and `licenses/rust-crates-licenses.txt` (the licence files of every Rust crate it is built from). 0.8.0 shipped none of these inside the archive.
+- The bundle is built from the exported public source tree (its own `Cargo.lock`, its own commit hash in `rv version` and `/health`), with the pinned Rust toolchain, so what you download can be rebuilt from the tag.
+
+### Added
+- `GET /v1/models/{id}` (OpenAI's retrieve-model route); a model that is unknown or not ready answers a JSON 404 `model_not_found` (D-12).
+
+### Changed
+- A request that sets only `temperature` (> 0) now takes `top_p`/`top_k` from the model's own `generation_config.json`
+  for the fields it left unset, instead of sampling over the whole vocabulary. Faster decode: on an Arc Pro B60 qwen3-1.7b went from 155.9 to 169.7 tok/s (+8.9 %) and qwen3-8b from 66.6 to 69.3 (+4.1 %); at high temperatures the very unlikely tail tokens are no longer drawn.
+
+- **`rv add` estimates a model's memory as its plain on-disk size** (the 1.12 margin of 0.8.3 is gone). The margin fixed Intel's mixed-precision qwen3-14b export but made `rv add` refuse qwen3.6-35b-a3b on a 24 GB card, which runs (needs 21.7 GB, was asked for 24.0); measured footprints range from 0.96 to 1.11 of the disk size, so no single ratio fits. The server still adds its own minimum KV and safety margin. The `rvbench` fit gate uses the same figure (D-03).
+- The warning `measured device memory exceeds the configured vram_gb` now fires only for overshoots above 5 % or 0.75 GB (whichever is larger); it used to fire for any overshoot, including a 1.7B model that measured 0.69 GB above its charge (D-01).
+
+### Fixed
+- A hybrid linear-attention vision model (Qwen3.5 / Qwen3.6) added on a GPU without prefix caching, which is what the server forces for such models, no longer fails after the compile with `reserved_la_bytes <= budget_in_bytes` (12-61 s of waiting for an error): the vision engine now tells GenAI it holds one sequence instead of the default 256, so the linear-attention reservation is small and the model simply loads (D-02, K-01a without the KV-precision part). Verified on Qwen3.5-4B (prefix caching on and off: two-turn recall and an image answer correct) and on Qwen3-VL-8B and InternVL2.5-8B (both modes).
+- `/tokenize` and `/detokenize` on a vision model no longer wait for the generation in progress (they took 21-27 s behind a long answer): the vision engine now has a tokenizer of its own with its own lock, and the calls answer in a few milliseconds while it is generating (D-13).
+- A gpt-oss model added without an explicit `reasoning_parser` (for example with `rv add`) leaked its raw harmony channels into the answer: `analysis…assistantfinalPlanet: Mars` in `content` (the QA run saw the `final` glued to the start of the answer). The harmony parser is now chosen automatically from the model's chat template, like the Qwen3 one already was; an explicit setting still wins (D-07). Side effects, both improvements: gpt-oss tool calls are now detected for such a model (they were never parsed without the parser), and the realtime voice path now applies the gpt-oss policy (`<|channel|>final` prefill, the session prompt sent as the model's identity).
+- A global `device` in `config.json` that OpenVINO does not enumerate (`"GPU.7"`) is now named at boot together with the devices that do exist, and, when `default_placement` is `"device"`, with the consequence that every model without its own `device` will fail to load. The boot check also understands `HETERO:` lists now (D-08).
+- `rv start` no longer reports a deliberate stop during model loading as an error (it said `the server exited during start (exit status: 0)` and dumped the log); it now says the server was stopped before it was ready. The refusal printed by a second `rv start` no longer claims `rv stop` cannot find a loading server (D-04).
+- `/detokenize` with a token id outside the model's vocabulary (negative, or at or above its size) is a 400 `invalid_value` naming the index and the vocabulary size, instead of a 200 with silently dropped text (a model whose detokenizer has no vocabulary table can only reject negative ids).
+- `/tokenize` and `/detokenize` now work for vision models (the qwen3.6 family and other VLMs), which they used to refuse with a 400; the vision engine runs its own tokenizer, so real ids and a real decode come back (D-09). NPU text models and non-text kinds are still refused.
+- The `developer` message role (OpenAI's newer name for `system`) is rendered to the chat template as `system`; before, the template received the unknown role `developer` and the instruction could be dropped.
+- The "measured device memory exceeds vram_gb" warning compares like with like: the measurement spans the whole load (weights plus the KV pool), so the charge it is held against is `vram_gb` plus the pool the load allocated. 0.8.4 B60 run: it had fired for every small model that was correctly sized (qwen3-1.7b 2.09 GB vs 1.2 GB of weights; qwen3-8b 5.90 vs 4.9). (D-01)
+- An unknown route answers a JSON 404 (`code: unknown_url`, OpenAI's wording) instead of an empty body (D-06). Done as a response layer, not a router fallback, so an extension router that sets its own fallback cannot make the merge panic; a keyless request to an unknown route is still a 401 on the base router (with an extension merged, unknown paths get the JSON 404 but no auth).
+- A chat message with an unknown `role` (anything but `system`, `developer`, `user`, `assistant`, `tool`, `function`) is now a 400 naming `messages[i].role`; it used to be answered as if nothing was wrong (D-05).
+- `top_k`/`top_p` sent with `temperature: 0` returned a 500 ("inference failed"); the request is now decoded greedily
+  and they are ignored (D-11).
+
+## [0.8.3] — internal build, never published
+
+Folds in 0.8.2 (below, never published); fixes everything the Arc Pro B60 torture run of 2026-10-14 found
+(57 pass / 2 fail / 1 skipped on an Arc Pro B60) except the load timeout.
+
+### Fixed
+- **Stopping a server that is still preloading.** SIGTERM / ctrl-C used to be honoured only when the GPU compile of the preloaded model
+  ended (273 s for a 16 GB model on a B60). The startup is now abandoned at once and the process exits cleanly (about 5 s). `rv stop` also
+  finds a server that `rv start` launched and that is not listening yet (it checks the pid file and that the process runs this config).
+- **`default_placement: "auto"` no longer sends a hybrid linear-attention model (Qwen3.5 / 3.6) to a GPU**, where it cannot load with the
+  prefix-cache guard in force. It goes to the CPU; `enable_prefix_caching: true` on the model lifts that, and an explicit `device` still wins.
+- **`rv add` memory estimate** uses a 1.12 margin (was 1.08): Intel's mixed INT4/INT8 export of qwen3-14b measured 0.3 GB above the old estimate.
+
+### Changed
+- **Schema errors name the field**: ``invalid value for field `max_tokens` `` / ``missing required field `messages[0].role` ``. Values and serde detail are still never returned.
+- **`rv add` / `rv load` print which models they evicted.** A failed `rv start` shows the cause first and only that run's log lines.
+  `rv check` on an unregistered model points to `rv add`. A CPU placement's memory shows as `x GB (RAM)` in `rv list` / `ps` / `status`.
+- `rvbench` retries a hybrid model with prefix caching on after a GPU load failure (and marks the row), and skips a model the shipped server
+  would refuse as larger than the GPU (`--no-fit-gate` measures it anyway).
+- README: `rv start` is unsupervised (`--supervise` exists); `rv add` needs `-y` without a terminal.
+
+### Not fixed (0.8.3 backlog)
+- No load timeout / lock release for a hung GPU compile; no request deadline.
+
+## [0.8.2] — internal build, never published
+
+Folds in the whole of 0.8.1, an internal test build (local tag `v0.8.1`, bundle sha256 `adf7e957...`) that was never
+published; the QA reports of 2026-10-12 cite it.
+
+### Changed
+- **Models load on the CPU by default; an integrated GPU is a last resort.** New setting `default_placement` (`"auto"` | `"device"`).
+  The release bundle's `config.json` ships `"device": "CPU"` with `"default_placement": "device"`: every model without its own `device` loads on
+  the global `device`, so `device: CPU` finally means CPU (before, the placement engine ignored it). The capability-aware engine (`"auto"`, stated
+  explicitly in every fleet config) no longer puts an iGPU before the CPU for any default order. Chat LLMs, embedders and rerankers take a discrete GPU
+  when there is one and the CPU otherwise; STT goes CPU, then a discrete GPU (never the NPU or an iGPU by default: whisper-turbo hung the NPU on a clip over 60 s); a thin vision model takes the CPU; **TTS is CPU-only** (no GPU tier at all);
+  the decision model stays dGPU-first; image generation keeps a strong iGPU ahead of the CPU because FLUX needs > 19 GB of host RAM there. Why: on an Arc Pro
+  B50 box the 1.7B chat model decoded at 114 tok/s on the B50 against 35 on the CPU and 26 on its UHD 730 iGPU (embeddings 727/s vs 39/s); on an Acer UHD iGPU
+  every light model ran 20-45 % slower than the CPU; SpeechT5 stalls or crawls on every GPU class (3x slower on an Arc 140V, RTF 16-100 on the UHD, a ~10 minute
+  stall then HTTP 503 on the B50); the old orders were tuned on one unusually good iGPU (Arc 140V).
+  **Upgrade note:** a config that relied on automatic iGPU offload for light models now gets the CPU or a dGPU; pin the model with `"device": "GPU"` (or
+  `embedding_device`). the example fleet configs pin their embedding/rerank models for this reason.
+  `light_stt_max_gb` no longer changes the default order and is kept only so existing configs load.
+
+### Added
+- **`rv start`, `rv stop`, `rv restart`, `rv version`.** For a server run by hand from a bundle:
+  `rv start` launches it detached (log in `rustedvino.log` beside `config.json`) and waits for
+  `/health`; `rv stop` sends SIGTERM to the process holding the configured port and waits for it to
+  exit, and refuses one that systemd runs (use `systemctl`, or `--force`). `rv start` refuses a
+  `--port` the config does not set and a second start while a server from the same directory is
+  still loading; `rv restart` keeps `--supervise`. Errors follow the compiler's shape (`error:`, then
+  `= note:` / `= help:`). `rv version` shows the server binary on
+  disk and the running server. Linux only for now.
+- **`rustedvino --version`** (`-V`) prints the version and commit and exits; it used to fail with
+  "no config file found".
+- **`rv` works against an open server, and says so.** With a keys file that holds no keys (for
+  example `{}`, or the empty-lists template the bundles ship), the server needs no bearer for its
+  admin routes, but `rv` used to refuse every admin command with "no admin key available". It now
+  proceeds without authentication and prints, on every call, that the server is OPEN and NOT
+  SECURE (anyone who can reach the port can load, unload and delete models); `rv resolve` says the
+  same. A missing, malformed, or inference-key-only keys file is still refused.
+- **Bundles ship `config.keys.example.json`** (empty lists; copy to `config.keys.json`) and a
+  download-to-first-request quick start; the README lists a starter set of models with measured
+  disk, RAM and CPU speed. `tools/bench/rvbench.py` reproduces those measurements.
+- **`/v1/audio/speech` speaks numbers.** Digits and `%` were silently dropped by the Polish and
+  SpeechT5 voices and garbled by Kokoro in chat TTS (only the realtime flow normalised text), so
+  "W 1948 roku opublikowano 3 artykuły." was heard as "W roku opublikowano artykuły.". The route
+  now expands digits and symbols into words before synthesis, in the language of the request's new
+  optional `language` field or else of the model. New optional `normalize` (default `true`) turns
+  it off. The Polish normaliser also gained scale-word agreement ("dwa tysiące", was "dwa tysiąc"),
+  `zł` / `kg` / `km` agreeing with the number, and ordinal years before "roku" / "r." in the right
+  case. English no longer reads a quantity like "1250 dollars" or "1500 people" as a year ("twelve
+  fifty"; this also affected the realtime flow). See `INTERFACE.md`. Clients that send words already are unaffected.
+
+### Fixed
+- **A `0.0` that means "gate off" is no longer used as a number** (bundle default `total_vram_gb: 0.0`; review round 2026-10-13): the `rv add` refusal on a CPU install with plenty of RAM ("needs 5.8 GB (0.0 GB free)", the dry-run eviction plan read 0.0 as no room and could never admit the load; `rv check` now says `no VRAM limit set`); the KV pool on the CPU was always the 1.0 GB floor, now it follows `cache_size_gb`; the discrete-GPU size ceiling collapsed to zero and kept every model off the GPU under `auto` (fixed earlier, now also covered by a test on the shipped config).
+- **Kind detection** (`rv add` without `--kind`): SpeechT5 is recognised as text-to-speech (it used to be taken for a Whisper model and "loaded" as one), a one-label sequence classifier as a reranker, a bare BERT / XLM-RoBERTa-family model as an embedder.
+- A non-Intel discrete GPU that OpenCL enumerates (an NVIDIA T1200) is no longer treated as the workhorse: OpenVINO cannot build for it, so it takes the last-resort tier.
+- **Speech-to-text defaults to the CPU under `auto`**, never the NPU (whisper-large-v3-turbo hung the NPU on a clip over 60 s).
+- The hybrid-model load error now says what actually works (`rv add ... --enable-prefix-caching`; `cache_size_gb` caps every KV pool) and no longer quotes a build-farm path.
+- **`rv start` creates a missing `config.keys.json`** with ONE random admin key (mode 600, no `api_keys`) and says so, so the quick start no longer dead-ends at `rv add` with "no admin key available" followed by a restart; a key rather than empty lists because an empty file leaves the admin API open to any web page that can reach 127.0.0.1 (permissive CORS). `rv add --enable-prefix-caching` forces prefix caching on for a hybrid Qwen3.5/3.6 model on a GPU (D-03). A relative `models_dir` (`./models`) is resolved against the bundle directory and a relative `RUSTEDVINO_CONFIG` against rv's working directory (the launcher changes directory, so the server used to read another file). `rv list`, `status` and `version` now print the open-server warning too; the "no admin key" error says to restart; `rv status` prints `no limit` instead of `0.0 GB` for a memory domain with the gate off; the no-config error of `rv start` lists where rv looked.
+- **Memory refusal names the gate that refused.** When the live system-RAM gate (not the logical tracker) blocks a load, the error now reports the RAM figures (needed / available / OS floor) instead of the tracker's misleading "0.0 GB free".
+- **`rv` no longer panics on a closed pipe** (`rv ps | head`): SIGPIPE is restored to its default action.
+- Bundle README: step 5 downloads with `download-model.py` (stdlib only) or a virtual environment, which needs `python3-venv` on a stock Ubuntu / Mint (one `sudo apt install`); the bundle ships `download-model.py`, which needs only Python 3 - no sudo, no pip (the venv path fails without python3-venv) and `huggingface_hub[cli]` no longer exists .
+- Bundle README: `--kind` for embedding / reranking / tts models, the rotate-the-admin-key recipe, and a pointer to CONFIG.md.
+- The bundle now ships `CONFIG.md` (server errors already pointed to it).
+- Docs: a larger `kv_cache_gb` does NOT make the hybrid Qwen3.5 / Qwen3.6 models load on a GPU; `enable_prefix_caching: true` per model does. `dgpu_size_ceiling_fraction` behaviour with VRAM gating off documented.
+- **Wrong answers from hybrid linear-attention models (Qwen3.5 / Qwen3.6) on a GPU with prefix
+  caching on.** OpenVINO GenAI 2026.2.x returns a different continuation when a prompt prefix is
+  served from the prefix cache: the same request alternated between a full answer and a truncated
+  one (reproduced with plain GenAI, no RustedVINO code; the CPU is unaffected; fixed upstream in
+  2026.4.1). The server now turns prefix caching off for such a model when it loads on a GPU and
+  logs a warning. Without the cache, the linear-attention state may no longer fit: Qwen3.5-9B loaded
+  at `kv_cache_gb` 8, but the 4B and the Qwen3.6 27B / 35B-A3B failed even at 16 on an Arc Pro B70 (use `rv add --enable-prefix-caching`), and repeated
+  long prompts lose the prefill speed-up. New per-model `enable_prefix_caching` (`true`/`false`,
+  `null` = automatic; also settable with `PATCH /v1/admin/models/{id}`, next load) overrides it —
+  see `CONFIG.md`.
+
+### Changed
+- **Busy models are not evicted (the D3 fix from the 0.8.0 known issues).** A model with a request
+  running is never chosen as a victim by a plain load, and a plain unload, deregister or resize of
+  it is refused with `409 model_busy` (a load that could only be satisfied by evicting such models
+  is refused with `503 model_busy`, both with `Retry-After`) — the request finishes undisturbed.
+  `force` is the override: `"force": true` on `/load` and `/resize`, `?force=true` on
+  `DELETE /v1/admin/models/{id}` and `…/register`, and `rv load|unload|deregister|resize --force`
+  now bypass the eviction-grace window **and** the busy rule (the model is drained for 15 s on a
+  load, up to 2 minutes on an unload, then what is left is aborted). `force` still never overrides
+  `pinned`, `evictable: false` or the models of a live realtime session. The automatic recovery
+  paths (KV-wedge recovery, a dead decision engine, shutdown) are forced. A hard never-evict-busy
+  rule was tried and reverted during 0.8.0 development (it starved other loads for as long as a
+  client kept the busy model occupied, and made a wedged generation un-evictable); this one
+  refuses immediately instead of waiting, and has the override.
+- **A load executes the eviction plan it previewed.** Before it evicts anything the load runs the
+  same dry-run as `POST …/check`; if even full eviction would not make room it is refused with
+  "nothing was evicted", and it never evicts a model the preview did not name. The upfront RAM
+  check credits an evictable model with its weights only (as the plan always did), not its
+  reserved KV pool, so on the shared-memory domain a load that was only feasible by counting
+  reserved KV as free RAM is refused up front instead of after evicting idle models.
+- **A forced eviction of an engine that cannot be aborted waits for it.** Everything except the
+  continuous-batching text engine runs its current request to completion; a forced eviction used
+  to free the memory tracker after 8 s even if the engine thread was still holding the memory.
+  It now waits up to 30 s and otherwise answers `503 eviction_incomplete`; the reservation is
+  released when the thread exits.
+- **A resize that cannot succeed no longer strands the model or burns the cooldown.** The reload
+  at the new size is checked before anything is evicted, and a refused resize (busy model, or a
+  reload that would not be admitted) leaves the resize cooldown untouched.
+- **Realtime:** a client whose requested model's room is held by busy models gets the new reason
+  `would_evict_busy`, and the default-model fallback is no longer started when it would only be
+  refused (`loading: false` at once instead of a 90 s wait). `POST …/add` answers a busy load
+  refusal with the same `503 model_busy` instead of a 400.
+
+### Added
+- **Admin `force` on unload, deregister and resize**, `rv … --force`, and `blocked_by_busy` in
+  the `POST …/check` response (the busy models whose eviction would have made the load fit).
+- **Metrics:** `rustedvino_load_refusals_total{reason}`, `rustedvino_eviction_refusals_total{reason}`,
+  `rustedvino_forced_evictions_total{kind}` and `rustedvino_eviction_aborted_requests_total{kind}`,
+  with a WARN naming the blocking models on every refused load.
+- Admin eviction refusals use the JSON error envelope (`model_busy`, `eviction_incomplete`).
+
+### Fixed
+- **A cancelled eviction completes.** An eviction whose caller went away (an admin client
+  disconnected) used to leave the model `Evicting` with its VRAM reserved until a restart; it is
+  now finished in the background.
+- **A late request during an eviction is refused, not aborted.** A request that slipped in
+  through a handle taken before the eviction began gets a retryable 503 instead of being accepted
+  into an engine that is being torn down.
+- **Image and rerank requests keep their model busy until the engine is done.** A client that
+  disconnected mid-request used to make the model look idle while the engine thread still ran.
+- Refusal text no longer says "this load can never fit, nothing was evicted" when busy models are
+  the only obstacle.
+- **Vietnamese speech normalisation:** a session with `language: "vi"` had digits and symbols
+  expanded as English words before Piper's own Vietnamese expansion ran ("8 giờ 30" was spoken as
+  "eight giờ thirty"). `vi` now reads numbers, decimals, negatives, currency and `%`, `&`, `=`, `@`,
+  `+` in Vietnamese. Vietnamese `.`-thousands / `,`-decimal notation is not interpreted (as for
+  Polish).
+
 ## [0.8.0] — 2026-10-05
 
 ### Added

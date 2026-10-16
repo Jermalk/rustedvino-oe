@@ -42,7 +42,7 @@ fn auth_line(ctx: &Ctx, inf: Option<bool>, adm: Option<bool>) -> String {
         st.bad()
     } else if inf.is_none() || adm.is_none() {
         st.warn()
-    } else if r.admin_key.is_none() {
+    } else if !r.admin_usable() {
         return format!(
             "{} {label}{summary} — but no admin key available here; set RV_ADMIN_KEY or \
              --admin-key; {}",
@@ -127,6 +127,16 @@ fn zero_if_none_or_zero(v: Option<f64>) -> f64 {
     v.filter(|x| *x != 0.0).unwrap_or(0.0)
 }
 
+/// A memory budget as text. `0` means the gate is off for that domain (the release bundle ships
+/// `total_vram_gb: 0.0`), which `0.0 GB` would read as "over budget".
+fn budget_text(total: f64) -> String {
+    if total > 0.0 {
+        human_bytes(total)
+    } else {
+        "no limit".to_owned()
+    }
+}
+
 fn vram_section(ctx: &Ctx, rows: &[Sample]) {
     let st = ctx.style;
     let devices: BTreeSet<&str> = rows
@@ -152,7 +162,7 @@ fn vram_section(ctx: &Ctx, rows: &[Sample]) {
         println!(
             "  {dev:<8} {:>9} / {:<9} {}",
             human_bytes(used),
-            human_bytes(total),
+            budget_text(total),
             bar(st, used, total)
         );
     }
@@ -169,7 +179,7 @@ fn vram_section(ctx: &Ctx, rows: &[Sample]) {
             "  {:<8} {:>9} / {:<9} {}",
             "system",
             human_bytes(used),
-            human_bytes(total),
+            budget_text(total),
             bar(st, used, total)
         );
     }
@@ -196,6 +206,8 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
                 .and_then(Value::as_f64)
                 .map_or_else(|| "n/a".into(), |v| format!("{v:.1} GB"));
             let (kv, req) = load_cells(rows_m, id);
+            let device = get("device").and_then(Value::as_str).unwrap_or("?");
+            let vram = crate::commands::models::mem_cell(device, vram);
             vec![
                 id.to_owned(),
                 get("state")
@@ -229,6 +241,7 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
 #[must_use]
 #[allow(clippy::too_many_lines)] // one linear report, mirrors the Python verb
 pub fn run(ctx: &Ctx) -> i32 {
+    ctx.warn_if_open();
     let st = ctx.style;
     let health = ctx.api.get("/health");
     let models = ctx.api.get("/v1/models");
@@ -246,7 +259,7 @@ pub fn run(ctx: &Ctx) -> i32 {
     let mut audit: Option<Value> = None;
     let mut watchdog: Option<Value> = None;
     let mut rows_m: Vec<Sample> = Vec::new();
-    if ctx.res.admin_key.is_some() {
+    if ctx.res.admin_usable() {
         admin_models = ctx.api.get("/v1/admin/models").json().cloned();
         audit = ctx.api.get("/v1/admin/config/audit").json().cloned();
         watchdog = ctx.api.get("/v1/admin/health/watchdog").json().cloned();
@@ -364,7 +377,7 @@ pub fn run(ctx: &Ctx) -> i32 {
                 );
             }
         }
-    } else if ctx.res.admin_key.is_some() {
+    } else if ctx.res.admin_usable() {
         println!(
             "{} {:<10} audit unreachable/unauthorized",
             st.warn(),
@@ -387,7 +400,7 @@ pub fn run(ctx: &Ctx) -> i32 {
         }
     }
 
-    if ctx.res.admin_key.is_none() {
+    if !ctx.res.admin_usable() {
         println!();
         println!(
             "{}",

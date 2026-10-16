@@ -379,6 +379,9 @@ pub async fn embeddings(
                     Some("server_overloaded"),
                 );
             }
+            Err(crate::cb_engine::AdmitError::Closing) => {
+                return super::error::model_closing_response();
+            }
             Err(crate::cb_engine::AdmitError::EngineDead) => {
                 return openai_error(
                     StatusCode::SERVICE_UNAVAILABLE,

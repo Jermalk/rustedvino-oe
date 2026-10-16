@@ -22,6 +22,13 @@ pub fn run(ctx: &Ctx, model: &str) -> i32 {
                 r.err.unwrap_or_else(|| crate::commands::code_text(r.code))
             ))
         );
+        // 0.8.3 (F5): an on-disk model that is not registered yet answers 404.
+        if r.code == Some(404) {
+            eprintln!(
+                "  = help: if '{model}' is on disk, register it with `rv add {model}` \
+                 (`rv list` shows models on disk that are not registered)"
+            );
+        }
         return 1;
     };
     if ctx.json {
@@ -35,10 +42,16 @@ pub fn run(ctx: &Ctx, model: &str) -> i32 {
     }
     let fits = body["fits"].as_bool().unwrap_or(false);
     let glyph = if fits { s.ok() } else { s.bad() };
+    // `vram_gated: false` = no VRAM budget on that domain (`total_vram_gb: 0.0`): the "free" figure
+    // is a meaningless 0.0 and only system RAM decides. Older servers omit the key: gated.
+    let free_text = if body["vram_gated"].as_bool().unwrap_or(true) {
+        format!("{:.1} GB free", body["free_gb"].as_f64().unwrap_or(0.0))
+    } else {
+        "no VRAM limit set".to_owned()
+    };
     println!(
-        "{glyph} '{model}' — needs {:.1} GB, {:.1} GB free",
+        "{glyph} '{model}' — needs {:.1} GB, {free_text}",
         body["needed_gb"].as_f64().unwrap_or(0.0),
-        body["free_gb"].as_f64().unwrap_or(0.0)
     );
     // Shared-memory (UMA) boxes gate on live system RAM as well as VRAM, and it
     // is the RAM gate that refuses loads there. Absent on discrete-GPU servers

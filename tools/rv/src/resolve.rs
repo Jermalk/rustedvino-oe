@@ -112,6 +112,9 @@ pub struct Resolved {
     pub keys_file: PathBuf,
     /// Whether `keys_file` exists on disk.
     pub keys_present: bool,
+    /// Whether `keys_file` was read and parsed as JSON. An unreadable or
+    /// malformed file is never treated as an empty (open) one.
+    pub keys_parsed: bool,
     /// Number of inference keys in the keys file.
     pub api_key_count: usize,
     /// Number of admin keys in the keys file.
@@ -124,6 +127,21 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The keys file parsed and holds no keys at all. The server treats that as
+    /// **open**: its admin and inference routes need no bearer, so anyone who can
+    /// reach the port can load, unload and delete models.
+    #[must_use]
+    pub fn keys_file_is_empty(&self) -> bool {
+        self.keys_parsed && self.api_key_count == 0 && self.admin_key_count == 0
+    }
+
+    /// Whether admin calls can be made: an admin key is known, or the server is
+    /// open (see [`keys_file_is_empty`](Self::keys_file_is_empty)) and needs none.
+    #[must_use]
+    pub fn admin_usable(&self) -> bool {
+        self.admin_key.is_some() || self.keys_file_is_empty()
+    }
+
     /// `http://127.0.0.1:<port>` — the host is always this machine: the verbs
     /// read the PID file, models dir and keys off it, so a remote target would
     /// make half the output describe the wrong box. The numeric address, not
@@ -149,7 +167,10 @@ impl Resolved {
 #[must_use]
 pub fn pick_config_path(inputs: &Inputs) -> PathBuf {
     if let Some(p) = &inputs.env_config {
-        return PathBuf::from(p);
+        // Absolute: the launcher `cd`s into the bundle before the server reads this variable, so a
+        // relative path would name a different file for the server than for rv.
+        let p = PathBuf::from(p);
+        return std::path::absolute(&p).unwrap_or(p);
     }
     let bundle = inputs.exe_dir.as_ref().map(|d| d.join("config.json"));
     if let Some(b) = &bundle
@@ -197,6 +218,26 @@ pub fn resolve_keys_file_path(config_path: &Path, explicit: Option<&Path>) -> Pa
     dir.join(format!("{stem}.keys.json"))
 }
 
+/// The directory `rv` lives in, when a server launcher sits next to it (a release bundle). The
+/// launcher `cd`s there before it starts the server, so the server's relative paths mean "relative
+/// to this directory", not to wherever `rv` happens to be run from.
+fn bundle_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    // A release bundle has the launcher AND its `lib/`; a cargo `target/debug` dir has a binary
+    // called `rustedvino` too, but no `lib/`.
+    (dir.join("rustedvino").is_file() && dir.join("lib").is_dir()).then_some(dir)
+}
+
+/// A relative `models_dir` anchored to the bundle directory (see [`bundle_dir`]); absolute paths and
+/// non-bundle installs are returned unchanged.
+fn anchor_to_bundle(models_dir: &str, bundle: Option<&Path>) -> String {
+    let p = Path::new(models_dir);
+    match bundle {
+        Some(b) if p.is_relative() && !models_dir.is_empty() => b.join(p).display().to_string(),
+        _ => models_dir.to_owned(),
+    }
+}
+
 /// Resolves config, keys, admin key and port.
 ///
 /// # Errors
@@ -217,7 +258,7 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
         .as_ref()
         .and_then(|c| c.get("models_dir"))
         .and_then(|v| v.as_str())
-        .map(str::to_owned);
+        .map(|d| anchor_to_bundle(d, bundle_dir().as_deref()));
     let raw_models = cfg
         .as_ref()
         .and_then(|c| c.get("models"))
@@ -235,11 +276,13 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
     let mut api_key_count = 0;
     let mut admin_key_count = 0;
     let mut first_admin_key: Option<String> = None;
+    let mut keys_parsed = false;
     if keys_present
         && let Some(kf) = std::fs::read_to_string(&keys_file)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(strip_bom(&t)).ok())
     {
+        keys_parsed = true;
         api_key_count = kf
             .get("api_keys")
             .and_then(|v| v.as_array())
@@ -268,6 +311,7 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
         raw_models,
         keys_file,
         keys_present,
+        keys_parsed,
         api_key_count,
         admin_key_count,
         admin_key,
@@ -374,6 +418,16 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_env_config_is_made_absolute() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut i = base(d.path());
+        i.env_config = Some("sub/x.json".to_owned());
+        let got = pick_config_path(&i);
+        assert!(got.is_absolute(), "{}", got.display());
+        assert!(got.ends_with("sub/x.json"));
+    }
+
+    #[test]
     fn bundle_config_beats_the_platform_default() {
         let d = tempfile::tempdir().expect("tempdir");
         let bundle = write(d.path(), "config.json", "{}");
@@ -401,6 +455,15 @@ mod tests {
         assert_eq!(r.port, DEFAULT_PORT);
         assert!(r.admin_key.is_none());
         assert!(!r.keys_present);
+    }
+
+    #[test]
+    fn a_relative_models_dir_is_anchored_to_the_bundle_only() {
+        let b = Path::new("/bundle");
+        assert_eq!(anchor_to_bundle("./models", Some(b)), "/bundle/./models");
+        assert_eq!(anchor_to_bundle("/abs/models", Some(b)), "/abs/models");
+        assert_eq!(anchor_to_bundle("./models", None), "./models");
+        assert_eq!(anchor_to_bundle("", Some(b)), "");
     }
 
     #[test]

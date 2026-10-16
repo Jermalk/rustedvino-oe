@@ -239,7 +239,8 @@ pub fn phonemes_to_ids<S: std::hash::BuildHasher>(
 
 // ── Vietnamese numbers ───────────────────────────────────────────────────────
 
-const VI_DIGITS: [&str; 10] = [
+/// Vietnamese digit words, `0..=9` (shared with `tts_normalize`).
+pub(crate) const VI_DIGITS: [&str; 10] = [
     "không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín",
 ];
 

@@ -22,9 +22,13 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, response::Response};
 use serde::{Deserialize, Serialize};
 
-use super::error::{JsonBody, model_error_response, openai_error};
+use super::error::{JsonBody, model_error_response, openai_error, openai_error_with_param};
 use crate::app_state::AppState;
-use crate::cb_engine::EngineHandle;
+use crate::model_manager::engine::TokenizerHandle;
+
+/// Text the bridge puts in the error for an id outside the model's vocabulary
+/// (`ov_cb_decode` / `ov_vlm_decode`); the handler turns it into a 400.
+pub(crate) const INVALID_TOKEN_ID_MARKER: &str = "invalid token id:";
 
 // ---- Request / response shapes --------------------------------------
 
@@ -71,7 +75,7 @@ struct DetokenizeResponse {
 /// The error half is boxed: a full `Response` is large (>128 bytes), and
 /// `clippy::result_large_err` flags returning it by value in a `Result`. The
 /// happy path (an `EngineHandle`) stays unboxed and cheap.
-fn resolve_handle(state: &AppState, model: &str) -> Result<EngineHandle, Box<Response>> {
+fn resolve_handle(state: &AppState, model: &str) -> Result<TokenizerHandle, Box<Response>> {
     let Some(mm) = state.model_manager.as_ref() else {
         return Err(Box::new(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -80,7 +84,7 @@ fn resolve_handle(state: &AppState, model: &str) -> Result<EngineHandle, Box<Res
             Some("model_unavailable"),
         )));
     };
-    mm.get_handle(model)
+    mm.get_tokenizer(model)
         .map_err(|e| Box::new(model_error_response(e)))
 }
 
@@ -115,6 +119,20 @@ pub async fn detokenize(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<DetokenizeRequest>,
 ) -> Response {
+    // A negative id is invalid for every model. The bridge range-checks against the vocabulary, but
+    // a detokenizer without a vocabulary table (SentencePiece) cannot, so catch this one here.
+    if let Some(i) = req.tokens.iter().position(|&t| t < 0) {
+        return openai_error_with_param(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{INVALID_TOKEN_ID_MARKER} tokens[{i}] = {} is negative",
+                req.tokens[i]
+            ),
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("tokens"),
+        );
+    }
     let handle = match resolve_handle(&state, &req.model) {
         Ok(h) => h,
         Err(resp) => return *resp,
@@ -122,6 +140,22 @@ pub async fn detokenize(
 
     match handle.detokenize(req.tokens).await {
         Ok(text) => Json(DetokenizeResponse { text }).into_response(),
+        // The bridge refuses an id outside the vocabulary and says so; that is the caller's
+        // mistake, not a server failure.
+        Err(e) if e.to_string().contains(INVALID_TOKEN_ID_MARKER) => {
+            // Drop the internal "ov_xx_decode failed: " prefix; the API user needs only the rest.
+            let full = e.to_string();
+            let message = full
+                .find(INVALID_TOKEN_ID_MARKER)
+                .map_or(full.as_str(), |i| &full[i..]);
+            openai_error_with_param(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                Some("invalid_value"),
+                Some("tokens"),
+            )
+        }
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("detokenization failed: {e}"),
@@ -162,6 +196,33 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "server_error");
         assert_eq!(json["error"]["code"], "model_unavailable");
+    }
+
+    /// A negative token id is invalid for every model, so it is a 400 before any model lookup (a
+    /// model with no vocabulary table cannot range-check ids in the bridge).
+    #[tokio::test]
+    async fn detokenize_negative_id_is_400_before_the_model_lookup() {
+        let resp = detokenize(
+            State(AppState::mock()),
+            JsonBody(DetokenizeRequest {
+                model: "anything".to_owned(),
+                tokens: vec![5, -1],
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_value");
+        assert_eq!(json["error"]["param"], "tokens");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tokens[1]")
+        );
     }
 
     /// Same for `/detokenize` in mock mode.

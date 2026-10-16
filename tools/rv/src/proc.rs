@@ -89,6 +89,14 @@ pub fn probe(port: u16, pid_file: &Path) -> ProcState {
     platform::probe(port, pid_file)
 }
 
+/// Whether `pid` was started with `RUSTEDVINO_CONFIG` equal to `config` (which
+/// `rv start` always sets). Tells "my server, still loading models" apart from
+/// another server on the same machine. `false` when it cannot be read.
+#[must_use]
+pub fn runs_config(pid: u32, config: &Path) -> bool {
+    platform::runs_config(pid, config)
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use std::collections::HashSet;
@@ -121,6 +129,16 @@ mod platform {
         let argv0 = String::from_utf8_lossy(argv0);
         let base = argv0.rsplit('/').next().unwrap_or("");
         SERVER_NAMES.contains(&base)
+    }
+
+    pub fn runs_config(pid: u32, config: &Path) -> bool {
+        let Ok(raw) = fs::read(format!("/proc/{pid}/environ")) else {
+            return false;
+        };
+        raw.split(|b| *b == 0).any(|kv| {
+            kv.strip_prefix(b"RUSTEDVINO_CONFIG=")
+                .is_some_and(|v| Path::new(&*String::from_utf8_lossy(v)) == config)
+        })
     }
 
     /// PID holding a LISTEN socket on `port`, via `/proc/net/tcp{,6}` then the
@@ -265,6 +283,10 @@ mod platform {
     }
 
     pub fn is_server_pid(_pid: u32) -> bool {
+        false
+    }
+
+    pub fn runs_config(_pid: u32, _config: &Path) -> bool {
         false
     }
 

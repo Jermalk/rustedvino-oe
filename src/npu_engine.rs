@@ -38,7 +38,7 @@
 // ============================================================
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{Sender, error::TrySendError};
@@ -170,6 +170,12 @@ pub struct NpuHandle {
     waiting: Arc<AtomicUsize>,
     /// The shape the resident pipeline was compiled with.
     shape: NpuShape,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked by ``generate`` *after*
+    /// it holds an admission permit. Shared by every clone of this handle, so a submit that
+    /// slips in after the eviction started is refused (retryable) instead of being drained and
+    /// aborted; a reload builds a new engine with a clear flag. See
+    /// `cb_engine::EngineHandle::closing`. D3-S1.D2; nothing sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl NpuHandle {
@@ -213,6 +219,7 @@ impl NpuHandle {
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             shape: NpuShape::resolve(None, None),
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -233,6 +240,7 @@ impl NpuHandle {
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
             shape: NpuShape::resolve(None, None),
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -264,6 +272,14 @@ impl NpuHandle {
             Ok(Err(_)) => return SubmitResult::EngineDead, // semaphore closed (shouldn't happen)
             Err(_) => return SubmitResult::AtCapacity,     // timed out waiting for a permit
         };
+
+        // The eviction may have started while this caller waited for (or just took) its permit.
+        // Checked AFTER holding it: `begin_evict` sets `closing` before reading `active()`, so
+        // either it counted this permit (and drains it) or this check sees the flag.
+        if self.closing.load(Ordering::SeqCst) {
+            drop(permit);
+            return SubmitResult::Closing;
+        }
 
         // Permit acquired. Send to the engine — if the channel is closed, the
         // permit (moved into the command) drops here, automatically releasing
@@ -312,6 +328,10 @@ impl NpuHandle {
 impl ManagedEngine for NpuHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::TextGen
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     /// Accepted-but-unfinished requests (queued + the one generating) —
@@ -411,6 +431,7 @@ pub fn spawn_npu_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             shape,
+            closing: Arc::new(AtomicBool::new(false)),
         },
         thread,
     ))
@@ -454,6 +475,7 @@ pub(crate) fn spawn_mock_npu(model_id: &str) -> (NpuHandle, std::thread::JoinHan
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             shape: NpuShape::resolve(None, None),
+            closing: Arc::new(AtomicBool::new(false)),
         },
         thread,
     )
@@ -968,5 +990,58 @@ mod tests {
             }
         );
         assert_eq!(NpuShape::resolve(None, Some(512)).max_prompt_len, 1024);
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// `active()` is `cap - available_permits`: a held admission permit counts, a released one does not.
+    #[test]
+    fn active_counts_held_permits_for_npu() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let h = NpuHandle::from_sender(tx, "t-npu");
+        assert_eq!(h.active(), 0, "idle");
+        let permit = Arc::clone(&h.sem).try_acquire_owned().unwrap();
+        assert_eq!(h.active(), 1, "one permit held");
+        drop(permit);
+        assert_eq!(h.active(), 0, "released");
+    }
+
+    /// D3-S1.D2: with the closing flag set, a submit that already holds its permit is refused
+    /// (retryable) and the permit is released; cleared again, submits are accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_submit_and_releases_its_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<NpuCommand>(4);
+        let h = NpuHandle::from_sender(tx, "t-npu");
+        let submit = |h: &NpuHandle| {
+            let (tok_tx, _tok_rx) = crate::streaming::stream_channel();
+            let h = h.clone();
+            async move {
+                h.generate(
+                    "hi".to_owned(),
+                    GenParams::default(),
+                    tok_tx,
+                    Instant::now(),
+                )
+                .await
+            }
+        };
+
+        ManagedEngine::set_closing(&h, true);
+        assert_eq!(submit(&h).await, SubmitResult::Closing);
+        assert_eq!(h.active(), 0, "the refused submit's permit is released");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        assert_eq!(submit(&h).await, SubmitResult::Submitted);
+        assert!(rx.try_recv().is_ok(), "the command reached the engine");
     }
 }

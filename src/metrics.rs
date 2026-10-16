@@ -63,6 +63,24 @@ const OV_CACHE_BYTES: &str = "rustedvino_ov_cache_bytes";
 const OV_CACHE_PRUNED_BYTES_TOTAL: &str = "rustedvino_ov_cache_pruned_bytes_total";
 const OV_CACHE_PRUNED_FILES_TOTAL: &str = "rustedvino_ov_cache_pruned_files_total";
 
+/// Eviction-policy counters (D3, the project's internal engineering log) — what makes the busy-model rule visible in
+/// production, above all the failure mode that got the hard rule reverted on 2026-10-04: loads
+/// refused for as long as a client keeps another model busy.
+///
+/// Evictions that proceeded although the model had requests running (an operator's or a load's
+/// `force`, or an automatic recovery); `kind` is the engine kind.
+const FORCED_EVICTIONS_TOTAL: &str = "rustedvino_forced_evictions_total";
+/// Requests that were still running when a forced eviction's drain deadline passed and were
+/// aborted (the count of requests, by engine kind).
+const EVICTION_ABORTED_REQUESTS_TOTAL: &str = "rustedvino_eviction_aborted_requests_total";
+/// Loads refused rather than evicting a busy model: `reason` = `busy` (the only room is held by
+/// models with requests running).
+const LOAD_REFUSALS_TOTAL: &str = "rustedvino_load_refusals_total";
+/// Evictions that did not happen: `reason` = `busy` (the target has requests running; an admin
+/// unload, deregister or resize without force) or `incomplete` (a forced eviction's engine was
+/// still running its request when the join deadline passed).
+const EVICTION_REFUSALS_TOTAL: &str = "rustedvino_eviction_refusals_total";
+
 // Co-residency Slice 3a sizing/policy gauges (pull-at-scrape).
 const KV_CACHE_POOL_GB: &str = "rustedvino_kv_cache_pool_gb";
 const MODEL_LOAD_DURATION_SECONDS: &str = "rustedvino_model_load_duration_seconds";
@@ -207,6 +225,7 @@ fn register_metrics() {
     register_state_gauges();
     register_hot_path_metrics();
     register_key_usage_metrics();
+    register_eviction_metrics();
     register_ov_cache_metrics();
 }
 
@@ -226,6 +245,39 @@ fn register_ov_cache_metrics() {
         OV_CACHE_PRUNED_FILES_TOTAL,
         Unit::Count,
         "Cumulative .blob files deleted by ov_cache pruning since server start. Same gating as rustedvino_ov_cache_pruned_bytes_total"
+    );
+}
+
+/// Eviction-policy counters — see [`FORCED_EVICTIONS_TOTAL`].
+fn register_eviction_metrics() {
+    describe_counter!(
+        FORCED_EVICTIONS_TOTAL,
+        Unit::Count,
+        "Evictions that went ahead although the model had requests running (a forced load, an \
+         admin force, or an automatic recovery eviction). `kind` label: the engine kind. \
+         Cumulative since server start."
+    );
+    describe_counter!(
+        EVICTION_ABORTED_REQUESTS_TOTAL,
+        Unit::Count,
+        "Requests still running when a forced eviction's drain deadline passed, and aborted. \
+         `kind` label: the engine kind. Cumulative since server start."
+    );
+    describe_counter!(
+        LOAD_REFUSALS_TOTAL,
+        Unit::Count,
+        "Loads refused instead of evicting a busy model. `reason` label: busy (the room is held \
+         by models with requests running: retry when they finish, or load with force). A \
+         sustained rate means clients are keeping other models busy, the failure mode of a \
+         hard never-evict-busy rule. Cumulative since server start."
+    );
+    describe_counter!(
+        EVICTION_REFUSALS_TOTAL,
+        Unit::Count,
+        "Evictions that did not happen. `reason` label: busy (the target has requests running: \
+         an admin unload, deregister or resize without force) | incomplete (a forced eviction's \
+         engine was still running its request at the join deadline; its memory is released when \
+         it exits). Cumulative since server start."
     );
 }
 
@@ -666,6 +718,31 @@ pub(crate) fn record_own_budget_rejected(model_id: &str) {
     counter!(OWN_BUDGET_REJECTED_TOTAL, "model" => model_id.to_owned()).increment(1);
 }
 
+/// An eviction went ahead although the model had requests running — see
+/// [`FORCED_EVICTIONS_TOTAL`]. `kind` is [`ModelKind::label`].
+pub(crate) fn record_forced_eviction(kind: &'static str) {
+    counter!(FORCED_EVICTIONS_TOTAL, "kind" => kind).increment(1);
+}
+
+/// `aborted` requests were still running when a forced eviction's drain deadline passed — see
+/// [`EVICTION_ABORTED_REQUESTS_TOTAL`].
+pub(crate) fn record_eviction_aborted_requests(kind: &'static str, aborted: usize) {
+    counter!(EVICTION_ABORTED_REQUESTS_TOTAL, "kind" => kind)
+        .increment(u64::try_from(aborted).unwrap_or(u64::MAX));
+}
+
+/// A load was refused instead of evicting a busy model — see [`LOAD_REFUSALS_TOTAL`]. `reason`
+/// is `busy`.
+pub(crate) fn record_load_refusal(reason: &'static str) {
+    counter!(LOAD_REFUSALS_TOTAL, "reason" => reason).increment(1);
+}
+
+/// An eviction did not happen — see [`EVICTION_REFUSALS_TOTAL`]. `reason` is `busy` or
+/// `incomplete`.
+pub(crate) fn record_eviction_refusal(reason: &'static str) {
+    counter!(EVICTION_REFUSALS_TOTAL, "reason" => reason).increment(1);
+}
+
 /// Records one request attributed to `key_suffix` — see [`KEY_USAGE_TOTAL`]'s
 /// doc comment for the full metric semantics. `key_suffix` must already be
 /// exactly the last 6 characters of a key that matched a configured one;
@@ -711,6 +788,50 @@ pub(crate) fn record_ov_cache_pruned(freed_bytes: u64, deleted_files: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D3-S1.F5: the four eviction-policy counters render with their labels and add up.
+    #[test]
+    fn eviction_policy_counters_render_with_their_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_forced_eviction("text_gen");
+            record_forced_eviction("text_gen");
+            record_eviction_aborted_requests("text_gen", 3);
+            record_load_refusal("busy");
+            record_load_refusal("busy");
+            record_eviction_refusal("busy");
+            record_eviction_refusal("incomplete");
+            let out = handle.render();
+            let line = |needle: &str| {
+                out.lines()
+                    .find(|l| l.starts_with(needle))
+                    .and_then(|l| l.rsplit(' ').next())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or_else(|| panic!("no series `{needle}` in:\n{out}"))
+            };
+            assert!(
+                (line("rustedvino_forced_evictions_total{kind=\"text_gen\"}") - 2.0).abs()
+                    < f64::EPSILON
+            );
+            assert!(
+                (line("rustedvino_eviction_aborted_requests_total{kind=\"text_gen\"}") - 3.0).abs()
+                    < f64::EPSILON
+            );
+            assert!(
+                (line("rustedvino_load_refusals_total{reason=\"busy\"}") - 2.0).abs()
+                    < f64::EPSILON
+            );
+            assert!(
+                (line("rustedvino_eviction_refusals_total{reason=\"busy\"}") - 1.0).abs()
+                    < f64::EPSILON
+            );
+            assert!(
+                (line("rustedvino_eviction_refusals_total{reason=\"incomplete\"}") - 1.0).abs()
+                    < f64::EPSILON
+            );
+        });
+    }
 
     /// D14: byte gauges are whole, non-negative numbers.
     #[test]

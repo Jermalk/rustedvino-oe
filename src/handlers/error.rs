@@ -60,15 +60,57 @@ where
                 // (field names, expected types, byte offsets). Log it server-side
                 // for operators; return a fixed generic message to the client so
                 // nothing internal is disclosed and no input is echoed.
-                tracing::debug!(detail = %rejection.body_text(), "rejected malformed request body");
+                let detail = rejection.body_text();
+                tracing::debug!(%detail, "rejected malformed request body");
+                // 0.8.3 (F1): name the offending field, never the value or the
+                // serde type detail. Field names are the public API surface.
+                let message = field_hint(&detail).map_or_else(
+                    || GENERIC_BODY_MESSAGE.to_owned(),
+                    |hint| format!("malformed request body: {hint}"),
+                );
                 Err(openai_error(
                     StatusCode::BAD_REQUEST,
-                    "malformed request body: expected valid JSON matching the endpoint schema",
+                    &message,
                     "invalid_request_error",
                     Some("invalid_body"),
                 ))
             }
         }
+    }
+}
+
+const GENERIC_BODY_MESSAGE: &str =
+    "malformed request body: expected valid JSON matching the endpoint schema";
+
+/// A path segment is safe to echo only if it is a plain identifier/index path.
+fn is_safe_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 64
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'))
+}
+
+/// Extracts "which field" from axum's serde rejection text, e.g.
+/// `Failed to deserialize ...: messages[0].role: invalid type: ...` or
+/// `... missing field `model` at line 1 column 2`. Returns only a field path
+/// (charset-checked, length-capped); values and type detail are never echoed.
+fn field_hint(detail: &str) -> Option<String> {
+    let body = detail.strip_prefix("Failed to deserialize the JSON body into the target type: ")?;
+    let path = body
+        .split_once(": ")
+        .map(|(p, _)| p)
+        .filter(|p| *p != "." && is_safe_path(p));
+    let missing = body.find("missing field `").and_then(|i| {
+        let rest = &body[i + "missing field `".len()..];
+        rest.split_once('`')
+            .map(|(n, _)| n)
+            .filter(|n| is_safe_path(n))
+    });
+    match (path, missing) {
+        (Some(p), Some(m)) => Some(format!("missing required field `{p}.{m}`")),
+        (None, Some(m)) => Some(format!("missing required field `{m}`")),
+        (Some(p), None) => Some(format!("invalid value for field `{p}`")),
+        (None, None) => None,
     }
 }
 
@@ -375,6 +417,34 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             "server_error",
             Some("insufficient_memory"),
         ),
+        // D3: busy models are not evicted. `TargetBusy` (an admin eviction of a model with
+        // work in flight) and `BlockedByBusy` (a load that would have to evict busy models)
+        // both resolve when the work ends, so they advertise `Retry-After`. Neither is
+        // produced until the policy flip (D3-S1.E2).
+        ModelError::TargetBusy(_) | ModelError::BlockedByBusy(_) => {
+            let mut resp = openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("model busy: {e}"),
+                "server_error",
+                Some("model_busy"),
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
+            resp
+        }
+        // A forced eviction's engine is still finishing its request: its memory is not free
+        // yet, so the load that needed it is refused; retryable.
+        ModelError::EvictionIncomplete(_) => {
+            let mut resp = openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{e}"),
+                "server_error",
+                Some("eviction_incomplete"),
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
+            resp
+        }
         ModelError::WrongKind(msg) => openai_error(
             StatusCode::BAD_REQUEST,
             msg,
@@ -382,6 +452,13 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             Some("unsupported_operation"),
         ),
     }
+}
+
+/// The answer for a request an engine refused because its model is being evicted (the engine's
+/// `closing` flag, D3): exactly what a request gets when it finds the model `Evicting` — 503
+/// `model_unavailable` with `Retry-After`.
+pub(crate) fn model_closing_response() -> Response {
+    model_error_response(ModelError::Evicting)
 }
 
 /// Map an inference-path failure (`embed` / generate) to an `OpenAI` error
@@ -580,9 +657,53 @@ fn classify_inference_error(
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn field_hint_names_path_but_never_value() {
+        let p = "Failed to deserialize the JSON body into the target type: ";
+        assert_eq!(
+            field_hint(&format!(
+                "{p}max_tokens: invalid value: integer `-5`, expected u32 at line 1 column 30"
+            ))
+            .as_deref(),
+            Some("invalid value for field `max_tokens`")
+        );
+        assert_eq!(
+            field_hint(&format!(
+                "{p}messages[0]: missing field `role` at line 1 column 20"
+            ))
+            .as_deref(),
+            Some("missing required field `messages[0].role`")
+        );
+        assert_eq!(
+            field_hint(&format!("{p}missing field `model` at line 1 column 2")).as_deref(),
+            Some("missing required field `model`")
+        );
+        assert!(
+            field_hint(&format!(
+                "{p}temperature: invalid type: string \"hot\", expected f32"
+            ))
+            .unwrap()
+            .contains("temperature")
+        );
+        assert!(
+            !field_hint(&format!(
+                "{p}temperature: invalid type: string \"hot\", expected f32"
+            ))
+            .unwrap()
+            .contains("hot")
+        );
+        // Unsafe path characters or a non-serde rejection fall back to generic.
+        assert_eq!(field_hint(&format!("{p}a b<script>: invalid type")), None);
+        assert_eq!(
+            field_hint("Failed to parse the request body as JSON: EOF"),
+            None
+        );
+    }
 
     /// `openai_error` serialises the `{error:{message,type,code}}` envelope.
     #[tokio::test]
@@ -756,6 +877,35 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["param"], "dimensions");
         assert_eq!(json["error"]["code"], "unsupported_parameter");
+    }
+
+    /// D3-S1.B2: the busy-eviction refusals are 503 `model_busy` with a `Retry-After`, and name
+    /// the cause (the models whose eviction was refused).
+    #[tokio::test]
+    async fn busy_refusals_are_503_model_busy_with_retry_after() {
+        for e in [
+            ModelError::TargetBusy(2),
+            ModelError::BlockedByBusy(vec!["qwen".to_owned(), "bielik".to_owned()]),
+        ] {
+            let text = e.to_string();
+            let resp = model_error_response(e);
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["code"], "model_busy");
+            assert!(json["error"]["message"].as_str().unwrap().contains(&text));
+        }
+        let many =
+            ModelError::BlockedByBusy(vec!["qwen".to_owned(), "bielik".to_owned()]).to_string();
+        assert!(
+            many.contains("qwen, bielik") && many.contains("have requests running"),
+            "{many}"
+        );
+        let one = ModelError::BlockedByBusy(vec!["qwen".to_owned()]).to_string();
+        assert!(one.contains("has requests running"), "{one}");
     }
 
     /// Slice 3b: the *transient* model states (`Loading`/`Evicting`) carry a

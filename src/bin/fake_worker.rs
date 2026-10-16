@@ -11,6 +11,7 @@
 //   fake_worker crash
 //   fake_worker hang
 //   fake_worker healthy <bind-addr>   (e.g. "127.0.0.1:18123")
+//   fake_worker exit <code>           (exit immediately with that status)
 //
 // - "crash": raises a real, hardware-fault SIGSEGV immediately — not a
 //   software `raise()` or Rust's null-check panic->SIGABRT path, both of
@@ -56,6 +57,7 @@ mod unix {
             Some("crash") => crash(),
             Some("hang") => hang(),
             Some("healthy") => healthy(args.get(2)),
+            Some("exit") => exit_with(args.get(2)),
             other => {
                 eprintln!("fake_worker: unknown or missing behavior arg: {other:?}");
                 std::process::exit(2);
@@ -72,6 +74,11 @@ mod unix {
             let addr: usize = black_box(1);
             std::ptr::write_volatile(addr as *mut i32, 42);
         }
+    }
+
+    fn exit_with(code: Option<&String>) {
+        let code = code.and_then(|c| c.parse::<i32>().ok()).unwrap_or(2);
+        std::process::exit(code);
     }
 
     fn hang() {

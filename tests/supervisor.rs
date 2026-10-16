@@ -59,6 +59,75 @@ async fn crash_loop_gives_up_after_max_restarts() {
     );
 }
 
+/// A worker that exits 78 (fatal config error) is NOT respawned: the supervisor
+/// returns at once, even with a long backoff and a generous restart budget.
+#[tokio::test]
+async fn config_fatal_exit_is_not_respawned() {
+    let cfg = SupervisorConfig {
+        backoff_base_secs: 30,
+        backoff_max_secs: 60,
+        max_restarts: 5,
+        restart_window_secs: 600,
+        health_timeout_secs: 5,
+        hang_kill_grace_secs: 1,
+        watchdog_poll_secs: 30,
+        watchdog_hang_ceiling_secs: 0,
+    };
+    let health_addr = "127.0.0.1:18193".parse().unwrap();
+
+    let start = Instant::now();
+    let result = run_supervised(
+        &fake_worker(),
+        &["exit".to_string(), "78".to_string()],
+        health_addr,
+        &cfg,
+    )
+    .await;
+
+    let err = result.expect_err("a config-fatal exit must end the supervisor with an error");
+    assert!(
+        err.to_string().contains("fatal configuration error"),
+        "unexpected message: {err}"
+    );
+    // One spawn, no 30 s backoff: a respawn path would take >= 30 s.
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "supervisor should stop immediately, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// Control: an ordinary failure exit (code 1) still goes through the respawn
+/// path - it burns the whole restart budget before giving up.
+#[tokio::test]
+async fn ordinary_failure_exit_is_still_respawned() {
+    let cfg = SupervisorConfig {
+        backoff_base_secs: 0,
+        backoff_max_secs: 0,
+        max_restarts: 3,
+        restart_window_secs: 600,
+        health_timeout_secs: 5,
+        hang_kill_grace_secs: 1,
+        watchdog_poll_secs: 30,
+        watchdog_hang_ceiling_secs: 0,
+    };
+    let health_addr = "127.0.0.1:18194".parse().unwrap();
+
+    let result = run_supervised(
+        &fake_worker(),
+        &["exit".to_string(), "1".to_string()],
+        health_addr,
+        &cfg,
+    )
+    .await;
+
+    let err = result.expect_err("exit 1 loops until the restart cap");
+    assert!(
+        err.to_string().contains("crash-looping"),
+        "exit 1 must reach the give-up path, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn hung_worker_is_actively_killed() {
     let cfg = SupervisorConfig {

@@ -175,6 +175,10 @@ async fn submit_health_probe(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "engine at capacity",
                 )),
+                crate::cb_engine::SubmitResult::Closing => Err(hg_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model is being evicted",
+                )),
                 crate::cb_engine::SubmitResult::EngineDead => {
                     Err(hg_err(StatusCode::SERVICE_UNAVAILABLE, "engine dead"))
                 }
@@ -207,6 +211,10 @@ async fn submit_health_probe(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "vlm engine at capacity",
                 )),
+                crate::cb_engine::SubmitResult::Closing => Err(hg_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model is being evicted",
+                )),
                 crate::cb_engine::SubmitResult::EngineDead => {
                     Err(hg_err(StatusCode::SERVICE_UNAVAILABLE, "vlm engine dead"))
                 }
@@ -237,6 +245,10 @@ async fn submit_health_probe(
                 crate::cb_engine::SubmitResult::AtCapacity => Err(hg_err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "npu engine at capacity",
+                )),
+                crate::cb_engine::SubmitResult::Closing => Err(hg_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model is being evicted",
                 )),
                 crate::cb_engine::SubmitResult::EngineDead => {
                     Err(hg_err(StatusCode::SERVICE_UNAVAILABLE, "npu engine dead"))
@@ -388,7 +400,8 @@ struct AdminModelEntry {
     device: String,
     /// This model's own resolved sampling default (`generation_config.json`,
     /// post sanity-check), applied to a request that sets none of
-    /// `temperature`/`top_p`/`top_k` itself — see
+    /// `temperature`/`top_p`/`top_k` itself, and (`top_p`/`top_k` only) to one that sets
+    /// only a positive `temperature` — see
     /// `crate::handlers::chat::resolve_sampling_defaults`. Key omitted
     /// entirely (not `null`) before the model's first successful load, for
     /// media/embedding models, or when the file didn't pass the loader's gate
@@ -763,13 +776,7 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
             mm.list_models()
                 .into_iter()
                 .filter(|info| info.state == crate::model_manager::ModelState::Ready)
-                .map(|info| ModelObject {
-                    id: info.id,
-                    object: "model",
-                    created: server_created_ts(),
-                    owned_by: "rustedvino",
-                    max_model_len: (info.max_prompt_tokens > 0).then_some(info.max_prompt_tokens),
-                })
+                .map(model_object)
                 .collect()
         })
         .unwrap_or_default();
@@ -778,6 +785,38 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
         object: "list",
         data,
     })
+}
+
+/// Build the public `ModelObject` for one model; shared by the list and the retrieve route
+/// so the two cannot drift apart.
+fn model_object(info: crate::model_manager::ModelInfo) -> ModelObject {
+    ModelObject {
+        id: info.id,
+        object: "model",
+        created: server_created_ts(),
+        owned_by: "rustedvino",
+        max_model_len: (info.max_prompt_tokens > 0).then_some(info.max_prompt_tokens),
+    }
+}
+
+/// GET /v1/models/{id} — `OpenAI`'s retrieve-model route (D-12).
+///
+/// Same visibility rule as the list: only `Ready` models exist for `OpenAI` clients, so a
+/// registered-but-not-loaded model answers 404 `model_not_found` like an unknown id. Without
+/// a model manager (mock mode) every id is unknown.
+pub async fn model_retrieve(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let found = state.model_manager.as_ref().and_then(|mm| {
+        mm.list_models()
+            .into_iter()
+            .find(|info| info.id == id && info.state == crate::model_manager::ModelState::Ready)
+    });
+    match found {
+        Some(info) => Json(model_object(info)).into_response(),
+        None => super::error::model_error_response(crate::model_manager::ModelError::NotFound(id)),
+    }
 }
 
 // ---- /metrics ------------------------------------------------------
@@ -826,10 +865,11 @@ struct LoadRequest {
     /// Must be `>= 1`.
     #[serde(default)]
     max_concurrent_streams: Option<usize>,
-    /// Realtime voice arbitration v2
-    /// (the project's internal engineering log, D3): bypass the eviction-grace window for this
-    /// load. Only the grace window — never the realtime serving set,
-    /// `pinned`, or non-`evictable`, all of which remain unconditionally
+    /// Bypass the eviction-grace window AND the busy rule for this load (realtime voice
+    /// arbitration v2 D3, then the busy-eviction policy): a model with a request running is
+    /// otherwise never evicted to make room — the load is refused with `503 model_busy` — and
+    /// with `force` it is drained (up to 15 s) and what is left is aborted. Never the realtime
+    /// serving set, `pinned`, or non-`evictable`, all of which remain unconditionally
     /// protected. Default `false`.
     #[serde(default)]
     force: bool,
@@ -872,7 +912,10 @@ impl LoadRequest {
 /// - 400 Bad Request — body is malformed JSON or has an out-of-range override
 /// - 404 Not Found — model ID is not in the registry
 /// - 409 Conflict  — model is already loading or in a non-loadable state
-/// - 503 Service Unavailable — model manager not initialised
+/// - 503 Service Unavailable — model manager not initialised, or (JSON, code `model_busy`,
+///   `Retry-After`) the room the load needs is held by models with a request running: nothing
+///   was evicted — retry, or load with `"force": true`; or (`eviction_incomplete`) a forced
+///   eviction's engine is still finishing its request
 /// - 500 Internal Server Error — engine / factory failure
 ///
 /// Loading may take 10–60 seconds depending on model size and GPU JIT.
@@ -915,6 +958,13 @@ pub async fn admin_load_model(
             // Downcast to ModelError for fine-grained HTTP status mapping.
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
+                    // envelope.
+                    ModelError::TargetBusy(_)
+                    | ModelError::BlockedByBusy(_)
+                    | ModelError::EvictionIncomplete(_) => {
+                        return eviction_refusal(model_err);
+                    }
                     ModelError::NotFound(_)
                     | ModelError::FilesMissing(_)
                     | ModelError::FilesIncomplete(..) => {
@@ -956,6 +1006,11 @@ struct ResizeRequest {
     /// `/load`'s optional override, a resize with nothing to change is a
     /// no-op the caller should simply not make.
     kv_cache_gb: f64,
+    /// Bypass the busy rule and the eviction-grace window (D3): a model with requests running
+    /// is refused (409 `model_busy`) unless this is `true`, in which case it is drained
+    /// (bounded) and what is left is aborted, and the reload is a forced load. Default `false`.
+    #[serde(default)]
+    force: bool,
 }
 
 #[allow(clippy::doc_markdown)]
@@ -1016,7 +1071,7 @@ pub async fn admin_resize_model(
     };
 
     match mm
-        .resize_model_kv_cache(&model_id, request.kv_cache_gb)
+        .resize_model_kv_cache_with(&model_id, request.kv_cache_gb, request.force)
         .await
     {
         // `achieved` is the pool the allocator actually handed out, which can be
@@ -1050,6 +1105,13 @@ pub async fn admin_resize_model(
             }
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
+                    // envelope.
+                    ModelError::TargetBusy(_)
+                    | ModelError::BlockedByBusy(_)
+                    | ModelError::EvictionIncomplete(_) => {
+                        return eviction_refusal(model_err);
+                    }
                     ModelError::NotFound(_) => {
                         return (StatusCode::NOT_FOUND, e.to_string()).into_response();
                     }
@@ -1084,9 +1146,14 @@ pub async fn admin_resize_model(
 #[allow(clippy::doc_markdown)]
 /// DELETE /v1/admin/models/{model_id} — evict a model from VRAM.
 ///
+/// A model with a request running is not evicted: the call is refused with the JSON 409
+/// `model_busy` and the request is untouched. `?force=true` drains it (up to 2 minutes) and
+/// aborts what is left.
+///
 /// - 200 OK       — model evicted; VRAM freed
 /// - 404 Not Found — model ID is not in the registry
-/// - 409 Conflict  — model is not in a state that can be evicted (not loaded, already evicting)
+/// - 409 Conflict  — model is not in a state that can be evicted (not loaded, already
+///   evicting), or (JSON, code `model_busy`) it has a request running and `force` was not given
 /// - 503 Service Unavailable — model manager not initialised, or the GPU context is poisoned
 ///   (eviction refused — dropping a resident pipeline on a poisoned context can crash the
 ///   process; see the project's internal engineering log)
@@ -1094,11 +1161,18 @@ pub async fn admin_resize_model(
 ///
 /// Eviction blocks until the engine thread has drained all in-flight requests
 /// and exited. In-flight requests receive their remaining tokens before the
-/// model is freed.
+/// model is freed. For every engine except the continuous-batching text engine a FORCED
+/// eviction waits up to 30 s for the engine thread to finish its request and otherwise
+/// answers 503 `eviction_incomplete` (retryable; the memory is released when it exits).
 pub async fn admin_unload_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    let force = match force_from_query(query) {
+        Ok(force) => force,
+        Err(resp) => return resp,
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1107,11 +1181,23 @@ pub async fn admin_unload_model(
             .into_response();
     };
 
-    match mm.evict_model(&model_id).await {
+    let evicted = if force {
+        mm.evict_model_forced(&model_id).await
+    } else {
+        mm.evict_model(&model_id).await
+    };
+    match evicted {
         Ok(()) => (StatusCode::OK, format!("model '{model_id}' evicted")).into_response(),
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
+                    // envelope.
+                    ModelError::TargetBusy(_)
+                    | ModelError::BlockedByBusy(_)
+                    | ModelError::EvictionIncomplete(_) => {
+                        return eviction_refusal(model_err);
+                    }
                     ModelError::NotFound(_) => {
                         return (StatusCode::NOT_FOUND, e.to_string()).into_response();
                     }
@@ -1147,17 +1233,24 @@ pub async fn admin_unload_model(
 /// registered), this erases the model from the live registry and, if it was
 /// durably persisted, from `config.json` — it will not reappear in
 /// `GET /v1/admin/models`, on the next restart, or after a config reload.
-/// Evicts from VRAM first if the model is currently `Ready`.
+/// Evicts from VRAM first if the model is currently `Ready`: a model with a request running is
+/// refused with the JSON 409 `model_busy` unless `?force=true` (drain, then abort).
 ///
 /// - 200 OK        — model deregistered (and evicted first, if it was loaded)
 /// - 404 Not Found — model ID is not in the registry
-/// - 409 Conflict  — a load or eviction is already in flight for this model
+/// - 409 Conflict  — a load or eviction is already in flight for this model, or (JSON, code
+///   `model_busy`) it has a request running and `force` was not given
 /// - 503 Service Unavailable — model manager not initialised
 /// - 500 Internal Server Error — eviction failed unexpectedly
 pub async fn admin_deregister_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    let force = match force_from_query(query) {
+        Ok(force) => force,
+        Err(resp) => return resp,
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1166,11 +1259,18 @@ pub async fn admin_deregister_model(
             .into_response();
     };
 
-    match mm.deregister_model(&model_id).await {
+    match mm.deregister_model_with(&model_id, force).await {
         Ok(()) => (StatusCode::OK, format!("model '{model_id}' deregistered")).into_response(),
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
+                    // envelope.
+                    ModelError::TargetBusy(_)
+                    | ModelError::BlockedByBusy(_)
+                    | ModelError::EvictionIncomplete(_) => {
+                        return eviction_refusal(model_err);
+                    }
                     ModelError::NotFound(_) => {
                         return (StatusCode::NOT_FOUND, e.to_string()).into_response();
                     }
@@ -1284,6 +1384,13 @@ pub async fn admin_patch_model(
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
+                    // envelope.
+                    ModelError::TargetBusy(_)
+                    | ModelError::BlockedByBusy(_)
+                    | ModelError::EvictionIncomplete(_) => {
+                        return eviction_refusal(model_err);
+                    }
                     ModelError::NotFound(_) => {
                         return (StatusCode::NOT_FOUND, e.to_string()).into_response();
                     }
@@ -1345,14 +1452,22 @@ struct AdmissionCheckResponse {
     /// VRAM the load needs (`weights + min KV + safety margin`), GB.
     needed_gb: f64,
     /// Unreserved VRAM in the model's inference domain before any eviction, GB.
-    /// `0.0` when VRAM gating is disabled for the domain.
+    /// `0.0` when VRAM gating is disabled for the domain (see `vram_gated`).
     free_gb: f64,
+    /// `false` when the model's domain has no VRAM budget (`total_vram_gb: 0.0`): `free_gb` is then
+    /// meaningless and only the live system-RAM gate applies.
+    vram_gated: bool,
     /// Residents that would be evicted (in eviction order) to admit the model.
     /// Empty when it already fits or cannot be admitted at all.
     would_evict: Vec<String>,
-    /// Members of `would_evict` with a request running now: the load drains
-    /// each for at most 15 s and then aborts what is left.
+    /// Members of `would_evict` with a request running now. Non-empty only for a **forced**
+    /// check (`?force=true`): a plain load never evicts a busy model (see `blocked_by_busy`),
+    /// and a forced one drains each for at most 15 s and then aborts what is left.
     busy_victims: Vec<String>,
+    /// Residents that were NOT counted as victims only because they have a request running
+    /// (busy models are not evicted without `force`) and whose eviction would have made the
+    /// load fit. Empty unless the load cannot proceed for that reason.
+    blocked_by_busy: Vec<String>,
     /// Live system-RAM the load needs (`weights + conservative KV + margin`), GB.
     /// Present **only on the shared UMA `system` domain**, where a live-RAM gate
     /// applies on top of the VRAM arithmetic; omitted entirely on discrete-GPU
@@ -1368,13 +1483,36 @@ struct AdmissionCheckResponse {
     already_loaded: bool,
 }
 
-/// Query string of `POST /v1/admin/models/{id}/check`.
+/// Query string of `POST /v1/admin/models/{id}/check`, `DELETE /v1/admin/models/{id}` and
+/// `DELETE /v1/admin/models/{id}/register`.
 #[derive(serde::Deserialize, Default)]
-pub struct CheckQuery {
-    /// Preview the load as `force: true` would run it: bypass the
-    /// eviction-grace window (nothing else). Default `false`.
+pub struct ForceQuery {
+    /// Bypass the eviction-grace window **and** the busy rule (D3): a model with requests
+    /// running is not evicted unless this is set — then it is drained (bounded) and the rest
+    /// aborted. Never bypasses `pinned`, non-`evictable` or a live realtime session's models.
+    /// For `/check`, previews a load run that way. Default `false`.
     #[serde(default)]
     force: bool,
+}
+
+/// Parse the optional `?force=` query of an eviction route, answering a malformed one with the
+/// shared JSON envelope (not axum's plain-text rejection).
+#[allow(clippy::result_large_err)]
+fn force_from_query(
+    query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<bool, Response> {
+    match query {
+        Ok(axum::extract::Query(q)) => Ok(q.force),
+        Err(rejection) => {
+            tracing::debug!(detail = %rejection.body_text(), "rejected malformed query string");
+            Err(super::error::openai_error(
+                StatusCode::BAD_REQUEST,
+                "malformed query string: `force` must be true or false",
+                "invalid_request_error",
+                Some("invalid_query"),
+            ))
+        }
+    }
 }
 
 #[allow(clippy::doc_markdown)]
@@ -1390,26 +1528,18 @@ pub struct CheckQuery {
 /// - 404 Not Found  — model ID is not in the registry
 /// - 503 Service Unavailable — model manager not initialised
 ///
-/// `?force=true` previews the load as `force: true` would run it (grace window
-/// bypassed, nothing else).
+/// `?force=true` previews the load as `force: true` would run it (grace window and
+/// busy rule bypassed, nothing else).
 pub async fn admin_check_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
-    query: Result<axum::extract::Query<CheckQuery>, axum::extract::rejection::QueryRejection>,
+    query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     // A bad query string (`?force=maybe`) gets the shared JSON envelope, not
     // axum's plain-text rejection.
-    let q = match query {
-        Ok(axum::extract::Query(q)) => q,
-        Err(rejection) => {
-            tracing::debug!(detail = %rejection.body_text(), "rejected malformed query string");
-            return super::error::openai_error(
-                StatusCode::BAD_REQUEST,
-                "malformed query string: `force` must be true or false",
-                "invalid_request_error",
-                Some("invalid_query"),
-            );
-        }
+    let force = match force_from_query(query) {
+        Ok(force) => force,
+        Err(resp) => return resp,
     };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
@@ -1419,7 +1549,7 @@ pub async fn admin_check_model(
             .into_response();
     };
 
-    match mm.check_admission_with(&model_id, q.force) {
+    match mm.check_admission_with(&model_id, force) {
         Ok(check) => (
             StatusCode::OK,
             Json(AdmissionCheckResponse {
@@ -1427,8 +1557,10 @@ pub async fn admin_check_model(
                 fits: check.fits,
                 needed_gb: check.needed_gb,
                 free_gb: check.free_gb,
+                vram_gated: check.vram_gated,
                 would_evict: check.would_evict,
                 busy_victims: check.busy_victims,
+                blocked_by_busy: check.blocked_by_busy,
                 ram_needed_gb: check.ram_needed_gb,
                 ram_avail_gb: check.ram_avail_gb,
                 already_loaded: check.already_loaded,
@@ -1616,6 +1748,18 @@ pub async fn admin_add_model(
                     ),
                 )
                     .into_response();
+            }
+            // D3: the load that follows the registration was refused because the room is held
+            // by busy models (or a forced eviction is still finishing). The registration was
+            // rolled back; answer with the same JSON busy codes as `/load` instead of a
+            // misleading 400.
+            if let Some(
+                model_err @ (crate::model_manager::ModelError::BlockedByBusy(_)
+                | crate::model_manager::ModelError::TargetBusy(_)
+                | crate::model_manager::ModelError::EvictionIncomplete(_)),
+            ) = e.downcast_ref::<crate::model_manager::ModelError>()
+            {
+                return eviction_refusal(model_err);
             }
             let msg = e.to_string();
             if msg.contains("already registered") {
@@ -2023,11 +2167,82 @@ pub async fn admin_logs_tail(
 // ============================================================
 // Unit tests
 // ============================================================
+/// The response for a refusal caused by the eviction policy (D3): `409` when an operator's
+/// eviction of a busy model was refused ([`ModelError::TargetBusy`]); `503` when a load was
+/// refused because the only room is held by busy models ([`ModelError::BlockedByBusy`], code
+/// `model_busy`) or because a forced eviction's engine is still finishing its request and its
+/// memory is not free yet ([`ModelError::EvictionIncomplete`], code `eviction_incomplete`).
+/// All use the same JSON error envelope as the inference routes and a `Retry-After`: the cause
+/// resolves when the in-flight work ends.
+fn eviction_refusal(e: &ModelError) -> Response {
+    let (status, err_type, code) = match e {
+        ModelError::TargetBusy(_) => (StatusCode::CONFLICT, "invalid_request_error", "model_busy"),
+        ModelError::EvictionIncomplete(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "eviction_incomplete",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "model_busy",
+        ),
+    };
+    let mut resp = super::error::openai_error(status, e.to_string(), err_type, Some(code));
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        super::error::RETRY_AFTER_TRANSIENT,
+    );
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// D3-S1.B4/E5: eviction refusals use the JSON envelope with a `Retry-After`: 409
+    /// `model_busy` for an eviction of a busy model, 503 `model_busy` for a load blocked by busy
+    /// models, 503 `eviction_incomplete` for a forced eviction whose engine is still running.
+    #[tokio::test]
+    async fn eviction_refusals_use_the_json_envelope() {
+        for (e, status, err_type, code) in [
+            (
+                ModelError::TargetBusy(3),
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "model_busy",
+            ),
+            (
+                ModelError::BlockedByBusy(vec!["bielik".to_owned()]),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "model_busy",
+            ),
+            (
+                ModelError::EvictionIncomplete("whisper".to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "eviction_incomplete",
+            ),
+        ] {
+            let text = e.to_string();
+            let resp = eviction_refusal(&e);
+            assert_eq!(resp.status(), status);
+            assert_eq!(
+                resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+                "5"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["code"], code);
+            assert_eq!(json["error"]["type"], err_type);
+            assert_eq!(json["error"]["message"], text.as_str());
+        }
+    }
 
     /// `HealthResponse` serialises to the exact JSON shape clients expect.
     #[test]
@@ -2355,8 +2570,10 @@ mod tests {
             fits: true,
             needed_gb: 6.5,
             free_gb: 3.0,
+            vram_gated: true,
             would_evict: vec!["embed".to_owned()],
             busy_victims: Vec::new(),
+            blocked_by_busy: Vec::new(),
             ram_needed_gb: None,
             ram_avail_gb: None,
             already_loaded: false,
@@ -2383,8 +2600,10 @@ mod tests {
             fits: false,
             needed_gb: 22.0,
             free_gb: 27.0,
+            vram_gated: true,
             would_evict: Vec::new(),
             busy_victims: Vec::new(),
+            blocked_by_busy: Vec::new(),
             ram_needed_gb: Some(24.0),
             ram_avail_gb: Some(23.0),
             already_loaded: false,
@@ -2474,5 +2693,177 @@ mod tests {
     fn load_request_rejects_unknown_field() {
         let parsed: Result<LoadRequest, _> = serde_json::from_str(r#"{"kv_cache": 4.0}"#);
         assert!(parsed.is_err(), "unknown field must be rejected");
+    }
+
+    // ---- D3-S1.F6: the `force` parameter of the eviction routes (HTTP level) ---------------
+
+    /// A router over a mock manager with one loaded, BUSY text model (`busy-a`): the returned
+    /// permit stands for a request that is running on it.
+    async fn busy_router() -> (
+        axum::Router,
+        tokio::sync::OwnedSemaphorePermit,
+        std::sync::Arc<crate::model_manager::ModelManager>,
+    ) {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-admin-force-models", "device": "CPU", "total_vram_gb": 22.5,
+            "eviction_grace_secs": 0.0,
+            "models": { "busy-a": {"vram_gb": 2.0} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        mm.load_model("busy-a").await.unwrap();
+        let permit = match mm.get_chat_context("busy-a").unwrap().handle {
+            EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+            other => panic!("busy-a must be a TextGen mock, got {other:?}"),
+        };
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        (app, permit, mm)
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, json)
+    }
+
+    /// Release the simulated request after a short delay, so a forced eviction has something to
+    /// drain.
+    fn release_later(permit: tokio::sync::OwnedSemaphorePermit) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            drop(permit);
+        });
+    }
+
+    /// Unload: a busy model is refused with the JSON 409 `model_busy` unless `?force=true`,
+    /// which drains it and evicts it.
+    #[tokio::test]
+    async fn unload_refuses_a_busy_model_unless_forced() {
+        let (app, permit, mm) = busy_router().await;
+        let (status, json) = send(&app, "DELETE", "/v1/admin/models/busy-a", "").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"]["code"], "model_busy");
+        assert!(
+            mm.list_models()
+                .iter()
+                .any(|m| m.id == "busy-a" && m.state == crate::model_manager::ModelState::Ready),
+            "a refused unload leaves the model loaded"
+        );
+
+        release_later(permit);
+        let (status, body) = send(&app, "DELETE", "/v1/admin/models/busy-a?force=true", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(mm.list_models().iter().any(|m| m.id == "busy-a"
+            && m.state == crate::model_manager::ModelState::NotLoaded));
+    }
+
+    /// Deregister: same contract as unload.
+    #[tokio::test]
+    async fn deregister_refuses_a_busy_model_unless_forced() {
+        let (app, permit, mm) = busy_router().await;
+        let (status, json) = send(&app, "DELETE", "/v1/admin/models/busy-a/register", "").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"]["code"], "model_busy");
+
+        release_later(permit);
+        let (status, body) = send(
+            &app,
+            "DELETE",
+            "/v1/admin/models/busy-a/register?force=true",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            mm.list_models().iter().all(|m| m.id != "busy-a"),
+            "deregistered"
+        );
+    }
+
+    /// Resize: a busy model is refused with the JSON 409 unless the body says `"force": true`,
+    /// and a refused resize does NOT burn the resize cooldown (D3-S1.F2): the forced retry right
+    /// after it succeeds instead of being answered 429.
+    #[tokio::test]
+    async fn resize_refuses_a_busy_model_unless_forced() {
+        let (app, permit, _mm) = busy_router().await;
+        let (status, json) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/busy-a/resize",
+            r#"{"kv_cache_gb": 2.0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"]["code"], "model_busy");
+
+        release_later(permit);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/busy-a/resize",
+            r#"{"kv_cache_gb": 2.0, "force": true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// D3-S1.F3: `POST /v1/admin/models/add` whose load can only be satisfied by evicting a busy
+    /// model is answered with the JSON 503 `model_busy` (not a 400), and the registration is
+    /// rolled back as for any failed load; once the resident is idle the same add succeeds.
+    #[tokio::test]
+    async fn add_whose_load_is_blocked_by_a_busy_model_answers_model_busy() {
+        let (app, permit, mm) = busy_router().await;
+        // `add` checks the model's directory exists under `models_dir` before registering.
+        std::fs::create_dir_all("/tmp/test-admin-force-models/newcomer").unwrap();
+        let body = r#"{"model_id": "newcomer", "vram_gb": 15.0}"#;
+        let (status, json) = send(&app, "POST", "/v1/admin/models/add", body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["error"]["code"], "model_busy", "{json}");
+        assert!(
+            mm.list_models().iter().all(|m| m.id != "newcomer"),
+            "a refused add leaves nothing registered"
+        );
+        let busy_state = mm
+            .list_models()
+            .into_iter()
+            .find(|m| m.id == "busy-a")
+            .unwrap()
+            .state;
+        assert_eq!(
+            busy_state,
+            crate::model_manager::ModelState::Ready,
+            "nothing was evicted"
+        );
+
+        drop(permit);
+        let (status, ok) = send(&app, "POST", "/v1/admin/models/add", body).await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
     }
 }

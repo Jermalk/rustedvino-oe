@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -102,6 +102,14 @@ pub struct TtsHandle {
     waiting: Arc<AtomicUsize>,
     /// PCM sample rate of this engine's output (`16_000` for `SpeechT5`, `24_000` for Kokoro).
     sample_rate: u32,
+    /// Language the model speaks (`"en"`, `"pl"`, `"vi"`, ...), when it is fixed
+    /// by the checkpoint: the default for text normalisation on
+    /// `/v1/audio/speech` when the request names none. `None` = unknown.
+    language: Option<Arc<str>>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after the admission
+    /// permit is held. Shared by every clone of this handle; a reload builds a new engine with a
+    /// clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3a; nothing sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl TtsHandle {
@@ -118,6 +126,12 @@ impl TtsHandle {
         self.sample_rate
     }
 
+    /// Language the loaded model speaks, if known (see the field doc).
+    #[must_use]
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
     /// Build a handle around an existing command channel — test seam only.
     #[cfg(test)]
     #[must_use]
@@ -130,7 +144,9 @@ impl TtsHandle {
             cap,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
+            language: None,
         }
     }
 
@@ -150,7 +166,9 @@ impl TtsHandle {
             cap,
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
+            language: None,
         }
     }
 
@@ -188,6 +206,14 @@ impl TtsHandle {
             Err(_) => return Err(AdmitError::AtCapacity),     // timed out waiting for a permit
         };
 
+        // The eviction may have started while this caller waited for (or just took) its permit.
+        // Checked AFTER holding it: `begin_evict` sets `closing` before reading `active()`, so
+        // either it counted this permit (and drains it) or this check sees the flag.
+        if self.closing.load(Ordering::SeqCst) {
+            drop(permit);
+            return Err(AdmitError::Closing);
+        }
+
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -222,6 +248,10 @@ impl TtsHandle {
 impl ManagedEngine for TtsHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::Tts
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     /// Accepted-but-unfinished requests (queued + the one synthesizing) —
@@ -320,7 +350,9 @@ pub fn spawn_tts_engine(
             cap: TTS_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
+            language: Some(Arc::from("en")),
         },
         thread,
     ))
@@ -444,7 +476,9 @@ pub fn spawn_kokoro_engine(
             cap: TTS_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: KOKORO_SAMPLE_RATE,
+            language: Some(Arc::from("en")),
         },
         thread,
     ))
@@ -724,7 +758,9 @@ pub fn spawn_coqui_vits_engine(
             cap: TTS_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: COQUI_VITS_PL_SAMPLE_RATE,
+            language: Some(Arc::from("pl")),
         },
         thread,
     ))
@@ -803,6 +839,7 @@ pub fn spawn_piper_engine(
     queue_timeout: Duration,
 ) -> anyhow::Result<(TtsHandle, std::thread::JoinHandle<()>)> {
     let cfg = crate::pipelines::piper::load_config(Path::new(config_path))?;
+    let language: Arc<str> = Arc::from(cfg.espeak.voice.as_str());
     let verified = crate::pipelines::piper::self_check(
         &cfg.espeak.voice,
         &crate::pipelines::piper::espeak_cli,
@@ -887,7 +924,9 @@ pub fn spawn_piper_engine(
             cap: TTS_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate,
+            language: Some(language),
         },
         thread,
     ))
@@ -920,7 +959,9 @@ pub(crate) fn spawn_mock_tts(model_id: &str) -> (TtsHandle, std::thread::JoinHan
             cap: TTS_CHANNEL_CAP,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
+            language: None,
         },
         thread,
     )
@@ -1092,5 +1133,69 @@ mod tests {
             "must 429 after timeout, got {result:?}"
         );
         drop(rx);
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// A request that reached the engine keeps `active()` at 1 (its admission permit travels in
+    /// the command) even after the caller is abandoned, and releases when the engine drops the command.
+    #[tokio::test]
+    async fn active_holds_for_a_tts_request_until_the_engine_is_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender(tx, "t-tts");
+        assert_eq!(h.active(), 0, "idle");
+
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.synthesize("a".to_owned(), None, 1.0).await.ok();
+            }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "request delivered to the engine");
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            h.active(),
+            1,
+            "abandoned caller: the engine still holds the permit"
+        );
+
+        drop(cmd);
+        assert_eq!(h.active(), 0, "engine finished (command dropped)");
+    }
+
+    /// D3-S1.D3a: with the closing flag set, a submit that already holds its permit is refused
+    /// (retryable `AdmitError::Closing`) and the permit is released; cleared again, it is accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_submit_and_releases_its_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender(tx, "t-tts");
+
+        ManagedEngine::set_closing(&h, true);
+        let refused = h.synthesize("a".to_owned(), None, 1.0).await;
+        assert!(matches!(refused, Err(AdmitError::Closing)), "{refused:?}");
+        assert_eq!(h.active(), 0, "the refused submit's permit is released");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move { h.synthesize("a".to_owned(), None, 1.0).await.ok() }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "accepted: the command reached the engine");
+        drop(cmd);
+        let _ = caller.await;
     }
 }

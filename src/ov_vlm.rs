@@ -66,6 +66,7 @@ unsafe extern "C" {
         ov_cache_dir: *const std::ffi::c_char,
         cache_size_gb: f64,
         enable_prefix_caching: bool,
+        max_num_seqs: usize,
     ) -> *mut c_void;
 
     fn ov_vlm_free(handle: *mut c_void);
@@ -98,6 +99,23 @@ unsafe extern "C" {
         text: *const u8,
         len: usize,
         out_count: *mut usize,
+    ) -> std::ffi::c_int;
+
+    fn ov_vlm_encode(
+        handle: *mut c_void,
+        text: *const u8,
+        len: usize,
+        out_ids: *mut i64,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> std::ffi::c_int;
+
+    fn ov_vlm_decode(
+        handle: *mut c_void,
+        ids: *const i64,
+        count: usize,
+        callback: Option<crate::ov_cb::OvTextCallback>,
+        user_data: *mut c_void,
     ) -> std::ffi::c_int;
 
     /// `sizeof(OvGenParams)` on the C++ side — see the size-check test below.
@@ -180,6 +198,7 @@ impl OvVlmEngine {
         ov_cache_dir: &str,
         cache_size_gb: f64,
         enable_prefix_caching: bool,
+        max_num_seqs: usize,
     ) -> anyhow::Result<Self> {
         let c_path = CString::new(model_path).context("model_path contains interior NUL")?;
         let c_device = CString::new(device).context("device contains interior NUL")?;
@@ -195,6 +214,7 @@ impl OvVlmEngine {
                 c_cache_dir.as_ptr(),
                 cache_size_gb,
                 enable_prefix_caching,
+                max_num_seqs,
             )
         };
 
@@ -407,6 +427,65 @@ impl OvVlmEngine {
             anyhow::bail!("ov_vlm_count_tokens failed: {}", last_error());
         }
         Ok(count)
+    }
+
+    /// Encode `text` into token ids with the VLM's tokenizer (`/tokenize`, D-09). Two passes —
+    /// count, then fill an exactly-sized buffer — like [`OvCbEngine::encode`](crate::ov_cb::OvCbEngine::encode).
+    ///
+    /// # Errors
+    /// Returns an error if the tokenizer fails.
+    ///
+    /// # Threading
+    /// Engine-thread only (see [`count_tokens`](Self::count_tokens)).
+    pub fn encode(&self, text: &str) -> anyhow::Result<Vec<i64>> {
+        let n = self.count_tokens(text)?;
+        let mut ids = vec![0i64; n];
+        if n == 0 {
+            return Ok(ids);
+        }
+        let mut count: usize = 0;
+        // SAFETY: handle is non-null (invariant); `text` is a valid `len`-byte buffer; `ids` has
+        // `n` slots and `cap == n`; `out_count` points to a live usize.
+        let ret = unsafe {
+            ov_vlm_encode(
+                self.handle,
+                text.as_ptr(),
+                text.len(),
+                ids.as_mut_ptr(),
+                n,
+                std::ptr::addr_of_mut!(count),
+            )
+        };
+        if ret != 0 {
+            anyhow::bail!("ov_vlm_encode failed: {}", last_error());
+        }
+        ids.truncate(count.min(n));
+        Ok(ids)
+    }
+
+    /// Decode token `ids` back to text with the VLM's tokenizer (`/detokenize`, D-09).
+    ///
+    /// # Errors
+    /// Returns an error if the detokenizer fails.
+    ///
+    /// # Threading
+    /// Engine-thread only (see [`count_tokens`](Self::count_tokens)).
+    pub fn decode(&self, ids: &[i64]) -> anyhow::Result<String> {
+        crate::ov_cb::decode_with(|callback, user_data| {
+            // SAFETY: handle is non-null (invariant); `ids`/`len` describe a valid slice (possibly
+            // empty, which the C side allows); `callback`/`user_data` come from `decode_with`,
+            // which keeps the context alive for the whole blocking call.
+            unsafe {
+                ov_vlm_decode(
+                    self.handle,
+                    ids.as_ptr(),
+                    ids.len(),
+                    Some(callback),
+                    user_data,
+                )
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("ov_vlm_decode failed: {e}"))
     }
 }
 

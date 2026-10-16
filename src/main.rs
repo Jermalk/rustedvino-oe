@@ -99,6 +99,32 @@ fn print_template(template: anyhow::Result<serde_json::Value>) {
 /// [`PROCESS_EXIT_TIMEOUT`]. `async_main` is unchanged behaviourally; only
 /// what happens *after* it returns is different.
 fn main() -> std::process::ExitCode {
+    // `--version` / `-V`: answer before anything else (no config, no signal
+    // thread, no runtime) so it works on a fresh unpacked bundle.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "rustedvino {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("RV_GIT_HASH")
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    // Take SIGTERM/SIGINT on a dedicated sigwait thread so a foreign
+    // (IGC/NEO) signal handler can never run for them - see
+    // `shutdown_signals`. Must come before the runtime builds any thread, and
+    // not in `--supervise` mode (the supervisor uses tokio's own handler).
+    #[cfg(unix)]
+    if !std::env::args().any(|a| a == "--supervise")
+        && let Err(e) = rustedvino::shutdown_signals::install()
+    {
+        eprintln!(
+            "warning: dedicated shutdown-signal thread unavailable ({e}); using tokio's handler"
+        );
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -121,9 +147,22 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(rustedvino::startup::EXIT_GPU_POISONED)
         }
         Ok(()) => std::process::ExitCode::SUCCESS,
+        // A stop requested while models were still loading is a clean stop.
+        Err(e)
+            if e.downcast_ref::<rustedvino::startup::ShutdownDuringStartup>()
+                .is_some() =>
+        {
+            std::process::ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("Error: {e:?}");
-            std::process::ExitCode::FAILURE
+            if e.downcast_ref::<rustedvino::startup::ConfigFatal>()
+                .is_some()
+            {
+                std::process::ExitCode::from(rustedvino::startup::EXIT_CONFIG_FATAL)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
     }
 }

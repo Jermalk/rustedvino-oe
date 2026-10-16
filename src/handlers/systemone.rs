@@ -96,7 +96,8 @@ fn evict_dead_engine(
 ) -> Response {
     let (mm, id) = (std::sync::Arc::clone(mm), model.to_owned());
     tokio::spawn(async move {
-        if let Err(e) = mm.evict_model(&id).await {
+        // Forced: a dead engine must be unloaded even if (queued) requests still count as busy.
+        if let Err(e) = mm.evict_model_forced(&id).await {
             tracing::error!(model = %id, error = %e, "evicting a dead decision engine failed");
         }
     });
@@ -173,6 +174,10 @@ pub async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
                 StatusCode::SERVICE_UNAVAILABLE,
                 DecideError::Cancelled.to_string(),
             );
+        }
+        // The model is being evicted: retryable, in Ollama's error shape.
+        Err(DecideError::Closing) => {
+            return not_ready_transient(&req.model, &ModelError::Evicting);
         }
         Err(DecideError::Engine(m)) => {
             tracing::error!(model = %req.model, err = %m, "systemone scoring failed");

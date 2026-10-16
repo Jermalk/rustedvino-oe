@@ -188,6 +188,12 @@ pub enum SubmitResult {
     AtCapacity,
     /// Command channel closed (engine thread exited) — caller should return HTTP 503.
     EngineDead,
+    /// The model is being evicted: the engine's `closing` flag was set between the
+    /// caller's handle lookup and its submit, so the request was not accepted (its
+    /// admission permit was released). Retryable — caller should return HTTP 503 with
+    /// `Retry-After`, exactly as for a request that finds the model `Evicting`.
+    /// Not produced until `begin_evict` sets the flag (D3-S1.D4).
+    Closing,
 }
 
 /// Admission-gate outcome for **request/response** engines (embedding, STT,
@@ -209,6 +215,11 @@ pub enum AdmitError {
     AtCapacity,
     /// Command channel closed (engine thread exited) — caller should return HTTP 503.
     EngineDead,
+    /// The model is being evicted: its `closing` flag was set between the caller's handle
+    /// lookup and its submit, so the request was refused (the admission permit was released).
+    /// Retryable — caller should return HTTP 503 with `Retry-After`, like a model found
+    /// `Evicting`. Not produced until `begin_evict` sets the flag (D3-S1.D4).
+    Closing,
     /// Admitted, but the pipeline call itself failed.
     Failed(anyhow::Error),
 }
@@ -218,6 +229,7 @@ impl std::fmt::Display for AdmitError {
         match self {
             Self::AtCapacity => write!(f, "engine at capacity"),
             Self::EngineDead => write!(f, "engine unavailable (engine thread exited)"),
+            Self::Closing => write!(f, "model is being evicted — retry shortly"),
             Self::Failed(e) => write!(f, "{e}"),
         }
     }
@@ -227,7 +239,7 @@ impl std::error::Error for AdmitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Failed(e) => Some(e.as_ref()),
-            Self::AtCapacity | Self::EngineDead => None,
+            Self::AtCapacity | Self::EngineDead | Self::Closing => None,
         }
     }
 }
@@ -260,6 +272,14 @@ pub struct EngineHandle {
     /// process shutdown would block on the join until that generation finished
     /// naturally (up to minutes): the off-switch hang.
     shutting_down: Arc<AtomicBool>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked by
+    /// [`add_request`](Self::add_request) *after* it holds an admission permit. Shared by
+    /// every clone of this handle (it is an `Arc`), so a handler that cloned the handle
+    /// before the eviction began still sees it, and a reload builds a new engine with a
+    /// fresh flag. It closes the select/begin race: a submit that slips in after the
+    /// eviction started is refused (retryable) instead of being drained and then aborted.
+    /// D3-S1.D1; nothing sets it yet.
+    closing: Arc<AtomicBool>,
     /// Live KV-cache occupancy percentage (0–100), as `f32` bits, published by
     /// the engine thread after each step and read sync by `/metrics`
     /// (`rustedvino_kv_cache_usage_percent`, co-residency Slice 3a). `0.0` while
@@ -296,6 +316,7 @@ impl EngineHandle {
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            closing: Arc::new(AtomicBool::new(false)),
             cache_usage: Arc::new(AtomicU64::new(0)),
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         }
@@ -316,6 +337,7 @@ impl EngineHandle {
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            closing: Arc::new(AtomicBool::new(false)),
             cache_usage: Arc::new(AtomicU64::new(0)),
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         }
@@ -389,6 +411,15 @@ impl EngineHandle {
             Ok(Err(_)) => return SubmitResult::EngineDead, // semaphore closed (shouldn't happen)
             Err(_) => return SubmitResult::AtCapacity,     // timed out waiting for a slot
         };
+
+        // The eviction may have started while this caller waited for (or just took) its
+        // permit. Check AFTER holding it: `begin_evict` sets `closing` before reading
+        // `active()`, so either it counted this permit (and drains it) or this check sees
+        // the flag (and the request is refused, retryable). Never both missed.
+        if self.closing.load(Ordering::SeqCst) {
+            drop(permit);
+            return SubmitResult::Closing;
+        }
 
         // Permit acquired. Send to engine — if the channel is closed, the
         // permit drops here and the slot is returned to the semaphore.
@@ -531,6 +562,10 @@ impl ManagedEngine for EngineHandle {
         ModelKind::TextGen
     }
 
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
+    }
+
     fn active(&self) -> usize {
         self.max_seqs.saturating_sub(self.sem.available_permits())
     }
@@ -652,6 +687,7 @@ pub fn spawn_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down,
+            closing: Arc::new(AtomicBool::new(false)),
             cache_usage,
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         },
@@ -2171,5 +2207,64 @@ mod tests {
             handle.detokenize(vec![1]).await.is_err(),
             "detokenize must error when the reply sender is dropped"
         );
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// The trait `active()` (what eviction reads) is `cap - available_permits`: a held admission permit counts, a released one does not.
+    #[test]
+    fn active_counts_held_permits_for_cb() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let h = EngineHandle::from_sender(tx);
+        assert_eq!(ManagedEngine::active(&h), 0, "idle");
+        let permit = h.occupy_slot_for_test().unwrap();
+        assert_eq!(ManagedEngine::active(&h), 1, "one permit held");
+        drop(permit);
+        assert_eq!(ManagedEngine::active(&h), 0, "released");
+    }
+
+    /// D3-S1.D1: with the closing flag set, a submit that already holds its permit is refused
+    /// (retryable) and the permit is released; cleared again, submits are accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_submit_and_releases_its_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+        let h = EngineHandle::from_sender(tx);
+        let submit = |h: &EngineHandle| {
+            let (token_tx, _token_rx) = tokio::sync::mpsc::channel(8);
+            let h = h.clone();
+            async move {
+                h.add_request(
+                    1,
+                    "p".to_owned(),
+                    None,
+                    GenParams::default(),
+                    token_tx,
+                    Instant::now(),
+                )
+                .await
+            }
+        };
+
+        ManagedEngine::set_closing(&h, true);
+        assert_eq!(submit(&h).await, SubmitResult::Closing);
+        assert_eq!(
+            ManagedEngine::active(&h),
+            0,
+            "the refused submit's permit is released"
+        );
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        assert_eq!(submit(&h).await, SubmitResult::Submitted);
+        assert!(rx.try_recv().is_ok(), "the command reached the engine");
     }
 }

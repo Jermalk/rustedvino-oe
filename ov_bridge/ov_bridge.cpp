@@ -76,6 +76,7 @@
 #include "openvino/genai/image_generation/image2image_pipeline.hpp"
 #include "openvino/genai/image_generation/inpainting_pipeline.hpp"
 #include <variant>
+#include <mutex>
 
 // Per-thread error buffer — avoids heap allocation in the error path.
 // thread_local is safe because each spawn_blocking call runs on its own
@@ -337,19 +338,32 @@ struct OvCbReqState {
     size_t                      pending_new_tokens = 0;
 };
 
+/// Size of the detokenizer's vocabulary, or 0 when it has none. `get_vocab_vector()` THROWS (it
+/// does not return an empty vector) for a detokenizer without a `VocabDecoder` op, which is what
+/// SentencePiece-style detokenizers (InternVL2.5, ...) have, so resolve it once at construction
+/// and treat a failure as "unknown": the id range check in the decode functions is then skipped.
+static size_t tokenizer_vocab_size(const ov::genai::Tokenizer& tok) noexcept {
+    try {
+        return tok.get_vocab_vector().size();
+    } catch (...) {
+        return 0;
+    }
+}
+
 /// Owns the ContinuousBatchingPipeline, its tokenizer, and the live request map.
 /// One instance lives on the dedicated Rust engine thread — no internal locking.
 struct OvCbEngine {
     ov::genai::ContinuousBatchingPipeline      pipe;
     ov::genai::Tokenizer                       tok;
     std::unordered_map<uint64_t, OvCbReqState> requests;
+    size_t                                     vocab_size = 0;   // 0 = unknown, see above
 
     OvCbEngine(const std::string& model_path,
                const ov::genai::SchedulerConfig& sched,
                const std::string& device,
                const ov::AnyMap& properties)
         : pipe(std::filesystem::path(model_path), sched, device, properties),
-          tok(pipe.get_tokenizer()) {}
+          tok(pipe.get_tokenizer()) { vocab_size = tokenizer_vocab_size(tok); }
 };
 
 } // anonymous namespace
@@ -413,14 +427,17 @@ static void build_gen_config(ov::genai::GenerationConfig& cfg,
         cfg.temperature = params->temperature;
         cfg.do_sample = (params->temperature > 0.0f);
     }
-    // top_p < 1 overrides greedy only when temperature is also non-zero.
-    if (!std::isnan(params->top_p)) {
+    // An explicit temperature of 0 means greedy: top_p/top_k must not turn sampling back on,
+    // GenAI rejects do_sample with temperature 0 (D-11, surfaced as a 500).
+    const bool greedy = !std::isnan(params->temperature) && params->temperature <= 0.0f;
+    // top_p < 1 enables sampling unless the temperature is explicitly 0 (then it is ignored).
+    if (!std::isnan(params->top_p) && !greedy) {
         cfg.top_p = params->top_p;
         if (params->top_p < 1.0f) cfg.do_sample = true;
     }
     // top_k: 0 = not set (GenerationConfig's own default is SIZE_MAX =
-    // unlimited). Mirrors top_p's do_sample semantics, quirks included.
-    if (params->top_k > 0) {
+    // unlimited). Same do_sample rule as top_p.
+    if (params->top_k > 0 && !greedy) {
         cfg.top_k = params->top_k;
         cfg.do_sample = true;
     }
@@ -1060,6 +1077,17 @@ int ov_cb_decode(OvCbHandle     handle,
     if (!ids && count) { set_error("null ids with non-zero count"); return -1; }
     auto* eng = static_cast<OvCbEngine*>(handle);
     try {
+        const size_t vocab_size = eng->vocab_size;
+        if (vocab_size > 0) {
+            for (size_t i = 0; i < count; ++i) {
+                if (ids[i] < 0 || static_cast<uint64_t>(ids[i]) >= vocab_size) {
+                    set_error(("invalid token id: tokens[" + std::to_string(i) + "] = " +
+                               std::to_string(ids[i]) + " is outside the vocabulary (size " +
+                               std::to_string(vocab_size) + ")").c_str());
+                    return -1;
+                }
+            }
+        }
         std::vector<int64_t> v(ids, ids + count);
         std::string text = eng->tok.decode(v);
         if (callback) {
@@ -1234,11 +1262,13 @@ struct OvVlmState {
     // below, rather than pipe->get_tokenizer() (avoids depending on pipe's
     // construction order and keeps this member independently testable).
     ov::genai::Tokenizer    tok;
+    size_t                  vocab_size = 0;   // 0 = unknown (see tokenizer_vocab_size)
 
     OvVlmState(const char* model_path, const char* device, const char* ov_cache_dir,
-               double cache_size_gb, bool enable_prefix_caching)
+               double cache_size_gb, bool enable_prefix_caching, size_t max_num_seqs)
         : tok(std::filesystem::path(model_path))
     {
+        vocab_size = tokenizer_vocab_size(tok);
         ov::AnyMap props;
         if (ov_cache_dir && ov_cache_dir[0] != '\0') {
             props.emplace(ov::cache_dir(std::string(ov_cache_dir)));
@@ -1283,6 +1313,11 @@ struct OvVlmState {
             // ov_cb_create above; same landmine, same fix.
             sched.cache_size = static_cast<size_t>(std::ceil(cache_size_gb));
             sched.enable_prefix_caching = enable_prefix_caching;
+            // Without this GenAI assumes its default of 256 sequences and, for a model with
+            // linear-attention layers, reserves their per-sequence state for all 256 (about
+            // 18.7 GiB for the 27B), which fails "reserved_la_bytes <= budget" at any realistic
+            // pool when prefix caching is off (D-02). The CB path already sets it (ov_cb_create).
+            if (max_num_seqs > 0) sched.max_num_seqs = max_num_seqs;
             props.emplace(ov::genai::scheduler_config(sched));
         }
         // cache_size_gb <= 0.0 here means no scheduler_config is built at all
@@ -1323,10 +1358,13 @@ typedef void* OvVlmHandle;
 ///                   Measured critical for this server's resent-full-history
 ///                   chat pattern — see `OvVlmState`'s constructor doc.
 ///
+/// `max_num_seqs` — sequences the scheduler must be able to hold at once; 0 = GenAI's default
+///                   (256). The VLM engine thread runs one generation at a time, so callers pass 1.
+///
 /// Returns NULL on failure; call ov_last_error() for the message.
 OvVlmHandle ov_vlm_create(const char* model_path, const char* device,
                            const char* ov_cache_dir, double cache_size_gb,
-                           bool enable_prefix_caching) {
+                           bool enable_prefix_caching, size_t max_num_seqs) {
     s_last_error[0] = '\0';
     if (!model_path || !device) {
         set_error("ov_vlm_create: null model_path or device");
@@ -1334,7 +1372,7 @@ OvVlmHandle ov_vlm_create(const char* model_path, const char* device,
     }
     try {
         return new OvVlmState(model_path, device, ov_cache_dir, cache_size_gb,
-                               enable_prefix_caching);
+                               enable_prefix_caching, max_num_seqs);
     } catch (const std::exception& e) {
         set_error(e.what());
         return nullptr;
@@ -1558,7 +1596,202 @@ int ov_vlm_count_tokens(OvVlmHandle handle,
     }
 }
 
+/// Encode `text` to token ids with the VLM's standalone tokenizer (`/tokenize` for vision models,
+/// D-09). Same contract as ov_cb_encode: always writes the true count to `*out_count`; writes up to
+/// `cap` ids into `out_ids` when it is non-null and `cap > 0`. Returns 0 / -1 (ov_last_error()).
+int ov_vlm_encode(OvVlmHandle handle,
+                  const char* text,
+                  size_t      len,
+                  int64_t*    out_ids,
+                  size_t      cap,
+                  size_t*     out_count) {
+    s_last_error[0] = '\0';
+    if (!handle)      { set_error("ov_vlm_encode: null handle"); return -1; }
+    if (!text && len) { set_error("ov_vlm_encode: null text with non-zero len"); return -1; }
+    if (!out_count)   { set_error("ov_vlm_encode: null out_count"); return -1; }
+    auto* state = static_cast<OvVlmState*>(handle);
+    try {
+        ov::genai::TokenizedInputs enc = state->tok.encode(std::string(text, len));
+        const ov::Tensor& ids = enc.input_ids;
+        *out_count = ids.get_size();
+        if (out_ids && cap > 0) {
+            const size_t to_copy = (*out_count < cap) ? *out_count : cap;
+            const auto   et      = ids.get_element_type();
+            if (et == ov::element::i64) {
+                std::memcpy(out_ids, ids.data<int64_t>(), to_copy * sizeof(int64_t));
+            } else if (et == ov::element::i32) {
+                const int32_t* src = ids.data<int32_t>();
+                for (size_t i = 0; i < to_copy; ++i) {
+                    out_ids[i] = static_cast<int64_t>(src[i]);
+                }
+            } else {
+                set_error("unexpected input_ids element type (not i32/i64)");
+                return -1;
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_vlm_encode");
+        return -1;
+    }
+}
+
+/// Decode `count` token ids to UTF-8 text with the VLM's standalone tokenizer, delivering the whole
+/// string to `callback` exactly once (`/detokenize` for vision models, D-09). `ids` may be NULL only
+/// when `count == 0`. Returns 0 / -1 (ov_last_error()).
+int ov_vlm_decode(OvVlmHandle    handle,
+                  const int64_t* ids,
+                  size_t         count,
+                  OvTextCallback callback,
+                  void*          user_data) {
+    s_last_error[0] = '\0';
+    if (!handle)       { set_error("ov_vlm_decode: null handle"); return -1; }
+    if (!ids && count) { set_error("ov_vlm_decode: null ids with non-zero count"); return -1; }
+    auto* state = static_cast<OvVlmState*>(handle);
+    try {
+        const size_t vocab_size = state->vocab_size;
+        if (vocab_size > 0) {
+            for (size_t i = 0; i < count; ++i) {
+                if (ids[i] < 0 || static_cast<uint64_t>(ids[i]) >= vocab_size) {
+                    set_error(("invalid token id: tokens[" + std::to_string(i) + "] = " +
+                               std::to_string(ids[i]) + " is outside the vocabulary (size " +
+                               std::to_string(vocab_size) + ")").c_str());
+                    return -1;
+                }
+            }
+        }
+        std::vector<int64_t> v(ids, ids + count);
+        std::string text = state->tok.decode(v);
+        if (callback) {
+            callback(user_data, text.data(), text.size());
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_vlm_decode");
+        return -1;
+    }
+}
+
 } // extern "C" (VLM section)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Standalone tokenizer (D-13)
+// ─────────────────────────────────────────────────────────────────────────────
+// A tokenizer loaded from a model directory that is NOT tied to an engine thread: every call
+// takes the mutex, so any thread may use it while a generation is running. /tokenize and
+// /detokenize on a vision model use it instead of queueing behind the (single-stream) VLM
+// engine thread, where a call waited for the running generation to finish.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+struct OvTokState {
+    ov::genai::Tokenizer tok;
+    std::mutex           mu;
+    size_t               vocab_size = 0;   // 0 = unknown (see tokenizer_vocab_size)
+    explicit OvTokState(const char* model_path) : tok(std::filesystem::path(model_path)) {
+        vocab_size = tokenizer_vocab_size(tok);
+    }
+};
+} // namespace
+
+extern "C" {
+
+/// Load the tokenizer in `model_path`. Returns NULL on error (call ov_last_error()).
+void* ov_tok_create(const char* model_path) {
+    s_last_error[0] = '\0';
+    if (!model_path) { set_error("ov_tok_create: null model_path"); return nullptr; }
+    try {
+        return new OvTokState(model_path);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("unknown exception in ov_tok_create");
+        return nullptr;
+    }
+}
+
+void ov_tok_free(void* handle) {
+    delete static_cast<OvTokState*>(handle);
+}
+
+/// Same contract as ov_vlm_encode: always writes the true count to *out_count; writes up to `cap`
+/// ids when out_ids is non-null and cap > 0. Returns 0 / -1 (ov_last_error()). Thread-safe.
+int ov_tok_encode(void* handle, const char* text, size_t len,
+                  int64_t* out_ids, size_t cap, size_t* out_count) {
+    s_last_error[0] = '\0';
+    if (!handle)      { set_error("ov_tok_encode: null handle"); return -1; }
+    if (!text && len) { set_error("ov_tok_encode: null text with non-zero len"); return -1; }
+    if (!out_count)   { set_error("ov_tok_encode: null out_count"); return -1; }
+    auto* state = static_cast<OvTokState*>(handle);
+    try {
+        std::lock_guard<std::mutex> lock(state->mu);
+        ov::genai::TokenizedInputs enc = state->tok.encode(std::string(text, len));
+        const ov::Tensor& ids = enc.input_ids;
+        *out_count = ids.get_size();
+        if (out_ids && cap > 0) {
+            const size_t to_copy = (*out_count < cap) ? *out_count : cap;
+            const auto   et      = ids.get_element_type();
+            if (et == ov::element::i64) {
+                std::memcpy(out_ids, ids.data<int64_t>(), to_copy * sizeof(int64_t));
+            } else if (et == ov::element::i32) {
+                const int32_t* src = ids.data<int32_t>();
+                for (size_t i = 0; i < to_copy; ++i) out_ids[i] = static_cast<int64_t>(src[i]);
+            } else {
+                set_error("unexpected input_ids element type (not i32/i64)");
+                return -1;
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_tok_encode");
+        return -1;
+    }
+}
+
+/// Same contract as ov_vlm_decode, including the vocabulary range check. Thread-safe.
+int ov_tok_decode(void* handle, const int64_t* ids, size_t count,
+                  OvTextCallback callback, void* user_data) {
+    s_last_error[0] = '\0';
+    if (!handle)       { set_error("ov_tok_decode: null handle"); return -1; }
+    if (!ids && count) { set_error("ov_tok_decode: null ids with non-zero count"); return -1; }
+    auto* state = static_cast<OvTokState*>(handle);
+    try {
+        std::lock_guard<std::mutex> lock(state->mu);
+        const size_t vocab_size = state->vocab_size;
+        if (vocab_size > 0) {
+            for (size_t i = 0; i < count; ++i) {
+                if (ids[i] < 0 || static_cast<uint64_t>(ids[i]) >= vocab_size) {
+                    set_error(("invalid token id: tokens[" + std::to_string(i) + "] = " +
+                               std::to_string(ids[i]) + " is outside the vocabulary (size " +
+                               std::to_string(vocab_size) + ")").c_str());
+                    return -1;
+                }
+            }
+        }
+        std::vector<int64_t> v(ids, ids + count);
+        std::string text = state->tok.decode(v);
+        if (callback) callback(user_data, text.data(), text.size());
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("unknown exception in ov_tok_decode");
+        return -1;
+    }
+}
+
+} // extern "C" (standalone tokenizer)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TextEmbeddingPipeline C-API (R4/G3 — the first real "media" registry flow)

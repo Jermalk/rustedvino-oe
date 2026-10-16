@@ -7,7 +7,7 @@
 // ============================================================
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{mpsc::Sender, oneshot};
@@ -36,6 +36,12 @@ pub(crate) enum RerankCommand {
         documents: Vec<String>,
         reply: oneshot::Sender<anyhow::Result<RerankOutput>>,
         started_at: Instant,
+        /// In-flight count for this request, held by the engine thread until it is done with
+        /// the request (including a probe/reload after a failure) — NOT by the caller's future:
+        /// a disconnected client drops that future while the engine thread may still be
+        /// scoring, and `active()` reaching 0 then would let eviction treat a busy model as
+        /// idle. Dropped with the command on every path (send failure, engine finished).
+        guard: InFlightGuard,
     },
     /// Count the tokens `query` and `document` need combined, via the
     /// pipeline's tokenizer. Not admission-gated (mirrors
@@ -65,6 +71,11 @@ pub struct RerankingHandle {
     /// `config.json` reader, not embedding-specific despite its module).
     /// `None` when `config.json` didn't declare it — fail-open, no gate.
     max_seq_len: Option<usize>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after this request
+    /// has been counted in `active()`. Shared by every clone of this handle; a reload builds a
+    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b; nothing
+    /// sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl RerankingHandle {
@@ -90,6 +101,7 @@ impl RerankingHandle {
             tx,
             model_id: Arc::from(model_id),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
         }
     }
@@ -107,6 +119,7 @@ impl RerankingHandle {
             tx,
             model_id: Arc::from(model_id),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             max_seq_len: Some(max_seq_len),
         }
     }
@@ -122,7 +135,15 @@ impl RerankingHandle {
     ) -> anyhow::Result<RerankOutput> {
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _guard = InFlightGuard::new(&self.in_flight);
+        // Increment now; the guard travels in the command so the ENGINE THREAD, not this
+        // future, decrements when it is done (see `RerankCommand::Rerank::guard`).
+        let guard = InFlightGuard::new(&self.in_flight);
+        // Counted first, checked second: `begin_evict` sets `closing` before reading `active()`,
+        // so either it saw this request (and drains it) or this check sees the flag. The guard
+        // drops on the early return, so a refused request leaves `active()` untouched.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(crate::model_manager::engine::closing_error());
+        }
 
         self.tx
             .send(RerankCommand::Rerank {
@@ -130,6 +151,7 @@ impl RerankingHandle {
                 documents,
                 reply: reply_tx,
                 started_at,
+                guard,
             })
             .await
             .map_err(|_| anyhow::anyhow!("reranking engine is not available"))?;
@@ -172,6 +194,10 @@ impl RerankingHandle {
 impl ManagedEngine for RerankingHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::Reranking
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     fn active(&self) -> usize {
@@ -222,6 +248,7 @@ pub fn spawn_rerank_engine(
                         documents,
                         reply,
                         started_at,
+                        guard: _guard,
                     } => {
                         metrics.request_accepted(Modality::Text);
                         let result = engine
@@ -285,6 +312,7 @@ pub fn spawn_rerank_engine(
             tx,
             model_id: model_id_arc,
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             max_seq_len,
         },
         thread,
@@ -335,6 +363,7 @@ pub(crate) fn spawn_mock_rerank(model_id: &str) -> (RerankingHandle, std::thread
             tx,
             model_id: Arc::from(model_id),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
         },
         thread,
@@ -349,6 +378,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The engine thread drops the in-flight guard right after it sends the reply, so a caller that
+    /// has just received the reply may observe `active()` a moment before it reaches 0.
+    async fn settle_to_idle(h: &RerankingHandle) {
+        for _ in 0..200 {
+            if h.active() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.active(), 0, "counter settled back to zero");
+    }
 
     #[test]
     fn waiting_is_in_flight_minus_running() {
@@ -371,7 +412,7 @@ mod tests {
             .await
             .expect("mock rerank");
         assert_eq!(out.results.len(), 3);
-        assert_eq!(handle.active(), 0);
+        settle_to_idle(&handle).await;
     }
 
     #[tokio::test]
@@ -395,5 +436,77 @@ mod tests {
 
         let with_ceiling = RerankingHandle::from_sender_with_max_seq_len(tx, "test-rerank", 512);
         assert_eq!(with_ceiling.max_seq_len(), Some(512));
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// A request that reached the engine keeps `active()` at 1 (the in-flight guard travels in the
+    /// command) even after the caller is abandoned, and releases when the engine drops the command.
+    #[tokio::test]
+    async fn active_holds_for_a_rerank_request_until_the_engine_is_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RerankCommand>(8);
+        let h = RerankingHandle::from_sender(tx, "t-rerank");
+        assert_eq!(h.active(), 0, "idle");
+
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.rerank("q".to_owned(), vec!["d".to_owned()]).await.ok();
+            }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "request delivered to the engine");
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            h.active(),
+            1,
+            "abandoned caller: the engine still holds the guard (D3-S1.A2)"
+        );
+
+        drop(cmd);
+        assert_eq!(h.active(), 0, "engine finished (command dropped)");
+    }
+
+    /// D3-S1.D3b: with the closing flag set, a request is refused with the shutdown-marker error
+    /// (which the inference mapping answers as a retryable 503) and leaves `active()` untouched;
+    /// cleared again, it is accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_request_without_leaking_the_count() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RerankCommand>(8);
+        let h = RerankingHandle::from_sender(tx, "t-rerank");
+
+        ManagedEngine::set_closing(&h, true);
+        let err = h
+            .rerank("q".to_owned(), vec!["d".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::handlers::error::ENGINE_SHUTDOWN_MARKER),
+            "{err}"
+        );
+        assert_eq!(h.active(), 0, "the refused request is not counted");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move { h.rerank("q".to_owned(), vec!["d".to_owned()]).await.ok() }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "accepted: the command reached the engine");
+        drop(cmd);
+        let _ = caller.await;
     }
 }

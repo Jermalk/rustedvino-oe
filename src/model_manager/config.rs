@@ -182,6 +182,14 @@ pub struct Config {
     #[serde(default)]
     pub system_ram_budget_gb: Option<f64>,
 
+    /// How a model with no `device` / `tier_preference` of its own is placed: `"auto"` (the
+    /// capability-aware engine - iGPU / NPU offload for light models, dGPU-first for heavy ones) or
+    /// `"device"` (the global `device`, nothing else). The release bundle ships `"device"` with
+    /// `device: "CPU"`, so a newcomer's models load on the CPU unless they ask otherwise; every fleet
+    /// config states `"auto"`. An explicit per-model `device` or `tier_preference` always wins.
+    #[serde(default)]
+    pub default_placement: DefaultPlacement,
+
     /// Phase C2: the size threshold (GB) below which an LLM/VLM is treated as
     /// *light* work by the auto placement engine and gets the offload-first tier
     /// order (`weak-igpu` before `heavy`), parking a thin model off the dGPU. At
@@ -851,6 +859,25 @@ pub enum ReasoningParser {
     Phi,
 }
 
+/// How a model that has no `device` and no `tier_preference` of its own is placed.
+///
+/// `Auto` (the default, and what every fleet config states explicitly) runs the capability-aware
+/// placement engine: light models are parked on an iGPU or NPU, heavy ones go dGPU-first. `Device`
+/// loads such a model on the global [`Config::device`] and nothing else - the bundle default
+/// (`device: CPU`), because most machines have no iGPU worth using: on a weak iGPU every light
+/// model measured 20-45 % slower than the CPU, `SpeechT5` was unusable (RTF 16-100), and a vision
+/// model's GPU kernel build hung. An explicit per-model `device` or `tier_preference` still wins
+/// over either value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultPlacement {
+    /// Capability-aware placement by model kind and size (iGPU / NPU offload, dGPU first for heavy).
+    #[default]
+    Auto,
+    /// The global `device`, for every model without its own `device` / `tier_preference`.
+    Device,
+}
+
 /// Default for [`ModelPolicy::evictable`]: a model with no policy is evictable,
 /// i.e. the pre-feature behaviour. (A bare `#[derive(Default)]` would give
 /// `false` — wrong — so [`ModelPolicy`] hand-implements `Default`.)
@@ -1046,6 +1073,19 @@ pub struct ModelPolicy {
     /// under the global setting).
     #[serde(default)]
     pub eviction_grace_secs: Option<f64>,
+
+    /// Per-model override of [`Config::enable_prefix_caching`] (KV-block reuse
+    /// across requests sharing a prompt prefix). `None` (the default) lets the
+    /// server decide: the global flag, except that a hybrid linear-attention
+    /// model (`layer_types` containing `linear_attention` in its
+    /// `config.json`) loaded on a GPU gets it forced **off**, because
+    /// `OpenVINO` `GenAI` 2026.2.x returns wrong continuations on a prefix-cache
+    /// hit for those models on GPU (fixed upstream in 2026.4.1; CPU is
+    /// unaffected). `Some(true)` forces it on even for such a model (use once
+    /// the runtime is fixed); `Some(false)` forces it off for any model.
+    /// Applies from the model's next load.
+    #[serde(default)]
+    pub enable_prefix_caching: Option<bool>,
 }
 
 impl Default for ModelPolicy {
@@ -1069,6 +1109,7 @@ impl Default for ModelPolicy {
             model_revision: None,
             capabilities: Vec::new(),
             eviction_grace_secs: None,
+            enable_prefix_caching: None,
         }
     }
 }
@@ -1223,6 +1264,8 @@ pub struct ModelEntryPatch {
     pub kv_cache_gb: Option<Option<f64>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub max_concurrent_streams: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub enable_prefix_caching: Option<Option<bool>>,
     #[serde(default)]
     pub load: Option<LoadPolicy>,
     #[serde(default)]
@@ -1267,6 +1310,7 @@ impl ModelEntryPatch {
             && self.priority.is_none()
             && self.kv_cache_gb.is_none()
             && self.max_concurrent_streams.is_none()
+            && self.enable_prefix_caching.is_none()
             && self.load.is_none()
             && self.evictable.is_none()
             && self.device.is_none()
@@ -1348,6 +1392,7 @@ impl ModelEntryPatch {
         hot!(priority, "priority");
         next_load!(kv_cache_gb, "kv_cache_gb");
         next_load!(max_concurrent_streams, "max_concurrent_streams");
+        next_load!(enable_prefix_caching, "enable_prefix_caching");
         hot!(load, "load");
         hot!(evictable, "evictable");
         hot_opt!(device, "device");
@@ -2022,7 +2067,7 @@ define_globals_not_applied! {
     diffed: [
         models_dir, device, preload, total_vram_gb, max_num_seqs, cache_size_gb,
         default_kv_cache_gb, vram_safety_margin_gb, npu_footprint_factor, min_kv_cache_gb,
-        system_ram_reservation_gb, system_ram_budget_gb, light_model_max_gb,
+        system_ram_reservation_gb, system_ram_budget_gb, default_placement, light_model_max_gb,
         light_stt_max_gb, dgpu_size_ceiling_fraction, domain_budgets,
         eviction_grace_secs, realtime_defaults, realtime_viable_minimum,
         device_budgets, kv_cache_precision, enable_prefix_caching,
@@ -2062,6 +2107,49 @@ mod tests {
 
     /// Windows pass 2 D13: persisting a patched model keeps the operator's
     /// stanza as written — it gains the patched field, not every default.
+    #[test]
+    fn enable_prefix_caching_policy_defaults_to_none_and_round_trips() {
+        let unset: ModelEntry = serde_json::from_str(r#"{"vram_gb":2.5}"#).unwrap();
+        assert_eq!(
+            unset.policy.enable_prefix_caching, None,
+            "default: server decides"
+        );
+        let on: ModelEntry =
+            serde_json::from_str(r#"{"vram_gb":2.5,"enable_prefix_caching":true}"#).unwrap();
+        assert_eq!(on.policy.enable_prefix_caching, Some(true));
+        let off: ModelEntry =
+            serde_json::from_str(r#"{"vram_gb":2.5,"enable_prefix_caching":false}"#).unwrap();
+        assert_eq!(off.policy.enable_prefix_caching, Some(false));
+    }
+
+    /// PATCH sets, changes and clears the override; every change is next-load
+    /// (the engine is built once, so a live flip cannot apply), and the
+    /// no-op cases report `unchanged`.
+    #[test]
+    fn enable_prefix_caching_patch_is_next_load_and_null_clears() {
+        let base: ModelEntry = serde_json::from_str(r#"{"vram_gb":2.5}"#).unwrap();
+        let set: ModelEntryPatch =
+            serde_json::from_str(r#"{"enable_prefix_caching":true}"#).unwrap();
+        let (after_set, out) = set.apply_to(&base);
+        assert_eq!(after_set.policy.enable_prefix_caching, Some(true));
+        assert_eq!(out.effective_on_next_load, ["enable_prefix_caching"]);
+        assert!(out.applied_live.is_empty());
+
+        let (_, again) = set.apply_to(&after_set);
+        assert_eq!(again.unchanged, ["enable_prefix_caching"]);
+
+        let clear: ModelEntryPatch =
+            serde_json::from_str(r#"{"enable_prefix_caching":null}"#).unwrap();
+        let (after_clear, out) = clear.apply_to(&after_set);
+        assert_eq!(after_clear.policy.enable_prefix_caching, None);
+        assert_eq!(out.effective_on_next_load, ["enable_prefix_caching"]);
+
+        // An absent field is not a patch at all.
+        let empty: ModelEntryPatch = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+        assert!(!set.is_empty());
+    }
+
     #[test]
     fn minimal_stanza_adds_only_the_patched_field() {
         let old: serde_json::Value =

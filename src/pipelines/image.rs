@@ -18,7 +18,7 @@
 // ============================================================
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{mpsc::Sender, oneshot};
@@ -48,6 +48,12 @@ pub(crate) enum ImageCommand {
         reply: oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>,
         /// Wall-clock start (handler entry) for the duration metric.
         started_at: Instant,
+        /// In-flight count for this request, held by the engine thread until it is done with
+        /// the request — NOT by the caller's future: a disconnected client drops that future
+        /// while the engine thread may still be generating, and `active()` reaching 0 then
+        /// would let eviction treat a busy model as idle. Dropped with the command on every
+        /// path (send failure, queued-then-skipped, engine finished).
+        guard: InFlightGuard,
     },
     /// Edit an existing image: inpaint (`mask` present) or img2img (`mask` absent).
     Edit {
@@ -63,6 +69,12 @@ pub(crate) enum ImageCommand {
         reply: oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>,
         /// Wall-clock start (handler entry) for the duration metric.
         started_at: Instant,
+        /// In-flight count for this request, held by the engine thread until it is done with
+        /// the request — NOT by the caller's future: a disconnected client drops that future
+        /// while the engine thread may still be generating, and `active()` reaching 0 then
+        /// would let eviction treat a busy model as idle. Dropped with the command on every
+        /// path (send failure, queued-then-skipped, engine finished).
+        guard: InFlightGuard,
     },
 }
 
@@ -85,6 +97,11 @@ pub struct ImageHandle {
     /// is the honest [`ManagedEngine::active`] value even when the awaiting task
     /// is cancelled (HTTP client disconnects mid-generation).
     in_flight: Arc<AtomicUsize>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after this request
+    /// has been counted in `active()`. Shared by every clone of this handle; a reload builds a
+    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b; nothing
+    /// sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl ImageHandle {
@@ -154,6 +171,7 @@ impl ImageHandle {
             model_id: Arc::from(model_id),
             metadata: Arc::new(ImageModelMetadata::default()),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -170,9 +188,15 @@ impl ImageHandle {
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        // Increment now, decrement on Drop — covers every exit including task
-        // cancellation across the awaits below.
-        let _guard = InFlightGuard::new(&self.in_flight);
+        // Increment now; the guard travels in the command so the ENGINE THREAD, not this
+        // future, decrements when it is done (see `ImageCommand::Generate::guard`).
+        let guard = InFlightGuard::new(&self.in_flight);
+        // Counted first, checked second: `begin_evict` sets `closing` before reading `active()`,
+        // so either it saw this request (and drains it) or this check sees the flag. The guard
+        // drops on the early return, so a refused request leaves `active()` untouched.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(crate::model_manager::engine::closing_error());
+        }
 
         self.tx
             .send(ImageCommand::Generate {
@@ -180,6 +204,7 @@ impl ImageHandle {
                 opts,
                 reply: reply_tx,
                 started_at,
+                guard,
             })
             .await
             .map_err(|_| anyhow::anyhow!("image engine is not available"))?;
@@ -206,8 +231,14 @@ impl ImageHandle {
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        // Same cancellation-safe in-flight accounting as `generate`.
-        let _guard = InFlightGuard::new(&self.in_flight);
+        // Same in-flight accounting as `generate`: the guard travels in the command.
+        let guard = InFlightGuard::new(&self.in_flight);
+        // Counted first, checked second: `begin_evict` sets `closing` before reading `active()`,
+        // so either it saw this request (and drains it) or this check sees the flag. The guard
+        // drops on the early return, so a refused request leaves `active()` untouched.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(crate::model_manager::engine::closing_error());
+        }
 
         self.tx
             .send(ImageCommand::Edit {
@@ -217,6 +248,7 @@ impl ImageHandle {
                 opts,
                 reply: reply_tx,
                 started_at,
+                guard,
             })
             .await
             .map_err(|_| anyhow::anyhow!("image engine is not available"))?;
@@ -232,6 +264,10 @@ impl ImageHandle {
 impl ManagedEngine for ImageHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::ImageGen
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     fn active(&self) -> usize {
@@ -293,6 +329,7 @@ pub fn spawn_image_engine(
                         opts,
                         reply,
                         started_at,
+                        guard: _guard,
                     } => {
                         metrics.request_accepted(Modality::Text);
                         let result = run_generate(&engine, &model_id_owned, &prompt, &opts);
@@ -307,6 +344,7 @@ pub fn spawn_image_engine(
                         opts,
                         reply,
                         started_at,
+                        guard: _guard,
                     } => {
                         metrics.request_accepted(Modality::Text);
                         let result = run_edit(
@@ -335,6 +373,7 @@ pub fn spawn_image_engine(
             model_id: model_id_arc,
             metadata: Arc::new(metadata),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
         },
         thread,
     ))
@@ -644,6 +683,7 @@ pub(crate) fn spawn_mock_image(model_id: &str) -> (ImageHandle, std::thread::Joi
             model_id: Arc::from(model_id),
             metadata: Arc::new(ImageModelMetadata::default()),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
         },
         thread,
     )
@@ -668,6 +708,18 @@ mod tests {
             seed: None,
             guidance_scale: 0.0,
         }
+    }
+
+    /// The engine thread drops the in-flight guard right after it sends the reply, so a caller that
+    /// has just received the reply may observe `active()` a moment before it reaches 0.
+    async fn settle_to_idle(h: &ImageHandle) {
+        for _ in 0..200 {
+            if h.active() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.active(), 0, "counter settled back to zero");
     }
 
     /// The single-stream engine reports `waiting = in_flight − 1`, zero when idle.
@@ -697,7 +749,7 @@ mod tests {
         for png in &pngs {
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "each blob is a PNG");
         }
-        assert_eq!(handle.active(), 0, "counter settled back to zero");
+        settle_to_idle(&handle).await;
     }
 
     fn edit_opts(n: u32) -> ImageEditOptions {
@@ -728,7 +780,7 @@ mod tests {
         for png in &pngs {
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "each blob is a PNG");
         }
-        assert_eq!(handle.active(), 0, "counter settled back to zero");
+        settle_to_idle(&handle).await;
     }
 
     /// A dropped engine (closed channel) surfaces as an error, not a hang.
@@ -1117,6 +1169,7 @@ mod tests {
             model_id: Arc::from("test-model"),
             metadata: Arc::new(metadata),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
         };
 
         assert_eq!(handle.model_family(), Some("StableDiffusionXLPipeline"));
@@ -1125,5 +1178,96 @@ mod tests {
             Some("EulerDiscreteScheduler"),
             "must come from scheduler/scheduler_config.json, not model_index.json's stale pointer"
         );
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// A request that reached the engine keeps `active()` at 1 (the in-flight guard travels in the
+    /// command) even after the caller is abandoned, and releases when the engine drops the command.
+    #[tokio::test]
+    async fn active_holds_for_an_image_request_until_the_engine_is_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ImageCommand>(8);
+        let h = ImageHandle::from_sender(tx, "t-image");
+        assert_eq!(h.active(), 0, "idle");
+
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.generate(
+                    "p".to_owned(),
+                    ImageGenOptions {
+                        negative_prompt: None,
+                        width: 512,
+                        height: 512,
+                        num_inference_steps: 1,
+                        num_images: 1,
+                        seed: None,
+                        guidance_scale: 0.0,
+                    },
+                )
+                .await
+                .ok();
+            }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "request delivered to the engine");
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            h.active(),
+            1,
+            "abandoned caller: the engine still holds the guard (D3-S1.A1)"
+        );
+
+        drop(cmd);
+        assert_eq!(h.active(), 0, "engine finished (command dropped)");
+    }
+
+    /// D3-S1.D3b: with the closing flag set, a request is refused with the shutdown-marker error
+    /// (which the inference mapping answers as a retryable 503) and leaves `active()` untouched;
+    /// cleared again, it is accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_request_without_leaking_the_count() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ImageCommand>(8);
+        let h = ImageHandle::from_sender(tx, "t-image");
+        let gen_opts = || ImageGenOptions {
+            negative_prompt: None,
+            width: 512,
+            height: 512,
+            num_inference_steps: 1,
+            num_images: 1,
+            seed: None,
+            guidance_scale: 0.0,
+        };
+
+        ManagedEngine::set_closing(&h, true);
+        let err = h.generate("p".to_owned(), gen_opts()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::handlers::error::ENGINE_SHUTDOWN_MARKER),
+            "{err}"
+        );
+        assert_eq!(h.active(), 0, "the refused request is not counted");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move { h.generate("p".to_owned(), gen_opts()).await.ok() }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "accepted: the command reached the engine");
+        drop(cmd);
+        let _ = caller.await;
     }
 }

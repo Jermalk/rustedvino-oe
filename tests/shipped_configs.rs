@@ -95,3 +95,15 @@ fn template_covers_the_expected_settings() {
         );
     }
 }
+
+/// The keys template the bundles ship as `config.keys.example.json` must load through the
+/// server's own loader and carry no live credential - a placeholder token copied unedited
+/// would become a real, publicly known key.
+#[test]
+fn dist_keys_template_loads_and_holds_no_keys() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("dist.example-keys.json");
+    let auth = rustedvino::AuthConfig::load_from_file(&path).unwrap();
+    assert!(auth.api_keys.is_empty() && auth.admin_api_keys.is_empty());
+}

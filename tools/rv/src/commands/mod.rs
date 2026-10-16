@@ -10,6 +10,7 @@ pub mod logs;
 pub mod models;
 pub mod ops;
 pub mod prompt;
+pub mod service;
 pub mod status;
 
 /// `200`, or `no response` when the request never got one.
@@ -39,6 +40,35 @@ pub fn error_detail(r: &Reply) -> String {
         .unwrap_or(raw)
 }
 
+/// The machine-readable `error.code` of a JSON error reply (`model_busy`, ...), if it has one.
+pub fn error_code(r: &Reply) -> Option<String> {
+    let raw = r
+        .err
+        .clone()
+        .or_else(|| r.body.as_ref().map(|b| b.to_value().to_string()))?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("error")?
+        .get("code")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// After a refused eviction (`model_busy`): say why and how to override it. The server refuses to
+/// evict a model that has a request running, so the request finishes undisturbed; `--force`
+/// drains it (bounded) and then aborts what is left.
+pub fn print_busy_hint(ctx: &Ctx, r: &Reply, verb: &str) {
+    if error_code(r).as_deref() == Some("model_busy") {
+        eprintln!(
+            "{}",
+            ctx.style.dim(&format!(
+                "(a request is running on it, so it was left alone — retry when it finishes, or \
+                 `rv {verb} --force` to drain it and abort what is left)"
+            ))
+        );
+    }
+}
+
 /// Prints `error (CODE): detail` to stderr, in red.
 pub fn print_error(ctx: &Ctx, r: &Reply) {
     eprintln!(
@@ -61,6 +91,16 @@ mod tests {
             body: None,
             err: Some(err.to_owned()),
         }
+    }
+
+    #[test]
+    fn error_code_reads_the_json_envelope_only() {
+        assert_eq!(
+            error_code(&reply(r#"{"error":{"message":"m","code":"model_busy"}}"#)).as_deref(),
+            Some("model_busy")
+        );
+        assert_eq!(error_code(&reply(r#"{"error":"plain"}"#)), None);
+        assert_eq!(error_code(&reply("not json")), None);
     }
 
     #[test]

@@ -228,6 +228,16 @@ impl DeviceInventory {
         self.devices.iter().find(|d| d.name == name)
     }
 
+    /// `true` when every device the spec names is enumerated: a plain name (`GPU.1`), or a
+    /// `HETERO:a,b` list of them.
+    #[must_use]
+    pub fn spec_known(&self, spec: &str) -> bool {
+        spec.strip_prefix("HETERO:").map_or_else(
+            || self.get(spec).is_some(),
+            |parts| parts.split(',').all(|c| self.get(c.trim()).is_some()),
+        )
+    }
+
     /// Phase D — capability-based startup gate. `true` when `OpenVINO`
     /// enumerated at least one inference device.
     ///
@@ -389,8 +399,21 @@ fn static_tier(full_name: &str, kind: DeviceKind) -> Option<DeviceTier> {
     match kind {
         DeviceKind::Cpu => Some(DeviceTier::Fallback),
         DeviceKind::Npu => Some(DeviceTier::Npu),
-        // Every discrete GPU in the fleet (Arc B50/B60/B70) is the workhorse.
-        DeviceKind::DiscreteGpu => Some(DeviceTier::Heavy),
+        // Every Intel discrete GPU in the fleet (Arc B50/B60/B70) is the workhorse. OpenVINO's GPU
+        // plugin builds kernels for Intel hardware only: an NVIDIA / AMD card that OpenCL still
+        // enumerates (an Acer's T1200 did) cannot run a model, so it takes the last-resort tier
+        // that no default order reaches before the CPU.
+        DeviceKind::DiscreteGpu => {
+            let n = full_name.to_lowercase();
+            if ["nvidia", "geforce", "quadro", "tesla", "radeon", "amd"]
+                .iter()
+                .any(|v| n.contains(v))
+            {
+                Some(DeviceTier::WeakIgpu)
+            } else {
+                Some(DeviceTier::Heavy)
+            }
+        }
         DeviceKind::IntegratedGpu => {
             let n = full_name.to_lowercase();
             // Low-EU Gen12 integrated parts — the weak offload target.
@@ -527,6 +550,26 @@ mod tests {
         assert!(uma.get("GPU.1").is_none());
     }
 
+    /// D-08: a device spec is known when every device it names is enumerated; `HETERO:a,b` names a
+    /// list. Used by the boot warning and by placement, so the two cannot disagree.
+    #[test]
+    fn spec_known_handles_plain_and_hetero_specs() {
+        let inv = DeviceInventory::from_devices(vec![
+            min_dev("CPU", DeviceKind::Cpu),
+            min_dev("GPU.0", DeviceKind::IntegratedGpu),
+            min_dev("GPU.1", DeviceKind::IntegratedGpu),
+        ]);
+        assert!(inv.spec_known("CPU"));
+        assert!(inv.spec_known("GPU.1"));
+        assert!(!inv.spec_known("GPU.7"));
+        assert!(
+            !inv.spec_known("GPU"),
+            "the bare 'GPU' alias is not an enumerated name"
+        );
+        assert!(inv.spec_known("HETERO:GPU.0, GPU.1"));
+        assert!(!inv.spec_known("HETERO:GPU.0,GPU.7"));
+    }
+
     #[test]
     fn classify_kind_by_name_and_type() {
         assert_eq!(classify_kind("CPU", None), DeviceKind::Cpu);
@@ -550,6 +593,11 @@ mod tests {
             Some(DeviceTier::Fallback)
         );
         assert_eq!(static_tier("any", DeviceKind::Npu), Some(DeviceTier::Npu));
+        assert_eq!(
+            static_tier("NVIDIA T1200 Laptop GPU (dGPU)", DeviceKind::DiscreteGpu),
+            Some(DeviceTier::WeakIgpu),
+            "OpenVINO cannot build kernels for a non-Intel card: it must never rank as the workhorse"
+        );
         assert_eq!(
             static_tier("Intel(R) Arc(TM) Pro B50 Graphics", DeviceKind::DiscreteGpu),
             Some(DeviceTier::Heavy)

@@ -24,7 +24,7 @@ fn text<'a>(v: &'a Value, k: &str) -> &'a str {
 /// failed reload the model may be left unloaded (the server deliberately does
 /// not roll back).
 #[must_use]
-pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool) -> i32 {
+pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool, force: bool) -> i32 {
     if !ctx.require_admin_key() {
         return 1;
     }
@@ -58,7 +58,11 @@ pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool) -> i32 {
     );
     let r = ctx.api.post(
         &format!("/v1/admin/models/{}/resize", encode_segment(model)),
-        Some(&json!({ "kv_cache_gb": kv_cache_gb })),
+        Some(&if force {
+            json!({ "kv_cache_gb": kv_cache_gb, "force": true })
+        } else {
+            json!({ "kv_cache_gb": kv_cache_gb })
+        }),
         MUTATE_TIMEOUT,
     );
     if r.code == Some(200) {
@@ -67,7 +71,13 @@ pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool) -> i32 {
         return 0;
     }
     print_error(ctx, &r);
-    if r.code == Some(409) {
+    if crate::commands::error_code(&r).as_deref() == Some("model_busy") {
+        crate::commands::print_busy_hint(
+            ctx,
+            &r,
+            &format!("resize {model} --kv-cache-gb {kv_cache_gb}"),
+        );
+    } else if r.code == Some(409) {
         eprintln!(
             "{}",
             st.dim(&format!(

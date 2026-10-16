@@ -11,7 +11,7 @@
 // ============================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,20 @@ pub(crate) enum VlmCommand {
         text: String,
         /// Where the engine thread sends the count (or a stringified error).
         reply: oneshot::Sender<Result<usize, String>>,
+    },
+    /// Encode `text` to token ids on the engine thread (`/tokenize`, D-09).
+    Tokenize {
+        /// Text to encode.
+        text: String,
+        /// Where the engine thread sends the ids (or a stringified error).
+        reply: oneshot::Sender<Result<Vec<i64>, String>>,
+    },
+    /// Decode token ids back to text on the engine thread (`/detokenize`, D-09).
+    Detokenize {
+        /// Ids to decode.
+        tokens: Vec<i64>,
+        /// Where the engine thread sends the text (or a stringified error).
+        reply: oneshot::Sender<Result<String, String>>,
     },
 }
 
@@ -189,7 +203,24 @@ pub struct VlmHandle {
     waiting: Arc<AtomicUsize>,
     /// Watchdog clock — see [`GenerationClock`].
     clock: GenerationClock,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked by ``generate`` *after*
+    /// it holds an admission permit. Shared by every clone of this handle, so a submit that
+    /// slips in after the eviction started is refused (retryable) instead of being drained and
+    /// aborted; a reload builds a new engine with a clear flag. See
+    /// `cb_engine::EngineHandle::closing`. D3-S1.D2; nothing sets it yet.
+    closing: Arc<AtomicBool>,
+    /// Standalone tokenizer (D-13): `/tokenize` and `/detokenize` call it directly from a blocking
+    /// thread instead of queueing behind the single-stream engine thread. `None` (mock engines, or
+    /// a tokenizer that failed to load) falls back to the engine-thread commands.
+    tokenizer: Option<Arc<crate::ov_tokenizer::OvTokenizer>>,
+    /// Bounds how many standalone-tokenizer calls occupy blocking-pool threads at once. The C++
+    /// tokenizer serialises on one mutex anyway, so without this a flood of `/tokenize` requests
+    /// would park hundreds of OS threads (shared with every other `OpenVINO` call) behind that lock.
+    tok_gate: Arc<Semaphore>,
 }
+
+/// Standalone-tokenizer calls allowed in flight at once per vision model (the rest wait async).
+const VLM_TOKENIZER_CONCURRENCY: usize = 4;
 
 impl VlmHandle {
     /// The model ID of the loaded VLM.
@@ -219,6 +250,9 @@ impl VlmHandle {
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             clock: GenerationClock::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            tokenizer: None,
+            tok_gate: Arc::new(Semaphore::new(VLM_TOKENIZER_CONCURRENCY)),
         }
     }
 
@@ -240,6 +274,9 @@ impl VlmHandle {
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
             clock: GenerationClock::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            tokenizer: None,
+            tok_gate: Arc::new(Semaphore::new(VLM_TOKENIZER_CONCURRENCY)),
         }
     }
 
@@ -278,6 +315,14 @@ impl VlmHandle {
             Ok(Err(_)) => return SubmitResult::EngineDead, // semaphore closed (shouldn't happen)
             Err(_) => return SubmitResult::AtCapacity,     // timed out waiting for a permit
         };
+
+        // The eviction may have started while this caller waited for (or just took) its permit.
+        // Checked AFTER holding it: `begin_evict` sets `closing` before reading `active()`, so
+        // either it counted this permit (and drains it) or this check sees the flag.
+        if self.closing.load(Ordering::SeqCst) {
+            drop(permit);
+            return SubmitResult::Closing;
+        }
 
         // Started here, on the caller's task, before dispatch — never on the
         // engine thread, which is exactly what a wedged FFI call would leave
@@ -331,6 +376,54 @@ impl VlmHandle {
             .map_err(|_| anyhow::anyhow!("engine dropped count_tokens reply"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
+
+    /// Encode `text` to token ids with the VLM's tokenizer (`/tokenize`). Uses the standalone
+    /// tokenizer on a blocking thread when there is one (D-13), else the engine thread like
+    /// [`count_tokens`](Self::count_tokens). Takes no admission slot either way.
+    ///
+    /// # Errors
+    /// Returns an error if the engine thread is gone or the tokenizer fails.
+    pub(crate) async fn tokenize(&self, text: String) -> anyhow::Result<Vec<i64>> {
+        if let Some(tok) = &self.tokenizer {
+            let tok = Arc::clone(tok);
+            let _slot = self.tok_gate.acquire().await;
+            return tokio::task::spawn_blocking(move || tok.encode(&text))
+                .await
+                .map_err(|e| anyhow::anyhow!("tokenize task failed: {e}"))?;
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(VlmCommand::Tokenize { text, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("VLM engine unavailable"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine dropped tokenize reply"))?
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Decode token ids to text with the VLM's tokenizer (`/detokenize`).
+    ///
+    /// # Errors
+    /// Returns an error if the engine thread is gone or the detokenizer fails.
+    pub(crate) async fn detokenize(&self, tokens: Vec<i64>) -> anyhow::Result<String> {
+        if let Some(tok) = &self.tokenizer {
+            let tok = Arc::clone(tok);
+            let _slot = self.tok_gate.acquire().await;
+            return tokio::task::spawn_blocking(move || tok.decode(&tokens))
+                .await
+                .map_err(|e| anyhow::anyhow!("detokenize task failed: {e}"))?;
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(VlmCommand::Detokenize { tokens, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("VLM engine unavailable"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine dropped detokenize reply"))?
+            .map_err(|e| anyhow::anyhow!(e))
+    }
 }
 
 /// The VLM is a [`ModelKind::Vision`] engine. This is the `ManagedEngine`
@@ -339,6 +432,10 @@ impl VlmHandle {
 impl ManagedEngine for VlmHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::Vision
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     /// Accepted-but-unfinished requests (queued + the one generating) —
@@ -382,6 +479,7 @@ pub fn spawn_vlm_engine(
     device: &str,
     cap: Option<usize>,
     queue_timeout: Duration,
+    tokenizer: Option<Arc<crate::ov_tokenizer::OvTokenizer>>,
 ) -> anyhow::Result<(VlmHandle, std::thread::JoinHandle<()>)> {
     let cap = cap.unwrap_or(VLM_CHANNEL_CAP);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<VlmCommand>(VLM_COMMAND_CAPACITY);
@@ -444,6 +542,12 @@ pub fn spawn_vlm_engine(
                     VlmCommand::CountTokens { text, reply } => {
                         let _ = reply.send(engine.count_tokens(&text).map_err(|e| e.to_string()));
                     }
+                    VlmCommand::Tokenize { text, reply } => {
+                        let _ = reply.send(engine.encode(&text).map_err(|e| e.to_string()));
+                    }
+                    VlmCommand::Detokenize { tokens, reply } => {
+                        let _ = reply.send(engine.decode(&tokens).map_err(|e| e.to_string()));
+                    }
                 }
             }
             tracing::info!(
@@ -462,6 +566,9 @@ pub fn spawn_vlm_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             clock: GenerationClock::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            tokenizer,
+            tok_gate: Arc::new(Semaphore::new(VLM_TOKENIZER_CONCURRENCY)),
         },
         thread,
     ))
@@ -511,6 +618,29 @@ pub(crate) fn spawn_mock_vlm(model_id: &str) -> (VlmHandle, std::thread::JoinHan
                 VlmCommand::CountTokens { text, reply } => {
                     let _ = reply.send(Ok(text.split_whitespace().count()));
                 }
+                // Mock tokenizer for /tokenize tests: one id per character (its code point), so
+                // encode/decode round-trip exactly.
+                VlmCommand::Tokenize { text, reply } => {
+                    let _ = reply.send(Ok(text.chars().map(|c| i64::from(u32::from(c))).collect()));
+                }
+                VlmCommand::Detokenize { tokens, reply } => {
+                    let decoded = tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &t)| {
+                            u32::try_from(t)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "{} tokens[{i}] = {t} is outside the vocabulary",
+                                        crate::handlers::tokenize::INVALID_TOKEN_ID_MARKER
+                                    )
+                                })
+                        })
+                        .collect::<Result<String, String>>();
+                    let _ = reply.send(decoded);
+                }
             }
         }
     });
@@ -524,6 +654,9 @@ pub(crate) fn spawn_mock_vlm(model_id: &str) -> (VlmHandle, std::thread::JoinHan
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             clock: GenerationClock::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            tokenizer: None,
+            tok_gate: Arc::new(Semaphore::new(VLM_TOKENIZER_CONCURRENCY)),
         },
         thread,
     )
@@ -1030,5 +1163,74 @@ mod tests {
             )
             .await;
         assert_eq!(result, SubmitResult::EngineDead);
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// `active()` is `cap - available_permits`: a held admission permit counts, a released one does not.
+    #[test]
+    fn active_counts_held_permits_for_vlm() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let h = VlmHandle::from_sender(tx, "t-vlm");
+        assert_eq!(h.active(), 0, "idle");
+        let permit = Arc::clone(&h.sem).try_acquire_owned().unwrap();
+        assert_eq!(h.active(), 1, "one permit held");
+        drop(permit);
+        assert_eq!(h.active(), 0, "released");
+    }
+
+    /// D3-S1.D2: with the closing flag set, a submit that already holds its permit is refused
+    /// (retryable) and the permit is released; cleared again, submits are accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_submit_and_releases_its_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<VlmCommand>(4);
+        let h = VlmHandle::from_sender(tx, "t-vlm");
+        let submit = |h: &VlmHandle| {
+            let (tok_tx, _tok_rx) = crate::streaming::stream_channel();
+            let h = h.clone();
+            async move {
+                h.generate(
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    GenParams::default(),
+                    tok_tx,
+                    Instant::now(),
+                )
+                .await
+            }
+        };
+
+        ManagedEngine::set_closing(&h, true);
+        assert_eq!(submit(&h).await, SubmitResult::Closing);
+        assert_eq!(h.active(), 0, "the refused submit's permit is released");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        assert_eq!(submit(&h).await, SubmitResult::Submitted);
+        assert!(rx.try_recv().is_ok(), "the command reached the engine");
+    }
+
+    /// D-09: the VLM handle serves tokenize/detokenize through the engine thread. The mock
+    /// tokenizer is one id per character, so the round trip is exact and the ids are checkable.
+    #[tokio::test]
+    async fn tokenize_and_detokenize_round_trip_through_the_engine_thread() {
+        let (h, _thread) = spawn_mock_vlm("t-vlm");
+        let ids = h.tokenize("Hi z".to_owned()).await.unwrap();
+        assert_eq!(ids, vec![72, 105, 32, 122]);
+        assert_eq!(h.detokenize(ids).await.unwrap(), "Hi z");
+        assert_eq!(h.detokenize(vec![]).await.unwrap(), "");
+        // Tokenizing consumes no admission slot.
+        assert_eq!(h.active(), 0);
     }
 }

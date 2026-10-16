@@ -134,9 +134,48 @@ pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Exit code of a worker that stopped itself because the GPU context was
-/// poisoned (`EX_TEMPFAIL`). The supervisor recognises it in its log; any exit
-/// is respawned either way.
+/// poisoned (`EX_TEMPFAIL`). The supervisor recognises it in its log; it is respawned.
 pub const EXIT_GPU_POISONED: u8 = 75;
+
+/// Exit code of a worker that cannot start because of a deterministic
+/// configuration or filesystem error (`EX_CONFIG`) - an unreadable or invalid
+/// config file, a `preload` model that is not registered. Retrying the same
+/// inputs can never succeed, so the supervisor does NOT respawn on it.
+pub const EXIT_CONFIG_FATAL: u8 = 78;
+
+/// A startup error that no restart can fix. Wrap it in the `anyhow::Error` a
+/// startup step returns; `main` finds it with `downcast_ref` and exits with
+/// [`EXIT_CONFIG_FATAL`] instead of the generic failure code.
+#[derive(Debug)]
+pub struct ConfigFatal(pub String);
+
+impl std::fmt::Display for ConfigFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigFatal {}
+
+/// A shutdown signal arrived while the server was still starting (preloading
+/// models). `bootstrap` returns it; `main` treats it as a clean stop (exit 0),
+/// not an error.
+#[derive(Debug)]
+pub struct ShutdownDuringStartup;
+
+impl std::fmt::Display for ShutdownDuringStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shutdown requested during startup")
+    }
+}
+
+impl std::error::Error for ShutdownDuringStartup {}
+
+/// Tags `e` as [`ConfigFatal`], keeping its full cause chain in the message.
+#[must_use]
+pub fn config_fatal(e: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(ConfigFatal(format!("{e:#}")))
+}
 
 /// Set by the supervisor on the worker it spawns. A worker without it has no
 /// one to restart it, so it stays up (degraded, and says so) instead of exiting.
@@ -188,6 +227,13 @@ async fn wait_for_flag(notify: &tokio::sync::Notify, flag: &std::sync::atomic::A
 fn raise_flag(notify: &tokio::sync::Notify, flag: &std::sync::atomic::AtomicBool) {
     flag.store(true, std::sync::atomic::Ordering::Release);
     notify.notify_waiters();
+}
+
+/// Asks the server to shut down gracefully - the same drain path SIGTERM takes.
+/// Safe to call from any thread, including one outside the tokio runtime (the
+/// dedicated signal thread in `shutdown_signals`).
+pub fn request_shutdown() {
+    raise_flag(&SHUTDOWN_REQUEST, &SHUTDOWN_REQUESTED);
 }
 
 /// Records that the server is accepting requests ([`serve`] calls it once the
@@ -328,9 +374,9 @@ pub struct Startup {
 #[allow(clippy::too_many_lines)]
 pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     mark_process_start();
-    let config_path = resolve_config_path()?;
+    let config_path = resolve_config_path().map_err(|e| config_fatal(&e))?;
     tracing::info!(path = %config_path.display(), "loading config");
-    let config = Config::load(&config_path)?;
+    let config = Config::load(&config_path).map_err(|e| config_fatal(&e))?;
     if let Some(dir) = config.ov_cache_dir.as_deref().filter(|d| !d.is_empty())
         && let Err(e) = probe_cache_dir_writable(Path::new(dir))
     {
@@ -401,12 +447,33 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     // domain falls back to the device name and registration is the real gate.
     if inventory.get(&config.device).is_some() {
         tracing::info!(device = %config.device, "budget-anchor device enumerated");
+    } else if inventory.spec_known(&config.device) {
+        // A HETERO list whose members all exist: usable for placement, but the memory domain
+        // lookup is by plain device name and falls back to the literal spec.
+        tracing::info!(
+            device = %config.device,
+            "global device is a HETERO list of enumerated devices; its memory domain falls back to \
+             the literal name"
+        );
     } else {
+        let enumerated: Vec<&str> = inventory
+            .devices()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        // With default_placement "device" every model without its own `device` is placed here
+        // and will be refused, so say so; otherwise the device is only the budget anchor.
+        let consequence = if config.default_placement
+            == crate::model_manager::config::DefaultPlacement::Device
+        {
+            "every model without its own `device` will fail to load (default_placement = \"device\")"
+        } else {
+            "the inference memory domain falls back to the device name; each model is still placed on its own resolved device"
+        };
         tracing::warn!(
             device = %config.device,
-            "configured budget-anchor device is not enumerated — the inference \
-             memory domain falls back to the device name; each model is still \
-             placed on its own resolved device (registration validates placement)"
+            enumerated = ?enumerated,
+            "configured global `device` is not an enumerated OpenVINO device: {consequence}"
         );
     }
 
@@ -474,9 +541,22 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     // R1: VLMs are managed models. The manager's engine factory classifies each
     // preload entry (`detect_kind`) and builds a CB or VLM engine accordingly —
     // no caller special-casing. LLM + VLM preload uniformly here.
+    // D-02 (0.8.3): a preload can sit inside one GPU compile for minutes, and a
+    // blocking OpenVINO call cannot be cancelled. Race the construction against
+    // the shutdown signal so SIGTERM/ctrl-C is honoured at once; dropping the
+    // future abandons the compile, and process exit tears its thread down.
+    let constructed = tokio::select! {
+        r = ModelManager::new_production(config, Arc::clone(&inventory)) => r?,
+        () = shutdown_signal() => {
+            tracing::warn!(
+                "shutdown signal received while models were still loading - abandoning \
+                 startup (nothing was serving yet)"
+            );
+            return Err(anyhow::Error::new(ShutdownDuringStartup));
+        }
+    };
     let model_manager = Arc::new(
-        ModelManager::new_production(config, Arc::clone(&inventory))
-            .await?
+        constructed
             .with_config_path(config_path.clone())
             .with_voice_pin(Arc::clone(&voice_pin))
             .with_auth(Arc::clone(&auth))

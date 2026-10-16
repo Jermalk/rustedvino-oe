@@ -179,6 +179,9 @@ pub enum DecideError {
     Engine(String),
     /// The client disconnected; the remaining questions were not scored (nobody receives this).
     Cancelled,
+    /// The model is being evicted: the request was refused before reaching the engine
+    /// (HTTP 503, retryable). Not produced until `begin_evict` sets the flag (D3-S1.D4).
+    Closing,
 }
 
 impl std::fmt::Display for DecideError {
@@ -186,6 +189,7 @@ impl std::fmt::Display for DecideError {
         match self {
             Self::Length(m) | Self::Engine(m) => f.write_str(m),
             Self::Cancelled => f.write_str("request cancelled by the client"),
+            Self::Closing => f.write_str("model is being evicted — retry shortly"),
         }
     }
 }
@@ -252,6 +256,11 @@ pub struct DecisionHandle {
     /// Set by the engine thread when the reload after a failed prefill also failed: the
     /// engine can no longer serve, and the model must be evicted (and reloaded) to recover.
     dead: Arc<AtomicBool>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after this request
+    /// has been counted in `active()`. Shared by every clone of this handle; a reload builds a
+    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b; nothing
+    /// sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl DecisionHandle {
@@ -331,6 +340,13 @@ impl DecisionHandle {
         prompts: Vec<String>,
         widths: Vec<usize>,
     ) -> Result<DecideOutput, DecideError> {
+        // `turn` already counts this request in `active()` (its guard, and the gate permit
+        // when one was taken). Checked second: `begin_evict` sets `closing` before reading
+        // `active()`, so either it saw this request or this check sees the flag; dropping
+        // `turn` on the early return releases both.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(DecideError::Closing);
+        }
         let started_at = Instant::now();
         let (reply, reply_rx) = oneshot::channel();
         self.tx
@@ -352,6 +368,10 @@ impl DecisionHandle {
 impl ManagedEngine for DecisionHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::Decision
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     fn active(&self) -> usize {
@@ -481,6 +501,7 @@ pub fn spawn_decision_engine(
             in_flight: Arc::new(AtomicUsize::new(0)),
             meta,
             gate: Arc::new(Semaphore::new(1)),
+            closing: Arc::new(AtomicBool::new(false)),
             dead,
         },
         thread,
@@ -563,6 +584,7 @@ fn spawn_mock(
             in_flight: Arc::new(AtomicUsize::new(0)),
             meta,
             gate: Arc::new(Semaphore::new(1)),
+            closing: Arc::new(AtomicBool::new(false)),
             dead: Arc::new(AtomicBool::new(false)),
         },
         thread,
@@ -759,5 +781,32 @@ mod tests {
             DecisionMeta::load(dir.path()).is_err(),
             "unsupported format"
         );
+    }
+}
+#[cfg(test)]
+mod closing_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// D3-S1.D3b: with the closing flag set, a request that already holds its turn is refused
+    /// (`DecideError::Closing`) and the turn is released; cleared again, it is accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_request_and_releases_its_turn() {
+        let (h, thread) = spawn_mock_decision("mock-decide");
+
+        ManagedEngine::set_closing(&h, true);
+        let refused = h.decide(vec!["a".into(), "b".into()], vec![2, 2]).await;
+        assert_eq!(refused.unwrap_err(), DecideError::Closing);
+        assert_eq!(h.active(), 0, "the refused request's turn is released");
+
+        ManagedEngine::set_closing(&h, false);
+        let ok = h.decide(vec!["a".into(), "b".into()], vec![2, 2]).await;
+        assert!(ok.is_ok(), "accepted once the flag is cleared: {ok:?}");
+
+        drop(h);
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
     }
 }

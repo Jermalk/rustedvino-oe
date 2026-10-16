@@ -54,7 +54,7 @@ included.
 
 | Endpoint | Status |
 |---|---|
-| `GET /health`, `GET /v1/models` | ✅ |
+| `GET /health`, `GET /v1/models`, `GET /v1/models/{id}` | ✅ |
 | `GET /health_generate` — 1-token GPU deep-readiness probe | ✅ |
 | `GET /metrics` — Prometheus endpoint (same port); full metric reference in [`METRICS.md`](METRICS.md) | ✅ |
 | `POST /v1/chat/completions` (SSE streaming + non-streaming) | ✅ |
@@ -67,7 +67,7 @@ included.
 | `POST /v1/audio/speech` — TTS (Kokoro-82M, Coqui VITS, Piper VITS voices such as Vietnamese `vi_VN-vais1000`, `SpeechT5`) | ✅ |
 | `POST /v1/images/generations` — text-to-image (SDXL, FLUX.1-schnell) | ✅ |
 | `POST /v1/images/edits` — inpainting + img2img (SDXL) | ✅ |
-| `POST /tokenize` / `POST /detokenize` | ✅ |
+| `POST /tokenize` / `POST /detokenize` (text and vision models; shape in [`INTERFACE.md`](INTERFACE.md)) | ✅ |
 | `GET /v1/realtime` — WebSocket voice flow (STT → LLM → TTS pipeline, barge-in, session history/retrieval) | ✅ |
 
 **Inference engines**
@@ -125,7 +125,7 @@ included.
 | VRAM estimator: STT/embed/image charge weight-only (no KV pool reservation) | ✅ |
 | LRU auto-eviction when a new model doesn't fit | ✅ |
 | `domain_budgets` — per-memory-domain VRAM budget overrides, keyed by domain id (a GPU's device name, or `"system"`) | ✅ |
-| Size/EU-aware STT placement — heavy Whisper routes to CPU, light to NPU/iGPU | ✅ |
+| STT placement under `default_placement: "auto"` — CPU first, then a discrete GPU; NPU / iGPU only when you name them | ✅ |
 | Capability-based device placement (`placement.rs` tier preference, no hardcoded names) | ✅ |
 | Self-managing OpenVINO compile-cache — size-reported always, size-bounded and self-pruning when `ov_cache_max_gb` is set (see [Compile-cache management](#compile-cache-management)) | ✅ |
 
@@ -142,7 +142,7 @@ included.
 | OV compile-cache metrics — `rustedvino_ov_cache_bytes` (current on-disk size), `rustedvino_ov_cache_pruned_bytes_total`/`_pruned_files_total` (cumulative, from the `ov_cache_max_gb` sweep) | ✅ |
 | KV-cache pressure metrics — `rustedvino_kv_cache_usage_percent` + `rustedvino_kv_cache_usage_supported` (per model; `supported=0` means the value is structurally unqueryable for that engine kind, **not** an empty pool) and `rustedvino_kv_cache_pressure_flagged` (1/0, set by the optional monitor — see [`CONFIG.md`](CONFIG.md)) | ✅ |
 | `GET /v1/admin/models` — per-model `kv_cache_usage_pct` + `kv_pressure_flagged`, so the pressure signal is readable without Prometheus | ✅ |
-| Measured device memory (Linux) — `rustedvino_process_gpu_memory_bytes` (per driver/device/region, from the kernel) and a per-model estimate (`rustedvino_model_gpu_memory_estimate_bytes`, admin `gpu_memory_estimate_gb`), with a log warning when a model uses more than its configured `vram_gb`. See [`METRICS.md`](METRICS.md) | ✅ |
+| Measured device memory (Linux) — `rustedvino_process_gpu_memory_bytes` (per driver/device/region, from the kernel) and a per-model estimate (`rustedvino_model_gpu_memory_estimate_bytes`, admin `gpu_memory_estimate_gb`), with a log warning when a model uses clearly more than its configured `vram_gb` plus its KV pool (above 5 % and 0.75 GB). See [`METRICS.md`](METRICS.md) | ✅ |
 | `GET /v1/admin/health/watchdog` — oldest in-flight generation age; polled by `--supervise` to kill+restart a wedged worker `/health` can't see | ✅ |
 | `GET /v1/admin/logs/tail` — tail an in-memory log ring buffer over HTTP | ✅ |
 
@@ -256,22 +256,131 @@ scripts/rv-cargo.sh build --release
 ### 3. Get some models
 
 RustedVINO expects pre-converted OpenVINO IR model directories under `models_dir` — it does not
-convert models itself. Two ways to get one:
+convert models itself.
 
 Models go in whatever directory you set as `models_dir` in step 4 — the two
 **must** match, or every request 404s with no hint that the path is why. These
 examples use `/opt/rustedvino/models`, matching the config below; substitute
 your own path in both places if you prefer.
 
+#### Starter model set
+
+One small model per kind, all published under [huggingface.co/jermalk](https://huggingface.co/jermalk)
+and each tested with this server. The directory name is the model id you use in requests.
+
+| Kind | Model | On disk | RAM in use* | Speed on CPU* (range over five machines) |
+|---|---|---|---|---|
+| Text | `qwen3-1.7b-int4-ov` | 1.2 GB | 2.9 GB | 13–41 tokens/s |
+| Vision | `qwen3.5-4b-int4-ov` | 3.3 GB | 6.8 GB | 6–17 tokens/s; first token after an image ≈ 6–15 s |
+| Embedding | `multilingual-e5-large-int8-ov` | 0.6 GB | 1.0 GB | 18–59 texts/s (batches of 16) |
+| Reranking | `bge-reranker-v2-m3-int8-ov` | 0.6 GB | 1.0 GB | 17–47 passages/s (≈ 0.02–0.06 s each) |
+| Speech-to-text | `whisper-large-v3-turbo-int8-ov` | 0.8 GB | 2.1 GB | 0.17–0.9× real time |
+| Speech-to-text, optional | `whisper-large-v3-int8-ov` | 1.5 GB | 4.0 GB | 0.61× real time |
+| Text-to-speech, English | `speecht5-tts-ov` | 0.6 GB | 2.5 GB | 0.3–0.6× real time |
+| Text-to-speech, Vietnamese | `vi-vais1000-piper` (recipe below) | 61 MB | 0.3 GB | 0.08× real time |
+
+\* Measured with `tools/bench/rvbench.py` on five machines (Core Ultra 7 258V laptop, i7-11800H laptop, i3-14100, i5-13500, Ryzen 7 5800H; **models on the CPU**, three runs per number). The slowest box was the Ryzen (AVX2 only, probably one memory channel); the fastest per-core results came from the i3/i5 desktops. The release bundle's `config.json` loads every model on the CPU
+(`"device": "CPU"`, `"default_placement": "device"`) unless you pass `--device`, which is what these figures are; a GPU is something you opt in to. Speeds moved up to ±25 % between runs on that machine, so read them as orders of
+magnitude, not promises; more machines will be added. "RAM in use" is the server process's peak while it
+worked — much more than it shows right after loading, because weights are mapped lazily. Speech-to-text
+speeds were timed on synthesised speech, so they measure speed, not recognition quality. All figures can be
+reproduced with `tools/bench/rvbench.py`.
+
 ```bash
 export MODELS_DIR=/opt/rustedvino/models
 sudo mkdir -p "$MODELS_DIR" && sudo chown "$USER" "$MODELS_DIR"
+python3 -m venv ~/hf && ~/hf/bin/pip install -U huggingface_hub   # provides ~/hf/bin/hf (no sudo; plain pip is blocked on Ubuntu 24.04 / Mint 22)
+export PATH="$HOME/hf/bin:$PATH"
 
-# (a) pull a pre-converted IR from Intel's own HF org, if one exists there for your model
-#     (browse huggingface.co/OpenVINO — not every model is pre-converted)
-hf download OpenVINO/<model>-ov --local-dir "$MODELS_DIR/<model>-ov"
+# download only what you need — each is independent
+for m in qwen3-1.7b-int4-ov multilingual-e5-large-int8-ov bge-reranker-v2-m3-int8-ov whisper-large-v3-turbo-int8-ov; do
+  hf download "jermalk/$m" --local-dir "$MODELS_DIR/$m"
+done
+hf download jermalk/qwen3.5-4b-int4-ov --local-dir "$MODELS_DIR/qwen3.5-4b-int4-ov"          # vision, optional
+hf download jermalk/whisper-large-v3-int8-ov --local-dir "$MODELS_DIR/whisper-large-v3-int8-ov"  # optional, see below
+hf download jermalk/speecht5-tts-ov --local-dir "$MODELS_DIR/speecht5-tts-ov"                      # English voice
+```
 
-# (b) convert any HF model yourself with optimum-cli (needs `optimum[openvino]` installed)
+Things worth knowing before you try them (run the commands in the next block once the server is up,
+step 6):
+
+- **Qwen3 "thinks" by default.** Send `"enable_thinking": false` unless you want the reasoning; with a small
+  `max_tokens` the whole budget can go into the reasoning and the answer comes back empty.
+- **Small models are weak in Polish.** The 1.7B writes fluent English, but in Polish it makes factual and
+  translation errors (for example, the wrong river for a capital city). Use a larger model when Polish
+  facts matter.
+- **e5 wants prefixes:** `"query: "` on search questions and `"passage: "` on the texts being searched.
+  Without them retrieval quality drops silently.
+- **Reranking cost grows with the list** (≈ 0.02–0.06 s per passage on CPU, far less on a discrete GPU): rerank the candidates your retrieval step returns (a few dozen is fine), not thousands.
+  `bge-reranker-v2-m3` is multilingual; an English-only reranker such as `ms-marco-MiniLM` was measured at
+  less than half the accuracy on Polish and made a good e5 ranking worse, so it is not in the set.
+- **Whisper large-v3 vs turbo.** Turbo is smaller and about 1.5× faster on CPU and agreed with large-v3 on
+  98 % of the words of a real Polish lecture. Only large-v3 supports `/v1/audio/translations`, which turns
+  speech into **English** only (it will not translate English into another language). Don't run turbo on
+  the NPU yet: a request hung one machine's NPU until the server was restarted.
+- **Vision on a GPU.** Qwen3.5 / Qwen3.6 are hybrid linear-attention models. On a GPU the server turns prefix caching
+  off for them (OpenVINO GenAI 2026.2 returns wrong continuations on a prefix-cache hit). Since 0.8.4 they load that way
+  without any flag: `./rv add qwen3.6-27b-int4-ov --device GPU.n` (58 s on an Arc Pro B60). The price is a smaller usable
+  context: the KV pool of that 27B with the default 2 GB `cache_size_gb` holds about 13,900 tokens, and a longer prompt is refused up front with a
+  clean 400 `context_length_exceeded` (4k, 8k and 12k prompts answered). Do not pass `--enable-prefix-caching` for these
+  models unless you accept the upstream bug. Tested on one card (B60) and the 27B and 35B-A3B models; other GPUs and the 9B
+  are not verified. Without `--device` these models go to the CPU (the bundle default, and also `default_placement: "auto"`, which never puts a hybrid model on a GPU); name `--device GPU.n` to use a GPU.
+- **Memory:** a model's "RAM in use" is on top of the OS and your other programs, and the server keeps
+  4 GB free for the OS. When RAM runs short, loading a model **unloads the least recently used ones** to make
+  room (the server log says `LRU eviction`), and requests to an unloaded model then fail with `model is not
+  loaded` until you load it again (`./rv load <model>`; `rv add` is only for a model not yet registered). On a 16 GB machine keep to one or two of these at a time; the vision model
+  alone needs ≈ 6.8 GB and is refused outright when less than that is free.
+
+```bash
+# register + load (the server must be running). `rv add` asks for confirmation; add -y to skip it.
+# With the bundle's config.json every model loads on the CPU; add --device GPU.n (see ./rustedvino --device-info for the names) to use a GPU.
+# A bare --device GPU is rejected on a machine with more than one GPU. An integrated GPU is usually slower than the CPU - try it before relying on it.
+./rv add qwen3-1.7b-int4-ov
+./rv add qwen3.5-4b-int4-ov                   # vision; on a GPU add --device GPU.n (see the vision note above)
+./rv add multilingual-e5-large-int8-ov --kind embedding
+./rv add bge-reranker-v2-m3-int8-ov --kind reranking
+./rv add whisper-large-v3-turbo-int8-ov
+./rv add speecht5-tts-ov --kind tts
+# `rv` reads the first `admin_api_keys` entry of your keys file (step 5), or `RV_ADMIN_KEY`.
+# If the keys file holds no keys at all (for example `{}`), the server is OPEN: `rv` still works but warns
+# when it runs list, status, version and the other commands, because anyone who can reach the port can then load, unload and delete models. That is
+# acceptable for a single-user machine on 127.0.0.1 and NOT SECURE anywhere else - add keys (step 5).
+# If the keys file does hold keys, add -H "Authorization: Bearer <key>" to the curl calls below.
+
+# text
+curl -s http://localhost:11437/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-1.7b-int4-ov","enable_thinking":false,"messages":[{"role":"user","content":"Explain what a vector database is in two sentences."}]}'
+
+# vision — a local picture, base64-encoded
+curl -s http://localhost:11437/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model":"qwen3.5-4b-int4-ov","enable_thinking":false,"max_tokens":100,
+  "messages":[{"role":"user","content":[
+    {"type":"text","text":"Describe this image."},
+    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,'"$(base64 -w0 photo.jpg)"'"}}]}]}'
+
+# embeddings (note the prefix)
+curl -s http://localhost:11437/v1/embeddings -H "Content-Type: application/json" \
+  -d '{"model":"multilingual-e5-large-int8-ov","input":["passage: Warszawa jest stolicą Polski.","query: stolica Polski"]}'
+
+# reranking
+curl -s http://localhost:11437/v1/rerank -H "Content-Type: application/json" \
+  -d '{"model":"bge-reranker-v2-m3-int8-ov","query":"stolica Polski","documents":["Warszawa leży nad Wisłą.","Pierogi z kapustą."]}'
+
+# speech-to-text (a WAV file)
+curl -s http://localhost:11437/v1/audio/transcriptions -F model=whisper-large-v3-turbo-int8-ov -F file=@speech.wav
+
+# text-to-speech (English; plain 16 kHz voice) - writes hello.wav
+curl -s http://localhost:11437/v1/audio/speech -H "Content-Type: application/json" \
+  -d '{"model":"speecht5-tts-ov","input":"Hello from RustedVINO.","language":"en"}' -o hello.wav
+```
+
+The English voice is deliberately small and plain. Digits and symbols in `input` are spoken as words;
+send `"normalize": false` if your text is already speakable. A Polish voice is not in the starter set yet.
+
+Other models: browse [huggingface.co/OpenVINO](https://huggingface.co/OpenVINO) for ready-made IR (not
+every model has one), or convert your own with `optimum-cli` (needs `optimum[openvino]`):
+
+```bash
 optimum-cli export openvino --model Qwen/Qwen3-8B --weight-format int4 "$MODELS_DIR/qwen3-8b-int4-ov"
 ```
 
@@ -360,6 +469,8 @@ sudo tee /opt/rustedvino/config.json << 'EOF'
   "models_dir": "/opt/rustedvino/models",
   "device": "GPU",
   "preload": [],
+  "default_placement": "auto",
+  "cache_size_gb": 2.0,
   "admission_queue_timeout_ms": 30000,
   "models": {
     "qwen3-8b-int4-ov":              { "vram_gb": 5.5 },
@@ -468,7 +579,7 @@ curl -s -X POST http://localhost:11437/v1/audio/transcriptions \
 # Text embedding
 curl -s -X POST http://localhost:11437/v1/embeddings \
   -H "Content-Type: application/json" \
-  -d '{"model":"multilingual-e5-large-int8","input":"hello world"}'
+  -d '{"model":"multilingual-e5-large-int8-ov","input":"hello world"}'
 
 # Text-to-image
 curl -s -X POST http://localhost:11437/v1/images/generations \
@@ -499,6 +610,7 @@ install needed); `scripts/rv` is the original single-file Python version, kept a
 alternative (Python 3.8+, stdlib only).
 
 ```bash
+rv start | stop | restart | version   # run the server by hand, and which one answers
 rv status                  # process/health/auth/models/VRAM in one report
 rv list                    # registered models, plus on-disk-but-unregistered ones
 rv ps                      # loaded models only, with live KV%/in-flight counts
@@ -513,7 +625,8 @@ rv logs -n 200             # tail recent server log lines
 rv reload-config           # pick up config.json edits — registers changes, loads/evicts nothing
 rv resize MODEL --kv-cache-gb 4 -y   # evict + reload a loaded model with a new KV-cache size
 rv completeness            # every registered model's file-completeness report (exit 1 on a gap)
-rv reload-keys             # re-read the keys file and hot-swap the API/admin keys
+rv reload-keys             # re-read the keys file and hot-swap the API/admin keys (to REPLACE the admin key: RV_ADMIN_KEY=<old key> rv reload-keys)
+rv save-defaults -y        # remember the loaded models: they load again at every start
 rv voice-pin               # the realtime voice-flow model pin
 rv sessions                # live realtime sessions   (also: rv session ID, rv session-kill ID -y)
 ```
@@ -638,12 +751,13 @@ today.
 plain `GPU` (no suffix), plus `NPU`.
 
 **NPU (Lunar Lake "AI Boost") constraints:**
-- STT (Whisper) works on NPU — a light Whisper variant (e.g. `whisper-tiny-fp16-ov`) routes there
-  by default on Lunar Lake; heavier Whisper models route to CPU instead (see size/EU-aware STT
-  placement in the feature table above).
+- STT (Whisper) compiles on the NPU, but `default_placement: "auto"` does **not** send it there: whisper-large-v3-turbo
+  hung the NPU on a clip over ~60 s (until the server was restarted), so STT defaults to the CPU, then a discrete GPU.
+  Put a small Whisper (e.g. `whisper-tiny-fp16-ov`) on the NPU yourself with `"device": "NPU"` if you want it.
 - Embeddings (`TextEmbeddingPipeline`) and LLM (`ContinuousBatchingPipeline`) cannot compile on
-  NPU at all — both tiers omit NPU; an LLM on a Lunar Lake box lands on the GPU unless explicitly
-  overridden to the NPU's single-stream `LLMPipeline` path (see below).
+  NPU at all — both tiers omit NPU; an LLM on a Lunar Lake box lands on the CPU by default (name the Arc iGPU with
+  `"device": "GPU"` - it measured 1.6× faster than the CPU on decode and 11× on prefill); the NPU's single-stream
+  `LLMPipeline` path needs an explicit override (see below).
 - The NPU LLM path requires channel-wise (`*-cw-ov`) int4 IR — group-wise quantization fails NPU
   compile.
 - **Prompt/context cap: 1024 tokens by default, configurable.** The NPU compiles a fixed-shape
@@ -670,11 +784,8 @@ plain `GPU` (no suffix), plus `NPU`.
   won't prune them while it is loaded (and never prunes anything with the default
   `ov_cache_max_gb: 0`). After experimenting with shapes, stop the server and clear
   `ov_cache_dir`; the next load recompiles the current shape (~30 s).
-  NPU *Whisper* is the exception: it never gets the cache dir, because it hangs with one. That
-  makes a large Whisper slow to start on the NPU: on one Lunar Lake laptop, `whisper-large-v3`
-  took 138 s to load there (1.6 s on the same box's GPU) and held 4.7 GB against 1.9 GB on the
-  GPU, for no speed gain.
-  Keep large Whisper models on the GPU; the NPU suits small ones.
+  NPU Whisper uses `ov_cache_dir` too (cold load ≈ 4 s, warm ≈ 0.3 s on one Lunar Lake laptop). Large Whisper models can
+  hang on the NPU on long clips; keep them on the CPU or a GPU.
 
 ---
 

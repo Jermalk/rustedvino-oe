@@ -31,6 +31,7 @@ pub mod ov_embed;
 pub mod ov_image;
 pub mod ov_pipeline;
 pub mod ov_rerank;
+pub mod ov_tokenizer;
 pub mod ov_tts;
 pub mod ov_vlm;
 pub mod ov_whisper;
@@ -38,6 +39,8 @@ pub mod pipelines;
 pub mod prompt_builder;
 pub mod realtime_types;
 pub mod rerank_engine;
+#[cfg(unix)]
+pub mod shutdown_signals;
 pub mod startup;
 pub mod streaming;
 #[cfg(unix)]
@@ -65,7 +68,7 @@ use handlers::admin::{
     admin_models_completeness, admin_patch_model, admin_realtime_session_by_id,
     admin_realtime_sessions, admin_reload_config, admin_reload_keys, admin_resize_model,
     admin_set_preload, admin_unload_model, admin_voice_pin, admin_watchdog, health,
-    health_generate, metrics_handler, models_list,
+    health_generate, metrics_handler, model_retrieve, models_list,
 };
 use handlers::chat::chat_completions;
 use handlers::completions::completions;
@@ -188,6 +191,7 @@ pub fn create_router_with_extension(
         .route("/health_generate", get(health_generate))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_list))
+        .route("/v1/models/{id}", get(model_retrieve))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
@@ -285,6 +289,11 @@ pub fn create_router_with_extension(
             },
             require_bearer_auth,
         ))
+        // Unknown routes get the JSON error envelope instead of axum's empty 404 (D-06). A layer
+        // rather than `Router::fallback`: `merge` panics when both routers set a fallback, and the
+        // extension router is not ours. Added after (so outside) the auth layer; auth still answers
+        // a keyless request first, so an unknown route without credentials is a 401.
+        .layer(axum::middleware::from_fn(json_for_empty_404))
         .layer(axum::middleware::from_fn(attach_request_id))
         .layer(axum::middleware::from_fn(attach_ruvi_host))
         .layer(axum::middleware::from_fn(attach_server_headers))
@@ -297,7 +306,13 @@ pub fn create_router_with_extension(
         .with_state(state);
 
     match extension {
-        Some(extension) => base.merge(extension),
+        // `merge` of two default fallbacks keeps the EXTENSION's, which none of the layers above
+        // wrap, so the JSON 404 is applied to the merged router as well (D-06). Auth is not: the
+        // extension owns its own auth story (see the doc above), so an unknown path still gets
+        // no 401 here.
+        Some(extension) => base
+            .merge(extension)
+            .layer(axum::middleware::from_fn(json_for_empty_404)),
         None => base,
     }
 }
@@ -384,6 +399,29 @@ async fn attach_server_headers(req: Request, next: Next) -> Response {
             HeaderName::from_static("x-server-version"),
             HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
         );
+    }
+    response
+}
+
+/// Replace a 404 that has no body (axum's answer for a path no route matches) with the standard
+/// JSON error envelope. A 404 a handler produced itself (for example `model_not_found`) has a
+/// body and is passed through untouched.
+async fn json_for_empty_404(req: Request, next: Next) -> Response {
+    let route = format!("{} {}", req.method(), req.uri().path());
+    let mut response = next.run(req).await;
+    if response.status() == StatusCode::NOT_FOUND
+        && axum::body::HttpBody::is_end_stream(response.body())
+    {
+        let mut replacement = openai_error(
+            StatusCode::NOT_FOUND,
+            format!("Unknown request URL: {route}. Please check the URL for typos."),
+            "invalid_request_error",
+            Some("unknown_url"),
+        );
+        // Keep what inner layers attached (for example the `Authenticated` marker that
+        // `attach_ruvi_host` reads).
+        *replacement.extensions_mut() = std::mem::take(response.extensions_mut());
+        return replacement;
     }
     response
 }
@@ -660,6 +698,19 @@ async fn require_bearer_auth(
 
     // Inference / general gate. Admin keys also satisfy it (superset credential).
     if keys.api_keys.is_empty() {
+        // No key of any kind is configured, so an admin route is open to whoever can reach the port.
+        // A web page in the operator's browser can reach `127.0.0.1` too, and the permissive default
+        // CORS policy plus a body-less POST (no preflight) would let it add, unload or delete models.
+        // Browsers always send `Origin` on such a request; curl, `rv` and Prometheus never do.
+        if is_admin_route && req.headers().contains_key(axum::http::header::ORIGIN) {
+            return openai_error(
+                StatusCode::FORBIDDEN,
+                "Admin routes of a server with no keys configured refuse browser requests (an \
+                 Origin header). Configure admin_api_keys (see CONFIG.md) or use rv / curl.",
+                "invalid_request_error",
+                Some("browser_origin_refused"),
+            );
+        }
         return next.run(req).await;
     }
     match provided {

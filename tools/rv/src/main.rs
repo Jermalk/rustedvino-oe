@@ -10,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use rv::ansi::Style;
 use rv::commands::config::{self, PatchArgs, PreloadArgs};
 use rv::commands::lifecycle::{self, AddArgs, LoadArgs};
-use rv::commands::{check, logs, models, ops, status};
+use rv::commands::{check, logs, models, ops, service, status};
 use rv::ctx::{Common, Ctx};
 use rv::resolve::{Inputs, resolve};
 
@@ -24,6 +24,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// the server binary on disk and the server that is answering
+    Version(Common),
+    /// start the server from the bundle (detached, log next to config.json)
+    Start {
+        /// respawn the server after a crash (passes --supervise)
+        #[arg(long)]
+        supervise: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// stop a server started by hand (refuses one that systemd runs)
+    Stop {
+        /// signal it even though it sits in a systemd service cgroup
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// stop, then start (keeps --supervise if the old server had it)
+    Restart {
+        /// signal the old server even though it sits in a systemd service cgroup
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        common: Common,
+    },
     /// full server report
     Status(Common),
     /// every registered model, any state
@@ -60,9 +86,17 @@ enum Cmd {
         common: Common,
     },
     /// evict a model from VRAM (stays registered)
+    #[command(
+        long_about = "A model with a request running is not evicted: the server refuses (409) \
+                      and the request finishes undisturbed. --force drains it (up to 2 minutes) \
+                      and then aborts what is left."
+    )]
     Unload {
         /// model id
         model: String,
+        /// evict even if a request is running (it is drained, then aborted)
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -74,6 +108,9 @@ enum Cmd {
         /// don't prompt for confirmation
         #[arg(short = 'y', long)]
         yes: bool,
+        /// evict even if a request is running (it is drained, then aborted)
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -118,6 +155,9 @@ enum Cmd {
         /// don't prompt for confirmation
         #[arg(short = 'y', long)]
         yes: bool,
+        /// resize even if a request is running (it is drained, then aborted)
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -183,6 +223,8 @@ fn print_resolved(port: Option<u16>, admin_key: Option<String>) -> i32 {
                 "admin key   : {}",
                 if r.admin_key.is_some() {
                     "available"
+                } else if r.keys_file_is_empty() {
+                    "none needed - the keys file holds no keys, so the server is OPEN and NOT SECURE"
                 } else {
                     "none"
                 }
@@ -219,7 +261,20 @@ fn with_margin(common: &Common, f: impl FnOnce(&Ctx) -> i32) -> i32 {
     code
 }
 
+/// Restores the default SIGPIPE action (Rust's runtime ignores it), so `rv ps | head`
+/// ends quietly like any Unix tool instead of panicking on a broken pipe.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: `signal` with SIG_DFL only resets the disposition for this signal; it runs
+    // first thing in `main`, before any thread exists and before any handler is installed.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    restore_sigpipe();
     let cli = Cli::parse();
     let code = match cli.cmd {
         // Bare `rv` prints help instead of erroring, like the Python script.
@@ -229,6 +284,14 @@ fn main() -> ExitCode {
             0
         }
         Some(Cmd::Resolve { port, admin_key }) => print_resolved(port, admin_key),
+        Some(Cmd::Version(c)) => with_margin(&c, service::version),
+        Some(Cmd::Start { supervise, common }) => {
+            with_margin(&common, |ctx| service::start(ctx, supervise))
+        }
+        Some(Cmd::Stop { force, common }) => with_margin(&common, |ctx| service::stop(ctx, force)),
+        Some(Cmd::Restart { force, common }) => {
+            with_margin(&common, |ctx| service::restart(ctx, force))
+        }
         Some(Cmd::Status(c)) => with_margin(&c, status::run),
         Some(Cmd::List(c)) => with_margin(&c, models::list),
         Some(Cmd::Ps(c)) => with_margin(&c, models::ps),
@@ -236,12 +299,19 @@ fn main() -> ExitCode {
         Some(Cmd::Logs { n, common }) => with_margin(&common, |ctx| logs::run(ctx, n)),
         Some(Cmd::Add { args, common }) => with_margin(&common, |ctx| lifecycle::add(ctx, &args)),
         Some(Cmd::Load { args, common }) => with_margin(&common, |ctx| lifecycle::load(ctx, &args)),
-        Some(Cmd::Unload { model, common }) => {
-            with_margin(&common, |ctx| lifecycle::unload(ctx, &model))
-        }
-        Some(Cmd::Deregister { model, yes, common }) => {
-            with_margin(&common, |ctx| lifecycle::deregister(ctx, &model, yes))
-        }
+        Some(Cmd::Unload {
+            model,
+            force,
+            common,
+        }) => with_margin(&common, |ctx| lifecycle::unload(ctx, &model, force)),
+        Some(Cmd::Deregister {
+            model,
+            yes,
+            force,
+            common,
+        }) => with_margin(&common, |ctx| {
+            lifecycle::deregister(ctx, &model, yes, force)
+        }),
         Some(Cmd::ReloadConfig(c)) => with_margin(&c, config::reload_config),
         Some(Cmd::Patch { args, common }) => with_margin(&common, |ctx| config::patch(ctx, &args)),
         Some(Cmd::Preload { args, common }) => {
@@ -251,8 +321,11 @@ fn main() -> ExitCode {
             model,
             kv_cache_gb,
             yes,
+            force,
             common,
-        }) => with_margin(&common, |ctx| ops::resize(ctx, &model, kv_cache_gb, yes)),
+        }) => with_margin(&common, |ctx| {
+            ops::resize(ctx, &model, kv_cache_gb, yes, force)
+        }),
         Some(Cmd::Completeness(c)) => with_margin(&c, ops::completeness),
         Some(Cmd::ReloadKeys(c)) => with_margin(&c, ops::reload_keys),
         Some(Cmd::VoicePin(c)) => with_margin(&c, ops::voice_pin),

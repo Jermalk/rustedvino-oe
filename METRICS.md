@@ -144,6 +144,19 @@ counter would tell you nothing about which. None of them appear until the first 
 | `rustedvino_pool_capacity_rejected_total` | counter | `model` | The prompt would fit on its own, but admitting it alongside requests already in flight would overcommit the KV pool. Action: **retry shortly** — this is transient contention, and a rising rate means the model needs a larger KV pool or lower concurrency |
 | `rustedvino_own_budget_rejected_total` | counter | `model` | On a single-slot model, this request's own `prompt_tokens + max_tokens` cannot fit the KV pool, with nothing else in flight. Action: **do not retry unchanged** — an identical retry fails identically; the client needs a smaller `max_tokens`, or the model needs a bigger pool |
 
+### Eviction policy
+
+A model with a request running is never evicted by a plain load, unload, deregister or resize;
+`force` overrides it. These counters show the policy at work. They do not appear until the
+first event.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rustedvino_load_refusals_total` | counter | `reason` | A load was refused instead of evicting a busy model (`reason="busy"`: the room it needs is held by models with requests running). A sustained rate means clients are keeping other models busy. Action: **retry when the request ends**, or load with `force` |
+| `rustedvino_eviction_refusals_total` | counter | `reason` | An eviction did not happen. `reason="busy"`: the target has a request running (admin unload, deregister or resize without `force`). `reason="incomplete"`: a forced eviction's engine thread was still running its request at the 30 s join deadline — its memory is released when the thread exits |
+| `rustedvino_forced_evictions_total` | counter | `kind` | An eviction went ahead although requests were running (`force`, or an automatic recovery). The log names the model |
+| `rustedvino_eviction_aborted_requests_total` | counter | `kind` | Requests still running when a forced eviction's drain deadline passed, and aborted |
+
 ## Latency
 
 Rendered as real Prometheus histograms (bucketed), not the exporter's default summary, so
@@ -198,8 +211,8 @@ only trusts a measurement taken while nothing else changed memory. It reports Na
   model's memory about 11 s *after* the eviction returns (measured on Lunar Lake);
 - for an embedding model, any batch hit either of those conditions.
 
-A reload in a quiet moment measures it again. Use it to check `vram_gb`: when an estimate exceeds its model's `vram_gb`, the accounting
-under-counts that model. The server also logs this once per load, and
+A reload in a quiet moment measures it again. Use it to check `vram_gb`: when an estimate exceeds its model's `vram_gb` plus its KV pool (`kv_cache_gb`, which the
+measurement includes), the accounting under-counts that model. The server also logs this once per load, and
 `GET /v1/admin/models` shows it as `gpu_memory_estimate_gb`.
 
 ## KV cache

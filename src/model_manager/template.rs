@@ -366,6 +366,29 @@ pub(crate) fn template_hints_thinking(template: &str) -> bool {
     template.contains("enable_thinking")
 }
 
+/// The reasoning parser a model gets: its policy's explicit value if set, else one inferred from
+/// the chat template. A harmony template (family `GptOss`, recognised by `<|channel|>`) gets the
+/// harmony parser, which must not be missed (the raw `analysis…assistantfinal…` channel text would
+/// otherwise land in `content`, D-07) and is checked before the Qwen3 marker; a template that
+/// mentions `enable_thinking` gets Qwen3; anything else gets none.
+pub(crate) fn auto_reasoning_parser(
+    explicit: Option<super::config::ReasoningParser>,
+    template: &str,
+    family: crate::prompt_builder::ModelFamily,
+) -> Option<super::config::ReasoningParser> {
+    use super::config::ReasoningParser;
+    if explicit.is_some() {
+        return explicit;
+    }
+    if family == crate::prompt_builder::ModelFamily::GptOss {
+        Some(ReasoningParser::GptOss)
+    } else if template_hints_thinking(template) {
+        Some(ReasoningParser::Qwen3)
+    } else {
+        None
+    }
+}
+
 /// Minimal generic chat template used only as a last resort when a model
 /// directory ships **no** template at all.
 ///
@@ -615,6 +638,46 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// D-07: a gpt-oss model added without an explicit `reasoning_parser` must get the harmony
+    /// parser; without it the raw `analysis…assistantfinal…` text lands in `content`. Qwen3-style
+    /// templates still get Qwen3, an explicit setting wins, anything else gets none.
+    #[test]
+    fn auto_reasoning_parser_picks_harmony_for_gpt_oss_and_qwen3_for_enable_thinking() {
+        use crate::model_manager::config::ReasoningParser;
+        use crate::prompt_builder::ModelFamily;
+
+        let harmony = "{{ '<|start|>assistant<|channel|>final<|message|>' }}";
+        let qwen = "{% if enable_thinking %}<think>{% endif %}";
+        let both = "<|channel|> {% if enable_thinking %}";
+
+        assert_eq!(
+            auto_reasoning_parser(None, harmony, ModelFamily::detect(harmony)),
+            Some(ReasoningParser::GptOss)
+        );
+        // Harmony wins even if the template also mentions enable_thinking.
+        assert_eq!(
+            auto_reasoning_parser(None, both, ModelFamily::detect(both)),
+            Some(ReasoningParser::GptOss)
+        );
+        assert_eq!(
+            auto_reasoning_parser(None, qwen, ModelFamily::detect(qwen)),
+            Some(ReasoningParser::Qwen3)
+        );
+        assert_eq!(
+            auto_reasoning_parser(None, "plain", ModelFamily::detect("plain")),
+            None
+        );
+        // An explicit policy value is never overridden.
+        assert_eq!(
+            auto_reasoning_parser(
+                Some(ReasoningParser::Qwen3),
+                harmony,
+                ModelFamily::detect(harmony)
+            ),
+            Some(ReasoningParser::Qwen3)
+        );
+    }
 
     // ---- template_hints_thinking ----------------------------------------
 

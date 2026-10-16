@@ -160,7 +160,8 @@ type OvCbTokenCallback = unsafe extern "C" fn(
 /// One-shot text sink for [`ov_cb_decode`]: invoked exactly once with the full
 /// decoded UTF-8 string (`text`/`len`, NOT null-terminated).
 #[allow(non_camel_case_types)]
-type OvTextCallback = unsafe extern "C" fn(user_data: *mut c_void, text: *const u8, len: usize);
+pub(crate) type OvTextCallback =
+    unsafe extern "C" fn(user_data: *mut c_void, text: *const u8, len: usize);
 
 unsafe extern "C" {
     fn ov_cb_create(
@@ -961,6 +962,33 @@ unsafe extern "C" fn decode_trampoline(user_data: *mut c_void, text: *const u8, 
         );
         ctx.panicked = true;
     }
+}
+
+/// Run an FFI decode call that delivers its text through an [`OvTextCallback`], and collect the
+/// string. `call` gets the trampoline and the `user_data` pointer to pass to the C function and
+/// returns its status code (0 = ok). Shares the panic firewall with [`OvCbEngine::decode`]; used by
+/// the VLM tokenizer (`ov_vlm_decode`).
+///
+/// # Errors
+/// Returns the stringified bridge error when the call fails, or a message when the sink panicked.
+pub(crate) fn decode_with(
+    call: impl FnOnce(OvTextCallback, *mut c_void) -> std::ffi::c_int,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut sink = |s: &str| out.push_str(s);
+    let mut ctx = TextCbCtx {
+        sink: &mut sink,
+        panicked: false,
+    };
+    let user_data = std::ptr::addr_of_mut!(ctx).cast::<c_void>();
+    let ret = call(decode_trampoline, user_data);
+    if ret != 0 {
+        return Err(last_error());
+    }
+    if ctx.panicked {
+        return Err("decode text callback panicked".to_owned());
+    }
+    Ok(out)
 }
 
 impl Drop for OvCbEngine {

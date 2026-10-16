@@ -112,6 +112,11 @@ pub struct EmbeddingHandle {
     /// load or eviction overlapped it): the growth is then unknown for the
     /// rest of this load rather than silently wrong.
     mem_tainted: Arc<AtomicBool>,
+    /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after this request
+    /// has been counted in `active()`. Shared by every clone of this handle; a reload builds a
+    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b; nothing
+    /// sets it yet.
+    closing: Arc<AtomicBool>,
 }
 
 impl EmbeddingHandle {
@@ -133,6 +138,7 @@ impl EmbeddingHandle {
             cap,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             mem_growth: Arc::new(AtomicI64::new(0)),
             mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
@@ -170,6 +176,7 @@ impl EmbeddingHandle {
             cap,
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             mem_growth: Arc::new(AtomicI64::new(0)),
             mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
@@ -201,6 +208,14 @@ impl EmbeddingHandle {
             Ok(Err(_)) => return Err(AdmitError::EngineDead), // semaphore closed (shouldn't happen)
             Err(_) => return Err(AdmitError::AtCapacity),     // timed out waiting for a permit
         };
+
+        // The eviction may have started while this caller waited for (or just took) its permit.
+        // Checked AFTER holding it: `begin_evict` sets `closing` before reading `active()`, so
+        // either it counted this permit (and drains it) or this check sees the flag.
+        if self.closing.load(Ordering::SeqCst) {
+            drop(permit);
+            return Err(AdmitError::Closing);
+        }
 
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -259,6 +274,10 @@ impl EmbeddingHandle {
 impl ManagedEngine for EmbeddingHandle {
     fn kind(&self) -> ModelKind {
         ModelKind::Embedding
+    }
+
+    fn set_closing(&self, closing: bool) {
+        self.closing.store(closing, Ordering::SeqCst);
     }
 
     /// Accepted-but-unfinished requests (queued + the one embedding) —
@@ -371,6 +390,7 @@ pub fn spawn_embed_engine(
             cap: EMBED_CHANNEL_CAP,
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             mem_growth,
             mem_tainted,
             max_seq_len,
@@ -449,6 +469,7 @@ pub(crate) fn spawn_mock_embed(model_id: &str) -> (EmbeddingHandle, std::thread:
             cap: EMBED_CHANNEL_CAP,
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
             mem_growth: Arc::new(AtomicI64::new(0)),
             mem_tainted: Arc::new(AtomicBool::new(false)),
             max_seq_len: None,
@@ -684,5 +705,69 @@ mod tests {
             0,
             "releasing the held permit settles active()"
         );
+    }
+}
+
+// ── D3-S1.A0: `active()` contract tests ─────────────────────────────────────
+// Characterization of the busy signal that eviction reads (`ManagedEngine::active`).
+// Behaviour-neutral: tests only. See the project's internal engineering log.
+#[cfg(test)]
+mod active_contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::engine::ManagedEngine;
+
+    /// A request that reached the engine keeps `active()` at 1 (its admission permit travels in
+    /// the command) even after the caller is abandoned, and releases when the engine drops the command.
+    #[tokio::test]
+    async fn active_holds_for_a_embed_request_until_the_engine_is_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedCommand>(8);
+        let h = EmbeddingHandle::from_sender(tx, "t-embed");
+        assert_eq!(h.active(), 0, "idle");
+
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.embed(vec!["a".to_owned()]).await.ok();
+            }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "request delivered to the engine");
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            h.active(),
+            1,
+            "abandoned caller: the engine still holds the permit"
+        );
+
+        drop(cmd);
+        assert_eq!(h.active(), 0, "engine finished (command dropped)");
+    }
+
+    /// D3-S1.D3b: with the closing flag set, a submit that already holds its permit is refused
+    /// (retryable `AdmitError::Closing`) and the permit is released; cleared again, it is accepted.
+    #[tokio::test]
+    async fn closing_refuses_a_submit_and_releases_its_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedCommand>(8);
+        let h = EmbeddingHandle::from_sender(tx, "t-embed");
+
+        ManagedEngine::set_closing(&h, true);
+        let refused = h.embed(vec!["a".to_owned()]).await;
+        assert!(matches!(refused, Err(AdmitError::Closing)), "{refused:?}");
+        assert_eq!(h.active(), 0, "the refused submit's permit is released");
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        ManagedEngine::set_closing(&h, false);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move { h.embed(vec!["a".to_owned()]).await.ok() }
+        });
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(h.active(), 1, "accepted: the command reached the engine");
+        drop(cmd);
+        let _ = caller.await;
     }
 }

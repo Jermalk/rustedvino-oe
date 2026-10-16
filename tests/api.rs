@@ -99,6 +99,33 @@ async fn unknown_route_returns_404() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // D-06: the 404 carries the standard JSON envelope, not an empty body.
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["code"], "unknown_url");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("GET /this-route-does-not-exist"))
+    );
+}
+
+/// D-06 must not open a route-existence oracle: with keys configured, an unknown route
+/// without credentials is still 401, exactly like a known one.
+#[tokio::test]
+async fn unknown_route_without_key_is_401_not_404() {
+    let keys = ["sk-secret".to_owned()];
+    let app = rustedvino::create_router_with_cors(AppState::mock(), &["*".to_owned()], &keys);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/this-route-does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ------------------------------------------------------------------
@@ -911,6 +938,64 @@ async fn models_list_empty_without_model_manager() {
     assert_eq!(json["data"].as_array().unwrap().len(), 0);
 }
 
+/// D-12: `GET /v1/models/{id}` is routed; an unknown id (every id, in mock mode) answers
+/// the standard JSON 404 `model_not_found`, not an empty 404.
+#[tokio::test]
+async fn model_retrieve_unknown_id_is_json_404() {
+    let app = rustedvino::create_router(AppState::mock());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "model_not_found");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("nope"))
+    );
+}
+
+/// D-05: an unknown message role is a 400 `invalid_value` naming `messages[1].role`.
+#[tokio::test]
+async fn chat_unknown_message_role_is_400_naming_the_field() {
+    let app = rustedvino::create_router(AppState::mock());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"wizard","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["code"], "invalid_value");
+    assert_eq!(json["error"]["param"], "messages[1].role");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("wizard"))
+    );
+}
+
 /// Chat with any model when no model manager is configured uses the mock path.
 ///
 /// The mock path ignores the model name entirely and returns mock tokens.
@@ -1682,6 +1767,47 @@ async fn admin_scope_empty_falls_back_to_inference_gate() {
         StatusCode::FORBIDDEN,
         "with no admin scope, the inference key gates admin too"
     );
+}
+
+/// A server with no keys at all leaves admin open to curl and `rv`, but a browser request (it carries
+/// an `Origin` header) to an admin route or `/metrics` is refused, so a web page cannot drive it.
+#[tokio::test]
+async fn open_admin_refuses_browser_origin() {
+    let open =
+        || rustedvino::create_router_with_auth(AppState::mock(), &["*".to_owned()], &[], &[]);
+    let send = |origin: Option<&'static str>, method: &'static str, uri: &'static str| {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        open().oneshot(b.body(Body::empty()).unwrap())
+    };
+    let with_origin = send(
+        Some("https://evil.example"),
+        "POST",
+        "/v1/admin/config/reload",
+    )
+    .await
+    .unwrap();
+    assert_eq!(with_origin.status(), StatusCode::FORBIDDEN);
+    let json = body_json(with_origin.into_body()).await;
+    assert_eq!(json["error"]["code"], "browser_origin_refused");
+    let metrics = send(Some("https://evil.example"), "GET", "/metrics")
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::FORBIDDEN);
+    // No Origin (curl, rv, a Prometheus scrape): still served.
+    let curl = send(None, "GET", "/v1/admin/models").await.unwrap();
+    assert_ne!(
+        curl.status(),
+        StatusCode::FORBIDDEN,
+        "curl is not a browser"
+    );
+    // Inference routes are not affected.
+    let chat = send(Some("https://app.example"), "GET", "/v1/models")
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), StatusCode::OK);
 }
 
 // ------------------------------------------------------------------
@@ -2779,6 +2905,27 @@ async fn extension_router_still_merges_with_the_405_fallback() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_string(response.into_body()).await, "pong");
+}
+
+/// D-06 with an extension router merged (Bear Edition): `merge` keeps the extension's unlayered
+/// fallback, so the JSON 404 has to be applied to the merged router as well.
+#[tokio::test]
+async fn unknown_route_is_json_404_with_an_extension_router_merged() {
+    let ext = axum::Router::new().route("/ext/ping", axum::routing::get(|| async { "pong" }));
+    let app = rustedvino::create_router_with_extension(
+        AppState::mock(),
+        &["*".to_owned()],
+        &[],
+        &[],
+        Some(ext),
+    );
+    let response = app
+        .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "unknown_url");
 }
 
 /// `/v1/audio/transcriptions` with a non-multipart body: JSON 400, not

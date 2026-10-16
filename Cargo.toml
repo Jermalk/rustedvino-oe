@@ -22,7 +22,7 @@ expect_used = "deny"
 
 [package]
 name = "rustedvino"
-version = "0.8.0"
+version = "0.8.4"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"

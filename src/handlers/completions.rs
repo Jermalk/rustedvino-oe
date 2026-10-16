@@ -317,9 +317,8 @@ pub async fn completions(
     // Model-shipped sampling defaults (generation_config.json), same
     // resolution `/v1/chat/completions` uses — see `resolve_sampling_defaults`'s
     // doc comment. `tools_active` is always `false` here: legacy completions
-    // has no tool-calling concept at all, so only the "client set nothing →
-    // model defaults apply" branch of that function is ever reachable on this
-    // endpoint.
+    // has no tool-calling concept at all, so the tools-pin branch of that function is
+    // never reachable on this endpoint (the temperature branches are, as on chat).
     let model_defaults = state
         .model_manager
         .as_ref()
@@ -455,6 +454,11 @@ async fn submit_prompts(
                             "server at capacity — all inference slots busy, retry shortly",
                             "rate_limit_error",
                             Some("server_overloaded"),
+                        )));
+                    }
+                    SubmitResult::Closing => {
+                        return Err(Box::new(super::error::model_error_response(
+                            crate::model_manager::ModelError::Evicting,
                         )));
                     }
                     SubmitResult::EngineDead => {

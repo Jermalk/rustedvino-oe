@@ -96,6 +96,14 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     /// default channel size on the next load.
     fn register_concurrent_streams_hint(&self, _model_id: &str, _cap: Option<usize>) {}
 
+    /// Record a per-model `enable_prefix_caching` override
+    /// ([`crate::model_manager::config::ModelPolicy::enable_prefix_caching`])
+    /// for `model_id`'s next load. `None` removes the hint, so clearing the
+    /// field (PATCH `null`) restores the server's own decision
+    /// ([`resolve_prefix_caching`]). Default no-op: test factories build stub
+    /// engines that have no prefix cache.
+    fn register_prefix_caching_hint(&self, _model_id: &str, _value: Option<bool>) {}
+
     /// Record a `max_prompt_len` (NPU `MAX_PROMPT_LEN`) hint for `model_id` so
     /// an NPU-routed load compiles its `LLMPipeline` with that ceiling instead
     /// of `OpenVINO`'s own default (1024). Ignored for every other device.
@@ -209,6 +217,9 @@ pub(crate) struct OvEngineFactory {
     /// each VLM load so [`spawn_vlm_engine`] uses the configured cap instead of
     /// [`VLM_CHANNEL_CAP`].
     pub concurrent_streams: std::sync::RwLock<HashMap<String, usize>>,
+    /// Per-model `enable_prefix_caching` overrides, keyed by model ID, set via
+    /// [`EngineFactory::register_prefix_caching_hint`] before each load.
+    pub prefix_caching_overrides: std::sync::RwLock<HashMap<String, bool>>,
     /// Per-model NPU `MAX_PROMPT_LEN` hints from `max_prompt_len` config.
     /// Keyed by model ID, set via [`register_max_prompt_len_hint`] before each
     /// NPU load so `OvPipeline::new` compiles with the configured ceiling
@@ -360,6 +371,17 @@ impl EngineFactory for OvEngineFactory {
         };
     }
 
+    fn register_prefix_caching_hint(&self, model_id: &str, value: Option<bool>) {
+        let mut hints = self
+            .prefix_caching_overrides
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match value {
+            Some(v) => hints.insert(model_id.to_owned(), v),
+            None => hints.remove(model_id),
+        };
+    }
+
     fn register_max_prompt_len_hint(&self, model_id: &str, max_prompt_len: Option<u32>) {
         let mut hints = self
             .max_prompt_len_hints
@@ -445,6 +467,43 @@ impl EngineFactory for OvEngineFactory {
             .and_then(|s| s.to_str())
             .unwrap_or(device);
 
+        // Effective prefix-caching flag for this model: the per-model override,
+        // else the hybrid linear-attention guard, else the global flag.
+        let (prefix_caching, prefix_caching_source) = {
+            let model_override = self
+                .prefix_caching_overrides
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(model_id)
+                .copied();
+            resolve_prefix_caching(
+                self.enable_prefix_caching,
+                model_override,
+                is_linear_attention_model(model_path),
+                device,
+            )
+        };
+        if prefix_caching_source == PrefixCachingSource::HybridGuard {
+            tracing::warn!(
+                model_id,
+                device,
+                "prefix caching forced OFF for this hybrid linear-attention model on GPU: \
+                 OpenVINO GenAI 2026.2.x returns wrong continuations on a prefix-cache hit \
+                 (fixed upstream in 2026.4.1). Repeated long prompts lose the \
+                 prefill speed-up. Set \
+                 models['{model_id}'].enable_prefix_caching=true to override."
+            );
+        }
+        // Applied where the engine is built (the `?` in those arms returns from
+        // this function, so nothing after the `match` would ever see the error).
+        let guard_hint = |e: anyhow::Error| {
+            if prefix_caching_source == PrefixCachingSource::HybridGuard {
+                hint_if_hybrid_guard_pool_too_small(e, model_id)
+            } else {
+                e
+            }
+        };
+
         // OV compile-cache blob attribution (the project's internal engineering log):
         // snapshot `ov_cache_dir` before dispatch, diff after, so any new files
         // this load's `compile_model`/pipeline-construction call created can be
@@ -484,7 +543,7 @@ impl EngineFactory for OvEngineFactory {
                     .get(model_id)
                     .copied();
                 let vlm_cap = resolve_vlm_channel_cap(registered, max_num_seqs);
-                if cache_size_gb <= 0.0 && self.enable_prefix_caching {
+                if cache_size_gb <= 0.0 && prefix_caching {
                     // Not reachable on this project's own fleet configs (every
                     // Vision entry sets a real kv_cache_gb) but reachable via
                     // documented-legitimate config elsewhere (`vram_gb: 0.0`,
@@ -511,16 +570,35 @@ impl EngineFactory for OvEngineFactory {
                     device,
                     cache_dir,
                     cache_size_gb,
-                    self.enable_prefix_caching,
-                )?;
+                    prefix_caching,
+                    // The vision engine thread runs one generation at a time (`run_generate` in
+                    // `vlm_engine::spawn_vlm_engine`), so the scheduler needs room for one
+                    // sequence. GenAI's default of 256 reserves linear-attention state for all of
+                    // them and made a hybrid model fail to load without prefix caching (D-02).
+                    // If the vision engine ever becomes concurrent, raise this with it.
+                    1,
+                )
+                .map_err(guard_hint)?;
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
+                // A tokenizer of its own, so /tokenize does not queue behind a generation (D-13).
+                // Best effort: without it the engine-thread route still works, only slower.
+                let tokenizer = match crate::ov_tokenizer::OvTokenizer::new(std::path::Path::new(
+                    path_str,
+                )) {
+                    Ok(t) => Some(std::sync::Arc::new(t)),
+                    Err(e) => {
+                        tracing::warn!(model_id, error = %e, "standalone tokenizer not loaded; /tokenize will wait behind generations");
+                        None
+                    }
+                };
                 let (handle, thread) = crate::vlm_engine::spawn_vlm_engine(
                     engine,
                     model_id,
                     device,
                     vlm_cap,
                     queue_timeout,
+                    tokenizer,
                 )?;
                 Ok((EngineHandleKind::Vision(handle), thread))
             }
@@ -577,7 +655,7 @@ impl EngineFactory for OvEngineFactory {
                     return Ok((EngineHandleKind::NpuTextGen(handle), thread));
                 }
                 let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
-                if cache_size_gb <= 0.0 && self.enable_prefix_caching {
+                if cache_size_gb <= 0.0 && prefix_caching {
                     // The OPPOSITE silent failure mode from the Vision arm's
                     // equivalent warning above, and the more dangerous of the
                     // two: SchedulerConfig with cache_size<=0 is "dynamic
@@ -628,11 +706,11 @@ impl EngineFactory for OvEngineFactory {
                         cache_size_gb,
                         &self.kv_cache_precision,
                         cache_dir,
-                        self.enable_prefix_caching,
+                        prefix_caching,
                         hint,
                         model_id,
                     )
-                    .map_err(|e| hint_if_ambiguous_kind(e, model_path))?,
+                    .map_err(|e| guard_hint(hint_if_ambiguous_kind(e, model_path)))?,
                     None => crate::ov_cb::OvCbEngine::new(
                         path_str,
                         device,
@@ -640,12 +718,12 @@ impl EngineFactory for OvEngineFactory {
                         cache_size_gb,
                         &self.kv_cache_precision,
                         cache_dir,
-                        self.enable_prefix_caching,
+                        prefix_caching,
                         draft_path,
                         draft_device,
                         num_assistant_tokens,
                     )
-                    .map_err(|e| hint_if_ambiguous_kind(e, model_path))?,
+                    .map_err(|e| guard_hint(hint_if_ambiguous_kind(e, model_path)))?,
                 };
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
@@ -921,6 +999,46 @@ impl OvEngineFactory {
     }
 }
 
+/// What `config.json` says an encoder-only or speech model is: a `*ForTextToSpeech` architecture is TTS,
+/// a one-label `*ForSequenceClassification` is a reranker, and a bare `*Model` of an encoder family
+/// (BERT, XLM-RoBERTa, ...) is an embedder. `None` for everything else - decoders (`*ForCausalLM`),
+/// multi-label classifiers and unknown families keep the plain-LLM default and its hint.
+fn kind_from_hf_config(model_dir: &Path) -> Option<ModelKind> {
+    const ENCODERS: [&str; 8] = [
+        "bert",
+        "xlm-roberta",
+        "roberta",
+        "distilbert",
+        "electra",
+        "modernbert",
+        "deberta-v2",
+        "nomic_bert",
+    ];
+    let text = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let arch = cfg.get("architectures")?.as_array()?.first()?.as_str()?;
+    let family = cfg.get("model_type").and_then(serde_json::Value::as_str)?;
+    if arch.ends_with("ForTextToSpeech") {
+        return Some(ModelKind::Tts);
+    }
+    if !ENCODERS.contains(&family) {
+        return None;
+    }
+    if arch.ends_with("ForSequenceClassification") {
+        let labels = cfg
+            .get("id2label")
+            .and_then(serde_json::Value::as_object)
+            .map(serde_json::Map::len)
+            .or_else(|| {
+                cfg.get("num_labels")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            });
+        return (labels.unwrap_or(1) == 1).then_some(ModelKind::Reranking);
+    }
+    arch.ends_with("Model").then_some(ModelKind::Embedding)
+}
+
 /// The kind `model_dir`'s own files confidently prove, independent of any
 /// hint cache: `Some` for `Stt`'s encoder/decoder split, `ImageGen`'s
 /// `model_index.json` + submodel dir, or `Vision`'s vision-embeddings IR;
@@ -941,6 +1059,17 @@ impl OvEngineFactory {
 /// this keeps `OvEngineFactory::hint_if_ambiguous_kind` from having to
 /// (mis)read the hint cache to answer a question the cache cannot answer.
 fn detect_kind_from_markers(model_dir: &Path) -> Option<ModelKind> {
+    // SpeechT5 ships an encoder + decoder IR too (so the Whisper rule below would claim it), but
+    // also a vocoder and a postnet that no speech-to-text model has: those, or a text-to-speech
+    // architecture in config.json, make it a TTS model. Checked FIRST.
+    if model_dir.join("openvino_vocoder.xml").is_file()
+        || model_dir.join("openvino_postnet.xml").is_file()
+    {
+        return Some(ModelKind::Tts);
+    }
+    if let Some(kind) = kind_from_hf_config(model_dir) {
+        return Some(kind);
+    }
     // A Whisper OV GenAI dir ships a SEPARATE encoder + decoder IR
     // (`openvino_encoder_model.xml` + `openvino_decoder_model.xml`) — the
     // encoder/decoder split is unique to the speech models; a plain LLM ships
@@ -998,6 +1127,111 @@ fn hint_if_ambiguous_kind(err: anyhow::Error, model_dir: &Path) -> anyhow::Error
              has no distinguishing marker files — embedding, reranking, and TTS models are \
              indistinguishable from a plain LLM by file-sniffing alone. If this is actually one \
              of those, retry with an explicit kind (\"embedding\" / \"reranking\" / \"tts\")."
+        );
+    }
+    err
+}
+
+/// Where the effective `enable_prefix_caching` value for a load came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixCachingSource {
+    /// `Config::enable_prefix_caching`, no per-model decision applied.
+    Global,
+    /// The model's own `enable_prefix_caching` policy field.
+    ModelOverride,
+    /// Forced off by the hybrid linear-attention guard (see
+    /// [`resolve_prefix_caching`]).
+    HybridGuard,
+}
+
+/// Decide whether a load enables prefix caching.
+///
+/// Precedence: the model's explicit override, then the **hybrid guard**, then
+/// the global flag. The guard forces caching off when the model has
+/// linear-attention layers and loads on a GPU device, because `OpenVINO` `GenAI`
+/// 2026.2.x returns wrong continuations on a prefix-cache hit for those models
+/// on GPU (reproduced with bare `GenAI` on 2026.2.0 and 2026.2.1, absent on CPU
+/// and fixed in 2026.4.1).
+/// Correct output beats a faster prefill, and the override is always available.
+///
+/// A free function so the precedence is unit-testable without a GPU.
+pub(crate) fn resolve_prefix_caching(
+    global: bool,
+    model_override: Option<bool>,
+    linear_attention: bool,
+    device: &str,
+) -> (bool, PrefixCachingSource) {
+    if let Some(v) = model_override {
+        return (v, PrefixCachingSource::ModelOverride);
+    }
+    if global && linear_attention && device.starts_with("GPU") {
+        return (false, PrefixCachingSource::HybridGuard);
+    }
+    (global, PrefixCachingSource::Global)
+}
+
+/// Whether automatic placement must keep a model off every GPU: it has
+/// linear-attention layers and does not carry an explicit
+/// `enable_prefix_caching: true` (the guard in [`resolve_prefix_caching`] would
+/// force caching off on a GPU, and the model then fails to load there).
+pub(crate) fn hybrid_banned_from_gpu(linear_attention: bool, model_override: Option<bool>) -> bool {
+    linear_attention && model_override != Some(true)
+}
+
+/// Whether `model_dir/config.json` declares any `linear_attention` layer
+/// (`layer_types`, at the top level or under `text_config`). Unreadable or
+/// unparsable config counts as "no" — the guard then simply does not fire.
+pub(crate) fn is_linear_attention_model(model_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    [
+        cfg.get("layer_types"),
+        cfg.pointer("/text_config/layer_types"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_array)
+    .flatten()
+    .any(|t| t.as_str() == Some("linear_attention"))
+}
+
+/// With prefix caching forced off, a hybrid model's linear-attention state is
+/// budgeted from `kv_cache_gb` and can exceed it (measured: Qwen3.5-9B failed
+/// to load at 4 and 6 GB, loaded at 8). Say so instead of surfacing the bare
+/// C++ check failure.
+/// Replaces any absolute path of the machine `OpenVINO` was built on (build-farm home paths, as C++
+/// check failures quote them) with a neutral phrase: build-farm paths mean nothing to a user.
+fn strip_build_paths(msg: &str) -> String {
+    msg.split_inclusive(char::is_whitespace)
+        .map(|tok| {
+            let word = tok.trim_end();
+            if word.starts_with("/home/") {
+                let tail = &tok[word.len()..];
+                let colon = if word.ends_with(':') { ":" } else { "" };
+                format!("the OpenVINO GenAI source{colon}{tail}")
+            } else {
+                tok.to_owned()
+            }
+        })
+        .collect()
+}
+
+fn hint_if_hybrid_guard_pool_too_small(err: anyhow::Error, model_id: &str) -> anyhow::Error {
+    let msg = err.to_string();
+    if msg.contains("reserved_la_bytes") || msg.contains("linear attention cache") {
+        return anyhow::anyhow!(
+            "{}\n\nHint: prefix caching was forced off for '{model_id}' (hybrid \
+             linear-attention model on GPU; see enable_prefix_caching), and without it the \
+             linear-attention state no longer fits. Either accept the upstream prefix-cache bug \
+             for this model (`rv add {model_id} --device GPU.n --enable-prefix-caching`, or \
+             enable_prefix_caching=true in its config entry), or raise BOTH kv_cache_gb and the \
+             global cache_size_gb - cache_size_gb (2.0 in the release bundle) caps every model's \
+             KV pool, so a larger kv_cache_gb alone changes nothing. Or load it on the CPU.",
+            strip_build_paths(&msg)
         );
     }
     err
@@ -1352,6 +1586,202 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
+    // ── prefix-caching resolution (hybrid linear-attention guard) ───────────
+
+    #[test]
+    fn prefix_caching_guard_forces_off_for_hybrid_on_gpu_only() {
+        use PrefixCachingSource::{Global, HybridGuard};
+        // Hybrid + GPU (any GPU index, or bare "GPU") + global on -> guard.
+        for dev in ["GPU", "GPU.0", "GPU.1"] {
+            assert_eq!(
+                resolve_prefix_caching(true, None, true, dev),
+                (false, HybridGuard),
+                "{dev}"
+            );
+        }
+        // CPU / NPU were not shown broken: untouched.
+        for dev in ["CPU", "NPU"] {
+            assert_eq!(
+                resolve_prefix_caching(true, None, true, dev),
+                (true, Global)
+            );
+        }
+        assert!(hybrid_banned_from_gpu(true, None));
+        assert!(hybrid_banned_from_gpu(true, Some(false)));
+        assert!(!hybrid_banned_from_gpu(true, Some(true)));
+        assert!(!hybrid_banned_from_gpu(false, None));
+        // Non-hybrid models are never touched.
+        assert_eq!(
+            resolve_prefix_caching(true, None, false, "GPU.1"),
+            (true, Global)
+        );
+        // Global already off: nothing to force, and it is not the guard's doing.
+        assert_eq!(
+            resolve_prefix_caching(false, None, true, "GPU.1"),
+            (false, Global)
+        );
+    }
+
+    #[test]
+    fn prefix_caching_model_override_beats_guard_and_global() {
+        use PrefixCachingSource::ModelOverride;
+        // Opt back in for a hybrid model (the escape hatch once the runtime is fixed).
+        assert_eq!(
+            resolve_prefix_caching(true, Some(true), true, "GPU.1"),
+            (true, ModelOverride)
+        );
+        // Force off for a non-hybrid model, and over a global-off.
+        assert_eq!(
+            resolve_prefix_caching(true, Some(false), false, "GPU.1"),
+            (false, ModelOverride)
+        );
+        assert_eq!(
+            resolve_prefix_caching(false, Some(true), false, "CPU"),
+            (true, ModelOverride)
+        );
+    }
+
+    fn model_dir_with_config(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), json).unwrap();
+        dir
+    }
+
+    /// A model dir with `config.json` and the named (empty) marker files.
+    fn model_dir_with(config: &str, files: &[&str]) -> tempfile::TempDir {
+        let dir = model_dir_with_config(config);
+        for f in files {
+            std::fs::write(dir.path().join(f), b"").unwrap();
+        }
+        dir
+    }
+
+    /// The layouts seen on the QA machines (2026-10-13): `SpeechT5` was claimed by the Whisper rule
+    /// (encoder + decoder IR), and the embedder / reranker had no marker at all.
+    #[test]
+    fn kind_is_sniffed_for_tts_reranker_and_embedder_but_not_for_decoders() {
+        let speecht5 = model_dir_with(
+            r#"{"architectures":["SpeechT5ForTextToSpeech"],"model_type":"speecht5"}"#,
+            &[
+                "openvino_encoder_model.xml",
+                "openvino_decoder_model.xml",
+                "openvino_postnet.xml",
+                "openvino_vocoder.xml",
+            ],
+        );
+        assert_eq!(
+            detect_kind_from_markers(speecht5.path()),
+            Some(ModelKind::Tts)
+        );
+        let reranker = model_dir_with(
+            r#"{"architectures":["XLMRobertaForSequenceClassification"],"model_type":"xlm-roberta","id2label":{"0":"LABEL_0"}}"#,
+            &["openvino_model.xml"],
+        );
+        assert_eq!(
+            detect_kind_from_markers(reranker.path()),
+            Some(ModelKind::Reranking)
+        );
+        let e5 = model_dir_with(
+            r#"{"architectures":["XLMRobertaModel"],"model_type":"xlm-roberta"}"#,
+            &["openvino_model.xml"],
+        );
+        assert_eq!(
+            detect_kind_from_markers(e5.path()),
+            Some(ModelKind::Embedding)
+        );
+        // A multi-label classifier is neither a reranker nor an embedder; decoders stay LLMs.
+        let classifier = model_dir_with(
+            r#"{"architectures":["BertForSequenceClassification"],"model_type":"bert","id2label":{"0":"a","1":"b","2":"c"}}"#,
+            &[],
+        );
+        assert_eq!(detect_kind_from_markers(classifier.path()), None);
+        let llm = model_dir_with(
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+            &["openvino_model.xml"],
+        );
+        assert_eq!(detect_kind_from_markers(llm.path()), None);
+        // GPT-2's `GPT2LMHeadModel` also ends in "Model" but is not an encoder family.
+        let gpt2 = model_dir_with(
+            r#"{"architectures":["GPT2LMHeadModel"],"model_type":"gpt2"}"#,
+            &[],
+        );
+        assert_eq!(detect_kind_from_markers(gpt2.path()), None);
+        // Whisper keeps its own rule.
+        let whisper = model_dir_with(
+            r#"{"architectures":["WhisperForConditionalGeneration"],"model_type":"whisper"}"#,
+            &["openvino_encoder_model.xml", "openvino_decoder_model.xml"],
+        );
+        assert_eq!(
+            detect_kind_from_markers(whisper.path()),
+            Some(ModelKind::Stt)
+        );
+    }
+
+    #[test]
+    fn build_farm_paths_are_stripped_from_the_hybrid_hint() {
+        let cpp = anyhow::anyhow!(
+            "ov_vlm_create failed: Check reserved_la_bytes <= budget_in_bytes failed at \
+             /home/jenkins/agent/workspace/x/cache_orchestrator.hpp:764: Requested linear attention \
+             cache allocation exceeds the configured cache size."
+        );
+        let hinted = hint_if_hybrid_guard_pool_too_small(cpp, "m").to_string();
+        assert!(!hinted.contains("/home/"), "{hinted}");
+        assert!(hinted.contains("the OpenVINO GenAI source:"), "{hinted}");
+    }
+
+    #[test]
+    fn linear_attention_detected_at_top_level_and_under_text_config() {
+        let top = model_dir_with_config(
+            r#"{"layer_types":["linear_attention","linear_attention","full_attention"]}"#,
+        );
+        assert!(is_linear_attention_model(top.path()));
+        // Qwen3.5-style multimodal config nests the text model.
+        let nested = model_dir_with_config(
+            r#"{"model_type":"qwen3_5","text_config":{"layer_types":["full_attention","linear_attention"]}}"#,
+        );
+        assert!(is_linear_attention_model(nested.path()));
+    }
+
+    #[test]
+    fn linear_attention_not_detected_for_dense_or_unreadable_configs() {
+        let dense =
+            model_dir_with_config(r#"{"layer_types":["full_attention","sliding_attention"]}"#);
+        assert!(!is_linear_attention_model(dense.path()));
+        let no_field = model_dir_with_config(r#"{"model_type":"qwen3","num_hidden_layers":36}"#);
+        assert!(!is_linear_attention_model(no_field.path()));
+        let garbage = model_dir_with_config("{ not json");
+        assert!(!is_linear_attention_model(garbage.path()));
+        // Missing config.json and missing directory: guard stays off, no panic.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!is_linear_attention_model(empty.path()));
+        assert!(!is_linear_attention_model(Path::new("/nonexistent/model")));
+        // layer_types of the wrong JSON shape is ignored, not an error.
+        let odd = model_dir_with_config(r#"{"layer_types":"linear_attention"}"#);
+        assert!(!is_linear_attention_model(odd.path()));
+    }
+
+    #[test]
+    fn hybrid_guard_pool_hint_only_on_the_linear_attention_budget_error() {
+        let cpp = anyhow::anyhow!(
+            "ov_vlm_create failed: Check 'reserved_la_bytes <= budget_in_bytes' failed at x.hpp:764:\n\
+             Requested linear attention cache allocation exceeds the configured cache size."
+        );
+        let hinted = hint_if_hybrid_guard_pool_too_small(cpp, "qwen3.5-9b").to_string();
+        assert!(
+            hinted.contains("--enable-prefix-caching") && hinted.contains("cache_size_gb"),
+            "{hinted}"
+        );
+        assert!(hinted.contains("qwen3.5-9b"), "{hinted}");
+        assert!(
+            hinted.contains("reserved_la_bytes"),
+            "original error is kept: {hinted}"
+        );
+        // An unrelated failure is passed through untouched.
+        let other =
+            hint_if_hybrid_guard_pool_too_small(anyhow::anyhow!("out of device memory"), "m");
+        assert_eq!(other.to_string(), "out of device memory");
+    }
+
     fn kind_of(name: &str) -> ModelKind {
         MockEngineFactory::default().detect_kind(Path::new(name))
     }
@@ -1487,6 +1917,7 @@ mod tests {
             admission_queue_timeout_ms: 0,
             model_kinds: std::sync::RwLock::new(HashMap::new()),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
+            prefix_caching_overrides: std::sync::RwLock::new(HashMap::new()),
             max_prompt_len_hints: std::sync::RwLock::new(HashMap::new()),
             min_response_len_hints: std::sync::RwLock::new(HashMap::new()),
             draft_hints: std::sync::RwLock::new(HashMap::new()),

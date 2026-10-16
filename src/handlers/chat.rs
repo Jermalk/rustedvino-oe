@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use super::error::{
     JsonBody, device_admission_error_response, inference_error_from_text, model_error_response,
-    openai_error, sse_inference_error_event, unsupported_param,
+    openai_error, openai_error_with_param, sse_inference_error_event, unsupported_param,
 };
 use crate::{
     app_state::AppState,
@@ -599,7 +599,8 @@ pub struct ImageUrlData {
 /// turns. All tool fields default to absent so plain chat requests are unchanged.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ChatMessage {
-    /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
+    /// `"system"`, `"developer"`, `"user"`, `"assistant"`, `"tool"` or the legacy `"function"`; any
+    /// other value is a 400 (see [`validate_message_roles`]).
     pub role: String,
 
     /// The message text (or multimodal parts). Absent on assistant turns that
@@ -645,6 +646,12 @@ pub fn extract_text_content(content: &MessageContent) -> String {
     }
 }
 
+/// The role name a chat template understands: `developer` (`OpenAI`'s newer name for `system`)
+/// becomes `system`, every other role is passed through unchanged.
+fn template_role(role: &str) -> &str {
+    if role == "developer" { "system" } else { role }
+}
+
 /// Convert messages to plain `serde_json::Value` objects with string content,
 /// suitable for the CB engine's chat-template renderer.  Image parts are
 /// dropped; text parts are concatenated.
@@ -652,7 +659,7 @@ pub fn messages_to_template_values(messages: &[ChatMessage]) -> Vec<serde_json::
     messages
         .iter()
         .map(|m| {
-            let mut obj = serde_json::json!({ "role": m.role });
+            let mut obj = serde_json::json!({ "role": template_role(&m.role) });
             if let Some(c) = &m.content {
                 obj["content"] = serde_json::Value::String(extract_text_content(c));
             }
@@ -1403,6 +1410,39 @@ pub(crate) fn validate_sampling_params(
     None
 }
 
+/// Roles a chat message may carry. `developer` is `OpenAI`'s newer name for `system`;
+/// the deprecated `function` role (the pre-`tool` name) is still accepted so older clients keep working.
+const KNOWN_MESSAGE_ROLES: [&str; 6] = [
+    "system",
+    "developer",
+    "user",
+    "assistant",
+    "tool",
+    "function",
+];
+
+/// Reject a message whose `role` is not one of [`KNOWN_MESSAGE_ROLES`] with a 400 that names
+/// `messages[i].role` (D-05). Before this an unknown role (`"wizard"`) reached the chat template
+/// and produced a normal-looking answer, so a typo in a client went unnoticed.
+pub(crate) fn validate_message_roles(messages: &[ChatMessage]) -> Option<Response> {
+    let (i, m) = messages
+        .iter()
+        .enumerate()
+        .find(|(_, m)| !KNOWN_MESSAGE_ROLES.contains(&m.role.as_str()))?;
+    let param = format!("messages[{i}].role");
+    Some(openai_error_with_param(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "unknown role '{}' in '{param}' - must be one of: {}",
+            m.role,
+            KNOWN_MESSAGE_ROLES.join(", ")
+        ),
+        "invalid_request_error",
+        Some("invalid_value"),
+        Some(&param),
+    ))
+}
+
 /// Server-side repetition-penalty safety net, applied whenever a request
 /// doesn't specify its own `repetition_penalty` — see
 /// [`resolve_repetition_penalty`]'s doc comment for why this exists.
@@ -1450,14 +1490,17 @@ pub(crate) fn clamp_top_p(top_p: Option<f32>) -> Option<f32> {
 /// client-explicit values, `tools_active`, and a model's own shipped
 /// [`GenerationDefaults`] (`generation_config.json`) into one decision:
 ///
-/// 1. **The client set at least one of the three** — all three pass through
+/// 0. **The client set a `temperature`** (0.8.4, K-02a/D-11) — `0` is greedy, so
+///    `top_p`/`top_k` are dropped (the engine rejects them with it); a positive
+///    value keeps the client's `top_p`/`top_k` and fills the ones it left unset
+///    from the model's defaults (sampling is already on, so nothing flips).
+/// 1. **The client set `top_p` and/or `top_k` but no temperature** — all three pass through
 ///    exactly as given (`None` fields stay `None`, the engine's own default
 ///    applies to those). Never partially filled in from a model default:
-///    `ov_bridge.cpp`'s `build_gen_config` flips `do_sample` to `true` on a
-///    sub-1.0 `top_p` or nonzero `top_k` *independent of* `temperature`, so
-///    silently filling in a model-default `top_p`/`top_k` underneath an
-///    explicit client `temperature: 0.0` (or any other explicit value) would
-///    reshape the client's intended distribution instead of respecting it —
+///    with no temperature the engine's own sampling switch is decided by
+///    the client's `top_p`/`top_k` alone, so silently adding a model-default
+///    `top_p`/`top_k` or temperature would reshape the client's intended
+///    distribution instead of respecting it —
 ///    the same corruption class a `tools_active`-only pin already hit once
 ///    this session (2026-07-23, the project's internal engineering log) gating on `temperature`
 ///    alone.
@@ -1480,7 +1523,22 @@ pub(crate) fn resolve_sampling_defaults(
     tools_active: bool,
     model_defaults: GenerationDefaults,
 ) -> (Option<f32>, Option<f32>, Option<usize>) {
-    if temperature.is_some() || top_p.is_some() || top_k.is_some() {
+    if let Some(t) = temperature {
+        if t <= 0.0 {
+            // Explicit greedy: GenAI rejects top_p/top_k alongside temperature 0 (D-11, a 500),
+            // and they have no effect on an argmax anyway.
+            return (temperature, None, None);
+        }
+        // Sampling with a client temperature: take the unset top_p/top_k from the model so
+        // GenAI does not sample over the whole vocabulary every token (K-02a). `do_sample` is
+        // already true here, so filling them in cannot flip a greedy request into sampling.
+        return (
+            temperature,
+            top_p.or(model_defaults.top_p),
+            top_k.or(model_defaults.top_k),
+        );
+    }
+    if top_p.is_some() || top_k.is_some() {
         return (temperature, top_p, top_k);
     }
     if tools_active {
@@ -1621,7 +1679,8 @@ fn extract_vlm_messages(
             }
             None => String::new(),
         };
-        let mut obj = serde_json::json!({"role": msg.role, "content": text_content});
+        let mut obj =
+            serde_json::json!({"role": template_role(&msg.role), "content": text_content});
         if let Some(tc) = &msg.tool_calls {
             obj["tool_calls"] = serde_json::json!(tc);
         }
@@ -1740,6 +1799,11 @@ pub async fn chat_completions(
         req.frequency_penalty,
         req.n,
     ) {
+        return resp;
+    }
+
+    // D-05: an unknown message role is a 400 naming the field, not a silent answer.
+    if let Some(resp) = validate_message_roles(&req.messages) {
         return resp;
     }
 
@@ -1967,6 +2031,9 @@ pub async fn chat_completions(
                             Some("server_overloaded"),
                         );
                     }
+                    SubmitResult::Closing => {
+                        return super::error::model_error_response(ModelError::Evicting);
+                    }
                     SubmitResult::EngineDead => {
                         return openai_error(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -2150,6 +2217,9 @@ pub async fn chat_completions(
                             "rate_limit_error",
                             Some("server_overloaded"),
                         );
+                    }
+                    SubmitResult::Closing => {
+                        return super::error::model_error_response(ModelError::Evicting);
                     }
                     SubmitResult::EngineDead => {
                         return openai_error(
@@ -2398,6 +2468,9 @@ pub async fn chat_completions(
                     "rate_limit_error",
                     Some("server_overloaded"),
                 );
+            }
+            SubmitResult::Closing => {
+                return super::error::model_error_response(ModelError::Evicting);
             }
             SubmitResult::EngineDead => {
                 return openai_error(
@@ -3549,8 +3622,8 @@ mod tests {
             "no client sampling intent, tools active → greedy pin wins over model defaults"
         );
 
-        // Client sets temperature only (even the bug-triggering 0.0) → nothing
-        // else gets filled in, regardless of tools_active.
+        // Client sets temperature 0 (greedy) → nothing is filled in, regardless of
+        // tools_active. A positive temperature is covered by the fills_top_p_top_k test.
         assert_eq!(
             resolve_sampling_defaults(Some(0.0), None, None, false, defaults),
             (Some(0.0), None, None),
@@ -3612,6 +3685,102 @@ mod tests {
     }
 
     /// T7.4/#24: sampling params in range (or absent) pass; out-of-range → 400.
+    /// K-02a + D-11 (0.8.4): a client that sets only a positive `temperature`
+    /// gets the model's own `top_p`/`top_k` for the fields it left unset (so
+    /// `GenAI` no longer samples over the whole vocabulary on the engine
+    /// thread), and an explicit `temperature: 0` is greedy, so `top_p`/`top_k`
+    /// are dropped rather than sent to an engine that rejects them (500).
+    #[test]
+    fn resolve_sampling_defaults_fills_top_p_top_k_for_positive_temperature() {
+        let defaults = GenerationDefaults {
+            temperature: Some(0.7),
+            top_p: Some(0.8),
+            top_k: Some(20),
+        };
+
+        // Temperature only: top_p/top_k come from the model, temperature stays the client's.
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), None, None, false, defaults),
+            (Some(0.3), Some(0.8), Some(20)),
+            "positive temperature alone -> model top_p/top_k fill in"
+        );
+        // Same with tools active: an explicit temperature already beats the pin.
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), None, None, true, defaults),
+            (Some(0.3), Some(0.8), Some(20)),
+        );
+        // Client-set fields win over the model's; only the unset one is filled.
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), Some(0.5), None, false, defaults),
+            (Some(0.3), Some(0.5), Some(20)),
+        );
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), None, Some(5), false, defaults),
+            (Some(0.3), Some(0.8), Some(5)),
+        );
+        // No model defaults: nothing to fill, today's behaviour.
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), None, None, false, GenerationDefaults::default()),
+            (Some(0.3), None, None),
+        );
+        // A model that ships only top_k fills only top_k.
+        let only_k = GenerationDefaults {
+            temperature: Some(0.7),
+            top_p: None,
+            top_k: Some(20),
+        };
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.3), None, None, false, only_k),
+            (Some(0.3), None, Some(20)),
+        );
+
+        // D-11: temperature 0 is greedy; top_p/top_k sent with it are dropped.
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.0), None, Some(40), false, defaults),
+            (Some(0.0), None, None),
+            "temperature 0 + top_k must not reach the engine"
+        );
+        assert_eq!(
+            resolve_sampling_defaults(Some(0.0), Some(0.9), Some(40), false, defaults),
+            (Some(0.0), None, None),
+            "temperature 0 + top_p + top_k -> greedy"
+        );
+    }
+
+    /// D-05: an unknown message role is a 400 naming `messages[i].role`, not a silent 200.
+    #[test]
+    fn validate_message_roles_accepts_known_and_names_the_bad_one() {
+        let msg = |role: &str| ChatMessage {
+            role: role.into(),
+            ..Default::default()
+        };
+        let ok: Vec<ChatMessage> = [
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+            "function",
+        ]
+        .into_iter()
+        .map(msg)
+        .collect();
+        assert!(validate_message_roles(&ok).is_none());
+        assert!(
+            validate_message_roles(&[]).is_none(),
+            "emptiness is checked elsewhere"
+        );
+
+        let bad = vec![msg("user"), msg("wizard"), msg("oracle")];
+        assert_eq!(
+            validate_message_roles(&bad).map(|r| r.status()),
+            Some(StatusCode::BAD_REQUEST),
+            "unknown role must be rejected"
+        );
+        // Role names are case-sensitive in the `OpenAI` API.
+        assert!(validate_message_roles(&[msg("User")]).is_some());
+    }
+
     #[test]
     fn validate_sampling_params_rejects_out_of_range() {
         // All absent → accepted (engine keeps its defaults).
@@ -3908,6 +4077,7 @@ mod tests {
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
+            default_placement: crate::model_manager::config::DefaultPlacement::Auto,
             dgpu_size_ceiling_fraction: 0.8,
             system_ram_reservation_gb: None,
             system_ram_budget_gb: None,
@@ -5756,6 +5926,26 @@ mod tests {
                 .contains("ov_genai_image"),
             "no tag leaks into text-only content"
         );
+    }
+
+    /// `developer` is `OpenAI`'s newer name for `system`; chat templates only know `system`, so both
+    /// converters hand the template `system`. Every other role (incl. legacy `function`) is unchanged.
+    #[test]
+    fn developer_role_is_rendered_as_system_in_both_converters() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "developer", "content": "Answer in French"},
+            {"role": "user", "content": "hi"},
+            {"role": "function", "content": "42", "name": "f"}
+        ]))
+        .unwrap();
+        let vals = messages_to_template_values(&messages);
+        assert_eq!(vals[0]["role"], "system");
+        assert_eq!(vals[1]["role"], "user");
+        assert_eq!(vals[2]["role"], "function");
+        let (vlm, _images) = extract_vlm_messages(&messages).unwrap();
+        assert_eq!(vlm[0]["role"], "system");
+        assert_eq!(vlm[1]["role"], "user");
+        assert_eq!(vlm[2]["role"], "function");
     }
 
     #[test]

@@ -109,6 +109,17 @@ impl ModelKind {
 /// lifecycle bookkeeping. It is deliberately **sync** — async execution
 /// lives on the concrete handle reached through [`EngineHandleKind`], so
 /// no `async-trait` dependency and no change to the token hot path.
+/// The error a request/response engine that reports plain `anyhow` errors (rerank, image) returns
+/// when it refuses a submit because its model is being evicted (the engine's `closing` flag, D3).
+/// It carries [`crate::handlers::error::ENGINE_SHUTDOWN_MARKER`], so the existing inference error
+/// mapping answers it as a retryable 503 `model_unloading` + `Retry-After` — no handler change.
+pub(crate) fn closing_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: the model is being evicted — retry shortly",
+        crate::handlers::error::ENGINE_SHUTDOWN_MARKER
+    )
+}
+
 pub trait ManagedEngine: Send + Sync {
     /// The kind of model this engine serves (routing + metrics label).
     fn kind(&self) -> ModelKind;
@@ -125,6 +136,12 @@ pub trait ManagedEngine: Send + Sync {
     fn waiting(&self) -> usize {
         0
     }
+    /// Tell the engine it is being evicted: while `closing` is true a submit that already
+    /// holds its admission permit is refused (retryable) rather than accepted into an engine
+    /// that is about to be torn down (D3-S1.D1..D4). Shared state, so every clone of the
+    /// handle sees it; a reload builds a new engine with the flag clear. Default: no-op for a
+    /// kind that does not implement the flag yet.
+    fn set_closing(&self, _closing: bool) {}
     /// Net measured device-memory change (bytes) across this engine's requests
     /// since load — working memory the runtime keeps between requests, which
     /// the config-declared `vram_gb` doesn't see. Only the embedding engine
@@ -193,6 +210,42 @@ pub trait ManagedEngine: Send + Sync {
     }
 }
 
+/// A handle that can run the model's tokenizer for `/tokenize` and `/detokenize`: the
+/// continuous-batching text engine or the vision engine (D-09). The text engine's tokenizer is not
+/// thread-safe, so its calls go through the engine thread; the vision engine has a standalone,
+/// mutex-guarded tokenizer of its own (D-13) and falls back to its engine thread without it.
+#[derive(Clone, Debug)]
+pub enum TokenizerHandle {
+    /// Text-generation model.
+    Text(EngineHandle),
+    /// Vision-language model (its text path uses the same tokenizer).
+    Vision(VlmHandle),
+}
+
+impl TokenizerHandle {
+    /// Encode `text` to token ids.
+    ///
+    /// # Errors
+    /// Returns an error if the engine thread is gone or the tokenizer fails.
+    pub async fn tokenize(&self, text: String) -> anyhow::Result<Vec<i64>> {
+        match self {
+            Self::Text(h) => h.tokenize(text).await,
+            Self::Vision(h) => h.tokenize(text).await,
+        }
+    }
+
+    /// Decode token ids to text.
+    ///
+    /// # Errors
+    /// Returns an error if the engine thread is gone or the detokenizer fails.
+    pub async fn detokenize(&self, ids: Vec<i64>) -> anyhow::Result<String> {
+        match self {
+            Self::Text(h) => h.detokenize(ids).await,
+            Self::Vision(h) => h.detokenize(ids).await,
+        }
+    }
+}
+
 /// Typed dispatch handle — the value `ModelManager` stores per Ready model
 /// and the chat handler matches on to reach the concrete engine API.
 ///
@@ -257,6 +310,15 @@ impl EngineHandleKind {
             h.request_shutdown();
         }
         // NpuTextGen: no explicit shutdown flag — channel drop on thread exit suffices.
+    }
+
+    /// Whether [`request_shutdown`](Self::request_shutdown) really stops this engine's work
+    /// promptly. Only the continuous-batching engine has an abort flag; every other kind runs the
+    /// current request to completion before its thread can exit, so a forced eviction of one has
+    /// to WAIT for the thread rather than assume it is gone (D3-S1.E5).
+    #[must_use]
+    pub fn aborts_on_shutdown(&self) -> bool {
+        matches!(self, Self::TextGen(_))
     }
 
     /// Borrow the engine as its uniform [`ManagedEngine`] facade — what the

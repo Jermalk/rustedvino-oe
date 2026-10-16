@@ -59,6 +59,9 @@ enum AttemptOutcome {
     /// The worker exited on its own, or was killed for hanging — evaluate
     /// backoff/cap and try again.
     Failed,
+    /// The worker exited with [`crate::startup::EXIT_CONFIG_FATAL`]: a
+    /// deterministic config error that a respawn cannot fix. Stop for good.
+    ConfigFatal,
 }
 
 /// Core supervise loop — spawns `exe` with `args`, watches it, respawns with
@@ -114,6 +117,11 @@ pub async fn run_supervised(
         match run_one_attempt(&mut child, health_addr, cfg, &mut sigterm).await {
             AttemptOutcome::ShuttingDown => return Ok(()),
             AttemptOutcome::Failed => attempts.push(Instant::now()),
+            AttemptOutcome::ConfigFatal => anyhow::bail!(
+                "worker exited with a fatal configuration error (exit {}) — not respawning; \
+                 fix the config (see the worker's error above) and start again",
+                crate::startup::EXIT_CONFIG_FATAL
+            ),
         }
     }
 }
@@ -131,8 +139,7 @@ async fn run_one_attempt(
     let became_healthy = tokio::select! {
         healthy = wait_for_health(health_addr, health_timeout) => healthy,
         status = child.wait() => {
-            log_exit(status);
-            return AttemptOutcome::Failed;
+            return exit_outcome(status);
         }
         _ = sigterm.recv() => {
             return shut_down_child(child).await;
@@ -156,19 +163,13 @@ async fn run_one_attempt(
     // immediately on the first real tick.
     if cfg.watchdog_hang_ceiling_secs == 0 {
         return tokio::select! {
-            status = child.wait() => {
-                log_exit(status);
-                AttemptOutcome::Failed
-            }
+            status = child.wait() => exit_outcome(status),
             _ = sigterm.recv() => shut_down_child(child).await,
         };
     }
 
     tokio::select! {
-        status = child.wait() => {
-            log_exit(status);
-            AttemptOutcome::Failed
-        }
+        status = child.wait() => exit_outcome(status),
         _ = sigterm.recv() => shut_down_child(child).await,
         () = generation_watchdog(health_addr, cfg) => {
             tracing::error!(
@@ -274,10 +275,24 @@ async fn probe_health_once(addr: SocketAddr) -> bool {
 /// `OvCbEngine::Drop` for a worker that was shutting down cleanly.
 async fn shut_down_child(child: &mut Child) -> AttemptOutcome {
     send_signal(child, libc::SIGTERM);
-    if let Err(e) = child.wait().await {
-        tracing::warn!(error = %e, "error waiting for worker to exit during shutdown");
+    match child.wait().await {
+        Ok(status) if status.success() => {
+            tracing::info!("SIGTERM received — worker stopped cleanly, exiting (no respawn)");
+        }
+        Ok(status) => {
+            // A non-zero code or a fatal signal (e.g. SIGSEGV from teardown)
+            // means the worker's shutdown path crashed; record it rather than
+            // reporting a clean stop.
+            tracing::error!(
+                code = ?status.code(),
+                signal = ?status.signal(),
+                "SIGTERM received — worker did NOT exit cleanly during shutdown (no respawn)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "error waiting for worker to exit during shutdown");
+        }
     }
-    tracing::info!("SIGTERM received — worker stopped, exiting (no respawn)");
     AttemptOutcome::ShuttingDown
 }
 
@@ -321,6 +336,22 @@ fn is_poison_exit(code: Option<i32>) -> bool {
     code == Some(i32::from(crate::startup::EXIT_GPU_POISONED))
 }
 
+/// Whether a worker exit code is the deliberate fatal-config exit.
+fn is_config_fatal_exit(code: Option<i32>) -> bool {
+    code == Some(i32::from(crate::startup::EXIT_CONFIG_FATAL))
+}
+
+/// Logs a worker exit and decides whether the supervisor may respawn it.
+fn exit_outcome(status: std::io::Result<ExitStatus>) -> AttemptOutcome {
+    let fatal = matches!(&status, Ok(s) if is_config_fatal_exit(s.code()));
+    log_exit(status);
+    if fatal {
+        AttemptOutcome::ConfigFatal
+    } else {
+        AttemptOutcome::Failed
+    }
+}
+
 fn log_exit(status: std::io::Result<ExitStatus>) {
     match status {
         Ok(status) if is_poison_exit(status.code()) => {
@@ -328,6 +359,13 @@ fn log_exit(status: std::io::Result<ExitStatus>) {
                 code = ?status.code(),
                 "worker exited on purpose: its GPU context was poisoned (out of resources) — \
                  restarting it"
+            );
+        }
+        Ok(status) if is_config_fatal_exit(status.code()) => {
+            tracing::error!(
+                code = ?status.code(),
+                "worker exited on a fatal configuration error — NOT restarting (a respawn \
+                 would fail identically)"
             );
         }
         Ok(status) => {
@@ -359,7 +397,7 @@ fn backoff_delay(prior_failures: usize, cfg: &SupervisorConfig) -> Option<Durati
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_delay, is_poison_exit, prune_old_attempts};
+    use super::{backoff_delay, is_config_fatal_exit, is_poison_exit, prune_old_attempts};
 
     /// The supervisor recognises the worker's deliberate GPU-poisoned exit (75)
     /// and nothing else (a crash, a signal kill, a clean 0).
@@ -370,6 +408,20 @@ mod tests {
         assert!(!is_poison_exit(Some(1)));
         assert!(!is_poison_exit(None), "killed by a signal has no code");
     }
+    /// Only exit code 78 stops the supervisor; 75 (poison), 1 and signal kills
+    /// are all still respawned.
+    #[test]
+    fn only_exit_code_78_is_the_config_fatal_exit() {
+        assert!(is_config_fatal_exit(Some(78)));
+        assert!(!is_config_fatal_exit(Some(75)));
+        assert!(!is_config_fatal_exit(Some(1)));
+        assert!(!is_config_fatal_exit(Some(0)));
+        assert!(
+            !is_config_fatal_exit(None),
+            "killed by a signal has no code"
+        );
+    }
+
     use crate::model_manager::SupervisorConfig;
     use std::time::{Duration, Instant};
 

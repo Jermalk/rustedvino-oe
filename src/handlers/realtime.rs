@@ -980,11 +980,13 @@ async fn run_response(
                 err = %e,
                 "realtime: stt error"
             );
+            let message = gpu_poison_client_message(state, session.stt_model.as_deref(), &e)
+                .unwrap_or_else(|| e.to_string());
             send_event(
                 out,
                 &ServerEvent::Error {
                     stage: "asr",
-                    message: &e.to_string(),
+                    message: &message,
                 },
             )
             .await;
@@ -1135,11 +1137,13 @@ async fn run_response(
                 err = %e,
                 "realtime: llm error"
             );
+            let message = gpu_poison_client_message(state, session.llm_model.as_deref(), &e)
+                .unwrap_or_else(|| e.to_string());
             send_event(
                 out,
                 &ServerEvent::Error {
                     stage: "llm",
-                    message: &e.to_string(),
+                    message: &message,
                 },
             )
             .await;
@@ -1155,6 +1159,28 @@ async fn run_response(
     };
 
     (transcript, assistant_text)
+}
+
+/// A GPU out-of-resources failure inside a realtime turn poisons the `OpenCL` context for the whole
+/// process, exactly as on the HTTP routes: flag it so the supervisor restarts the worker at once
+/// (instead of the server serving a dead GPU until the next request trips over it), and return the
+/// message to send the client. The raw C++ diagnostics are never put on the wire for it (T6.2).
+fn gpu_poison_client_message(
+    state: &AppState,
+    model: Option<&str>,
+    err: &anyhow::Error,
+) -> Option<String> {
+    let text = err.to_string();
+    if !crate::model_manager::is_gpu_poison_error(&text) {
+        return None;
+    }
+    if let Some(mm) = state.model_manager.as_ref() {
+        mm.mark_gpu_poisoned(model.unwrap_or("unknown"), err);
+    }
+    Some(
+        "the GPU ran out of resources; the server is restarting its worker — retry shortly"
+            .to_owned(),
+    )
 }
 
 async fn run_stt(
@@ -1313,6 +1339,11 @@ async fn run_llm_tts(
             {
                 SubmitResult::Submitted => {}
                 SubmitResult::AtCapacity => return Err(anyhow::anyhow!("LLM engine at capacity")),
+                SubmitResult::Closing => {
+                    return Err(anyhow::anyhow!(
+                        "LLM model is being unloaded — retry shortly"
+                    ));
+                }
                 SubmitResult::EngineDead => return Err(anyhow::anyhow!("LLM engine unavailable")),
             }
         }
@@ -1380,6 +1411,11 @@ async fn run_llm_tts(
             {
                 SubmitResult::Submitted => {}
                 SubmitResult::AtCapacity => return Err(anyhow::anyhow!("LLM engine at capacity")),
+                SubmitResult::Closing => {
+                    return Err(anyhow::anyhow!(
+                        "LLM model is being unloaded — retry shortly"
+                    ));
+                }
                 SubmitResult::EngineDead => return Err(anyhow::anyhow!("LLM engine unavailable")),
             }
         }
@@ -3710,6 +3746,7 @@ mod tests {
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
+            default_placement: crate::model_manager::config::DefaultPlacement::Auto,
             dgpu_size_ceiling_fraction: 0.8,
             system_ram_reservation_gb: None,
             system_ram_budget_gb: None,
@@ -4002,6 +4039,50 @@ mod tests {
             err.to_string()
                 .contains("realtime needs a text-gen or vision model"),
             "got: {err}"
+        );
+    }
+
+    /// A GPU out-of-resources failure inside a realtime turn poisons the context (so the
+    /// supervisor restarts the worker) and is reported to the client without the raw C++ text; any
+    /// other error is left alone. This path used to classify nothing: the worker kept serving a
+    /// dead GPU after the first failure (live, 2026-10-08).
+    #[tokio::test]
+    async fn gpu_poison_in_a_realtime_turn_flags_the_context_and_hides_the_raw_text() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-rt-poison-models", "device": "CPU", "total_vram_gb": 22.5,
+            "models": { "m": {"vram_gb": 1.0} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = AppState::new().with_model_manager(std::sync::Arc::clone(&mm));
+
+        let benign = anyhow::anyhow!("ov_cb_step failed: bad input");
+        assert_eq!(gpu_poison_client_message(&state, Some("m"), &benign), None);
+        assert!(
+            !mm.is_gpu_poisoned(),
+            "an ordinary error must not poison the GPU"
+        );
+
+        let oom = anyhow::anyhow!(
+            "ov_cb_step failed: Exception from src/plugins/intel_gpu/src/graph/impls/onednn/\
+             primitive_onednn_base.h:550:\ncould not execute a primitive"
+        );
+        let shown = gpu_poison_client_message(&state, Some("m"), &oom).unwrap();
+        assert!(
+            mm.is_gpu_poisoned(),
+            "the oneDNN OOM form poisons the context"
+        );
+        assert!(
+            !shown.contains("Exception from") && !shown.contains("primitive"),
+            "{shown}"
         );
     }
 }

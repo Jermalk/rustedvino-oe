@@ -11,7 +11,9 @@ use crate::metrics::{self, Sample};
 /// when there is no key to try; prints and returns `None` when a key was sent
 /// but the call still failed, since that is a real, distinct error.
 fn fetch_admin_models(ctx: &Ctx) -> Option<Vec<Value>> {
-    ctx.res.admin_key.as_ref()?;
+    if !ctx.res.admin_usable() {
+        return None;
+    }
     let r = ctx.api.get("/v1/admin/models");
     if let Some(models) = r
         .json()
@@ -51,6 +53,16 @@ fn gb(m: &Value, k: &str) -> String {
     format!("{:.1} GB", m.get(k).and_then(Value::as_f64).unwrap_or(0.0))
 }
 
+/// The memory-budget cell: on a CPU placement the figure is a system-RAM
+/// budget, not VRAM, so say so (0.8.3, F6).
+pub(crate) fn mem_cell(device: &str, gb_text: String) -> String {
+    if device.eq_ignore_ascii_case("cpu") {
+        format!("{gb_text} (RAM)")
+    } else {
+        gb_text
+    }
+}
+
 /// `running/waiting/max`, or `n/a` unless all three metrics exist.
 fn req_triplet(rows: &[Sample], model: &str) -> String {
     let get = |name| metrics::by_label(rows, name, &[("model", model)]);
@@ -78,6 +90,7 @@ fn kv_percent(rows: &[Sample], model: &str) -> String {
 /// `models_dir` (needs none). Neither alone answers "what is available".
 #[must_use]
 pub fn list(ctx: &Ctx) -> i32 {
+    ctx.warn_if_open();
     let registered = fetch_admin_models(ctx);
     let disk_dirs = ctx.list_model_dirs();
     let st = ctx.style;
@@ -105,7 +118,7 @@ pub fn list(ctx: &Ctx) -> i32 {
                     s(m, "id").to_owned(),
                     s(m, "state").to_owned(),
                     s(m, "device").to_owned(),
-                    gb(m, "vram_gb"),
+                    mem_cell(s(m, "device"), gb(m, "vram_gb")),
                     s(m, "kind").to_owned(),
                     ctx.policy_flags(s(m, "id")),
                 ]
@@ -210,7 +223,7 @@ pub fn ps(ctx: &Ctx) -> i32 {
                 id.to_owned(),
                 s(m, "device").to_owned(),
                 s(m, "kind").to_owned(),
-                gb(m, "vram_gb"),
+                mem_cell(s(m, "device"), gb(m, "vram_gb")),
                 gb(m, "cache_size_gb"),
                 kv_percent(&rows_m, id),
                 req_triplet(&rows_m, id),
@@ -247,4 +260,15 @@ pub fn ps(ctx: &Ctx) -> i32 {
 #[must_use]
 pub fn load_cells(rows: &[Sample], model: &str) -> (String, String) {
     (kv_percent(rows, model), req_triplet(rows, model))
+}
+
+#[cfg(test)]
+mod mem_cell_tests {
+    use super::mem_cell;
+
+    #[test]
+    fn cpu_budget_is_labelled_ram() {
+        assert_eq!(mem_cell("CPU", "3.3 GB".into()), "3.3 GB (RAM)");
+        assert_eq!(mem_cell("GPU.1", "3.3 GB".into()), "3.3 GB");
+    }
 }

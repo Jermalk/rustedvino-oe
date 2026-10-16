@@ -67,6 +67,10 @@ impl Ctx {
         if self.res.admin_key.is_some() {
             return true;
         }
+        if self.server_is_open() {
+            self.warn_if_open();
+            return true;
+        }
         eprintln!(
             "{}",
             self.style.red(&format!(
@@ -74,7 +78,36 @@ impl Ctx {
                 self.res.keys_file.display()
             ))
         );
+        eprintln!(
+            "  = help: `rv start` creates that file when it is missing; a server that was already \
+             running reads it only at start, so `rv restart` after creating or filling it"
+        );
         false
+    }
+
+    /// Prints the OPEN-server warning when the keys file exists and holds no
+    /// keys: the server is open, so no bearer is needed. Said on every call that talks to the server,
+    /// on purpose - an open admin API is not a state to forget about. Does nothing when a key was
+    /// given (flag or environment) or the file holds keys.
+    pub fn warn_if_open(&self) {
+        if !self.server_is_open() {
+            return;
+        }
+        eprintln!(
+            "{}",
+            self.style.yellow(&format!(
+                "warning: this server is OPEN and NOT SECURE - {} holds no keys, so admin calls \
+                 go out with no authentication and anyone who can reach port {} can load, \
+                 unload and delete models. Add keys to enable authentication.",
+                self.res.keys_file.display(),
+                self.res.port
+            ))
+        );
+    }
+
+    /// No key was given and the keys file exists with empty lists: admin calls need no bearer.
+    fn server_is_open(&self) -> bool {
+        self.res.admin_key.is_none() && self.res.keys_file_is_empty()
     }
 
     /// Directory names under `models_dir` — a best-effort local scan. `None`

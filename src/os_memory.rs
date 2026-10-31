@@ -141,12 +141,47 @@ pub fn parse_meminfo_available_kb(contents: &str) -> Option<u64> {
     parse_meminfo_field_kb(contents, "MemAvailable:")
 }
 
+/// This process's anonymous resident memory (`RssAnon` of `/proc/self/status`), bytes. `None`
+/// off Linux or when the file is unreadable. What the CPU plugin really holds: it copies a
+/// model's weights from the mapped files into anonymous memory at the first request, and only
+/// anonymous pages leave `MemAvailable` (mapped file pages count as available).
+#[must_use]
+pub fn process_rss_anon_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_status_rss_anon_kb(&contents).map(|kb| kb.saturating_mul(1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Parses the `RssAnon:` line (kB) out of `/proc/<pid>/status` contents.
+#[cfg(any(target_os = "linux", test))]
+#[must_use]
+pub fn parse_status_rss_anon_kb(contents: &str) -> Option<u64> {
+    parse_meminfo_field_kb(contents, "RssAnon:")
+}
+
 /// Returns `true` when a load needing `need_gb` may proceed without pushing live
 /// free RAM below `floor_gb` — i.e. `avail_gb - need_gb >= floor_gb`. The pure
 /// arithmetic core of the M1 system-RAM admission gate, split out for testing.
 #[must_use]
 pub fn ram_floor_admits(avail_gb: f64, need_gb: f64, floor_gb: f64) -> bool {
     avail_gb - need_gb >= floor_gb
+}
+
+/// Live available RAM plus what evicting models is credited to give back, never more than
+/// `ceiling_gb` (`MemTotal`, or the declared budget when smaller): no eviction can make more RAM
+/// available than the machine has. The cap matters because CPU weights are mapped lazily and
+/// mostly already counted in `MemAvailable`, so the plain sum double-counts them and admitted a
+/// load that could never fit after evicting every resident (S281 defect f, QA cell MEM-01).
+#[must_use]
+pub fn credited_avail_gb(avail_gb: f64, credit_gb: f64, ceiling_gb: Option<f64>) -> f64 {
+    let sum = avail_gb + credit_gb;
+    ceiling_gb.map_or(sum, |c| sum.min(c.max(avail_gb)))
 }
 
 /// Reclaimable GPU page-cache in GiB — memory the kernel counts as *used* but
@@ -204,6 +239,85 @@ fn zram_used_bytes() -> u64 {
                 .and_then(|v| v.parse::<u64>().ok())
         })
         .sum()
+}
+
+/// zram's compressed pool in GiB (all devices); `0.0` without zram or off Linux. For the poison-time
+/// diagnostics (step 7, G2).
+#[must_use]
+pub fn zram_used_gb() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        #[allow(clippy::cast_precision_loss)] // bytes → GiB for a log line
+        let gb = zram_used_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
+        gb
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
+}
+
+/// Swap in use (`SwapTotal - SwapFree`) in GiB, or `None` when `/proc/meminfo` is unreadable.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // KiB → GiB for a log line
+pub fn swap_used_gb() -> Option<f64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo_swap_used_kb(&contents).map(|kb| kb as f64 / (1024.0 * 1024.0))
+}
+
+/// `SwapTotal - SwapFree` in KiB from `/proc/meminfo` text.
+#[must_use]
+pub fn parse_meminfo_swap_used_kb(contents: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        contents
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    Some(field("SwapTotal:")?.saturating_sub(field("SwapFree:")?))
+}
+
+/// Memory pressure stall information (`/proc/pressure/memory`), percent of wall time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemoryPressure {
+    /// `some avg10`: at least one task stalled on memory, last 10 s.
+    pub some_avg10: f64,
+    /// `some avg60`.
+    pub some_avg60: f64,
+    /// `full avg10`: every non-idle task stalled, last 10 s.
+    pub full_avg10: f64,
+    /// `full avg60`.
+    pub full_avg60: f64,
+}
+
+/// `/proc/pressure/memory`, or `None` (no PSI in the kernel, or not Linux).
+#[must_use]
+pub fn memory_pressure() -> Option<MemoryPressure> {
+    parse_memory_pressure(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+}
+
+/// Pure parser for [`memory_pressure`]:
+/// `some avg10=0.00 avg60=0.00 avg300=0.00 total=0` / `full avg10=… avg60=…`.
+#[must_use]
+pub fn parse_memory_pressure(contents: &str) -> Option<MemoryPressure> {
+    let avg = |kind: &str, key: &str| -> Option<f64> {
+        contents
+            .lines()
+            .find(|l| l.starts_with(kind))?
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key))?
+            .parse()
+            .ok()
+    };
+    Some(MemoryPressure {
+        some_avg10: avg("some", "avg10=")?,
+        some_avg60: avg("some", "avg60=")?,
+        full_avg10: avg("full", "avg10=")?,
+        full_avg60: avg("full", "avg60=")?,
+    })
 }
 
 /// Pure core of [`reclaimable_gpu_cache_gb`], split out so the arithmetic is
@@ -304,6 +418,31 @@ mod tests {
 
     use super::*;
 
+    /// Step 7 G2: swap in use from `/proc/meminfo`.
+    #[test]
+    fn swap_used_is_total_minus_free() {
+        let m = "MemTotal: 100 kB\nSwapTotal:  8388604 kB\nSwapFree:   8126460 kB\n";
+        assert_eq!(parse_meminfo_swap_used_kb(m), Some(262_144));
+        assert_eq!(parse_meminfo_swap_used_kb("MemTotal: 1 kB\n"), None);
+    }
+
+    /// Step 7 G2: PSI memory lines.
+    #[test]
+    fn memory_pressure_parses_some_and_full() {
+        let psi = "some avg10=1.50 avg60=0.75 avg300=0.10 total=123\n\
+                   full avg10=0.25 avg60=0.05 avg300=0.00 total=45\n";
+        assert_eq!(
+            parse_memory_pressure(psi),
+            Some(MemoryPressure {
+                some_avg10: 1.5,
+                some_avg60: 0.75,
+                full_avg10: 0.25,
+                full_avg60: 0.05,
+            })
+        );
+        assert_eq!(parse_memory_pressure("garbage"), None);
+    }
+
     /// `host_name()` on the real running box (this test binary's own host):
     /// non-empty, stable across calls, and — the specific thing left
     /// untested before — no trailing newline/whitespace left over from the
@@ -345,6 +484,13 @@ mod tests {
     fn parses_real_memavailable_line() {
         let sample = "MemTotal: 16129844 kB\nMemFree: 100 kB\nMemAvailable:  9876543 kB\n";
         assert_eq!(parse_meminfo_available_kb(sample), Some(9_876_543));
+    }
+
+    #[test]
+    fn parses_status_rss_anon_line() {
+        let sample = "VmRSS:\t   18296 kB\nRssAnon:\t    1332 kB\nRssFile:\t   16964 kB\n";
+        assert_eq!(parse_status_rss_anon_kb(sample), Some(1332));
+        assert_eq!(parse_status_rss_anon_kb("VmRSS:\t 1 kB\n"), None);
     }
 
     #[test]

@@ -8,6 +8,9 @@ A source checkout of this repository contains none of it; building from source
 fetches dependencies from crates.io and links against an OpenVINO runtime you
 install yourself.
 
+Not every release publishes a bundle for every platform: the notes below on Windows-only
+files (the `.dll` runtime, DirectML) apply only to a release that publishes a Windows bundle.
+
 ---
 
 ## Mozilla Public License 2.0 — Symphonia
@@ -40,18 +43,46 @@ MPL-2.0 explicitly permits for a larger work (MPL-2.0 §3.3).
 ## Apache License 2.0 — OpenVINO and OpenVINO GenAI
 
 The release bundles ship Intel's **OpenVINO** and **OpenVINO GenAI** runtime
-libraries (2026.2.1) so the server runs with no separate OpenVINO installation.
+libraries (2026.4.1) so the server runs with no separate OpenVINO installation.
 Both are licensed under the **Apache License 2.0**.
 
 - <https://github.com/openvinotoolkit/openvino>
 - <https://github.com/openvinotoolkit/openvino.genai>
 - <https://github.com/openvinotoolkit/openvino_tokenizers>
 
-The OpenVINO runtime libraries in the bundle (`lib/`) are the unmodified files of Intel's
-`openvino`, `openvino-genai` and `openvino-tokenizers` 2026.2.1 Python wheels, and they bring their own
+The OpenVINO runtime libraries in the bundles (Linux: `lib/`; a Windows bundle, when published: the
+`.dll` files beside `rustedvino.exe`) are the unmodified files of Intel's `openvino`, `openvino-genai` and
+`openvino-tokenizers` 2026.4.1 Python wheels for that platform, and they bring their own
 third-party components, among them **oneTBB** (Apache-2.0), **oneDNN** (Apache-2.0) and **hwloc**
 (BSD-3-Clause), each with its copyright notice. Intel's licence files for all of them are in the bundle
 under `licenses/openvino/` (look for the `third-party-programs` files).
+
+A Windows bundle is compiled against Intel's Windows OpenVINO GenAI archive (headers and import
+libraries), but ships none of its files: that archive's runtime is under Intel's separate
+distribution licence, the wheels' identical runtime under Apache-2.0.
+
+---
+
+## MIT License — ONNX Runtime
+
+The server binary of each release bundle statically links Microsoft's **ONNX Runtime** 1.24.2 (through the
+`ort` crate), used for the Kokoro, Piper and VITS text-to-speech voices. ONNX Runtime is licensed under
+the **MIT License**. Its licence and its third-party notices are in the bundle under
+`licenses/onnxruntime/`.
+
+- <https://github.com/microsoft/onnxruntime>
+
+---
+
+## Microsoft Software License Terms — DirectML (Windows bundle only)
+
+A Windows bundle, when published, ships Microsoft's **DirectML** 1.15.4 (`DirectML.dll`, unmodified), which ONNX
+Runtime loads on Windows. DirectML is not open source: it is distributed under the **Microsoft
+Software License Terms for Microsoft DirectX Machine Learning (DirectML)**, which allow it to be
+redistributed with applications that run on Windows. Those terms, the code licence and Microsoft's
+third-party notices are in the bundle under `licenses/directml/`; they apply to `DirectML.dll` only.
+
+- <https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.4>
 
 ## Rust crates
 
@@ -74,7 +105,8 @@ Piper voices refuse to load; every other feature works.
 
 The remaining Rust dependencies are permissively licensed — predominantly
 `MIT OR Apache-2.0`, with some MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0 and
-public-domain-equivalent terms. Symphonia above is the only copyleft component.
+public-domain-equivalent terms. Symphonia above is the only copyleft component, and
+DirectML (Windows bundle only) the only one that is not open source.
 
 The authoritative, per-crate list for any given build is that build's
 [`Cargo.lock`](Cargo.lock); each crate's license is declared in its own

@@ -131,6 +131,147 @@ pub fn process_total_bytes() -> Option<u64> {
     read_process().map(|m| m.values().sum())
 }
 
+/// Dedicated device memory this process holds on one PCI device (`pdev`), summed over its VRAM
+/// regions only: what a model load on that card really took, not system-memory regions or
+/// another device's. `None` where [`read_process`] is.
+#[must_use]
+pub fn process_vram_bytes(pdev: &str) -> Option<u64> {
+    read_process().map(|m| {
+        m.iter()
+            .filter(|((_, p, region), _)| p == pdev && is_device_region(region))
+            .map(|(_, b)| *b)
+            .sum()
+    })
+}
+
+// ── Physical probe of the memory other processes hold ────────────────────
+
+/// Reads what the rest of the machine holds of a device, so the server's own bookkeeping can be
+/// completed with what it cannot know (the desktop compositor, other users' processes). The
+/// manager's tracker supplies this process's own commitments; the probe never reports them.
+pub trait VramProbe: Send + Sync + std::fmt::Debug {
+    /// Bytes of dedicated device memory held by DRM clients other than this process on the PCI
+    /// device `pdev` (`"0000:03:00.0"`), or `None` when they cannot be read.
+    fn outside_used_bytes(&self, pdev: &str) -> Option<u64>;
+
+    /// Bytes of dedicated device memory this process itself holds on `pdev`, as the driver
+    /// reports it (what the tracker may not have booked: scratch buffers, weights booked at 0).
+    /// `None` when unknown, which is the default.
+    fn own_used_bytes(&self, _pdev: &str) -> Option<u64> {
+        None
+    }
+}
+
+/// [`VramProbe`] over `/proc/<pid>/fdinfo/<fd>` of every process this user may read (the
+/// compositor of the logged-in session is among them; other users' processes and root's are not
+/// visible, which is what `kv_headroom_margin_gib` is for).
+#[derive(Debug)]
+pub struct LinuxFdinfoProbe {
+    proc_root: std::path::PathBuf,
+    own_pid: u32,
+}
+
+impl LinuxFdinfoProbe {
+    /// The probe for this process, or `None` off Linux or when `/proc` is not readable.
+    #[must_use]
+    pub fn new() -> Option<Self> {
+        if !cfg!(target_os = "linux") || std::fs::read_dir("/proc/self/fdinfo").is_err() {
+            return None;
+        }
+        Some(Self {
+            proc_root: std::path::PathBuf::from("/proc"),
+            own_pid: std::process::id(),
+        })
+    }
+
+    /// A probe over another root (tests build a fake `/proc`).
+    #[cfg(test)]
+    fn with_root(root: &std::path::Path, own_pid: u32) -> Self {
+        Self {
+            proc_root: root.to_path_buf(),
+            own_pid,
+        }
+    }
+}
+
+/// Dedicated-memory regions: `vram0` on `xe`; `local0` on `i915`. System-memory regions
+/// (`gtt`, `system0`) do not count against a discrete GPU's own memory.
+fn is_device_region(region: &str) -> bool {
+    region.starts_with("vram") || region.starts_with("local")
+}
+
+impl VramProbe for LinuxFdinfoProbe {
+    fn own_used_bytes(&self, pdev: &str) -> Option<u64> {
+        process_vram_bytes(pdev)
+    }
+
+    fn outside_used_bytes(&self, pdev: &str) -> Option<u64> {
+        let procs = std::fs::read_dir(&self.proc_root).ok()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0_u64;
+        for entry in procs.filter_map(Result::ok) {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == self.own_pid {
+                continue;
+            }
+            // Not readable (another user's process): invisible, by design.
+            let Ok(fds) = std::fs::read_dir(entry.path().join("fdinfo")) else {
+                continue;
+            };
+            for fd in fds.filter_map(Result::ok) {
+                let Some(e) = std::fs::read_to_string(fd.path())
+                    .ok()
+                    .and_then(|c| parse_fdinfo(&c))
+                else {
+                    continue;
+                };
+                if e.pdev != pdev || !seen.insert((e.driver.clone(), e.pdev.clone(), e.client_id)) {
+                    continue;
+                }
+                total = total.saturating_add(
+                    e.regions
+                        .iter()
+                        .filter(|(r, _)| is_device_region(r))
+                        .map(|(_, b)| *b)
+                        .sum::<u64>(),
+                );
+            }
+        }
+        Some(total)
+    }
+}
+
+/// `"{domain: 0 bus: 3 device: 0x0 function: 0}"` (`OpenVINO`'s `DEVICE_PCI_INFO`) as the
+/// `"0000:03:00.0"` the DRM fdinfo reports, or `None` when it does not parse.
+#[must_use]
+pub fn pdev_from_pci_info(info: &str) -> Option<String> {
+    let field = |name: &str| -> Option<u32> {
+        let rest = info
+            .split(name)
+            .nth(1)?
+            .trim_start_matches(':')
+            .trim_start();
+        let tok = rest.split(|c: char| c.is_whitespace() || c == '}').next()?;
+        match tok.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => tok.parse().ok(),
+        }
+    };
+    Some(format!(
+        "{:04x}:{:02x}:{:02x}.{:x}",
+        field("domain")?,
+        field("bus")?,
+        field("device")?,
+        field("function")?
+    ))
+}
+
 // ── Measurement windows ────────────────────────────────────────────────────
 //
 // A per-model estimate is a delta of this process-wide total, so anything else
@@ -272,5 +413,68 @@ mod tests {
         assert_eq!(parse_size("1 GiB"), Some(1 << 30));
         assert_eq!(parse_size("5 TiB"), None);
         assert_eq!(parse_size("x KiB"), None);
+    }
+
+    #[test]
+    fn pdev_from_the_openvino_pci_info() {
+        assert_eq!(
+            pdev_from_pci_info("{domain: 0 bus: 3 device: 0x0 function: 0}").as_deref(),
+            Some("0000:03:00.0")
+        );
+        assert_eq!(
+            pdev_from_pci_info("{domain: 0 bus: 0 device: 0x2 function: 0}").as_deref(),
+            Some("0000:00:02.0")
+        );
+        assert_eq!(
+            pdev_from_pci_info("{domain: 1 bus: 0xaf device: 0x1f function: 7}").as_deref(),
+            Some("0001:af:1f.7")
+        );
+        assert_eq!(pdev_from_pci_info("garbage"), None);
+    }
+
+    fn write_fdinfo(root: &std::path::Path, pid: u32, fd: u32, body: &str) {
+        let dir = root.join(pid.to_string()).join("fdinfo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fd.to_string()), body).unwrap();
+    }
+
+    fn client(pdev: &str, id: u32, vram_kib: u64, gtt_kib: u64) -> String {
+        format!(
+            "pos:\t0\ndrm-driver:\txe\ndrm-client-id:\t{id}\ndrm-pdev:\t{pdev}\n\
+             drm-total-vram0:\t{vram_kib} KiB\ndrm-total-gtt:\t{gtt_kib} KiB\n"
+        )
+    }
+
+    /// The probe counts other processes' dedicated memory on one device: not its own process, not
+    /// system-memory regions, not other devices, each client once, and ignores non-DRM fds.
+    #[test]
+    fn linux_probe_sums_other_processes_vram_on_one_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // own process (pid 10): excluded
+        write_fdinfo(root, 10, 3, &client("0000:03:00.0", 1, 9_000_000, 1));
+        // compositor (pid 20): 500 MiB on the B60, with a duplicate fd of the same client
+        write_fdinfo(root, 20, 5, &client("0000:03:00.0", 7, 512_000, 100_000));
+        write_fdinfo(root, 20, 6, &client("0000:03:00.0", 7, 512_000, 100_000));
+        // another process: 100 MiB on the B60, and some on the iGPU (other device)
+        write_fdinfo(root, 30, 4, &client("0000:03:00.0", 8, 102_400, 5));
+        write_fdinfo(root, 30, 9, &client("0000:00:02.0", 9, 0, 4_000_000));
+        // a non-DRM fd and a non-process entry
+        write_fdinfo(root, 30, 11, "pos:\t0\nflags:\t02\n");
+        std::fs::create_dir_all(root.join("self")).unwrap();
+
+        let probe = LinuxFdinfoProbe::with_root(root, 10);
+        assert_eq!(
+            probe.outside_used_bytes("0000:03:00.0"),
+            Some((512_000 + 102_400) * 1024)
+        );
+        assert_eq!(
+            probe.outside_used_bytes("0000:00:02.0"),
+            Some(0),
+            "vram regions only"
+        );
+        assert_eq!(probe.outside_used_bytes("0000:99:00.0"), Some(0));
+        let missing = LinuxFdinfoProbe::with_root(&root.join("nope"), 10);
+        assert_eq!(missing.outside_used_bytes("0000:03:00.0"), None);
     }
 }

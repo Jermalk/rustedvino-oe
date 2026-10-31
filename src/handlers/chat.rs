@@ -22,7 +22,7 @@
 // ============================================================
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -42,15 +42,16 @@ use std::sync::Arc;
 
 use super::error::{
     JsonBody, device_admission_error_response, inference_error_from_text, model_error_response,
-    openai_error, openai_error_with_param, sse_inference_error_event, unsupported_param,
+    openai_error, openai_error_with_param, sse_inference_error_event, sse_json_event,
+    unsupported_param,
 };
 use crate::{
     app_state::AppState,
     cb_engine::{EngineHandle, SubmitResult},
     image_util::DecodedImage,
     model_manager::{
-        EngineHandleKind, ModelError, ModelManager, OnDemandLoad, ReasoningParser,
-        template::GenerationDefaults,
+        EngineHandleKind, GateClamp, GateDetail, ModelError, ModelManager, OnDemandLoad,
+        ReasoningParser, template::GenerationDefaults,
     },
     ov_cb::{FinishReason, GenParams},
     prompt_builder::{
@@ -64,13 +65,13 @@ use crate::{
 /// realistically span (the longest merged BPE/SentencePiece tokens — repeated
 /// whitespace/newline runs, long dictionary words — top out well under this
 /// across every tokenizer this server has loaded). Used only to size the
-/// byte-length pre-check shared by [`gate_prompt`] and [`gate_vlm_prompt`]:
+/// byte-length pre-check shared by [`gate_prompt`] and [`gate_vlm_admission`]:
 /// deliberately generous so it can never reject a prompt that would have
 /// actually passed the real tokenizer-based check below.
 const MAX_BYTES_PER_TOKEN: usize = 32;
 
 /// The 400 `context_length_exceeded` envelope for an exact, tokenizer-reported
-/// overflow — shared by [`gate_prompt`], [`gate_vlm_prompt`], and
+/// overflow — shared by [`gate_prompt`], [`gate_vlm_admission`], and
 /// [`gate_npu_prompt`] so all three gates produce byte-identical error shapes.
 ///
 /// A clean L0-gate rejection is fully visible to the client (the 400 body
@@ -85,6 +86,8 @@ fn prompt_too_long_error(
     gate: &'static str,
     token_count: usize,
     max_prompt_tokens: usize,
+    detail: Option<&GateDetail>,
+    breakdown: Option<&str>,
 ) -> Response {
     tracing::warn!(
         model_id,
@@ -104,10 +107,15 @@ fn prompt_too_long_error(
              model's max_prompt_len"
         )
     } else {
-        format!(
-            "prompt is {token_count} tokens — exceeds this model's KV-pool capacity \
-             of {max_prompt_tokens} tokens; shorten the prompt or increase cache_size_gb",
-        )
+        let message = kv_gate_refusal_message(token_count, max_prompt_tokens, detail);
+        match breakdown {
+            Some(parts) => message.replacen(
+                &format!("prompt is {token_count} tokens"),
+                &format!("prompt is {token_count} tokens ({parts})"),
+                1,
+            ),
+            None => message,
+        }
     };
     openai_error(
         StatusCode::BAD_REQUEST,
@@ -117,7 +125,69 @@ fn prompt_too_long_error(
     )
 }
 
-/// Byte-length pre-check shared by [`gate_prompt`] and [`gate_vlm_prompt`],
+/// The sentence a too-long prompt gets on a KV-pool gate: what the limit is and which knob moves
+/// it (E-10). With no detail (a path that does not carry it) the generic pool wording is used.
+fn kv_gate_refusal_message(
+    token_count: usize,
+    max_prompt_tokens: usize,
+    detail: Option<&GateDetail>,
+) -> String {
+    let Some(d) = detail else {
+        return format!(
+            "prompt is {token_count} tokens — exceeds this model's KV-pool capacity \
+             of {max_prompt_tokens} tokens; shorten the prompt or increase cache_size_gb",
+        );
+    };
+    match d.clamped_by {
+        Some(GateClamp::Native) => format!(
+            "prompt is {token_count} tokens — exceeds this model's native context of \
+             {max_prompt_tokens} tokens; shorten the prompt"
+        ),
+        Some(GateClamp::Ratchet) => format!(
+            "prompt is {token_count} tokens — exceeds {max_prompt_tokens} tokens, the limit \
+             learned after an earlier KV-pool overflow on this configuration (a limit learned on \
+             a larger pool also caps smaller ones); shorten the prompt, or raise kv_cache_gb \
+             (a larger pool is measured afresh)"
+        ),
+        Some(GateClamp::DeviceHeadroom) => {
+            let free = d.device_free_gib.map_or_else(String::new, |g| {
+                format!(" ({g:.2} GiB free after the safety margin)")
+            });
+            format!(
+                "prompt is {token_count} tokens — exceeds {max_prompt_tokens} tokens, the limit \
+                 set by the free device memory left after the weights, the KV pool and other \
+                 processes{free}; shorten the prompt or lower kv_cache_gb"
+            )
+        }
+        Some(GateClamp::Pool) | None => {
+            let precision = if d.precision.is_empty() {
+                "default precision"
+            } else {
+                d.precision
+            };
+            let hybrid_prefix = if d.hybrid && d.prefix_caching {
+                "; prefix caching halves a hybrid model's capacity: set \
+                 enable_prefix_caching=false for this model"
+            } else {
+                ""
+            };
+            format!(
+                "prompt is {token_count} tokens — exceeds this model's KV-pool capacity of \
+                 {max_prompt_tokens} tokens ({} GiB pool, {precision}{hybrid_prefix}); shorten \
+                 the prompt or raise kv_cache_gb",
+                fmt_pool_gib(d.kv_cache_gb)
+            )
+        }
+    }
+}
+
+/// A pool size as `4`, `4.2` or `0.75` (no trailing zeros).
+fn fmt_pool_gib(gb: f64) -> String {
+    let s = format!("{gb:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// Byte-length pre-check shared by [`gate_prompt`] and [`gate_vlm_admission`],
 /// run before either ever calls into a tokenizer.
 ///
 /// Session 2026-07-02: a long-enough raw prompt exhausted host RAM *inside*
@@ -267,6 +337,7 @@ pub(crate) async fn gate_prompt(
     model_id: &str,
     prompt: &str,
     max_prompt_tokens: usize,
+    detail: Option<&GateDetail>,
 ) -> Result<Option<Vec<i64>>, Box<Response>> {
     if max_prompt_tokens == 0 {
         return Ok(None);
@@ -278,13 +349,15 @@ pub(crate) async fn gate_prompt(
             "cb",
             ids.len(),
             max_prompt_tokens,
+            detail,
+            None,
         ))),
         Ok(ids) => Ok(Some(ids)), // within limit — reuse for add_request
         Err(_) => Ok(None),       // tokenize error — fail open, engine re-encodes
     }
 }
 
-/// Build the text [`gate_vlm_prompt`] measures from `vlm_messages` (the JSON
+/// Build the text [`gate_vlm_admission`] measures from `vlm_messages` (the JSON
 /// objects [`extract_vlm_messages`] produces).
 ///
 /// Must include `tool_calls`, not just `content`: an assistant turn that
@@ -310,52 +383,146 @@ fn vlm_gate_text(vlm_messages: &[serde_json::Value]) -> String {
         .join("\n")
 }
 
-/// L0 prompt-length gate for the VLM path.
+/// Tokens a vision model's chat template adds per message (role markers, separators). Measured
+/// on the Qwen family and used for every family: a family with heavier markup (`InternVL`'s default
+/// system prompt) is undercounted, which the 5 % the pool limit leaves absorbs.
+const VLM_TEMPLATE_TOKENS_PER_MESSAGE: usize = 5;
+/// Fixed tokens the template adds around the whole conversation.
+const VLM_TEMPLATE_TOKENS_FIXED: usize = 10;
+/// The tool schema is rendered into the prompt by the template; count its JSON and add 25 %.
+const VLM_TOOLS_RENDER_PERCENT: usize = 125;
+/// Room kept free in the pool beyond the prompt and the answer, at least: two 16-token blocks.
+const VLM_POOL_ROOM_TOKENS: usize = 32;
+/// The room is also this share of the pool, per hundred: the admission is an estimate (Block B1
+/// measured the tool schema 98 tokens above the old estimate), and the answer must not run the
+/// real prompt plus the answer past the pool.
+const VLM_POOL_ROOM_PERCENT: usize = 1;
+/// An answer shorter than this is not worth starting: the request is refused instead.
+const VLM_MIN_ANSWER_TOKENS: usize = 16;
+
+/// One warning per process: a vision request with images is admitted on its text, template and
+/// tool schema alone, because image token counts are not estimated yet.
+fn warn_vision_images_uncounted_once(model_id: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            model_id,
+            "vision request with images: image tokens are not counted by the context-limit \
+             admission (fail-open); logged once per process"
+        );
+    }
+}
+
+/// Template and tool-schema tokens a vision request adds beyond its message text (E-16): the
+/// `VLMPipeline` renders the chat template and the `tools` itself, so counting only the text
+/// undercounts a tool-heavy request. Images are not counted yet (there is no estimator per model
+/// family yet; the admission fails open for them).
+fn vlm_overhead_tokens(message_count: usize, tools_json_tokens: usize) -> usize {
+    VLM_TEMPLATE_TOKENS_PER_MESSAGE * message_count
+        + VLM_TEMPLATE_TOKENS_FIXED
+        + tools_json_tokens * VLM_TOOLS_RENDER_PERCENT / 100
+}
+
+/// Prompt admission for the vision chat path: the text, the template and the tool schema against
+/// the model's context limit. Returns the admitted prompt size for the `max_tokens` clamp.
+/// Fail-open when a tokenizer call errors: a rare tokenizer hiccup must not become a false 400.
 ///
-/// Mirrors [`gate_prompt`], including its byte-length pre-check
-/// ([`gate_prompt_bytes`]) — but `VLMPipeline::generate` always takes raw
-/// messages/images (never pre-tokenized ids the way the CB engine can), so
-/// this only needs a token *count*, not the ids themselves. `gate_text`
-/// ([`vlm_gate_text`]) is the concatenated text content (and tool-call JSON)
-/// of the request's messages (see `extract_vlm_messages`) — an approximation
-/// of what `VLMPipeline` will actually template-render and tokenize
-/// internally, close enough to catch a grossly oversized prompt before it
-/// reaches the GPU.
-///
-/// Without this gate, an oversized prompt reached `VLMPipeline::generate`
-/// directly and could exhaust GPU memory (`CL_OUT_OF_RESOURCES`), which
-/// poisons the `OpenCL` context for the **whole process** — every GPU-backed
-/// model, not just this request — until a manual restart (confirmed live: a
-/// ~75k-token prompt against a 49,932-token limit took the server down this
-/// way). The CB path already guards against the ids-only version of this
-/// failure (`gate_prompt`'s doc comment: "a prompt larger than the KV pool
-/// causes `engine.step()` to block forever, requiring a process restart") —
-/// the VLM path just never got the same treatment when it was added.
-///
-/// Same fail-open policy as `gate_prompt`: disabled when `max_prompt_tokens
-/// == 0`, and a tokenizer-call error does not become a false 400 (better to
-/// let a rare tokenizer hiccup through than reject a legitimate request).
+/// Why this gate exists: an oversized prompt that reached `VLMPipeline::generate` could exhaust GPU
+/// memory (`CL_OUT_OF_RESOURCES`), which poisons the `OpenCL` context for the whole process until a
+/// manual restart (a ~75k-token prompt against a 49,932-token limit did exactly that).
 ///
 /// # Errors
-/// The over-limit 400 response, boxed (large `Response` in `Err` position).
-pub(crate) async fn gate_vlm_prompt(
+/// The over-limit 400 response, boxed.
+pub(crate) async fn gate_vlm_admission(
     vlm: &crate::vlm_engine::VlmHandle,
     gate_text: &str,
-    max_prompt_tokens: usize,
-) -> Result<(), Box<Response>> {
-    if max_prompt_tokens == 0 {
-        return Ok(());
+    message_count: usize,
+    tools: Option<&[serde_json::Value]>,
+    has_images: bool,
+    (max, detail): (usize, Option<&GateDetail>),
+) -> Result<usize, Box<Response>> {
+    if max == 0 {
+        return Ok(0);
     }
-    gate_prompt_bytes(vlm.model_id(), "vlm", gate_text, max_prompt_tokens)?;
-    match vlm.count_tokens(gate_text.to_owned()).await {
-        Ok(count) if count > max_prompt_tokens => Err(Box::new(prompt_too_long_error(
+    gate_prompt_bytes(vlm.model_id(), "vlm", gate_text, max)?;
+    let Ok(counted) = vlm.count_tokens(gate_text.to_owned()).await else {
+        return Ok(0);
+    };
+    let tools_tokens = match tools.filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let json = serde_json::Value::Array(t.to_vec()).to_string();
+            // Same byte ceiling as the text: a huge schema is refused before any tokenizer call.
+            gate_prompt_bytes(vlm.model_id(), "vlm", &json, max)?;
+            vlm.count_tokens(json).await.unwrap_or(0)
+        }
+        None => 0,
+    };
+    if has_images {
+        warn_vision_images_uncounted_once(vlm.model_id());
+    }
+    let overhead = vlm_overhead_tokens(message_count, tools_tokens);
+    let needed = counted + overhead;
+    if needed > max {
+        let parts = format!(
+            "text {counted} + template and tools {overhead}{}",
+            if has_images {
+                "; images not counted"
+            } else {
+                ""
+            }
+        );
+        return Err(Box::new(prompt_too_long_error(
             vlm.model_id(),
             "vlm",
-            count,
-            max_prompt_tokens,
-        ))),
-        Ok(_) | Err(_) => Ok(()),
+            needed,
+            max,
+            detail,
+            Some(&parts),
+        )));
     }
+    Ok(needed)
+}
+
+/// Clamp a vision request's `max_tokens` so prompt and answer fit the KV pool (E-16), under the
+/// exact gate only (the legacy pool figure is an estimate, not a capacity). `admitted` is the
+/// prompt size [`gate_vlm_admission`] returned; `0` means unknown and leaves the request alone.
+///
+/// # Errors
+/// A 400 when the prompt leaves less than [`VLM_MIN_ANSWER_TOKENS`] tokens of room.
+pub(crate) fn clamp_vlm_max_tokens(
+    model_id: &str,
+    (exact_gate, pool_capacity_tokens): (bool, usize),
+    admitted: usize,
+    requested: usize,
+) -> Result<usize, Box<Response>> {
+    if !exact_gate || admitted == 0 || pool_capacity_tokens == 0 {
+        return Ok(requested);
+    }
+    let spare = (pool_capacity_tokens * VLM_POOL_ROOM_PERCENT / 100).max(VLM_POOL_ROOM_TOKENS);
+    let room = pool_capacity_tokens.saturating_sub(admitted + spare);
+    if requested <= room {
+        return Ok(requested);
+    }
+    if room < VLM_MIN_ANSWER_TOKENS {
+        crate::metrics::record_context_length_exceeded(model_id, "vlm");
+        return Err(Box::new(openai_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the prompt ({admitted} tokens) leaves no room to answer in this model's KV pool \
+                 of {pool_capacity_tokens} tokens; shorten the prompt"
+            ),
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+        )));
+    }
+    crate::metrics::record_kv_max_tokens_clamped(model_id);
+    tracing::info!(
+        model_id,
+        requested,
+        clamped_to = room,
+        "max_tokens clamped to KV pool"
+    );
+    Ok(room)
 }
 
 /// `OpenVINO` `GenAI`'s own default `MAX_PROMPT_LEN` for the NPU static
@@ -373,7 +540,7 @@ pub(crate) const NPU_DEFAULT_MAX_PROMPT_LEN: usize = 1024;
 /// C++ exception text instead of a clean 400 (found 2026-07-16 via an
 /// Ollama-comparison benchmark; the project's internal engineering log).
 ///
-/// Mirrors [`gate_vlm_prompt`] exactly (count-only — `NpuHandle::generate`
+/// Mirrors [`gate_vlm_admission`] exactly (count-only — `NpuHandle::generate`
 /// takes a plain string prompt, never pre-tokenized ids, so there is nothing
 /// to reuse downstream the way `gate_prompt` reuses CB ids). The ceiling is
 /// [`NpuHandle::max_prompt_len`](crate::npu_engine::NpuHandle::max_prompt_len):
@@ -382,7 +549,7 @@ pub(crate) const NPU_DEFAULT_MAX_PROMPT_LEN: usize = 1024;
 /// unset) — never the registry's current value, which can drift after a
 /// PATCH or config reload until the next load.
 ///
-/// Same fail-open policy as `gate_prompt`/`gate_vlm_prompt`: a tokenizer-call
+/// Same fail-open policy as `gate_prompt`/`gate_vlm_admission`: a tokenizer-call
 /// error does not become a false 400.
 ///
 /// # Errors
@@ -399,6 +566,8 @@ pub(crate) async fn gate_npu_prompt(
             "npu",
             count,
             max_prompt_len,
+            None,
+            None,
         ))),
         Ok(_) | Err(_) => Ok(()),
     }
@@ -512,6 +681,13 @@ pub struct ChatRequest {
     /// chat template.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+
+    /// vLLM-style template arguments (SF-5 D-04). Only `enable_thinking` is read: it applies
+    /// when the top-level [`Self::enable_thinking`] is absent (the top-level field wins when both
+    /// are set). Other keys are accepted and ignored; a non-boolean `enable_thinking` is a 400
+    /// `invalid_chat_template_kwargs`, a non-object value the generic body-parse 400.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 
     // ---- Known-but-unsupported params (rejected with 400, not silently dropped).
     // These are parsed only so the handler can detect their presence and return an
@@ -898,11 +1074,10 @@ fn role_event(id: &str, model: &str, created: u64, meta: ResponseMeta) -> Event 
         sampling: meta.sampling(),
     };
     // CRASH COURSE — serde_json::to_string:
-    //   Serialises any Serialize value to a JSON string.
-    //   Returns Result<String, Error>. We use unwrap_or_default()
-    //   so a serialisation failure produces an empty string (the
-    //   SSE frame is dropped) rather than panicking.
-    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    //   Serialises any Serialize value to a JSON string and returns
+    //   Result<String, Error>. `sse_json_event` handles the Err arm: an error
+    //   frame and a log line (K-02d), never a panic or a silent empty frame.
+    sse_json_event(&chunk)
 }
 
 /// Builds a token SSE frame.
@@ -923,7 +1098,7 @@ fn token_event(token: &str, id: &str, model: &str, created: u64, meta: ResponseM
         model_family: meta.family.label(),
         sampling: meta.sampling(),
     };
-    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    sse_json_event(&chunk)
 }
 
 /// Builds a reasoning SSE frame (`delta.reasoning_content`).
@@ -944,7 +1119,7 @@ fn reasoning_event(token: &str, id: &str, model: &str, created: u64, meta: Respo
         model_family: meta.family.label(),
         sampling: meta.sampling(),
     };
-    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    sse_json_event(&chunk)
 }
 
 /// Builds the final content SSE frame carrying the `OpenAI` `finish_reason`
@@ -969,7 +1144,7 @@ fn finish_event(
         model_family: meta.family.label(),
         sampling: meta.sampling(),
     };
-    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    sse_json_event(&chunk)
 }
 
 /// Builds the SSE usage chunk emitted before `[DONE]` when
@@ -1282,6 +1457,50 @@ fn parse_tool_choice(
                 .to_owned(),
         )),
     }
+}
+
+/// The request's effective `enable_thinking`: the top-level field, else
+/// `chat_template_kwargs.enable_thinking` (SF-5 D-04). A non-boolean kwarg is a 400 naming it;
+/// other kwargs are ignored (a warning once per process, then debug).
+fn resolve_enable_thinking(req: &ChatRequest) -> Result<Option<bool>, Box<Response>> {
+    let Some(kwargs) = req.chat_template_kwargs.as_ref() else {
+        return Ok(req.enable_thinking);
+    };
+    let ignored: Vec<&str> = kwargs
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "enable_thinking")
+        .collect();
+    if !ignored.is_empty() {
+        // A client using another switch name (`thinking`, `reasoning_effort`) silently gets the
+        // default: say so once at warn level, where a normal run can see it.
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if WARNED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                ?ignored,
+                "chat_template_kwargs: only enable_thinking is read"
+            );
+        } else {
+            tracing::warn!(
+                ?ignored,
+                "chat_template_kwargs: only enable_thinking is read, these keys are ignored \
+                 (logged once per process)"
+            );
+        }
+    }
+    let from_kwargs = match kwargs.get("enable_thinking") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return Err(Box::new(openai_error(
+                StatusCode::BAD_REQUEST,
+                "chat_template_kwargs.enable_thinking must be a boolean",
+                "invalid_request_error",
+                Some("invalid_chat_template_kwargs"),
+            )));
+        }
+    };
+    Ok(req.enable_thinking.or(from_kwargs))
 }
 
 /// Reject a known `OpenAI` chat parameter the engine cannot honor with an
@@ -1758,7 +1977,7 @@ fn prepare_text_prompt(
 #[allow(clippy::too_many_lines)]
 pub async fn chat_completions(
     State(state): State<AppState>,
-    JsonBody(req): JsonBody<ChatRequest>,
+    JsonBody(mut req): JsonBody<ChatRequest>,
 ) -> Response {
     // Zero point for the per-request latency metrics (TTFT, duration). Captured
     // at the very top so it includes prompt-build + queue time, matching how a
@@ -1781,6 +2000,12 @@ pub async fn chat_completions(
             "invalid_request_error",
             Some("empty_messages"),
         );
+    }
+
+    // SF-5 D-04: `chat_template_kwargs.enable_thinking` (vLLM's form) was silently ignored.
+    match resolve_enable_thinking(&req) {
+        Ok(v) => req.enable_thinking = v,
+        Err(resp) => return *resp,
     }
 
     // Reject known-but-unsupported params up front (n>1, logprobs, top_logprobs,
@@ -1901,6 +2126,7 @@ pub async fn chat_completions(
             Err(ModelError::NotLoaded) => {
                 return match mm.request_on_demand_load(&req.model) {
                     OnDemandLoad::Loading => model_error_response(ModelError::Loading),
+                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
                     OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
                 };
             }
@@ -1946,13 +2172,34 @@ pub async fn chat_completions(
                 // `images` may be empty and flows straight to the pipeline.
                 // (Validated live on B50/2026.2.) On 2026.1 this asserts in the bridge.
 
-                // L0: prompt-length gate — see gate_vlm_prompt's doc comment for
+                // L0: prompt-length gate — see gate_vlm_admission's doc comment for
                 // why this exists (a missing gate here previously let an
                 // oversized prompt reach the GPU directly and poison the OpenCL
                 // context for the whole process).
                 let gate_text = vlm_gate_text(&vlm_messages);
-                if let Err(resp) = gate_vlm_prompt(vlm, &gate_text, ctx.max_prompt_tokens).await {
-                    return *resp;
+                let admitted = match gate_vlm_admission(
+                    vlm,
+                    &gate_text,
+                    vlm_messages.len(),
+                    if tools_active {
+                        req.tools.as_deref()
+                    } else {
+                        None
+                    },
+                    !images.is_empty(),
+                    (ctx.max_prompt_tokens, ctx.gate_detail.as_ref()),
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(resp) => return *resp,
+                };
+                // F2-S-5 (E-16): an image request passed a limit that counted only its text.
+                if !images.is_empty()
+                    && ctx.max_prompt_tokens > 0
+                    && let Some(mm) = state.model_manager.as_ref()
+                {
+                    mm.note_uncounted_image_admission(&req.model);
                 }
 
                 // Cross-pipeline device admission (step 2): a second gate in
@@ -1970,6 +2217,13 @@ pub async fn chat_completions(
                     Ok(lease) => lease,
                     Err(e) => return device_admission_error_response(&e),
                 };
+                // A long prompt takes a transient device-memory reservation (the headroom limit of
+                // every vision model on the device counts it). It travels with the job to the
+                // engine thread and is released when the generation call returns: a client that
+                // disconnects during prefill does not stop the device from using the memory.
+                let transient_lease: Option<Box<dyn std::any::Any + Send>> = mm
+                    .acquire_transient_lease(&req.model, admitted)
+                    .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>);
 
                 // G2: same tools gating as the text path — inject only when
                 // active (suppressed by tool_choice:"none"), and (as of the
@@ -1987,13 +2241,22 @@ pub async fn chat_completions(
                 // AtCapacity  → 429: the admission gate is full: client should retry.
                 // EngineDead  → 503: engine thread exited (evicted mid-request?).
                 // Submitted   → proceed to stream the SSE response.
-                let vlm_gen_params = gen_params_from_chat(
+                let mut vlm_gen_params = gen_params_from_chat(
                     &req,
                     json_schema,
                     mm.max_tokens_cap(),
                     tools_active,
                     ctx.generation_defaults,
                 );
+                match clamp_vlm_max_tokens(
+                    &req.model,
+                    (ctx.kv_gate_mode == "exact", ctx.pool_capacity_tokens),
+                    admitted,
+                    vlm_gen_params.max_new_tokens,
+                ) {
+                    Ok(n) => vlm_gen_params.max_new_tokens = n,
+                    Err(resp) => return *resp,
+                }
                 let vlm_meta = ResponseMeta {
                     family: ctx.family,
                     temperature: vlm_gen_params.temperature,
@@ -2011,7 +2274,7 @@ pub async fn chat_completions(
                     .enable_thinking
                     .map(|v| serde_json::json!({ "enable_thinking": v }));
                 match vlm
-                    .generate(
+                    .generate_with_lease(
                         vlm_messages,
                         images,
                         effective_tools,
@@ -2019,6 +2282,8 @@ pub async fn chat_completions(
                         vlm_gen_params,
                         tx,
                         requested_at,
+                        transient_lease,
+                        admitted,
                     )
                     .await
                 {
@@ -2102,7 +2367,7 @@ pub async fn chat_completions(
                         ctx.reasoning_parser,
                         device_lease,
                         // VLM path: out of scope for this pass — its own
-                        // gate_vlm_prompt/EngineHandleKind::Vision have no
+                        // gate_vlm_admission/EngineHandleKind::Vision have no
                         // try_admit_tokens equivalent yet (the concurrent-
                         // KV-admission fix only covers the TextGen/CB path,
                         // matching the incident that motivated it). Not a silent gap: VLM engines don't
@@ -2381,7 +2646,14 @@ pub async fn chat_completions(
         // L0: prompt-length gate (shared with /v1/completions — see gate_prompt).
         // On success it hands back the token ids so add_request can reuse them
         // (T7.3 — one tokenize pass, not two).
-        let prompt_ids = match gate_prompt(handle, &req.model, &prompt, ctx.max_prompt_tokens).await
+        let prompt_ids = match gate_prompt(
+            handle,
+            &req.model,
+            &prompt,
+            ctx.max_prompt_tokens,
+            ctx.gate_detail.as_ref(),
+        )
+        .await
         {
             Ok(ids) => ids,
             Err(resp) => return *resp,
@@ -3140,10 +3412,8 @@ fn tool_completion_sse(
         sampling: meta.sampling(),
     };
 
-    let mut frames: Vec<Result<Event, Infallible>> = vec![
-        Ok(Event::default().data(serde_json::to_string(&payload).unwrap_or_default())),
-        Ok(Event::default().data(serde_json::to_string(&finish).unwrap_or_default())),
-    ];
+    let mut frames: Vec<Result<Event, Infallible>> =
+        vec![Ok(sse_json_event(&payload)), Ok(sse_json_event(&finish))];
     if include_usage {
         frames.push(Ok(usage_sse_event(
             id,
@@ -3288,6 +3558,140 @@ mod tests {
         EngineHandle::from_sender(tx)
     }
 
+    fn detail(by: Option<GateClamp>, hybrid: bool, prefix: bool) -> GateDetail {
+        GateDetail {
+            kv_cache_gb: 4.0,
+            precision: "u4",
+            prefix_caching: prefix,
+            hybrid,
+            clamped_by: by,
+            device_free_gib: Some(2.06),
+        }
+    }
+
+    /// E-10: the refusal names the pool, its size and precision, and the knob that helps; a hybrid
+    /// model with prefix caching on gets the halving explained; each other limit has its own text.
+    #[test]
+    fn kv_gate_refusal_message_names_the_limit_and_the_knob() {
+        let m = kv_gate_refusal_message(
+            129_958,
+            98_496,
+            Some(&detail(Some(GateClamp::Pool), true, true)),
+        );
+        assert!(
+            m.contains("129958 tokens") && m.contains("98496 tokens"),
+            "{m}"
+        );
+        assert!(m.contains("4 GiB pool, u4"), "{m}");
+        assert!(m.contains("enable_prefix_caching=false"), "{m}");
+        assert!(m.contains("raise kv_cache_gb"), "{m}");
+        // No prefix sentence for a dense model or with prefix caching off.
+        for (hybrid, prefix) in [(false, true), (true, false)] {
+            let m = kv_gate_refusal_message(
+                10,
+                5,
+                Some(&detail(Some(GateClamp::Pool), hybrid, prefix)),
+            );
+            assert!(!m.contains("enable_prefix_caching"), "{m}");
+        }
+        assert!(
+            kv_gate_refusal_message(10, 5, Some(&detail(Some(GateClamp::Native), false, false)))
+                .contains("native context")
+        );
+        assert!(
+            kv_gate_refusal_message(10, 5, Some(&detail(Some(GateClamp::Ratchet), false, false)))
+                .contains("learned")
+        );
+        assert!(
+            kv_gate_refusal_message(
+                10,
+                5,
+                Some(&detail(Some(GateClamp::DeviceHeadroom), false, false))
+            )
+            .contains("2.06 GiB free")
+        );
+        // Legacy (no clamp named) uses the pool wording; no detail keeps the old sentence.
+        assert!(
+            kv_gate_refusal_message(10, 5, Some(&detail(None, false, false)))
+                .contains("KV-pool capacity")
+        );
+        assert!(kv_gate_refusal_message(10, 5, None).contains("increase cache_size_gb"));
+        assert_eq!(fmt_pool_gib(4.0), "4");
+        assert_eq!(fmt_pool_gib(4.2), "4.2");
+        assert_eq!(fmt_pool_gib(0.75), "0.75");
+    }
+
+    /// A vision refusal names its parts (text, template and tools, and that images are not counted).
+    #[test]
+    fn prompt_too_long_error_names_the_vision_parts() {
+        let resp = prompt_too_long_error(
+            "m",
+            "vlm",
+            9_000,
+            8_000,
+            Some(&detail(Some(GateClamp::Pool), false, false)),
+            Some("text 8800 + template and tools 200; images not counted"),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The breakdown replaces only the first mention of the count.
+    #[test]
+    fn breakdown_is_inserted_after_the_prompt_size() {
+        let msg = kv_gate_refusal_message(
+            9_000,
+            8_000,
+            Some(&detail(Some(GateClamp::Pool), false, false)),
+        );
+        let with = msg.replacen(
+            "prompt is 9000 tokens",
+            "prompt is 9000 tokens (text 8800 + template and tools 200)",
+            1,
+        );
+        assert!(
+            with.starts_with(
+                "prompt is 9000 tokens (text 8800 + template and tools 200) — exceeds"
+            ),
+            "{with}"
+        );
+    }
+
+    /// E-16: the template and the tool schema count against the context limit (Qwen: 5 per message
+    /// + 10, tools x1.25).
+    #[test]
+    fn vlm_overhead_counts_template_and_tools() {
+        assert_eq!(vlm_overhead_tokens(0, 0), 10);
+        assert_eq!(vlm_overhead_tokens(3, 0), 25);
+        assert_eq!(vlm_overhead_tokens(3, 1000), 25 + 1250);
+    }
+
+    /// E-16: `max_tokens` is clamped to what the pool can still hold after the prompt (less 1 % of
+    /// the pool, at least two blocks), refused below 16 tokens, and left alone when it fits, when the gate is not exact,
+    /// or when the prompt size is unknown.
+    #[test]
+    fn vlm_max_tokens_is_clamped_to_the_pool() {
+        let ctx = (true, 10_000);
+        // fits: 1,000 prompt + 2,000 answer + 100 spare < 10,000
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 1_000, 2_000).unwrap(), 2_000);
+        // does not fit: room = 10,000 - 9_000 - 100 = 900
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 9_000, 2_000).unwrap(), 900);
+        // no room to answer: 400 context_length_exceeded
+        let resp = *clamp_vlm_max_tokens("m", ctx, 9_990, 2_000).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // exactly the minimum answer is allowed
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 9_884, 2_000).unwrap(), 16);
+        // unknown prompt size, legacy gate, or no pool figure: untouched
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 0, 2_000).unwrap(), 2_000);
+        assert_eq!(
+            clamp_vlm_max_tokens("m", (false, 10_000), 9_990, 2_000).unwrap(),
+            2_000
+        );
+        assert_eq!(
+            clamp_vlm_max_tokens("m", (true, 0), 9_990, 2_000).unwrap(),
+            2_000
+        );
+    }
+
     /// A grossly oversized prompt must be rejected by the byte-length
     /// pre-check before `tokenize` is ever called — proven with a handle
     /// whose channel is already closed, so `tokenize` can only ever fail open
@@ -3300,7 +3704,7 @@ mod tests {
         let handle = EngineHandle::from_sender(tx);
         // max_prompt_tokens=10 -> byte ceiling is 10*32=320 bytes.
         let huge_prompt = "a".repeat(1_000);
-        let resp = *gate_prompt(&handle, "test-model", &huge_prompt, 10)
+        let resp = *gate_prompt(&handle, "test-model", &huge_prompt, 10, None)
             .await
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -3315,7 +3719,7 @@ mod tests {
     #[tokio::test]
     async fn gate_prompt_rejects_over_limit_prompt() {
         let handle = handle_with_token_count(101);
-        let resp = *gate_prompt(&handle, "test-model", "long prompt", 100)
+        let resp = *gate_prompt(&handle, "test-model", "long prompt", 100, None)
             .await
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -3332,7 +3736,7 @@ mod tests {
     #[tokio::test]
     async fn gate_prompt_passes_within_limit_and_forwards_ids() {
         let handle = handle_with_token_count(100);
-        let ids = gate_prompt(&handle, "test-model", "ok prompt", 100)
+        let ids = gate_prompt(&handle, "test-model", "ok prompt", 100, None)
             .await
             .unwrap();
         assert_eq!(ids.map(|v| v.len()), Some(100));
@@ -3377,7 +3781,9 @@ mod tests {
         drop(rx);
         let dead = EngineHandle::from_sender(tx);
         assert_eq!(
-            gate_prompt(&dead, "test-model", "p", 0).await.unwrap(),
+            gate_prompt(&dead, "test-model", "p", 0, None)
+                .await
+                .unwrap(),
             None
         );
 
@@ -3386,12 +3792,14 @@ mod tests {
         drop(rx2);
         let dead2 = EngineHandle::from_sender(tx2);
         assert_eq!(
-            gate_prompt(&dead2, "test-model", "p", 100).await.unwrap(),
+            gate_prompt(&dead2, "test-model", "p", 100, None)
+                .await
+                .unwrap(),
             None
         );
     }
 
-    // ---- gate_vlm_prompt (VLM L0 gate — the fix for the GPU-poisoning bug) --
+    // ---- gate_vlm_admission (VLM L0 gate — the fix for the GPU-poisoning bug) --
 
     fn vlm_with_token_count(n_tokens: usize) -> crate::vlm_engine::VlmHandle {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -3411,13 +3819,15 @@ mod tests {
     /// whose channel is already closed can only ever fail open, so a 400 here
     /// can only have come from the byte gate.
     #[tokio::test]
-    async fn gate_vlm_prompt_rejects_oversized_prompt_before_counting() {
+    async fn gate_vlm_admission_rejects_oversized_prompt_before_counting() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         drop(rx);
         let dead = crate::vlm_engine::VlmHandle::from_sender(tx, "dead-vlm");
         // max_prompt_tokens=10 -> byte ceiling is 10*32=320 bytes.
         let huge_prompt = "a".repeat(1_000);
-        let resp = *gate_vlm_prompt(&dead, &huge_prompt, 10).await.unwrap_err();
+        let resp = *gate_vlm_admission(&dead, &huge_prompt, 0, None, false, (10, None))
+            .await
+            .unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3430,11 +3840,12 @@ mod tests {
     /// the CB path's `gate_prompt` — this is the exact case that previously
     /// reached `vlm.generate` unchecked and poisoned the GPU context.
     #[tokio::test]
-    async fn gate_vlm_prompt_rejects_over_limit_prompt() {
+    async fn gate_vlm_admission_rejects_over_limit_prompt() {
         let vlm = vlm_with_token_count(75_000);
-        let resp = *gate_vlm_prompt(&vlm, "a very long document", 49_932)
-            .await
-            .unwrap_err();
+        let resp =
+            *gate_vlm_admission(&vlm, "a very long document", 0, None, false, (49_932, None))
+                .await
+                .unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3445,25 +3856,37 @@ mod tests {
 
     /// Within-limit VLM prompt passes the gate silently.
     #[tokio::test]
-    async fn gate_vlm_prompt_passes_within_limit() {
+    async fn gate_vlm_admission_passes_within_limit() {
         let vlm = vlm_with_token_count(100);
-        assert!(gate_vlm_prompt(&vlm, "ok prompt", 49_932).await.is_ok());
+        assert!(
+            gate_vlm_admission(&vlm, "ok prompt", 0, None, false, (49_932, None))
+                .await
+                .is_ok()
+        );
     }
 
     /// Same fail-open policy as `gate_prompt`: disabled gate (`max == 0`) and a
     /// dead engine (tokenize errors) both let the request through rather than
     /// producing a false 400.
     #[tokio::test]
-    async fn gate_vlm_prompt_fails_open_when_disabled_or_engine_errors() {
+    async fn gate_vlm_admission_fails_open_when_disabled_or_engine_errors() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let dead = crate::vlm_engine::VlmHandle::from_sender(tx, "dead-vlm");
-        assert!(gate_vlm_prompt(&dead, "p", 0).await.is_ok());
+        assert!(
+            gate_vlm_admission(&dead, "p", 0, None, false, (0, None))
+                .await
+                .is_ok()
+        );
 
         let (tx2, rx2) = tokio::sync::mpsc::channel(1);
         drop(rx2);
         let dead2 = crate::vlm_engine::VlmHandle::from_sender(tx2, "dead-vlm-2");
-        assert!(gate_vlm_prompt(&dead2, "p", 100).await.is_ok());
+        assert!(
+            gate_vlm_admission(&dead2, "p", 0, None, false, (100, None))
+                .await
+                .is_ok()
+        );
     }
 
     // ---- NPU L0 prompt-length gate ----------------------------------------
@@ -3482,7 +3905,7 @@ mod tests {
 
     /// A grossly oversized NPU prompt must be rejected by the byte-length
     /// pre-check before `count_tokens` is ever called — same proof shape as
-    /// `gate_vlm_prompt_rejects_oversized_prompt_before_counting`.
+    /// `gate_vlm_admission_rejects_oversized_prompt_before_counting`.
     #[tokio::test]
     async fn gate_npu_prompt_rejects_oversized_prompt_before_counting() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -3543,7 +3966,7 @@ mod tests {
     }
 
     /// A dead engine (tokenize errors) fails open rather than producing a
-    /// false 400 — same policy as `gate_prompt`/`gate_vlm_prompt`.
+    /// false 400 — same policy as `gate_prompt`/`gate_vlm_admission`.
     #[tokio::test]
     async fn gate_npu_prompt_fails_open_when_engine_errors() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -3999,6 +4422,48 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// SF-5 D-04: `chat_template_kwargs.enable_thinking` applies when the top-level field is
+    /// absent; the top-level field wins; other kwargs are ignored; a non-boolean is a 400.
+    #[test]
+    fn chat_template_kwargs_enable_thinking_is_honoured() {
+        let m = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let r = |v: serde_json::Value| resolve_enable_thinking(&cr(v)).map_err(|e| e.status());
+        assert_eq!(
+            r(serde_json::json!({"model": "x", "messages": m})),
+            Ok(None)
+        );
+        assert_eq!(
+            r(serde_json::json!({"model": "x", "messages": m,
+                "chat_template_kwargs": {"enable_thinking": false}})),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            r(
+                serde_json::json!({"model": "x", "messages": m, "enable_thinking": true,
+                "chat_template_kwargs": {"enable_thinking": false}})
+            ),
+            Ok(Some(true)),
+            "the top-level field wins"
+        );
+        assert_eq!(
+            r(
+                serde_json::json!({"model": "x", "messages": m, "enable_thinking": false,
+                "chat_template_kwargs": {"other": 1}})
+            ),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            r(serde_json::json!({"model": "x", "messages": m,
+                "chat_template_kwargs": {"enable_thinking": null}})),
+            Ok(None)
+        );
+        assert_eq!(
+            r(serde_json::json!({"model": "x", "messages": m,
+                "chat_template_kwargs": {"enable_thinking": "false"}})),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
     #[test]
     fn chat_clean_request_has_no_unsupported_param() {
         let req = cr(serde_json::json!({"model": "m", "messages": []}));
@@ -4074,6 +4539,7 @@ mod tests {
             default_kv_cache_gb: 0.0,
             vram_safety_margin_gb: 0.0,
             npu_footprint_factor: 1.0,
+            cpu_image_gen_max_pixels: 1024 * 1024,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -4108,6 +4574,16 @@ mod tests {
             unknown_fields: std::collections::HashMap::new(),
             embedding_device: None,
             ov_cache_dir: None,
+            ov_cache_layout: "keyed".to_owned(),
+            kv_precision_pass: "explicit".to_owned(),
+            kv_gate_mode: "exact".to_owned(),
+            kv_gate_exact_on_unknown_engine: false,
+            kv_headroom_mode: "dynamic".to_owned(),
+            kv_transient_factor: 2.0,
+            kv_headroom_margin_gib: 0.5,
+            kv_headroom_min_tokens: 4096,
+            kv_headroom_inflight_tokens: 32_768,
+            kv_warmup: true,
             ov_cache_max_gb: 0.0,
             ov_cache_sweep_interval_secs: 21_600,
             kv_pressure_monitor_enabled: false,
@@ -4115,6 +4591,7 @@ mod tests {
             kv_pressure_sustained_secs: 0,
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
+            load_timeout_secs: 600,
         }
     }
 

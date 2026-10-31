@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use super::error::{
     JsonBody, device_admission_error_response, inference_error_from_text, model_error_response,
-    openai_error, sse_inference_error_event, unsupported_param,
+    openai_error, sse_inference_error_event, sse_json_event, unsupported_param,
 };
 use crate::{
     app_state::AppState,
@@ -413,13 +413,21 @@ async fn submit_prompts(
             // a model on its next load). Resolved once here since it cannot
             // change mid-request-array.
             let device = mm.record_device(model);
+            let gate_detail = mm.get_chat_context(model).ok().and_then(|c| c.gate_detail);
 
             for prompt in prompts {
                 // T2.1: L0 prompt-length gate — the same gate_prompt the chat
                 // path uses (an over-long prompt wedges engine.step() forever;
                 // the Session-28 fix never propagated to this endpoint). T7.3:
                 // reuse the gate's ids so add_request skips a second encode.
-                let prompt_ids = gate_prompt(&handle, model, &prompt, max_prompt_tokens).await?;
+                let prompt_ids = gate_prompt(
+                    &handle,
+                    model,
+                    &prompt,
+                    max_prompt_tokens,
+                    gate_detail.as_ref(),
+                )
+                .await?;
 
                 // Cross-pipeline device admission (step 2): a second gate in
                 // front of the engine's own per-engine gate below, capping
@@ -701,7 +709,7 @@ fn completion_chunk_event(
             finish_reason,
         }],
     };
-    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+    sse_json_event(&chunk)
 }
 
 // ============================================================

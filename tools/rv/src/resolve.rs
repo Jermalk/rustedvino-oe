@@ -233,7 +233,18 @@ fn bundle_dir() -> Option<PathBuf> {
 fn anchor_to_bundle(models_dir: &str, bundle: Option<&Path>) -> String {
     let p = Path::new(models_dir);
     match bundle {
-        Some(b) if p.is_relative() && !models_dir.is_empty() => b.join(p).display().to_string(),
+        // MR-5b: drop `.` components, so `./models` reads `/bundle/models`, not `/bundle/./models`.
+        Some(b) if p.is_relative() && !models_dir.is_empty() => {
+            let rel: std::path::PathBuf = p
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect();
+            if rel.as_os_str().is_empty() {
+                b.display().to_string()
+            } else {
+                b.join(rel).display().to_string()
+            }
+        }
         _ => models_dir.to_owned(),
     }
 }
@@ -460,7 +471,9 @@ mod tests {
     #[test]
     fn a_relative_models_dir_is_anchored_to_the_bundle_only() {
         let b = Path::new("/bundle");
-        assert_eq!(anchor_to_bundle("./models", Some(b)), "/bundle/./models");
+        assert_eq!(anchor_to_bundle("./models", Some(b)), "/bundle/models");
+        assert_eq!(anchor_to_bundle("./a/./b", Some(b)), "/bundle/a/b");
+        assert_eq!(anchor_to_bundle(".", Some(b)), "/bundle");
         assert_eq!(anchor_to_bundle("/abs/models", Some(b)), "/abs/models");
         assert_eq!(anchor_to_bundle("./models", None), "./models");
         assert_eq!(anchor_to_bundle("", Some(b)), "");

@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use crate::api::{MUTATE_TIMEOUT, Payload, READ_TIMEOUT, encode_segment};
+use crate::api::{LOAD_TIMEOUT, Payload, READ_TIMEOUT, encode_segment};
 use crate::commands::print_error;
 use crate::commands::prompt::confirm;
 use crate::ctx::Ctx;
@@ -63,7 +63,7 @@ pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool, force: bool) 
         } else {
             json!({ "kv_cache_gb": kv_cache_gb })
         }),
-        MUTATE_TIMEOUT,
+        LOAD_TIMEOUT,
     );
     if r.code == Some(200) {
         let msg = r.body.as_ref().and_then(Payload::text).unwrap_or("resized");

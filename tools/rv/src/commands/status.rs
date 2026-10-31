@@ -137,7 +137,7 @@ fn budget_text(total: f64) -> String {
     }
 }
 
-fn vram_section(ctx: &Ctx, rows: &[Sample]) {
+fn vram_section(ctx: &Ctx, rows: &[Sample], headroom: Option<&Value>) {
     let st = ctx.style;
     let devices: BTreeSet<&str> = rows
         .iter()
@@ -183,7 +183,52 @@ fn vram_section(ctx: &Ctx, rows: &[Sample]) {
             bar(st, used, total)
         );
     }
+    headroom_lines(ctx, headroom);
     println!();
+}
+
+/// The device-headroom state of each discrete GPU (`server.headroom` of the admin API): what a
+/// vision model's long prompt can still be given, and where the figure comes from.
+fn headroom_lines(ctx: &Ctx, headroom: Option<&Value>) {
+    let st = ctx.style;
+    let Some(h) = headroom else {
+        return;
+    };
+    let devices = h["devices"].as_array().map_or(&[][..], Vec::as_slice);
+    let mode = h["mode"].as_str().unwrap_or("?");
+    let probe = h["probe"].as_str().unwrap_or("none");
+    if mode == "off" {
+        println!("  {}", st.dim("headroom: off (kv_headroom_mode)"));
+        return;
+    }
+    if probe == "none" {
+        println!(
+            "  {}",
+            st.dim("headroom: unknown (the server cannot read device memory on this platform)")
+        );
+        return;
+    }
+    if devices.is_empty() {
+        return;
+    }
+    for d in devices {
+        let g = |k: &str| d[k].as_f64().unwrap_or(0.0);
+        let outside = d["outside_mib"].as_f64().map_or_else(
+            || "outside unknown".to_owned(),
+            |m| format!("{:.2} GiB others", m / 1024.0),
+        );
+        let leased = d["leases_mib"]
+            .as_f64()
+            .map_or_else(String::new, |m| format!("{m:.0} MiB leased, "));
+        println!(
+            "  {:<8} headroom: {:.1} GiB total, {outside}, {:.2} GiB mine (booked or measured, \
+             the larger), {leased}{:.2} GiB left for a prompt (probe: {probe})",
+            d["device"].as_str().unwrap_or("?"),
+            g("total_gib"),
+            g("own_gib"),
+            g("free_gib"),
+        );
+    }
 }
 
 fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_m: &[Sample]) {
@@ -219,6 +264,8 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
                     .unwrap_or("?")
                     .to_owned(),
                 vram,
+                a.map_or_else(|| "-".to_owned(), crate::commands::models::ctx_cell),
+                a.map_or_else(|| "-".to_owned(), crate::commands::models::kv_prec_cell),
                 kv,
                 req,
             ]
@@ -229,7 +276,16 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
         "{}",
         table(
             ctx.style,
-            &["ID", "STATE", "DEVICE", "VRAM", "KV%", "RUN/WAIT/MAX"],
+            &[
+                "ID",
+                "STATE",
+                "DEVICE",
+                "VRAM",
+                "CTX",
+                "KV PREC",
+                "KV%",
+                "RUN/WAIT/MAX"
+            ],
             &table_rows,
             Some(1)
         )
@@ -313,7 +369,31 @@ pub fn run(ctx: &Ctx) -> i32 {
 
     if let Some(h) = health.json().filter(|_| health_ok) {
         let v = h.get("version").and_then(Value::as_str).unwrap_or("?");
-        println!("{} {:<10} ok — v{v}", st.ok(), "Health");
+        // E-12: /health is a liveness probe and stays 200 on a poisoned GPU context;
+        // its body (public, no admin key needed) and the admin server block say so.
+        let poisoned = h["gpu_poisoned"].as_bool().unwrap_or(false)
+            || admin_models
+                .as_ref()
+                .is_some_and(|a| a["server"]["gpu_poisoned"].as_bool().unwrap_or(false));
+        if poisoned {
+            println!(
+                "{} {:<10} alive — v{v}, but {}",
+                st.bad(),
+                "Health",
+                st.red(GPU_POISONED_BANNER)
+            );
+        } else {
+            println!("{} {:<10} ok — v{v}", st.ok(), "Health");
+        }
+        // Step 6e: public flag; the device/model detail needs the admin watchdog read below.
+        if h["device_stalled"].as_bool().unwrap_or(false) {
+            println!(
+                "{} {:<10} {}",
+                st.warn(),
+                "Loads",
+                st.yellow("a model load has not returned — its device takes no new loads")
+            );
+        }
     } else {
         println!(
             "{} {:<10} unreachable  {}",
@@ -321,6 +401,16 @@ pub fn run(ctx: &Ctx) -> i32 {
             "Health",
             st.dim(health.err.as_deref().unwrap_or(""))
         );
+    }
+    // Step 8: driver versions and startup warnings (admin server block).
+    if let Some(server) = admin_models.as_ref().map(|a| &a["server"]) {
+        let (warnings, drivers) = startup_report_lines(server);
+        for d in drivers {
+            println!("{} {:<10} {}", st.ok(), "Driver", st.dim(&d));
+        }
+        for w in warnings {
+            println!("{} {:<10} {}", st.warn(), "Startup", st.yellow(&w));
+        }
     }
     // Report what the SERVER does, not what the local keys file implies.
     println!("{}", auth_line(ctx, inf, adm));
@@ -342,7 +432,11 @@ pub fn run(ctx: &Ctx) -> i32 {
     }
 
     if !rows_m.is_empty() {
-        vram_section(ctx, &rows_m);
+        vram_section(
+            ctx,
+            &rows_m,
+            admin_models.as_ref().map(|a| &a["server"]["headroom"]),
+        );
     }
 
     if let Some(a) = audit.as_ref().filter(|a| a.is_object()) {
@@ -386,6 +480,23 @@ pub fn run(ctx: &Ctx) -> i32 {
     }
 
     if let Some(w) = watchdog.as_ref().filter(|w| w.is_object()) {
+        for line in stalled_lines(w) {
+            println!("{} {:<10} {}", st.bad(), "Stalled", st.red(&line));
+        }
+        for line in recovery_lines(w) {
+            println!("{} {:<10} {}", st.warn(), "Recovery", st.yellow(&line));
+        }
+        if let Some(n) = w
+            .get("in_flight")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            println!(
+                "{} {:<10} {n} OpenVINO call(s) in flight",
+                st.ok(),
+                "In flight"
+            );
+        }
         match w.get("oldest_generation_secs").and_then(Value::as_f64) {
             None => println!(
                 "{} {:<10} idle — no in-flight generations",
@@ -413,6 +524,94 @@ pub fn run(ctx: &Ctx) -> i32 {
     }
     i32::from(!health_ok)
 }
+
+/// `rv status` / `rv start` lines for the admin `server` block's step-8 fields: one per startup
+/// warning (`code: message`) and one per device driver (`GPU.1  <name>  driver <v>`, kernel last).
+/// Empty for an older server or a caller without an admin key.
+#[must_use]
+pub fn startup_report_lines(server: &Value) -> (Vec<String>, Vec<String>) {
+    let warnings = server
+        .get("startup_warnings")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|w| {
+                    format!(
+                        "{}: {}",
+                        w["code"].as_str().unwrap_or("?"),
+                        w["message"].as_str().unwrap_or("")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut drivers: Vec<String> = server["platform"]["drivers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| {
+                    format!(
+                        "{}  {}  driver {}",
+                        d["device"].as_str().unwrap_or("?"),
+                        d["name"].as_str().unwrap_or("?"),
+                        d["driver_version"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(k) = server["platform"]["kernel"].as_str() {
+        drivers.push(format!("kernel {k}"));
+    }
+    (warnings, drivers)
+}
+
+/// One line per stalled load in a `/v1/admin/health/watchdog` body (step 6e); empty for an
+/// older server without the field.
+fn stalled_lines(watchdog: &Value) -> Vec<String> {
+    watchdog
+        .get("stalled")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|s| {
+                    let dev = s["device"].as_str().unwrap_or("?");
+                    format!(
+                        "{} of {} on {dev} has not returned for {} s — no new loads on {dev} \
+                         until it does",
+                        s["kind"].as_str().unwrap_or("load"),
+                        s["model"].as_str().unwrap_or("?"),
+                        s["secs"].as_u64().unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The distinct recovery steps of the stalled loads in a `/v1/admin/health/watchdog` body (D-04
+/// S9), in order; empty for an older server without the field.
+fn recovery_lines(watchdog: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in watchdog
+        .get("stalled")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["recovery"].as_str())
+    {
+        if !out.iter().any(|o| o == r) {
+            out.push(r.to_owned());
+        }
+    }
+    out
+}
+
+/// The `rv status` banner for a poisoned GPU context (E-12); `rv ps` / `rv list`
+/// print their own text from `models.rs`.
+const GPU_POISONED_BANNER: &str = "GPU CONTEXT POISONED — restart required; GPU models are unavailable \
+     until the server restarts (a `--supervise` worker restarts itself after a serving failure; \
+     otherwise restart it by hand)";
 
 /// How many config-audit problems `rv status` prints before summarising the rest.
 const AUDIT_LINES_SHOWN: usize = 8;
@@ -448,7 +647,7 @@ fn problem_line(p: &Value) -> String {
 
 #[cfg(test)]
 mod problem_line_tests {
-    use super::problem_line;
+    use super::{problem_line, recovery_lines, stalled_lines, startup_report_lines};
     use serde_json::json;
 
     #[test]
@@ -467,5 +666,61 @@ mod problem_line_tests {
     fn strings_and_unknown_shapes_pass_through() {
         assert_eq!(problem_line(&json!("old server text")), "old server text");
         assert_eq!(problem_line(&json!({"x":1})), r#"{"x":1}"#);
+    }
+
+    /// 6e: each stalled load in the watchdog body becomes one line; an older server's body
+    /// (no `stalled` field) gives none.
+    /// Step 8: warnings and drivers from the admin server block; nothing from an older server.
+    #[test]
+    fn startup_report_lines_render_warnings_and_drivers() {
+        let server = json!({
+            "startup_warnings": [{"code": "global_device_unknown", "message": "device GPU.7 …"}],
+            "platform": {"drivers": [{"device": "GPU.1", "name": "B60", "driver_version": "25.18.33578"}],
+                         "kernel": "7.0.0-38-generic"}
+        });
+        let (w, d) = startup_report_lines(&server);
+        assert_eq!(w, vec!["global_device_unknown: device GPU.7 …".to_owned()]);
+        assert_eq!(
+            d,
+            vec![
+                "GPU.1  B60  driver 25.18.33578".to_owned(),
+                "kernel 7.0.0-38-generic".to_owned()
+            ]
+        );
+        let (w, d) = startup_report_lines(&json!({"engine": "RustedVINO"}));
+        assert!(w.is_empty() && d.is_empty());
+    }
+
+    #[test]
+    fn stalled_lines_render_each_stalled_load() {
+        let w = json!({"stalled": [
+            {"device": "GPU.1", "model": "big", "kind": "load", "secs": 700}
+        ]});
+        assert_eq!(
+            stalled_lines(&w),
+            vec![
+                "load of big on GPU.1 has not returned for 700 s — no new loads on GPU.1 until it \
+                 does"
+                    .to_owned()
+            ]
+        );
+        assert!(stalled_lines(&json!({"oldest_generation_secs": null})).is_empty());
+    }
+
+    /// D-04 S9: one line per distinct recovery step; an older server without the field shows none.
+    #[test]
+    fn recovery_lines_are_distinct_and_optional() {
+        let w = json!({"stalled": [
+            {"device": "GPU.1", "model": "a", "kind": "load", "secs": 700, "recovery": "reset GPU.1"},
+            {"device": "GPU.1", "model": "b", "kind": "load", "secs": 650, "recovery": "reset GPU.1"},
+            {"device": "GPU.0", "model": "c", "kind": "load", "secs": 640, "recovery": "reboot"}
+        ]});
+        assert_eq!(
+            recovery_lines(&w),
+            vec!["reset GPU.1".to_owned(), "reboot".to_owned()]
+        );
+        let old =
+            json!({"stalled": [{"device": "GPU.1", "model": "a", "kind": "load", "secs": 1}]});
+        assert!(recovery_lines(&old).is_empty());
     }
 }

@@ -63,6 +63,65 @@ pub(crate) fn mem_cell(device: &str, gb_text: String) -> String {
     }
 }
 
+/// The context-limit cell: `max_prompt_tokens` as a plain number below 10,000,
+/// else rounded thousands with `k`. `*` marks a limit that follows free device
+/// memory (`device_headroom`), `~` an estimate (legacy gate), and a trailing `!` a vision
+/// model that has admitted image requests whose images the limit did not count
+/// (`kv_admission_low_confidence`, F2-S-5). `-` when unknown.
+pub(crate) fn ctx_cell(m: &Value) -> String {
+    let n = m
+        .get("max_prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if n == 0 {
+        return "-".to_owned();
+    }
+    let mut out = if n < 10_000 {
+        n.to_string()
+    } else {
+        format!("{}k", (n + 500) / 1000)
+    };
+    if m.get("limit_clamped_by").and_then(Value::as_str) == Some("device_headroom") {
+        out.push('*');
+    } else if m.get("kv_gate_mode").and_then(Value::as_str) == Some("legacy") {
+        out.push('~');
+    }
+    if m.get("kv_admission_low_confidence")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.push('!');
+    }
+    out
+}
+
+/// The KV pool cell: GiB with the whole MiB the server booked (`1.21 GiB (1239 MiB)`), from the
+/// admin `kv_pool_mib`; the old one-decimal `cache_size_gb` figure when the server does not report
+/// it, and `-` for a model with no pool.
+pub(crate) fn kv_pool_cell(m: &Value) -> String {
+    match m.get("kv_pool_mib").and_then(Value::as_u64) {
+        Some(0) => "-".to_owned(),
+        #[allow(clippy::cast_precision_loss)] // a pool is far below 2^52 MiB
+        Some(mib) => format!("{:.2} GiB ({mib} MiB)", mib as f64 / 1024.0),
+        None => gb(m, "cache_size_gb"),
+    }
+}
+
+/// The KV-cache precision cell, e.g. `u4 (auto)`; `-` when not reported.
+pub(crate) fn kv_prec_cell(m: &Value) -> String {
+    let Some(prec) = m.get("kv_cache_precision").and_then(Value::as_str) else {
+        return "-".to_owned();
+    };
+    let tag = match m.get("kv_precision_source").and_then(Value::as_str) {
+        Some("auto_rule") => " (auto)",
+        Some("global") => " (global)",
+        Some("per_model") => " (model)",
+        Some("ir_hint") => " (ir)",
+        _ => "",
+    };
+    format!("{prec}{tag}")
+}
+
 /// `running/waiting/max`, or `n/a` unless all three metrics exist.
 fn req_triplet(rows: &[Sample], model: &str) -> String {
     let get = |name| metrics::by_label(rows, name, &[("model", model)]);
@@ -200,7 +259,9 @@ pub fn ps(ctx: &Ctx) -> i32 {
     };
     let ready: Vec<Value> = all
         .into_iter()
-        .filter(|m| s(m, "state") == "ready")
+        // A GPU model on a poisoned context ("unavailable (gpu_poisoned)") is still
+        // resident in VRAM, so it stays in the table; the state column says why.
+        .filter(|m| s(m, "state") == "ready" || s(m, "state").starts_with("unavailable"))
         .collect();
     let rows_m = ctx
         .api
@@ -224,7 +285,9 @@ pub fn ps(ctx: &Ctx) -> i32 {
                 s(m, "device").to_owned(),
                 s(m, "kind").to_owned(),
                 mem_cell(s(m, "device"), gb(m, "vram_gb")),
-                gb(m, "cache_size_gb"),
+                kv_pool_cell(m),
+                ctx_cell(m),
+                kv_prec_cell(m),
                 kv_percent(&rows_m, id),
                 req_triplet(&rows_m, id),
                 ctx.policy_flags(id),
@@ -244,7 +307,9 @@ pub fn ps(ctx: &Ctx) -> i32 {
                 "DEVICE",
                 "KIND",
                 "VRAM",
-                "KV GB",
+                "KV POOL",
+                "CTX",
+                "KV PREC",
                 "KV%",
                 "RUN/WAIT/MAX",
                 "POLICY"
@@ -270,5 +335,64 @@ mod mem_cell_tests {
     fn cpu_budget_is_labelled_ram() {
         assert_eq!(mem_cell("CPU", "3.3 GB".into()), "3.3 GB (RAM)");
         assert_eq!(mem_cell("GPU.1", "3.3 GB".into()), "3.3 GB");
+    }
+}
+
+#[cfg(test)]
+mod kv_cell_tests {
+    use super::{ctx_cell, kv_pool_cell, kv_prec_cell};
+    use serde_json::json;
+
+    #[test]
+    fn kv_pool_shows_gib_and_mib() {
+        assert_eq!(
+            kv_pool_cell(&json!({"kv_pool_mib": 1239})),
+            "1.21 GiB (1239 MiB)"
+        );
+        assert_eq!(kv_pool_cell(&json!({"kv_pool_mib": 0})), "-");
+        assert_eq!(kv_pool_cell(&json!({"cache_size_gb": 2.0})), "2.0 GB");
+    }
+
+    #[test]
+    fn ctx_formats() {
+        assert_eq!(ctx_cell(&json!({})), "-");
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 0})), "-");
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 4096})), "4096");
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 10000})), "10k");
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 193_116})), "193k");
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 86381})), "86k");
+        // F2-S-5: images admitted uncounted mark the cell, after the headroom mark.
+        assert_eq!(
+            ctx_cell(
+                &json!({"max_prompt_tokens": 86381, "limit_clamped_by": "device_headroom",
+                             "kv_admission_low_confidence": true})
+            ),
+            "86k*!"
+        );
+        assert_eq!(ctx_cell(&json!({"max_prompt_tokens": 104_500})), "105k");
+    }
+
+    #[test]
+    fn ctx_flags() {
+        let hr = json!({"max_prompt_tokens": 104_500, "limit_clamped_by": "device_headroom"});
+        assert_eq!(ctx_cell(&hr), "105k*");
+        let lg = json!({"max_prompt_tokens": 27_000, "kv_gate_mode": "legacy"});
+        assert_eq!(ctx_cell(&lg), "27k~");
+        let pool = json!({"max_prompt_tokens": 27_000, "limit_clamped_by": "pool", "kv_gate_mode": "exact"});
+        assert_eq!(ctx_cell(&pool), "27k");
+    }
+
+    #[test]
+    fn kv_prec_formats() {
+        let c = |p: &str, s: &str| {
+            kv_prec_cell(&json!({"kv_cache_precision": p, "kv_precision_source": s}))
+        };
+        assert_eq!(c("u4", "auto_rule"), "u4 (auto)");
+        assert_eq!(c("i8", "global"), "i8 (global)");
+        assert_eq!(c("f16", "ir_hint"), "f16 (ir)");
+        assert_eq!(c("u4", "per_model"), "u4 (model)");
+        assert_eq!(c("auto", "passthrough"), "auto");
+        assert_eq!(kv_prec_cell(&json!({"kv_cache_precision": "i8"})), "i8");
+        assert_eq!(kv_prec_cell(&json!({})), "-");
     }
 }

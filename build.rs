@@ -282,7 +282,7 @@ fn link_unversioned(out_dir: &Path, lib_dir: &str, name: &str) {
 /// link against the import libraries (.lib) from Intel's `OpenVINO` **`GenAI`**
 /// Windows archive (the `GenAI` archive — the base runtime archive lacks
 /// `openvino_genai.dll`). Version MUST match the Linux pip wheel generation
-/// (2026.2 on this branch): the C++ API has no cross-version ABI guarantee.
+/// (2026.4.1 on this branch): the C++ API has no cross-version ABI guarantee.
 /// Build-host prerequisite: clang >= 19 (the MSVC STL headers static-assert it;
 /// `~/.local/bin/clang-cl` must resolve to clang-19, not 18).
 ///

@@ -333,6 +333,7 @@ pub async fn embeddings(
             Err(ModelError::NotLoaded) => {
                 return match mm.request_on_demand_load(&req.model) {
                     OnDemandLoad::Loading => model_error_response(ModelError::Loading),
+                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
                     OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
                 };
             }

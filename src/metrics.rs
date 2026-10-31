@@ -36,15 +36,18 @@ const REQUESTS_RUNNING: &str = "rustedvino_requests_running";
 const REQUESTS_MAX: &str = "rustedvino_requests_max";
 const REQUESTS_WAITING: &str = "rustedvino_requests_waiting";
 const MODEL_LOADED: &str = "rustedvino_model_loaded";
+const GPU_POISONED: &str = "rustedvino_gpu_poisoned";
+const KV_GATE_MODE: &str = "rustedvino_kv_gate_mode";
+const KV_SCHEDULER_DROP_TOTAL: &str = "rustedvino_kv_scheduler_drop_total";
 const VRAM_TOTAL_BYTES: &str = "rustedvino_vram_total_bytes";
 const VRAM_USED_BYTES: &str = "rustedvino_vram_used_bytes";
 
-/// GB (decimal, as the memory tracker counts) to a whole number of bytes for
-/// the `*_bytes` gauges. Rounded so accumulated float error shows up as
+/// The tracker's unit (GiB: the KV pools it books are exact byte counts over 2^30, and the device
+/// inventory reports device memory in GiB) to a whole number of bytes for the `*_bytes` gauges. Rounded so accumulated float error shows up as
 /// `16722654720`, not `16722654720.000002`, and clamped so an idle tracker
 /// reads `0`, not `-0` (Windows pass 2, D14).
 fn gb_to_bytes(gb: f64) -> f64 {
-    let bytes = (gb * 1e9).round();
+    let bytes = (gb * 1_073_741_824.0).round();
     if bytes > 0.0 { bytes } else { 0.0 }
 }
 const PROCESS_GPU_MEMORY_BYTES: &str = "rustedvino_process_gpu_memory_bytes";
@@ -53,7 +56,7 @@ const MODEL_GPU_MEMORY_ESTIMATE_BYTES: &str = "rustedvino_model_gpu_memory_estim
 /// `OpenVINO` compile-cache disk usage (the project's internal engineering log)
 /// — pushed from the background sweep (`ModelManager::prune_ov_cache_if_over_budget`,
 /// every `ov_cache_sweep_interval_secs`), not pulled at scrape time: computing
-/// it walks every file in `ov_cache_dir` (thousands of tiny `.cl_cache` files
+/// it walks every file in `ov_cache_dir` and its `kv-*` subdirectories (thousands of tiny `.cl_cache` files
 /// on a long-lived box), too expensive to redo on every `/metrics` scrape.
 /// Reported whenever `ov_cache_dir` is configured, regardless of whether
 /// `ov_cache_max_gb` bounds it — the original gap this plan set out to close
@@ -118,6 +121,7 @@ const CONTEXT_LENGTH_EXCEEDED_TOTAL: &str = "rustedvino_context_length_exceeded_
 /// alone, the pool is just busy right now" — conflating them would mislead
 /// an operator debugging which failure mode they're actually seeing.
 const POOL_CAPACITY_REJECTED_TOTAL: &str = "rustedvino_pool_capacity_rejected_total";
+const KV_MAX_TOKENS_CLAMPED_TOTAL: &str = "rustedvino_kv_max_tokens_clamped_total";
 
 /// Own-budget admission rejections: a single-slot model (`max_concurrent_streams
 /// == 1`) rejecting a request whose own `prompt_tokens + max_tokens` can't fit
@@ -323,6 +327,16 @@ fn register_state_gauges() {
         "Requests admitted but not yet actively processed: CB counts callers parked at the admission gate; the single-stream VLM counts queued-but-not-running"
     );
     describe_gauge!(
+        GPU_POISONED,
+        Unit::Count,
+        "1 once an out-of-resources failure has poisoned the GPU context (every GPU model is then unusable until the server restarts), 0 otherwise"
+    );
+    describe_gauge!(
+        KV_GATE_MODE,
+        Unit::Count,
+        "1 for the prompt-length gate mode a loaded text or vision model uses (`mode` label), 0 once it is unloaded. `exact` = from the model's real KV layout and pool, `legacy` = the 0.8.x estimate"
+    );
+    describe_gauge!(
         MODEL_LOADED,
         Unit::Count,
         "1 if the model is loaded and Ready, 0 otherwise"
@@ -391,6 +405,11 @@ fn register_state_gauges() {
 /// Hot-path counters/histograms (Phase 3.4) + realtime voice pipeline metrics.
 fn register_hot_path_metrics() {
     describe_counter!(
+        KV_SCHEDULER_DROP_TOTAL,
+        Unit::Count,
+        "Requests the continuous-batching scheduler ignored because the KV pool had no room for them (reported to the client as a retryable 503). A rising count means the prompt-length gate admits more than the pool holds"
+    );
+    describe_counter!(
         TOKENS_GENERATED_TOTAL,
         Unit::Count,
         "Output tokens generated across all requests (non-empty per-step deltas)"
@@ -404,6 +423,11 @@ fn register_hot_path_metrics() {
         CONTEXT_LENGTH_EXCEEDED_TOTAL,
         Unit::Count,
         "L0 prompt-length gate rejections (400 context_length_exceeded) before the request ever reached the engine — a clean, expected rejection, not a fault. The `gate` label (cb/vlm/npu) distinguishes which pipeline rejected, since NPU shares the cb path's text_gen kind label"
+    );
+    describe_counter!(
+        KV_MAX_TOKENS_CLAMPED_TOTAL,
+        Unit::Count,
+        "Vision requests whose max_tokens was lowered so the prompt and the answer fit the KV pool (finish_reason length when the clamp binds): the client asked for more than the pool can hold alongside this prompt. A clean, expected outcome, not a fault"
     );
     describe_counter!(
         POOL_CAPACITY_REJECTED_TOTAL,
@@ -534,6 +558,11 @@ pub struct HotMetrics {
     /// `rustedvino_rtf_ratio` — recorded by STT/TTS engines only (`record_rtf`
     /// is simply never called by other kinds, so their series stay empty).
     rtf: Histogram,
+    /// `rustedvino_kv_scheduler_drop_total` - set only by engines that can lose a request to
+    /// KV-pool admission (the continuous-batching text engine and the vision engine, via
+    /// [`HotMetrics::with_kv_scheduler_drops`]); `None` elsewhere, so no other engine (NPU,
+    /// embedding, ...) advertises a series that can never move.
+    kv_scheduler_drops: Option<Counter>,
 }
 
 impl HotMetrics {
@@ -569,6 +598,24 @@ impl HotMetrics {
             tokens_per_second: gauge!(TOKENS_PER_SECOND, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label),
             per_request,
             rtf: histogram!(RTF_RATIO, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label),
+            kv_scheduler_drops: None,
+        }
+    }
+
+    /// Registers `rustedvino_kv_scheduler_drop_total{model}` for this engine. Called by the
+    /// continuous-batching and vision engines only.
+    #[must_use]
+    pub fn with_kv_scheduler_drops(mut self, model_id: &str) -> Self {
+        self.kv_scheduler_drops =
+            Some(counter!(KV_SCHEDULER_DROP_TOTAL, "model" => model_id.to_owned()));
+        self
+    }
+
+    /// Count one request lost to KV-pool admission (the scheduler ignored it, or the vision
+    /// engine wedged on it). No-op for engines that do not register the counter.
+    pub fn kv_scheduler_drop(&self) {
+        if let Some(c) = &self.kv_scheduler_drops {
+            c.increment(1);
         }
     }
 
@@ -656,6 +703,15 @@ pub fn record_state(snap: &MetricsSnapshot) {
             .set(f64::from(u8::from(m.pinned)));
         gauge!(MODEL_PRIORITY, "model" => model.to_owned(), "device" => device.to_owned(), "kind" => kind)
             .set(f64::from(m.priority));
+        // NPU models have no KV-pool gate (their limit is the compiled prompt shape).
+        // Both series are written so a model that switches mode (a reload under another
+        // `kv_gate_mode`, a model the exact gate cannot describe) never leaves both reading 1.
+        if matches!(m.kind, ModelKind::TextGen | ModelKind::Vision) && !device.starts_with("NPU") {
+            for mode in ["legacy", "exact"] {
+                gauge!(KV_GATE_MODE, "model" => model.to_owned(), "mode" => mode)
+                    .set(f64::from(u8::from(m.loaded && m.kv_gate_mode == mode)));
+            }
+        }
         gauge!(KV_CACHE_USAGE_PERCENT, "model" => model.to_owned(), "device" => device.to_owned(), "kind" => kind)
             .set(m.kv_cache_usage_pct);
         gauge!(KV_CACHE_USAGE_SUPPORTED, "model" => model.to_owned(), "device" => device.to_owned(), "kind" => kind)
@@ -680,6 +736,7 @@ pub fn record_state(snap: &MetricsSnapshot) {
                 .set(secs);
         }
     }
+    gauge!(GPU_POISONED).set(f64::from(u8::from(snap.gpu_poisoned)));
     // Box-level aggregate VRAM gauges (backward-compat, single-domain view).
     let primary = snap.device.as_str();
     gauge!(VRAM_TOTAL_BYTES, "device" => primary.to_owned()).set(gb_to_bytes(snap.total_vram_gb));
@@ -699,13 +756,18 @@ pub fn record_state(snap: &MetricsSnapshot) {
 
 /// Record one L0 prompt-length gate rejection (`400 context_length_exceeded`)
 /// — see [`CONTEXT_LENGTH_EXCEEDED_TOTAL`]'s description. Called from the
-/// handler layer (`handlers/chat.rs`'s `gate_prompt`/`gate_vlm_prompt`/
+/// handler layer (`handlers/chat.rs`'s `gate_prompt`/`gate_vlm_admission`/
 /// `gate_npu_prompt`), not the engine thread — a registry lookup per call is
 /// fine here (these are rare relative to the token hot path `HotMetrics`
 /// caches handles for). `gate` is `"cb"`/`"vlm"`/`"npu"`.
 pub(crate) fn record_context_length_exceeded(model_id: &str, gate: &'static str) {
     counter!(CONTEXT_LENGTH_EXCEEDED_TOTAL, "model" => model_id.to_owned(), "gate" => gate)
         .increment(1);
+}
+
+/// See [`KV_MAX_TOKENS_CLAMPED_TOTAL`]'s description.
+pub(crate) fn record_kv_max_tokens_clamped(model_id: &str) {
+    counter!(KV_MAX_TOKENS_CLAMPED_TOTAL, "model" => model_id.to_owned()).increment(1);
 }
 
 /// See [`POOL_CAPACITY_REJECTED_TOTAL`]'s description.
@@ -837,7 +899,7 @@ mod tests {
     #[test]
     fn gb_to_bytes_rounds_and_never_goes_negative_zero() {
         // 16722654720 bytes expressed as GB with accumulated float error.
-        let noisy_gb = 16_722_654_720.0_f64 / 1e9 + 2e-15;
+        let noisy_gb = 16_722_654_720.0_f64 / 1_073_741_824.0 + 2e-15;
         assert!((gb_to_bytes(noisy_gb) - 16_722_654_720.0).abs() < f64::EPSILON);
         assert!(
             (gb_to_bytes(noisy_gb).fract()).abs() < f64::EPSILON,
@@ -1001,6 +1063,7 @@ mod tests {
     /// Build a one-model snapshot for the state-gauge tests.
     fn snap_with(loaded: bool, active: usize, max_seqs: usize) -> MetricsSnapshot {
         MetricsSnapshot {
+            gpu_poisoned: false,
             device: "GPU.1".to_owned(),
             total_vram_gb: 22.5,
             used_vram_gb: if loaded { 5.5 } else { 0.0 },
@@ -1016,6 +1079,7 @@ mod tests {
                 // Pool follows the live reservation (0 when evicted); pinned/
                 // priority are static policy and report loaded or not.
                 kv_cache_pool_gb: if loaded { 4.0 } else { 0.0 },
+                kv_gate_mode: if loaded { "legacy" } else { "" },
                 pinned: true,
                 priority: 100,
                 // Live occupancy only reads non-zero on a Ready engine.
@@ -1041,6 +1105,83 @@ mod tests {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| panic!("no `{metric}` series for qwen3-8b-int4-ov in:\n{rendered}"))
+    }
+
+    /// U-25 (Stage 0 part): the gate-mode gauge reads 1 for `legacy` while a text model is
+    /// loaded and 0 once it is evicted, and the scheduler-drop counter exists for text engines
+    /// only and counts per model.
+    #[test]
+    fn kv_max_tokens_clamped_counter_counts_per_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_kv_max_tokens_clamped("vlm-a");
+            record_kv_max_tokens_clamped("vlm-a");
+            record_kv_max_tokens_clamped("vlm-b");
+        });
+        let text = handle.render();
+        assert!(
+            text.contains("rustedvino_kv_max_tokens_clamped_total{model=\"vlm-a\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rustedvino_kv_max_tokens_clamped_total{model=\"vlm-b\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn kv_gate_mode_gauge_and_scheduler_drop_counter() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_state(&snap_with(true, 0, 16));
+            let loaded = handle.render();
+            assert!(
+                loaded.contains(
+                    "rustedvino_kv_gate_mode{model=\"qwen3-8b-int4-ov\",mode=\"legacy\"} 1"
+                )
+            );
+            record_state(&snap_with(false, 0, 0));
+            assert!(
+                handle.render().contains(
+                    "rustedvino_kv_gate_mode{model=\"qwen3-8b-int4-ov\",mode=\"legacy\"} 0"
+                ),
+                "evicted model must read 0"
+            );
+
+            // A model that switches to the exact gate flips both series, never leaves both at 1.
+            let mut exact = snap_with(true, 0, 16);
+            exact.models[0].kv_gate_mode = "exact";
+            record_state(&exact);
+            let text = handle.render();
+            assert!(text.contains("kv_gate_mode{model=\"qwen3-8b-int4-ov\",mode=\"exact\"} 1"));
+            assert!(text.contains("kv_gate_mode{model=\"qwen3-8b-int4-ov\",mode=\"legacy\"} 0"));
+
+            // An NPU-placed model carries no gate-mode series.
+            let mut npu = snap_with(true, 0, 16);
+            npu.models[0].id = "npu-model".to_owned();
+            npu.models[0].device = "NPU".to_owned();
+            record_state(&npu);
+            assert!(!handle.render().contains("kv_gate_mode{model=\"npu-model\""));
+
+            let text = HotMetrics::new(ModelKind::TextGen, "m-text", "GPU.1")
+                .with_kv_scheduler_drops("m-text");
+            let embed = HotMetrics::new(ModelKind::Embedding, "m-embed", "GPU.0");
+            text.kv_scheduler_drop();
+            text.kv_scheduler_drop();
+            embed.kv_scheduler_drop();
+            let out = handle.render();
+            assert!(
+                out.lines()
+                    .any(|l| l == "rustedvino_kv_scheduler_drop_total{model=\"m-text\"} 2"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("kv_scheduler_drop_total{model=\"m-embed"),
+                "{out}"
+            );
+        });
     }
 
     /// The per-model measured-memory gauge reports the estimate while loaded

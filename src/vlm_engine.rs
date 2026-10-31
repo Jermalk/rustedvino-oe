@@ -79,6 +79,11 @@ pub(crate) enum VlmCommand {
         /// generation's entry in the [`GenerationClock`]. See
         /// [`VlmHandle::generate`].
         ticket: GenerationTicket,
+        /// Resources the request reserved that must outlive the HTTP request: dropped by the
+        /// engine thread when the generation call returns, not when the client goes away (a
+        /// disconnect does not stop a prefill already running on the device). Today: the
+        /// transient device-memory lease of a long prompt.
+        lease: Option<Box<dyn std::any::Any + Send>>,
     },
     /// Count tokens in `text` on the engine thread (the only thread allowed to
     /// touch the tokenizer). Serves the L0 prompt-length gate in `chat.rs`,
@@ -129,44 +134,141 @@ pub(crate) enum VlmCommand {
 /// site per ticket, so the table can't leak a stale entry that would later
 /// make the watchdog kill a healthy worker.
 #[derive(Clone, Default, Debug)]
-pub(crate) struct GenerationClock(Arc<Mutex<HashMap<u64, Instant>>>);
+pub(crate) struct GenerationClock(Arc<Mutex<ClockState>>);
+
+/// One in-flight generation in the [`GenerationClock`].
+#[derive(Debug)]
+struct ClockEntry {
+    /// When the caller took the ticket (queued behind whatever the engine thread is running).
+    queued_at: Instant,
+    /// How long it may run once the engine thread has started it ([`generation_allowance`]).
+    allowance: Duration,
+    /// When the engine thread started it; `None` while it still waits in the command queue.
+    running_since: Option<Instant>,
+}
+
+/// The table plus the last moment the engine thread made progress (started or finished a
+/// generation).
+#[derive(Debug)]
+struct ClockState {
+    entries: HashMap<u64, ClockEntry>,
+    last_progress: Instant,
+}
+
+impl Default for ClockState {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_progress: Instant::now(),
+        }
+    }
+}
 
 static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Prefill speed the watchdog assumes at least, tokens per second. The 27B vision model measured
+/// about 375 tok/s on the B60 (92k tokens in ~245 s); half of that is the floor.
+pub(crate) const WATCHDOG_PREFILL_FLOOR_TOK_S: u64 = 200;
+/// Decode speed the watchdog assumes at least, tokens per second. The 27B measured 13-18 tok/s.
+pub(crate) const WATCHDOG_DECODE_FLOOR_TOK_S: u64 = 5;
+
+/// How long a generation may take before the watchdog starts counting it as overdue: the prompt
+/// at the prefill floor plus the answer budget at the decode floor. A fixed ceiling cannot serve
+/// a 5-token chat and a 92k-token prompt with a 6k-token answer alike (Block B2a: the second
+/// took over 600 s and was killed by a ceiling that was never meant for it).
+#[must_use]
+pub(crate) fn generation_allowance(prompt_tokens: usize, max_new_tokens: usize) -> Duration {
+    let secs = (prompt_tokens as u64) / WATCHDOG_PREFILL_FLOOR_TOK_S
+        + (max_new_tokens as u64) / WATCHDOG_DECODE_FLOOR_TOK_S;
+    Duration::from_secs(secs)
+}
 
 impl GenerationClock {
     /// Starts tracking a new generation, returning the ticket that must be
     /// held (directly or via the command it travels inside) for the
     /// generation's full duration.
-    fn start(&self) -> GenerationTicket {
+    ///
+    /// `allowance` is how long this generation may reasonably take once it runs (see
+    /// [`generation_allowance`]); the watchdog only counts time beyond it, and only from the
+    /// moment the engine thread calls [`GenerationTicket::begin`].
+    fn start(&self, allowance: Duration) -> GenerationTicket {
         let id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut table) = self.0.lock() {
-            table.insert(id, Instant::now());
+        if let Ok(mut state) = self.0.lock() {
+            state.entries.insert(
+                id,
+                ClockEntry {
+                    queued_at: Instant::now(),
+                    allowance,
+                    running_since: None,
+                },
+            );
         }
         GenerationTicket {
-            table: Arc::clone(&self.0),
+            state: Arc::clone(&self.0),
             id,
         }
     }
 
-    /// Age of the longest currently in-flight generation, if any are active.
+    /// How far past its allowance the worst generation is: zero while every one is inside it,
+    /// `None` when nothing is in flight. The supervisor compares this with
+    /// `watchdog_hang_ceiling_secs`, so a request's ceiling is its allowance plus that slack.
+    ///
+    /// The engine thread runs one generation at a time. A **running** generation is measured from
+    /// the moment it started. **Queued** ones wait behind it and are not counted while one runs
+    /// (the running one's own deadline covers a wedged thread, and a short request queued behind a
+    /// long one must not inherit the long one's time); when nothing is running, a queued one is
+    /// measured from the later of its own queueing and the engine thread's last progress, so a
+    /// thread that never picks anything up is still caught.
     fn oldest_age(&self) -> Option<Duration> {
         let now = Instant::now();
-        let table = self.0.lock().ok()?;
-        table.values().map(|start| now.duration_since(*start)).max()
+        let state = self.0.lock().ok()?;
+        if state.entries.is_empty() {
+            return None;
+        }
+        let running = state
+            .entries
+            .values()
+            .filter_map(|e| {
+                e.running_since
+                    .map(|since| now.duration_since(since).saturating_sub(e.allowance))
+            })
+            .max();
+        if running.is_some() {
+            return running;
+        }
+        state
+            .entries
+            .values()
+            .map(|e| now.duration_since(e.queued_at.max(state.last_progress)))
+            .max()
     }
 }
 
 /// RAII handle for one [`GenerationClock`] entry — see the clock's doc for why
 /// the Drop-based removal (not a statement after some await) is load-bearing.
 pub(crate) struct GenerationTicket {
-    table: Arc<Mutex<HashMap<u64, Instant>>>,
+    state: Arc<Mutex<ClockState>>,
     id: u64,
+}
+
+impl GenerationTicket {
+    /// The engine thread starts this generation now: its allowance runs from here.
+    fn begin(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let now = Instant::now();
+            state.last_progress = now;
+            if let Some(e) = state.entries.get_mut(&self.id) {
+                e.running_since = Some(now);
+            }
+        }
+    }
 }
 
 impl Drop for GenerationTicket {
     fn drop(&mut self) {
-        if let Ok(mut table) = self.table.lock() {
-            table.remove(&self.id);
+        if let Ok(mut state) = self.state.lock() {
+            state.entries.remove(&self.id);
+            state.last_progress = Instant::now();
         }
     }
 }
@@ -302,6 +404,36 @@ impl VlmHandle {
         token_tx: TokenSender,
         started_at: Instant,
     ) -> SubmitResult {
+        self.generate_with_lease(
+            messages,
+            images,
+            tools,
+            extra_context,
+            params,
+            token_tx,
+            started_at,
+            None,
+            0,
+        )
+        .await
+    }
+
+    /// [`Self::generate`] that hands `lease` to the engine thread, which drops it when the
+    /// generation call returns (success, error or a client that is long gone). On every early
+    /// return here (`AtCapacity`, `Closing`, `EngineDead`) it drops with this call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn generate_with_lease(
+        &self,
+        messages: Vec<serde_json::Value>,
+        images: Vec<DecodedImage>,
+        tools: Option<Vec<serde_json::Value>>,
+        extra_context: Option<serde_json::Value>,
+        params: GenParams,
+        token_tx: TokenSender,
+        started_at: Instant,
+        lease: Option<Box<dyn std::any::Any + Send>>,
+        prompt_tokens: usize,
+    ) -> SubmitResult {
         // `InFlightGuard` (not just an increment) so a cancelled caller — an
         // HTTP client disconnecting while parked at the gate — still
         // decrements: its `Drop` runs even if this `.await` is torn down
@@ -330,7 +462,9 @@ impl VlmHandle {
         // engine-thread completion (alongside `permit`) or a cancelled send
         // right here (this task torn down mid-`.await`) both clear it. See
         // `GenerationClock`.
-        let ticket = self.clock.start();
+        let ticket = self
+            .clock
+            .start(generation_allowance(prompt_tokens, params.max_new_tokens));
 
         // Permit acquired. Send to the engine — if the channel is closed, the
         // permit (moved into the command) drops here, automatically releasing
@@ -347,6 +481,7 @@ impl VlmHandle {
                 started_at,
                 permit,
                 ticket,
+                lease,
             })
             .await;
         if sent.is_err() {
@@ -357,15 +492,26 @@ impl VlmHandle {
 
     /// Count the tokens `text` encodes to with the VLM's tokenizer.
     ///
-    /// The tokenizer lives on the engine thread (its `InferRequest` is not
-    /// thread-safe), so this routes through the command channel and awaits a
-    /// `oneshot` reply rather than calling the tokenizer directly. It does NOT
-    /// consume an in-flight slot — counting is not a generation request.
+    /// Uses the standalone tokenizer on a blocking thread when there is one (as
+    /// [`tokenize`](Self::tokenize) does); otherwise the tokenizer on the engine thread (its
+    /// `InferRequest` is not thread-safe), reached through the command channel with a `oneshot`
+    /// reply, which waits behind a running generation. It does NOT consume an in-flight slot —
+    /// counting is not a generation request.
     ///
     /// # Errors
     /// Returns an error if the engine thread is gone (channel closed or reply
     /// dropped) or the tokenizer itself fails.
     pub(crate) async fn count_tokens(&self, text: String) -> anyhow::Result<usize> {
+        // The standalone tokenizer, when there is one, so counting does not queue behind a running
+        // generation on the engine thread (Fable review 3, S-4: every other request's admission
+        // waited for the whole of a long generation).
+        if let Some(tok) = &self.tokenizer {
+            let tok = Arc::clone(tok);
+            let _slot = self.tok_gate.acquire().await;
+            return tokio::task::spawn_blocking(move || tok.encode(&text).map(|ids| ids.len()))
+                .await
+                .map_err(|e| anyhow::anyhow!("count_tokens task failed: {e}"))?;
+        }
         let (reply, reply_rx) = oneshot::channel();
         self.tx
             .send(VlmCommand::CountTokens { text, reply })
@@ -491,7 +637,8 @@ pub fn spawn_vlm_engine(
     // Resolve the metric label handles once, off the per-token path — the
     // VLM's `Vision`-kind analogue of the cb-engine's `HotMetrics` (R2: VLMs
     // were previously invisible to the per-token metric family).
-    let metrics = HotMetrics::new(ModelKind::Vision, model_id, &device);
+    let metrics =
+        HotMetrics::new(ModelKind::Vision, model_id, &device).with_kv_scheduler_drops(model_id);
 
     let thread = std::thread::Builder::new()
         .name(format!("vlm-engine-{model_id_owned}"))
@@ -514,7 +661,19 @@ pub fn spawn_vlm_engine(
                         started_at,
                         permit,
                         ticket,
+                        lease,
                     } => {
+                        // The allowance runs from here, not from the queueing.
+                        ticket.begin();
+                        // Counted for the exit decision even after the record leaves Ready
+                        // (a failed shutdown eviction resets it while this thread is still in
+                        // the plugin) — see `ffi_watch::FfiKind::VlmGenerate`.
+                        let ffi = crate::ffi_watch::global().arm(
+                            crate::ffi_watch::FfiKind::VlmGenerate,
+                            &model_id_owned,
+                            None,
+                            std::time::Duration::ZERO,
+                        );
                         run_generate(
                             &engine,
                             &model_id_owned,
@@ -532,8 +691,10 @@ pub fn spawn_vlm_engine(
                         // here) — releases the slot for the next waiting caller.
                         // `ticket` clears this generation's watchdog entry the
                         // same way — see `GenerationClock`.
+                        drop(ffi);
                         drop(permit);
                         drop(ticket);
+                        drop(lease);
                     }
                     // Processed inline between generations, same as the CB
                     // engine's Tokenize command — encoding is fast against a
@@ -662,9 +823,19 @@ pub(crate) fn spawn_mock_vlm(model_id: &str) -> (VlmHandle, std::thread::JoinHan
     )
 }
 
+/// The generated-token count to report: the pipeline's own figure when it gave one (the streamer
+/// callback fires once per decoded chunk, and a chunk can hold several tokens), never less than
+/// the callbacks seen.
+fn authoritative_token_count(pipeline_generated: Option<usize>, callbacks: u64) -> u64 {
+    match pipeline_generated {
+        Some(n) if n > 0 => (n as u64).max(callbacks),
+        _ => callbacks,
+    }
+}
+
 /// Drive one generation request on the engine thread.
 ///
-/// Event ordering: Token… → PromptTokens(n) → Done(finish).
+/// Event ordering: Token… → PromptTokens(n) → CompletionTokens(n) → Done(finish).
 /// `PromptTokens` comes after all `Token` events but before `Done` so that
 /// `ScanState` (SSE path) sees it before emitting the usage chunk.
 ///
@@ -741,9 +912,19 @@ fn run_generate(
     // outcome (an error after N tokens still consumed N tokens of wall time).
     let elapsed = started_at.elapsed().as_secs_f64();
     metrics.record_duration(modality, elapsed);
+    // The streamer callback fires once per decoded text chunk and a chunk can hold several tokens
+    // (Block B2c: 4,678 callbacks for 6,425 tokens), so the pipeline's own count, when it
+    // reports one, is the authority for the throughput and the token metric.
+    let counted_tokens = authoritative_token_count(
+        result.as_ref().ok().map(|(_, _, generated, _)| *generated),
+        completion_tokens,
+    );
+    if counted_tokens > completion_tokens {
+        metrics.token_generated(counted_tokens - completion_tokens);
+    }
     if elapsed > 0.0 {
         #[allow(clippy::cast_precision_loss)] // token counts are far below f64's exact range
-        metrics.set_tokens_per_second(completion_tokens as f64 / elapsed);
+        metrics.set_tokens_per_second(counted_tokens as f64 / elapsed);
     }
 
     match result {
@@ -774,6 +955,7 @@ fn run_generate(
             // completion — not a wedge).
             let is_kv_wedge = generated_tokens == 0 && !aborted_early && params.max_new_tokens != 0;
             if is_kv_wedge {
+                metrics.kv_scheduler_drop();
                 tracing::error!(
                     model_id,
                     finish = finish.as_openai(),
@@ -803,6 +985,10 @@ fn run_generate(
             // sender drops at the end of this generation either way).
             if prompt_tokens > 0 {
                 let _ = token_tx.try_send(StreamEvent::PromptTokens(prompt_tokens));
+            }
+            // Usage must use the pipeline's count, not the number of streamer callbacks.
+            if generated_tokens > 0 {
+                let _ = token_tx.try_send(StreamEvent::CompletionTokens(generated_tokens));
             }
             let _ = token_tx.try_send(StreamEvent::Done(finish));
         }
@@ -866,7 +1052,7 @@ mod tests {
         let clock = GenerationClock::default();
         assert_eq!(clock.oldest_age(), None, "idle clock tracks nothing");
 
-        let ticket = clock.start();
+        let ticket = clock.start(Duration::ZERO);
         assert!(
             clock.oldest_age().is_some(),
             "a held ticket must be visible"
@@ -880,15 +1066,98 @@ mod tests {
         );
     }
 
+    /// Block B2c: 4,678 streamer callbacks carried 6,425 tokens; the pipeline's count wins.
+    #[test]
+    fn the_pipeline_count_beats_the_callback_count() {
+        assert_eq!(authoritative_token_count(Some(6_425), 4_678), 6_425);
+        assert_eq!(
+            authoritative_token_count(Some(0), 7),
+            7,
+            "no figure: callbacks"
+        );
+        assert_eq!(authoritative_token_count(None, 7), 7, "an error: callbacks");
+        assert_eq!(
+            authoritative_token_count(Some(3), 7),
+            7,
+            "never fewer than seen"
+        );
+    }
+
+    /// Block B2a: a generation is only overdue past its own allowance. A 92k-token prompt with a
+    /// 6,425-token answer gets 460 s + 1,285 s; the ceiling the supervisor applies on top is slack.
+    #[test]
+    fn the_watchdog_counts_only_time_beyond_the_requests_allowance() {
+        assert_eq!(
+            generation_allowance(92_159, 6_425),
+            Duration::from_secs(460 + 1_285)
+        );
+        assert_eq!(generation_allowance(0, 0), Duration::ZERO);
+        assert_eq!(generation_allowance(5, 512), Duration::from_secs(102));
+        let clock = GenerationClock::default();
+        let long = clock.start(Duration::from_secs(3_600));
+        long.begin();
+        assert_eq!(
+            clock.oldest_age(),
+            Some(Duration::ZERO),
+            "running inside its allowance: generating, but not overdue"
+        );
+        drop(long);
+        let short = clock.start(Duration::ZERO);
+        short.begin();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            clock
+                .oldest_age()
+                .is_some_and(|d| d >= Duration::from_millis(20)),
+            "a running generation with no allowance is overdue from its first second"
+        );
+    }
+
+    /// Fable review 3, B-1: a request queued behind a long running one must not be counted while
+    /// the long one runs, and must not inherit the long one's elapsed time when it starts.
+    #[test]
+    fn a_queued_request_does_not_inherit_the_running_ones_time() {
+        let clock = GenerationClock::default();
+        let long = clock.start(Duration::from_secs(3_600));
+        long.begin();
+        // A health probe (allowance 0) is queued behind it.
+        let probe = clock.start(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            clock.oldest_age(),
+            Some(Duration::ZERO),
+            "queued behind a running generation: not counted, the running one is inside its allowance"
+        );
+        // The long one finishes; the probe starts: its clock begins now, not at its queueing.
+        drop(long);
+        probe.begin();
+        assert!(
+            clock
+                .oldest_age()
+                .is_some_and(|d| d < Duration::from_millis(30)),
+            "the probe's wait is not counted against it"
+        );
+        // A thread that never picks up what is queued is still caught.
+        drop(probe);
+        let _stuck = clock.start(Duration::from_secs(3_600));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            clock
+                .oldest_age()
+                .is_some_and(|d| d >= Duration::from_millis(20)),
+            "nothing running and a request waiting: counted from the last progress"
+        );
+    }
+
     /// With two overlapping generations, the clock reports the *older* one's
     /// age — the watchdog cares about the longest-stuck request, not the
     /// most recent.
     #[test]
     fn generation_clock_reports_the_oldest_of_several_tickets() {
         let clock = GenerationClock::default();
-        let older = clock.start();
+        let older = clock.start(Duration::ZERO);
         std::thread::sleep(Duration::from_millis(20));
-        let _newer = clock.start();
+        let _newer = clock.start(Duration::ZERO);
 
         let oldest = clock.oldest_age().unwrap();
         assert!(
@@ -934,6 +1203,82 @@ mod tests {
             panic!("expected a Generate command");
         };
         assert_eq!(got, Some(tools));
+    }
+
+    /// S2: the lease travels with the job. The submitting call returning (or the HTTP request
+    /// being dropped) does not release it; only dropping the command the engine thread holds
+    /// does, and a submission that never gets in releases it at once.
+    #[tokio::test]
+    async fn the_lease_lives_as_long_as_the_engine_job() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<VlmCommand>(4);
+        let handle = VlmHandle::from_sender_with_cap(tx, "test-vlm", 1, 50);
+        let released = Arc::new(AtomicBool::new(false));
+        let (tok_tx, tok_rx) = stream_channel();
+        let result = handle
+            .generate_with_lease(
+                vec![],
+                vec![],
+                None,
+                None,
+                GenParams::default(),
+                tok_tx,
+                Instant::now(),
+                Some(Box::new(Flag(Arc::clone(&released)))),
+                0,
+            )
+            .await;
+        assert_eq!(result, SubmitResult::Submitted);
+        // The client goes away; the job is still running on the engine thread.
+        drop(tok_rx);
+        assert!(!released.load(Ordering::SeqCst), "held while the job runs");
+        let job = rx.recv().await.unwrap();
+        assert!(!released.load(Ordering::SeqCst), "held by the command");
+        drop(job); // the engine thread finishing the generation
+        assert!(released.load(Ordering::SeqCst), "released with the job");
+
+        // Take the only slot again; a second submission then times out and drops its lease.
+        let (tok_tx, _rx1) = stream_channel();
+        assert_eq!(
+            handle
+                .generate(
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    GenParams::default(),
+                    tok_tx,
+                    Instant::now()
+                )
+                .await,
+            SubmitResult::Submitted
+        );
+        let _busy = rx.recv().await.unwrap();
+        let rejected = Arc::new(AtomicBool::new(false));
+        let (tok_tx, _rx2) = stream_channel();
+        let result = handle
+            .generate_with_lease(
+                vec![],
+                vec![],
+                None,
+                None,
+                GenParams::default(),
+                tok_tx,
+                Instant::now(),
+                Some(Box::new(Flag(Arc::clone(&rejected)))),
+                0,
+            )
+            .await;
+        assert_eq!(result, SubmitResult::AtCapacity);
+        assert!(
+            rejected.load(Ordering::SeqCst),
+            "a rejected submission frees its lease"
+        );
     }
 
     /// When a slot opens (permit released), a waiting `generate` completes

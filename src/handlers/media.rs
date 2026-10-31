@@ -31,7 +31,7 @@ use super::error::{
 use crate::Authenticated;
 use crate::app_state::AppState;
 use crate::device_inventory::DeviceInfo;
-use crate::model_manager::{ModelError, OnDemandLoad};
+use crate::model_manager::{ModelError, ModelManager, OnDemandLoad};
 use crate::ov_image::{ImageEditOptions, ImageGenOptions, RgbImage};
 use crate::pipelines::stt::{Segment, SttTask, Transcription};
 use crate::pipelines::tts::TTS_SAMPLE_RATE;
@@ -173,6 +173,7 @@ async fn speech_to_text(state: &AppState, multipart: Multipart, task: SttTask) -
             Err(ModelError::NotLoaded) => {
                 return match mm.request_on_demand_load(&req.model) {
                     OnDemandLoad::Loading => model_error_response(ModelError::Loading),
+                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
                     OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
                 };
             }
@@ -605,6 +606,9 @@ pub async fn speech(
                     OnDemandLoad::Loading => {
                         model_error_response(crate::model_manager::ModelError::Loading)
                     }
+                    OnDemandLoad::ShuttingDown => {
+                        model_error_response(crate::model_manager::ModelError::ShuttingDown)
+                    }
                     OnDemandLoad::NotApplicable => {
                         model_error_response(crate::model_manager::ModelError::NotLoaded)
                     }
@@ -906,6 +910,10 @@ pub async fn image_generations(
     let mut hmeta = HandleMetadata::default();
     let mut device = None;
     let pngs = if let Some(mm) = state.model_manager.as_ref() {
+        let pixels = u64::from(valid.width) * u64::from(valid.height) * u64::from(valid.n);
+        if let Some(resp) = cpu_pixel_limit_refusal(mm, &req.model, pixels) {
+            return resp;
+        }
         let handle = match mm.get_image_handle(&req.model) {
             Ok(h) => h,
             // Slice 3c parity (see the STT path above): lazy-load an `on_demand`
@@ -913,6 +921,7 @@ pub async fn image_generations(
             Err(ModelError::NotLoaded) => {
                 return match mm.request_on_demand_load(&req.model) {
                     OnDemandLoad::Loading => model_error_response(ModelError::Loading),
+                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
                     OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
                 };
             }
@@ -1277,6 +1286,10 @@ pub async fn image_edits(
     let mut hmeta = HandleMetadata::default();
     let mut device = None;
     let pngs = if let Some(mm) = state.model_manager.as_ref() {
+        let pixels = u64::from(init.width) * u64::from(init.height) * u64::from(req.n);
+        if let Some(resp) = cpu_pixel_limit_refusal(mm, &req.model, pixels) {
+            return resp;
+        }
         let handle = match mm.get_image_handle(&req.model) {
             Ok(h) => h,
             // Slice 3c parity (see image_generations): lazy-load an `on_demand`
@@ -1284,6 +1297,7 @@ pub async fn image_edits(
             Err(ModelError::NotLoaded) => {
                 return match mm.request_on_demand_load(&req.model) {
                     OnDemandLoad::Loading => model_error_response(ModelError::Loading),
+                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
                     OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
                 };
             }
@@ -1538,6 +1552,27 @@ impl RawEditFields {
 
 /// A 400 with an owned (runtime-formatted) message — `bad_request` takes a
 /// `&'static str`; the decode/dimension errors here need interpolation.
+/// D-06: a 400 `size_exceeds_cpu_limit` when an image model on the CPU is asked for more
+/// pixels (`n x width x height`) than its memory charge was sized for
+/// ([`ModelManager::cpu_image_pixel_limit`]); `None` when the request fits or the model is
+/// not a CPU image model.
+fn cpu_pixel_limit_refusal(mm: &ModelManager, model: &str, pixels: u64) -> Option<Response> {
+    let limit = mm.cpu_image_pixel_limit(model)?;
+    (pixels > limit).then(|| cpu_pixel_limit_response(pixels, limit))
+}
+
+/// The response of [`cpu_pixel_limit_refusal`] (separate so the wording is unit-testable).
+fn cpu_pixel_limit_response(pixels: u64, limit: u64) -> Response {
+    bad_request_owned(
+        format!(
+            "this request asks for {pixels} pixels (n x width x height) but an image model on \
+             the CPU serves at most {limit} (cpu_image_gen_max_pixels, the size its memory charge \
+             is sized for): lower n or the size, or raise cpu_image_gen_max_pixels and restart"
+        ),
+        "size_exceeds_cpu_limit",
+    )
+}
+
 fn bad_request_owned(message: String, code: &'static str) -> Response {
     openai_error(
         StatusCode::BAD_REQUEST,
@@ -1699,6 +1734,22 @@ mod tests {
             guidance_scale: None,
             negative_prompt: None,
         }
+    }
+
+    /// D-06: the CPU pixel-limit refusal is a 400 `size_exceeds_cpu_limit` naming both
+    /// numbers and the config key.
+    #[tokio::test]
+    async fn cpu_pixel_limit_response_names_the_limit_and_the_key() {
+        let resp = cpu_pixel_limit_response(2 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "size_exceeds_cpu_limit");
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("2097152") && msg.contains("1048576"), "{msg}");
+        assert!(msg.contains("cpu_image_gen_max_pixels"), "{msg}");
     }
 
     #[test]

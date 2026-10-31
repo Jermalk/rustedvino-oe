@@ -3137,3 +3137,111 @@ async fn rerank_rejects_nul_and_empty_documents_with_a_400() {
         );
     }
 }
+
+// ------------------------------------------------------------------
+// Supervisor watchdog token — the probe must get through the admin gate
+// (live sweep 2026-10-27: a 401/503 was read as "no hang")
+// ------------------------------------------------------------------
+
+const WD_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+fn watchdog_get(token: Option<&str>, uri: &str) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri(uri);
+    if let Some(t) = token {
+        b = b.header(rustedvino::WATCHDOG_TOKEN_HEADER, t);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// Admin keys configured: the supervisor's token reads the watchdog; no token or a wrong one is
+/// still 401, and the token opens no other admin route.
+#[tokio::test]
+async fn watchdog_token_passes_the_admin_key_gate_and_nothing_else() {
+    let app = || {
+        let state = AppState::mock().with_watchdog_token(Some(WD_TOKEN.into()));
+        rustedvino::create_router_with_auth(
+            state,
+            &["*".to_owned()],
+            &[],
+            &["adm-key-000000000000".to_owned()],
+        )
+    };
+    let resp = app()
+        .oneshot(watchdog_get(Some(WD_TOKEN), rustedvino::WATCHDOG_PATH))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert!(json["oldest_generation_secs"].is_null());
+    // Step 6e fields (the supervisor reads only `oldest_generation_secs`).
+    assert!(json["in_flight"].is_u64());
+    assert_eq!(json["stalled"], serde_json::json!([]));
+    assert!(json.get("oldest_ffi_overdue_secs").is_some());
+
+    let resp = app()
+        .oneshot(watchdog_get(None, rustedvino::WATCHDOG_PATH))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app()
+        .oneshot(watchdog_get(
+            Some("ffffffffffffffffffffffffffffffff"),
+            rustedvino::WATCHDOG_PATH,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app()
+        .oneshot(watchdog_get(Some(WD_TOKEN), "/v1/admin/models"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the token is not an admin key"
+    );
+}
+
+/// No keys file at boot (`admin_locked`): the token still reads the watchdog, everything else
+/// admin stays 503.
+#[tokio::test]
+async fn watchdog_token_passes_the_admin_lockdown() {
+    let app = || {
+        let state = AppState::mock()
+            .with_admin_locked(true)
+            .with_watchdog_token(Some(WD_TOKEN.into()));
+        rustedvino::create_router_with_auth(state, &["*".to_owned()], &[], &[])
+    };
+    let resp = app()
+        .oneshot(watchdog_get(Some(WD_TOKEN), rustedvino::WATCHDOG_PATH))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app()
+        .oneshot(watchdog_get(None, rustedvino::WATCHDOG_PATH))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let resp = app()
+        .oneshot(watchdog_get(Some(WD_TOKEN), "/v1/admin/models"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// An unsupervised worker (no token) admits no header value at all.
+#[tokio::test]
+async fn no_watchdog_token_means_no_exemption() {
+    let state = AppState::mock();
+    let app = rustedvino::create_router_with_auth(
+        state,
+        &["*".to_owned()],
+        &[],
+        &["adm-key-000000000000".to_owned()],
+    );
+    let resp = app
+        .oneshot(watchdog_get(Some(""), rustedvino::WATCHDOG_PATH))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

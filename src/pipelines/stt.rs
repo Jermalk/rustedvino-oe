@@ -406,6 +406,14 @@ pub fn spawn_stt_engine(
     ))
 }
 
+/// How long one transcription of `n_samples` (16 kHz) may run before the watchdog counts it:
+/// twice the audio length, at least 60 s.
+#[must_use]
+pub(crate) fn transcribe_allowance(n_samples: usize) -> Duration {
+    let audio_secs = (n_samples as u64).div_ceil(u64::from(WHISPER_SAMPLE_RATE));
+    Duration::from_secs((2 * audio_secs).max(60))
+}
+
 /// Run one transcription on the engine thread: decode + resample the upload to
 /// 16 kHz mono, then transcribe and map the [`crate::ov_whisper::WhisperResult`]
 /// to a [`Transcription`].
@@ -419,7 +427,17 @@ fn run_transcribe(
 ) -> anyhow::Result<(Transcription, usize)> {
     let samples = prepare_samples(audio_bytes)?;
     let n = samples.len();
-    let result = engine.transcribe(&samples, language, timestamps, task == SttTask::Translate)?;
+    // Step 6c: visible to the watchdog (past its allowance) and to the exit decision while the
+    // OpenVINO call runs, also after the caller gave up or the record left Ready.
+    let ffi = crate::ffi_watch::global().arm(
+        crate::ffi_watch::FfiKind::Transcribe,
+        model_id,
+        None,
+        transcribe_allowance(n),
+    );
+    let result = engine.transcribe(&samples, language, timestamps, task == SttTask::Translate);
+    drop(ffi);
+    let result = result?;
     tracing::debug!(
         model_id,
         samples = n,
@@ -867,6 +885,21 @@ mod tests {
     }
 
     /// End-to-end pure-Rust path: WAV at 8 kHz → decode → resample to 16 kHz.
+    /// 6c: the transcription allowance is twice the audio, never under a minute.
+    #[test]
+    fn transcribe_allowance_is_twice_the_audio_at_least_a_minute() {
+        let sr = WHISPER_SAMPLE_RATE as usize;
+        assert_eq!(transcribe_allowance(0), Duration::from_secs(60));
+        assert_eq!(transcribe_allowance(10 * sr), Duration::from_secs(60));
+        assert_eq!(transcribe_allowance(30 * sr), Duration::from_secs(60));
+        assert_eq!(transcribe_allowance(31 * sr), Duration::from_secs(62));
+        assert_eq!(transcribe_allowance(600 * sr), Duration::from_mins(20));
+        assert_eq!(
+            transcribe_allowance(600 * sr + 1),
+            Duration::from_secs(1202)
+        );
+    }
+
     #[test]
     fn prepare_samples_decodes_and_resamples() {
         let samples: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.03).sin() * 0.4).collect();

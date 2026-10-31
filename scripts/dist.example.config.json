@@ -1,7 +1,6 @@
 {
   "models_dir": "./models",
   "device": "CPU",
-  "default_placement": "device",
   "preload": [],
   "total_vram_gb": 0.0,
   "max_num_seqs": 16,
@@ -9,9 +8,11 @@
   "default_kv_cache_gb": 0.0,
   "vram_safety_margin_gb": 1.0,
   "npu_footprint_factor": 1.5,
+  "cpu_image_gen_max_pixels": 1048576,
   "min_kv_cache_gb": 1.0,
   "system_ram_reservation_gb": null,
   "system_ram_budget_gb": null,
+  "default_placement": "device",
   "light_model_max_gb": 2.0,
   "light_stt_max_gb": 1.0,
   "dgpu_size_ceiling_fraction": 0.8,
@@ -20,7 +21,7 @@
   "realtime_defaults": null,
   "realtime_viable_minimum": null,
   "device_budgets": {},
-  "kv_cache_precision": "u8",
+  "kv_cache_precision": "i8",
   "enable_prefix_caching": true,
   "cors_allowed_origins": [
     "*"
@@ -42,11 +43,22 @@
   "ov_cache_dir": null,
   "ov_cache_max_gb": 0.0,
   "ov_cache_sweep_interval_secs": 21600,
+  "ov_cache_layout": "keyed",
+  "kv_precision_pass": "explicit",
+  "kv_gate_mode": "exact",
+  "kv_gate_exact_on_unknown_engine": false,
+  "kv_headroom_mode": "dynamic",
+  "kv_transient_factor": 2.0,
+  "kv_headroom_margin_gib": 0.5,
+  "kv_headroom_min_tokens": 4096,
+  "kv_headroom_inflight_tokens": 32768,
+  "kv_warmup": true,
   "kv_pressure_monitor_enabled": false,
   "kv_pressure_threshold_pct": 0.0,
   "kv_pressure_sustained_secs": 0,
   "kv_pressure_sweep_interval_secs": 15,
   "kv_resize_cooldown_secs": 30,
+  "load_timeout_secs": 600,
   "supervisor": {
     "backoff_base_secs": 5,
     "backoff_max_secs": 60,
@@ -55,7 +67,9 @@
     "health_timeout_secs": 90,
     "hang_kill_grace_secs": 10,
     "watchdog_poll_secs": 30,
-    "watchdog_hang_ceiling_secs": 600
+    "watchdog_hang_ceiling_secs": 600,
+    "gpu_probe_deadline_secs": 15,
+    "gpu_first_load_deadline_secs": 180
   },
   "models": {}
 }

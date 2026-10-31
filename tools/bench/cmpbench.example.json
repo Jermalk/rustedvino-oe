@@ -1,0 +1,9 @@
+{
+  "models": "~/cmp/models",
+  "caches": "~/cmp/caches",
+  "gpu": "GPU.0",
+  "rv_dir": "~/cmp/rustedvino-linux-x86_64-v0.8.4",
+  "ovms_dir": "~/cmp/ovms",
+  "oa_dir": "~/cmp/openarc",
+  "pdev": ""
+}

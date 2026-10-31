@@ -169,6 +169,7 @@ unsafe extern "C" {
         device: *const std::ffi::c_char,
         max_num_seqs: usize,
         cache_size_gb: f64,
+        num_kv_blocks: u64,
         kv_cache_precision: *const std::ffi::c_char,
         ov_cache_dir: *const std::ffi::c_char,
         enable_prefix_caching: bool,
@@ -226,6 +227,8 @@ unsafe extern "C" {
 
     fn ov_list_devices(out: *mut std::ffi::c_char, out_size: usize) -> std::ffi::c_int;
 
+    fn ov_gpu_probe(device: *const std::ffi::c_char) -> std::ffi::c_int;
+
     fn ov_device_property(
         device: *const std::ffi::c_char,
         key: *const std::ffi::c_char,
@@ -234,6 +237,7 @@ unsafe extern "C" {
     ) -> std::ffi::c_int;
 
     fn ov_get_openvino_version(out: *mut std::ffi::c_char, out_size: usize) -> std::ffi::c_int;
+    fn ov_get_genai_version(out: *mut std::ffi::c_char, out_size: usize) -> std::ffi::c_int;
 
     /// `sizeof(OvGenParams)` on the C++ side — see the size-check test below.
     #[cfg(test)]
@@ -254,6 +258,21 @@ pub fn device_available(device: &str) -> bool {
     // SAFETY: `ov_device_available` reads `device` as a C string and has no
     // aliasing or lifetime requirements beyond the call. `c_device` outlives it.
     unsafe { ov_device_available(c_device.as_ptr()) != 0 }
+}
+
+/// The GPU readiness probe on one device: compile a tiny graph, run
+/// one inference, check it (`ov_gpu_probe` in the bridge). Blocks for as long as the GPU takes;
+/// on a GPU whose first work is never scheduled it never returns, which is why it only ever
+/// runs in the `--gpu-probe` child the supervisor times out.
+///
+/// # Errors
+/// The bridge's message when the device fails, or an interior NUL in `device`.
+pub fn gpu_probe(device: &str) -> Result<(), String> {
+    let c = std::ffi::CString::new(device).map_err(|e| e.to_string())?;
+    // SAFETY: `c` is a valid NUL-terminated string alive for the call; the bridge only reads it
+    // and releases everything it created before returning.
+    let ret = unsafe { ov_gpu_probe(c.as_ptr()) };
+    if ret == 0 { Ok(()) } else { Err(last_error()) }
 }
 
 /// Returns every device listed by `ov::Core::get_available_devices()`.
@@ -309,6 +328,30 @@ pub fn device_property(device: &str, key: &str) -> Option<String> {
     }
     let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     Some(String::from_utf8_lossy(&buf[..nul_pos]).into_owned())
+}
+
+/// The linked `OpenVINO GenAI` build-number string (e.g. `"2026.4.1.0-3408-ab01d1771e4"`), or
+/// `None` when the bridge cannot tell (Windows, or any bridge error). Cached after the first
+/// call. Together with [`openvino_version`] it keys the exact capacity model and the ratchet.
+#[must_use]
+pub fn genai_version() -> Option<String> {
+    static VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let mut buf = vec![0u8; 256];
+            // SAFETY: `buf` is valid for `buf.len()` bytes; `ov_get_genai_version` never
+            // writes past `out_size` and always NUL-terminates.
+            let ret = unsafe {
+                ov_get_genai_version(buf.as_mut_ptr().cast::<std::ffi::c_char>(), buf.len())
+            };
+            if ret <= 0 {
+                return None;
+            }
+            let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let s = String::from_utf8_lossy(&buf[..nul_pos]).into_owned();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .clone()
 }
 
 /// The running `OpenVINO` runtime's build-number string (e.g.
@@ -414,8 +457,11 @@ impl OvCbEngine {
     /// * `max_num_seqs` – KV scheduler cap; `0` = `OpenVINO` default (256).
     ///   Keep small (e.g. 8) to avoid KV-pool exhaustion stalls.
     /// * `cache_size_gb` – fixed KV pool size in GB; `0.0` = dynamic (stall risk).
+    /// * `num_kv_blocks` – exact KV pool size in blocks; non-zero wins over `cache_size_gb`
+    ///   (blocks-first sizing, the pool is exactly what the capacity model computed).
     /// * `kv_cache_precision` – `KV_CACHE_PRECISION` property: `""` keeps the plugin
-    ///   default (`f16` on GPU), `"u8"` compresses the KV cache (~2× context per GB).
+    ///   default (u4 for int4-weight models on GPU, `f16` otherwise), `"i8"` compresses
+    ///   the KV cache to 8 bit (~2× context per GB vs f16), `"u4"` to 4 bit.
     /// * `ov_cache_dir` – directory for the `OpenVINO` GPU blob cache. `""` disables
     ///   caching. Non-empty: first load writes a compiled blob; subsequent loads
     ///   read the blob (~10–30 s) instead of recompiling from IR (~1–3 min).
@@ -446,6 +492,7 @@ impl OvCbEngine {
         device: &str,
         max_num_seqs: usize,
         cache_size_gb: f64,
+        num_kv_blocks: u64,
         kv_cache_precision: &str,
         ov_cache_dir: &str,
         enable_prefix_caching: bool,
@@ -478,6 +525,7 @@ impl OvCbEngine {
                 c_device.as_ptr(),
                 max_num_seqs,
                 cache_size_gb,
+                num_kv_blocks,
                 c_kv_prec.as_ptr(),
                 c_cache_dir.as_ptr(),
                 enable_prefix_caching,
@@ -486,6 +534,7 @@ impl OvCbEngine {
             )
         };
 
+        tracing::info!(props = %crate::ov_pipeline::last_props(), "CB engine properties");
         if handle.is_null() {
             bail!("ov_cb_create failed: {}", last_error());
         }
@@ -893,16 +942,18 @@ unsafe extern "C" fn step_trampoline(
     }
 
     // Build the &str. Guard len == 0 so we never deref for an empty delta.
-    // The bridge holds back partial multibyte chars, so from_utf8 should always
-    // succeed; on the off chance it doesn't, emit nothing rather than panic.
-    let text = if len == 0 {
-        ""
+    // The bridge holds back partial multibyte chars, so the bytes should always be
+    // valid UTF-8 (borrowed, no copy); if not, K-02d: keep the text with U+FFFD for the
+    // bad bytes and say so, instead of silently dropping the whole delta.
+    let text: std::borrow::Cow<'_, str> = if len == 0 {
+        std::borrow::Cow::Borrowed("")
     } else {
         // SAFETY: delta points to `len` valid bytes owned by the C++ string,
         // alive until this callback returns.
         let bytes = unsafe { std::slice::from_raw_parts(delta, len) };
-        std::str::from_utf8(bytes).unwrap_or("")
+        utf8_or_lossy(bytes, "token delta")
     };
+    let text: &str = &text;
     let finish = finish_from_code(finish_reason);
     let pool_exhausted = finish_reason == 3;
 
@@ -924,6 +975,20 @@ unsafe extern "C" fn step_trampoline(
     }
 }
 
+/// `bytes` as UTF-8: borrowed when valid (the normal case), else lossily decoded with a
+/// warning naming `what` and the byte count (K-02d; it used to be dropped silently).
+fn utf8_or_lossy<'a>(bytes: &'a [u8], what: &str) -> std::borrow::Cow<'a, str> {
+    let text = String::from_utf8_lossy(bytes);
+    if matches!(text, std::borrow::Cow::Owned(_)) {
+        tracing::warn!(
+            what,
+            bytes = bytes.len(),
+            "invalid UTF-8 from the engine — invalid bytes replaced with U+FFFD"
+        );
+    }
+    text
+}
+
 /// C callback that hands the decoded UTF-8 string to the Rust sink stored in
 /// `user_data` (a [`TextCbCtx`] set up by [`OvCbEngine::decode`]) — under a
 /// panic firewall.
@@ -942,14 +1007,15 @@ unsafe extern "C" fn decode_trampoline(user_data: *mut c_void, text: *const u8, 
         return;
     }
 
-    let s = if len == 0 {
-        ""
+    let s: std::borrow::Cow<'_, str> = if len == 0 {
+        std::borrow::Cow::Borrowed("")
     } else {
         // SAFETY: text points to `len` valid bytes owned by the C++ string,
         // alive until this callback returns.
         let bytes = unsafe { std::slice::from_raw_parts(text, len) };
-        std::str::from_utf8(bytes).unwrap_or("")
+        utf8_or_lossy(bytes, "decoded text")
     };
+    let s: &str = &s;
 
     // PANIC FIREWALL: never unwind out of this extern "C" frame (see the
     // context-struct block comment). AssertUnwindSafe is sound: on panic the
@@ -1014,8 +1080,18 @@ mod tests {
 
     use super::{
         FinishReason, OvCbEngine, OvGenParamsC, StepCtx, TextCbCtx, c_void, decode_trampoline,
-        finish_from_code, openvino_version, ov_gen_params_size, step_trampoline,
+        finish_from_code, openvino_version, ov_gen_params_size, step_trampoline, utf8_or_lossy,
     };
+
+    /// K-02d: valid UTF-8 is borrowed as-is; an invalid byte keeps the rest of the text with
+    /// U+FFFD instead of dropping the whole delta.
+    #[test]
+    fn utf8_or_lossy_borrows_valid_and_keeps_the_rest_of_invalid() {
+        let ok = utf8_or_lossy("zażółć".as_bytes(), "t");
+        assert!(matches!(ok, std::borrow::Cow::Borrowed("zażółć")));
+        let bad = utf8_or_lossy(b"ab\xffcd", "t");
+        assert_eq!(bad, "ab\u{fffd}cd");
+    }
 
     /// A client seed passes through; no seed yields a fresh value per call
     /// (A3: unseeded sampling must not repeat across requests).
@@ -1042,6 +1118,20 @@ mod tests {
             unsafe { ov_gen_params_size() },
             "OvGenParamsC (ov_cb.rs) has drifted from OvGenParams (ov_bridge.cpp) — \
              update both #[repr(C)] Rust mirrors when changing the C++ struct"
+        );
+    }
+
+    /// `genai_version` reports the linked `GenAI` build on Linux (the exact-capacity model and the
+    /// ratchet are keyed by it) and is stable across calls.
+    #[cfg(not(windows))]
+    #[test]
+    fn genai_version_is_stable_and_nonempty() {
+        let first = super::genai_version();
+        assert!(first.is_some(), "the linked GenAI must report a version");
+        assert_eq!(first, super::genai_version());
+        assert!(
+            first.is_some_and(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())),
+            "a build number starts with the year"
         );
     }
 
@@ -1185,7 +1275,7 @@ mod tests {
             .unwrap_or_else(|_| "/opt/rustedvino/models/qwen3-8b-int4-ov".to_owned());
         // One slot, tiny KV pool — we only exercise the tokenizer, not decoding.
         // Empty kv_cache_precision = plugin default.
-        let engine = OvCbEngine::new(&model, "GPU.1", 1, 1.0, "", "", true, "", "", 0).unwrap();
+        let engine = OvCbEngine::new(&model, "GPU.1", 1, 1.0, 0, "", "", true, "", "", 0).unwrap();
 
         let text = "Hello, world! 你好";
         let ids = engine.encode(text).unwrap();

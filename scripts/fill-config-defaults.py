@@ -73,7 +73,15 @@ def no_duplicates(pairs):
 def changed_from_default(config, global_tpl, model_tpl):
     """Settings whose value differs from the template default (placeholders excluded)."""
     skip = {"models_dir", "device", "total_vram_gb", "models"}
-    out = [k for k, d in global_tpl.items() if k not in skip and k in config and config[k] != d]
+    out = []
+    for k, d in global_tpl.items():
+        if k in skip or k not in config:
+            continue
+        if isinstance(d, dict) and isinstance(config[k], dict):
+            # A nested block: list the keys that differ, not a block that only lacks new ones.
+            out += [f"{k}.{n}" for n, nd in d.items() if n in config[k] and config[k][n] != nd]
+        elif config[k] != d:
+            out.append(k)
     for mid, stanza in config.get("models", {}).items():
         out += [f"models.{mid}.{k}" for k, d in model_tpl.items() if k not in ("vram_gb", "kind") and k in stanza and stanza[k] != d]
     return out
@@ -98,7 +106,11 @@ def fill(config, global_tpl, model_tpl, with_models):
     for key, default in global_tpl.items():
         if key == "models":
             continue
-        if key in config:
+        if key in config and isinstance(default, dict) and isinstance(config[key], dict):
+            # A nested block (`supervisor`) is merged key by key, so a key a newer build added
+            # inside it is reported as missing too.
+            out[key] = fill_stanza(config[key], default, missing, key)
+        elif key in config:
             out[key] = config[key]
         else:
             out[key] = default

@@ -67,9 +67,12 @@ const VAD_ONSET_SAMPLES: usize = (PCM_SAMPLE_RATE as usize * 100) / 1000; // 100
 const VAD_OFFSET_SAMPLES: usize = (PCM_SAMPLE_RATE as usize * 500) / 1000; // 500 ms
 
 // ── Safety bounds ─────────────────────────────────────────────────────────────
-// Whisper's context window is 30 s. Auto-commit the utterance at this limit so
-// the VAD audio buffer cannot grow without bound if speech never stops.
-const MAX_UTTERANCE_SAMPLES: usize = PCM_SAMPLE_RATE as usize * 30; // 480 000 samples ≈ 960 KB
+// Whisper's context window is 30 s. Auto-commit the utterance just below it so
+// the VAD audio buffer cannot grow without bound if speech never stops. Not at
+// exactly 30 s: whisper-large-v3-turbo (GenAI 2026.4.1) returns 1-2 words for a
+// clip of exactly 480 000 samples, while 29.0-29.99 s clips transcribe in full,
+// so the committed turn was dropped.
+const MAX_UTTERANCE_SAMPLES: usize = PCM_SAMPLE_RATE as usize * 59 / 2; // 29.5 s = 472 000 samples ≈ 944 KB
 
 // Trim conversation history to this many user+assistant turn pairs.
 // Bounds both memory and the LLM prompt length for long sessions.
@@ -516,12 +519,24 @@ impl EnergyVad {
                 silence_count,
             } => {
                 audio.extend_from_slice(&samples);
-                // Auto-commit at Whisper's 30 s context limit to bound memory usage.
+                // Auto-commit just inside Whisper's 30 s window to bound memory usage.
+                // Commit exactly MAX_UTTERANCE_SAMPLES: anything over 30 s puts the
+                // utterance on GenAI's long-form path, which on the NPU pipeline
+                // has never been exercised. The rest of this frame, if speech,
+                // starts the next utterance.
                 if audio.len() >= MAX_UTTERANCE_SAMPLES {
+                    let tail = audio.split_off(MAX_UTTERANCE_SAMPLES);
                     events.push(VadEvent::SpeechEnded(audio));
-                    return events;
-                }
-                if is_speech {
+                    if is_speech && !tail.is_empty() {
+                        events.push(VadEvent::SpeechStarted);
+                        VadState::Speech {
+                            audio: tail,
+                            silence_count: 0,
+                        }
+                    } else {
+                        VadState::Silence
+                    }
+                } else if is_speech {
                     VadState::Speech {
                         audio,
                         silence_count: 0,
@@ -1177,10 +1192,8 @@ fn gpu_poison_client_message(
     if let Some(mm) = state.model_manager.as_ref() {
         mm.mark_gpu_poisoned(model.unwrap_or("unknown"), err);
     }
-    Some(
-        "the GPU ran out of resources; the server is restarting its worker — retry shortly"
-            .to_owned(),
-    )
+    // G1 (step 7): "restarting — retry shortly" only when a supervised worker really restarts.
+    Some(super::error::gpu_poisoned_reply_now().0.to_owned())
 }
 
 async fn run_stt(
@@ -1364,7 +1377,7 @@ async fn run_llm_tts(
             // L0 gate — mandatory, not optional. Reused as-is from the HTTP
             // Vision arm: this is the exact check standing between an
             // oversized prompt and a confirmed live CL_OUT_OF_RESOURCES
-            // GPU-context-poisoning crash (see `gate_vlm_prompt`'s doc
+            // GPU-context-poisoning crash (see `gate_vlm_admission`'s doc
             // comment in handlers/chat.rs). The boxed HTTP Response in its
             // Err isn't unpacked — wrong shape for a WS error — just mapped
             // to a plain message; the caller already turns any Err here into
@@ -1374,7 +1387,7 @@ async fn run_llm_tts(
             // deleted — `run_llm_tts_serves_a_vision_kind_llm` loads its mock
             // model with no on-disk `config.json`, so `ModelManager` computes
             // `max_prompt_tokens = 0` (`compute_max_prompt_tokens` returns 0
-            // whenever `read_kv_bytes_per_token_f16` finds nothing to parse),
+            // whenever `legacy_bytes_per_token_f16` finds nothing to parse),
             // which self-disables the gate before it ever reaches here. Closing
             // this needs either a real on-disk config.json test fixture under a
             // temp `models_dir`, or a `ModelManager` test seam to set
@@ -1387,16 +1400,34 @@ async fn run_llm_tts(
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if crate::handlers::chat::gate_vlm_prompt(&vlm, &gate_text, chat_ctx.max_prompt_tokens)
-                .await
-                .is_err()
-            {
+            let Ok(admitted) = crate::handlers::chat::gate_vlm_admission(
+                &vlm,
+                &gate_text,
+                messages.len(),
+                None,
+                false,
+                (chat_ctx.max_prompt_tokens, chat_ctx.gate_detail.as_ref()),
+            )
+            .await
+            else {
                 return Err(anyhow::anyhow!(
                     "prompt too long for model '{llm_model}' — exceeds its context window"
                 ));
-            }
+            };
+            let mut gen_params = gen_params;
+            let (max_new_tokens, transient_lease) = vlm_clamp_and_lease(
+                mm,
+                llm_model,
+                (
+                    chat_ctx.kv_gate_mode == "exact",
+                    chat_ctx.pool_capacity_tokens,
+                ),
+                admitted,
+                gen_params.max_new_tokens,
+            )?;
+            gen_params.max_new_tokens = max_new_tokens;
             match vlm
-                .generate(
+                .generate_with_lease(
                     vlm_messages,
                     vec![],
                     None,
@@ -1406,6 +1437,8 @@ async fn run_llm_tts(
                     gen_params,
                     token_tx,
                     Instant::now(),
+                    transient_lease,
+                    admitted,
                 )
                 .await
             {
@@ -2971,6 +3004,32 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
 // Unit tests (no GPU / no WebSocket required)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The protections the realtime vision path shares with the HTTP one (F3-S-6): the answer
+/// may not outgrow the KV pool (`max_new_tokens` clamped by
+/// [`crate::handlers::chat::clamp_vlm_max_tokens`]; no room left is an error), and a long
+/// prompt takes its transient device-memory lease, which the engine thread holds until the
+/// job finishes (a dropped socket does not stop a running prefill). Returns the clamped
+/// `max_new_tokens` and the lease (`None` below the in-flight threshold or without headroom).
+pub(crate) fn vlm_clamp_and_lease(
+    mm: &crate::model_manager::ModelManager,
+    llm_model: &str,
+    pool: (bool, usize),
+    admitted: usize,
+    requested: usize,
+) -> anyhow::Result<(usize, Option<Box<dyn std::any::Any + Send>>)> {
+    let Ok(max_new_tokens) =
+        crate::handlers::chat::clamp_vlm_max_tokens(llm_model, pool, admitted, requested)
+    else {
+        anyhow::bail!(
+            "prompt too long for model '{llm_model}' — no room left to answer in its KV pool"
+        );
+    };
+    let lease = mm
+        .acquire_transient_lease(llm_model, admitted)
+        .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>);
+    Ok((max_new_tokens, lease))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -3484,6 +3543,49 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn vad_auto_commit_is_exactly_one_window() {
+        let mut vad = EnergyVad::new();
+        // Value 3276 is well within i16 range; cast_possible_truncation is a false positive.
+        let loud_sample: i16 = (0.1 * f32::from(i16::MAX)) as i16;
+        // ~31 s of continuous speech in 1 700-sample (~106 ms) frames: 472 000 is
+        // not a multiple of the frame size, so a naive commit overshoots the window.
+        let frame = i16_to_bytes(&[loud_sample; 1_700]);
+        let mut committed = Vec::new();
+        let mut restarted = false;
+        for _ in 0..(31 * 16_000 / 1_700) {
+            for ev in vad.push_bytes(&frame) {
+                match ev {
+                    VadEvent::SpeechEnded(audio) => committed.push(audio.len()),
+                    VadEvent::SpeechStarted if !committed.is_empty() => restarted = true,
+                    VadEvent::SpeechStarted => {}
+                }
+            }
+        }
+        assert_eq!(committed, vec![MAX_UTTERANCE_SAMPLES]);
+        assert!(restarted, "overshoot should start the next utterance");
+        match vad.state {
+            VadState::Speech { ref audio, .. } => {
+                assert_eq!(
+                    audio.len(),
+                    1_700 * (31 * 16_000 / 1_700) - MAX_UTTERANCE_SAMPLES
+                );
+            }
+            _ => panic!("expected Speech state carrying the overshoot"),
+        }
+    }
+
+    #[test]
+    fn vad_auto_commit_stays_clear_of_whisper_exact_window() {
+        // A clip of exactly 30 s makes Whisper turbo return 1-2 words (and the
+        // turn is dropped as empty); over 30 s is the long-form path. Commit at
+        // 29.5 s: inside the window, with margin from the bad exact length.
+        let whisper_window = PCM_SAMPLE_RATE as usize * 30;
+        assert_eq!(MAX_UTTERANCE_SAMPLES, 472_000);
+        assert!(whisper_window - MAX_UTTERANCE_SAMPLES >= PCM_SAMPLE_RATE as usize / 4);
+    }
+
     // ── run_receiver shutdown (C1 zombie-session fix) ────────────────────────
 
     /// The always-streaming client never closes the socket, so the frame stream
@@ -3743,6 +3845,7 @@ mod tests {
             default_kv_cache_gb: 0.0,
             vram_safety_margin_gb: 0.0,
             npu_footprint_factor: 1.0,
+            cpu_image_gen_max_pixels: 1024 * 1024,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -3778,6 +3881,16 @@ mod tests {
             unknown_fields: std::collections::HashMap::new(),
             embedding_device: None,
             ov_cache_dir: None,
+            ov_cache_layout: "keyed".to_owned(),
+            kv_precision_pass: "explicit".to_owned(),
+            kv_gate_mode: "exact".to_owned(),
+            kv_gate_exact_on_unknown_engine: false,
+            kv_headroom_mode: "dynamic".to_owned(),
+            kv_transient_factor: 2.0,
+            kv_headroom_margin_gib: 0.5,
+            kv_headroom_min_tokens: 4096,
+            kv_headroom_inflight_tokens: 32_768,
+            kv_warmup: true,
             ov_cache_max_gb: 0.0,
             ov_cache_sweep_interval_secs: 21_600,
             kv_pressure_monitor_enabled: false,
@@ -3785,6 +3898,7 @@ mod tests {
             kv_pressure_sustained_secs: 0,
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
+            load_timeout_secs: 600,
         }
     }
 

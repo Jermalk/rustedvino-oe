@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use crate::api::{MUTATE_TIMEOUT, Payload, READ_TIMEOUT, encode_segment};
+use crate::api::{LOAD_TIMEOUT, Payload, READ_TIMEOUT, encode_segment};
 use crate::commands::prompt::confirm;
 use crate::commands::{error_code, print_busy_hint, print_error};
 use crate::ctx::Ctx;
@@ -18,45 +18,113 @@ use crate::ctx::Ctx;
 /// model measures well above its charge. A measured-footprint run is planned.
 const VRAM_ESTIMATE_MARGIN: f64 = 1.0;
 
-/// `(raw_disk_gb, estimated_vram_gb)` from every file under `model_dir`, or
-/// `None` when there is nothing to estimate from (missing or empty). Sums the
-/// whole tree, not just `openvino_model.bin`: some kinds (image-gen's
-/// `unet`/`vae`/`text_encoder`, a VLM's vision tower) split weights across several
-/// files with no single dominant one, and the small metadata files are noise
-/// at the KB scale against GB-scale weights.
+/// What the size estimate leaves out of a model directory (SF-2), matched case-insensitively on
+/// the entry name at any depth, each with the label `rv add` prints:
+/// - backups left beside the weights by hand edits (0.8.4 D-08), files or directories;
+/// - partial or temporary downloads and editor leftovers;
+/// - another server's compile cache (`OpenArc`'s `model_cache/`, about 3x the weights of an
+///   embedding model measured on one box), a `git lfs` clone's second copy of the weights
+///   (`.git/`) and Python/Jupyter caches (directories only).
+const SKIPPED_SUFFIXES: [(&str, &str); 7] = [
+    (".bak", "backups"),
+    (".orig", "backups"),
+    (".old", "backups"),
+    (".part", "partial downloads"),
+    (".incomplete", "partial downloads"),
+    (".tmp", "partial downloads"),
+    ("~", "editor backups"),
+];
+const SKIPPED_DIRS: [(&str, &str); 4] = [
+    ("model_cache", "model_cache/"),
+    (".git", ".git/"),
+    ("__pycache__", "__pycache__/"),
+    (".ipynb_checkpoints", ".ipynb_checkpoints/"),
+];
+
+/// The label of an entry the estimate does not count, or `None` when it counts.
+fn skipped_by_estimate(name: &std::ffi::OsStr, is_dir: bool) -> Option<&'static str> {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    if is_dir && let Some((_, label)) = SKIPPED_DIRS.iter().find(|(d, _)| name == *d) {
+        return Some(label);
+    }
+    SKIPPED_SUFFIXES
+        .iter()
+        .find(|(suffix, _)| name.ends_with(suffix))
+        .map(|(_, label)| *label)
+}
+
+/// A model directory's size as `rv add` estimates it.
+#[derive(Debug, Default)]
+pub struct ModelDirSize {
+    /// `(raw_disk_gb, estimated_vram_gb)` of the counted files; `None` when nothing counts
+    /// (missing, empty, or only skipped entries).
+    pub estimate: Option<(f64, f64)>,
+    /// GB of the entries left out ([`skipped_by_estimate`]).
+    pub skipped_gb: f64,
+    /// Their labels, deduplicated, in first-seen order.
+    pub skipped_kinds: Vec<&'static str>,
+}
+
+/// The size estimate from the files under `model_dir`. Sums the whole tree, not just
+/// `openvino_model.bin`: some kinds (image-gen's `unet`/`vae`/`text_encoder`, a VLM's vision
+/// tower) split weights across several files with no single dominant one, and the small
+/// metadata files are noise at the KB scale against GB-scale weights. Backups, partial
+/// downloads and foreign caches ([`skipped_by_estimate`]) are left out and reported.
 #[must_use]
-pub fn estimate_vram_gb(model_dir: &Path) -> Option<(f64, f64)> {
-    fn walk(dir: &Path, total: &mut u64, found: &mut bool) {
+pub fn estimate_vram_gb(model_dir: &Path) -> ModelDirSize {
+    struct Walk {
+        total: u64,
+        skipped: u64,
+        found: bool,
+        kinds: Vec<&'static str>,
+    }
+    fn walk(dir: &Path, w: &mut Walk, skipped_as: Option<&'static str>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for e in entries.flatten() {
             let Ok(ft) = e.file_type() else { continue };
+            let label = skipped_as.or_else(|| skipped_by_estimate(&e.file_name(), ft.is_dir()));
             if ft.is_dir() {
-                walk(&e.path(), total, found);
+                walk(&e.path(), w, label);
             } else if let Ok(md) = std::fs::metadata(e.path()) {
                 // `metadata` follows file symlinks (like os.path.getsize);
                 // directory symlinks are not descended (like os.walk).
                 if md.is_file() {
-                    *total += md.len();
-                    *found = true;
+                    if let Some(label) = label {
+                        w.skipped += md.len();
+                        if !w.kinds.contains(&label) {
+                            w.kinds.push(label);
+                        }
+                    } else {
+                        w.total += md.len();
+                        w.found = true;
+                    }
                 }
             }
         }
     }
-    let (mut total, mut found) = (0u64, false);
-    walk(model_dir, &mut total, &mut found);
-    if !found {
-        return None;
-    }
+    let mut w = Walk {
+        total: 0,
+        skipped: 0,
+        found: false,
+        kinds: Vec::new(),
+    };
+    walk(model_dir, &mut w, None);
     #[allow(clippy::cast_precision_loss)]
-    let raw_gb = total as f64 / 1e9;
+    let (raw_gb, skipped_gb) = (w.total as f64 / 1e9, w.skipped as f64 / 1e9);
     // `{:.1}` rounds the exact binary value (half-even on exact ties), like
     // Python's `round(x, 1)`; rounding `x * 10` first would round twice.
-    let est = format!("{:.1}", raw_gb * VRAM_ESTIMATE_MARGIN)
-        .parse()
-        .ok()?;
-    Some((raw_gb, est))
+    let estimate = w
+        .found
+        .then(|| format!("{:.1}", raw_gb * VRAM_ESTIMATE_MARGIN).parse().ok())
+        .flatten()
+        .map(|est| (raw_gb, est));
+    ModelDirSize {
+        estimate,
+        skipped_gb,
+        skipped_kinds: w.kinds,
+    }
 }
 
 /// Ids of the models currently `ready`, read quietly (empty when the list is
@@ -98,6 +166,15 @@ fn message(body: Option<&Payload>, default: &str) -> String {
     body.and_then(Payload::text).unwrap_or(default).to_owned()
 }
 
+/// `true` when an add answered 200 with `"persisted": false` (the model loaded but its
+/// config.json entry was not written).
+fn not_persisted(body: Option<&Payload>) -> bool {
+    body.and_then(Payload::json)
+        .and_then(|v| v.get("persisted"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
 /// Flags of `rv add`. Doc comments here are `--help` text, so doc_markdown is
 /// relaxed.
 #[allow(clippy::doc_markdown)]
@@ -116,7 +193,7 @@ pub struct AddArgs {
     #[arg(long)]
     pub device: Option<String>,
     /// KV cache size in GB
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub kv_cache_gb: Option<f64>,
     /// concurrent stream cap
     #[arg(long)]
@@ -124,8 +201,8 @@ pub struct AddArgs {
     /// never evict this model once loaded
     #[arg(long)]
     pub pinned: bool,
-    /// force prefix caching ON for this model (hybrid Qwen3.5/3.6 models on a GPU: the server turns it
-    /// off for them; this accepts the upstream prefix-cache bug in exchange for prefix caching on a GPU)
+    /// force prefix caching ON for this model (it also follows the server's `enable_prefix_caching`
+    /// setting; hybrid Qwen3.5/3.6/3.8 models on a GPU run with it on)
     #[arg(long)]
     pub enable_prefix_caching: bool,
     /// don't prompt for confirmation
@@ -152,12 +229,24 @@ fn vram_for_add(ctx: &Ctx, a: &AddArgs) -> Result<f64, i32> {
         return Err(1);
     };
     let model_dir = Path::new(dir).join(&a.model);
-    let Some((_, est)) = estimate_vram_gb(&model_dir) else {
+    let size = estimate_vram_gb(&model_dir);
+    let skipped_note = (!size.skipped_kinds.is_empty()).then(|| {
+        format!(
+            "{:.1} GB of {}",
+            size.skipped_gb,
+            size.skipped_kinds.join(", ")
+        )
+    });
+    let Some((_, est)) = size.estimate else {
+        let why = skipped_note.as_ref().map_or_else(
+            || "is missing or empty. Check the model_id against `rv list`".to_owned(),
+            |note| format!("holds no weights the estimate counts (only {note})"),
+        );
         eprintln!(
             "{}",
             st.red(&format!(
-                "error: --vram-gb not given and couldn't estimate it — '{}' is missing or empty. \
-                 Check the model_id against `rv list`, or pass --vram-gb explicitly",
+                "error: --vram-gb not given and couldn't estimate it — '{}' {why}, or pass \
+                 --vram-gb explicitly",
                 model_dir.display()
             ))
         );
@@ -174,6 +263,9 @@ fn vram_for_add(ctx: &Ctx, a: &AddArgs) -> Result<f64, i32> {
              measure up to about 10 % more; override with --vram-gb)"
         ))
     );
+    if let Some(note) = skipped_note {
+        println!("{}", st.dim(&format!("  not counted: {note}")));
+    }
     Ok(est)
 }
 
@@ -204,6 +296,17 @@ pub fn add_body(a: &AddArgs, vram_gb: f64) -> Value {
     Value::Object(body)
 }
 
+/// `--kv-cache-gb` must be a finite positive number. Checked before anything is sent: JSON has no
+/// NaN, so a `NaN` would travel as `null` and the server would read it as "not given".
+fn check_kv_cache_gb(v: Option<f64>) -> Result<(), String> {
+    match v {
+        Some(k) if !k.is_finite() || k <= 0.0 => Err(format!(
+            "error: --kv-cache-gb must be a finite positive number, got {k}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Runs `rv add`: register an on-disk model and load it.
 #[must_use]
 pub fn add(ctx: &Ctx, a: &AddArgs) -> i32 {
@@ -211,6 +314,10 @@ pub fn add(ctx: &Ctx, a: &AddArgs) -> i32 {
         return 1;
     }
     let st = ctx.style;
+    if let Err(msg) = check_kv_cache_gb(a.kv_cache_gb) {
+        eprintln!("{}", st.red(&msg));
+        return 1;
+    }
     let vram_gb = match vram_for_add(ctx, a) {
         Ok(v) => v,
         Err(code) => return code,
@@ -245,9 +352,21 @@ pub fn add(ctx: &Ctx, a: &AddArgs) -> i32 {
     let r = ctx.api.post(
         "/v1/admin/models/add",
         Some(&add_body(a, vram_gb)),
-        MUTATE_TIMEOUT,
+        LOAD_TIMEOUT,
     );
     match r.code {
+        // Loaded and serving, but its config.json entry was not written: say it loudly — the
+        // model is gone after a restart.
+        Some(200) if not_persisted(r.body.as_ref()) => {
+            let msg = r
+                .body
+                .as_ref()
+                .and_then(|b| b.json()?.get("message")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "loaded, but NOT persisted to config.json".to_owned());
+            eprintln!("{} {}", st.warn(), st.yellow(&msg));
+            report_evicted(ctx, &before);
+            0
+        }
         Some(200) => {
             println!(
                 "{} {}",
@@ -257,8 +376,8 @@ pub fn add(ctx: &Ctx, a: &AddArgs) -> i32 {
             report_evicted(ctx, &before);
             0
         }
-        // 409 means "already registered" — unless the server says it is busy, which is a
-        // different cause with a different remedy.
+        // 409 means "already registered" — unless the server says it is busy, or that
+        // config.json is already invalid: a different cause with a different remedy.
         Some(409) if error_code(&r).is_none() => {
             eprintln!(
                 "{}",
@@ -283,7 +402,7 @@ pub struct LoadArgs {
     /// model id
     pub model: String,
     /// KV cache size in GB
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub kv_cache_gb: Option<f64>,
     /// concurrent stream cap
     #[arg(long)]
@@ -336,6 +455,14 @@ fn does_not_fit_message(st: crate::ansi::Style, model: &str, check: &Value) -> S
         .as_array()
         .map(|v| v.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+    // F1: the device-headroom check (vision models on a discrete GPU) can be what refuses even
+    // though the booked figures would fit; older servers omit the key.
+    if let Some(why) = check["headroom_refusal"].as_str() {
+        return format!(
+            "{} '{model}' does not fit — device headroom: {why}; nothing was evicted",
+            st.bad()
+        );
+    }
     if busy.is_empty() {
         format!(
             "{} '{model}' does not fit — needs {needed:.1} GB, {free:.1} GB free, and nothing \
@@ -355,6 +482,17 @@ fn does_not_fit_message(st: crate::ansi::Style, model: &str, check: &Value) -> S
     }
 }
 
+/// F1/A2: a vision model not loaded on this server yet may need more evictions than the check
+/// could see; say so before asking to confirm them. Older servers omit the key.
+fn headroom_not_previewed_note(st: crate::ansi::Style, check: &Value) {
+    if let Some(why) = check["headroom_not_previewed"].as_str() {
+        println!(
+            "{}",
+            st.yellow(&format!("note: device headroom not previewed: {why}"))
+        );
+    }
+}
+
 /// Runs `rv load`: an admission check first (unless `--no-check`), a
 /// confirmation when the load would evict, then the load.
 #[must_use]
@@ -363,6 +501,10 @@ pub fn load(ctx: &Ctx, a: &LoadArgs) -> i32 {
         return 1;
     }
     let st = ctx.style;
+    if let Err(msg) = check_kv_cache_gb(a.kv_cache_gb) {
+        eprintln!("{}", st.red(&msg));
+        return 1;
+    }
     let seg = encode_segment(&a.model);
     if !a.no_check {
         let c = ctx.api.post(&check_path(&seg, a.force), None, READ_TIMEOUT);
@@ -396,6 +538,7 @@ pub fn load(ctx: &Ctx, a: &LoadArgs) -> i32 {
                 .map(|v| v.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
             let busy_note = busy_note(&check["busy_victims"]);
+            headroom_not_previewed_note(st, check);
             if !evict.is_empty()
                 && !confirm(
                     st,
@@ -447,7 +590,7 @@ pub fn load(ctx: &Ctx, a: &LoadArgs) -> i32 {
     let r = ctx.api.post(
         &format!("/v1/admin/models/{seg}/load"),
         body.as_ref(),
-        MUTATE_TIMEOUT,
+        LOAD_TIMEOUT,
     );
     if r.code == Some(200) {
         println!("{} {}", st.ok(), message(r.body.as_ref(), "loaded"));
@@ -530,6 +673,30 @@ pub fn deregister(ctx: &Ctx, model: &str, yes: bool, force: bool) -> i32 {
 #[cfg(test)]
 #[allow(clippy::expect_used)] // fixtures: a failed setup should fail the test loudly
 mod tests {
+
+    /// S281 defect (a): a 200 with `"persisted": false` is told apart from a plain success.
+    #[test]
+    fn not_persisted_reads_the_flag_only() {
+        let off = Payload::Json(serde_json::json!({"message": "m", "persisted": false}));
+        let on = Payload::Json(serde_json::json!({"persisted": true}));
+        let text = Payload::Text("model 'x' added to config and loaded".into());
+        assert!(not_persisted(Some(&off)));
+        assert!(!not_persisted(Some(&on)));
+        assert!(!not_persisted(Some(&text)));
+        assert!(!not_persisted(None));
+    }
+    #[test]
+    fn kv_cache_gb_must_be_finite_and_positive() {
+        assert!(check_kv_cache_gb(None).is_ok());
+        assert!(check_kv_cache_gb(Some(2.5)).is_ok());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let Err(err) = check_kv_cache_gb(Some(bad)) else {
+                panic!("{bad} must be refused");
+            };
+            assert!(err.contains("--kv-cache-gb"), "{err}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -538,7 +705,7 @@ mod tests {
         std::fs::create_dir(d.path().join("unet")).expect("mkdir");
         std::fs::write(d.path().join("unet/w.bin"), vec![0u8; 2_000_000]).expect("write");
         std::fs::write(d.path().join("tok.json"), vec![0u8; 1_000_000]).expect("write");
-        let (raw, est) = estimate_vram_gb(d.path()).expect("estimate");
+        let (raw, est) = estimate_vram_gb(d.path()).estimate.expect("estimate");
         assert!((raw - 0.003).abs() < 1e-9, "{raw}");
         // 0.003 GB -> rounds to one decimal: 0.0
         assert!(est.abs() < f64::EPSILON, "{est}");
@@ -550,7 +717,7 @@ mod tests {
         let d = tempfile::tempdir().expect("tempdir");
         let f = std::fs::File::create(d.path().join("w.bin")).expect("create");
         f.set_len(13_750_000_000).expect("set_len");
-        let (_, est) = estimate_vram_gb(d.path()).expect("estimate");
+        let (_, est) = estimate_vram_gb(d.path()).estimate.expect("estimate");
         assert!((est - 13.8).abs() < 1e-9, "{est}");
     }
 
@@ -561,7 +728,7 @@ mod tests {
         let d = tempfile::tempdir().expect("tempdir");
         let f = std::fs::File::create(d.path().join("openvino_model.bin")).expect("create");
         f.set_len(9_700_000_000).expect("set_len");
-        let (raw, est) = estimate_vram_gb(d.path()).expect("estimate");
+        let (raw, est) = estimate_vram_gb(d.path()).estimate.expect("estimate");
         assert!((est - raw).abs() < 1e-9, "{est} vs {raw}");
         assert!((est - 9.7).abs() < 1e-9, "{est}");
     }
@@ -573,7 +740,7 @@ mod tests {
         let d = tempfile::tempdir().expect("tempdir");
         let f = std::fs::File::create(d.path().join("w.bin")).expect("create");
         f.set_len(19_700_000_000).expect("set_len");
-        let (_, est) = estimate_vram_gb(d.path()).expect("estimate");
+        let (_, est) = estimate_vram_gb(d.path()).estimate.expect("estimate");
         assert!(est + 1.0 + 1.0 <= 22.7, "{est}");
     }
 
@@ -583,18 +750,67 @@ mod tests {
         // sparse 3.2 GB file: cheap to create, big enough to exercise the rounding.
         let f = std::fs::File::create(d.path().join("openvino_model.bin")).expect("create");
         f.set_len(3_200_000_000).expect("set_len");
-        let (raw, est) = estimate_vram_gb(d.path()).expect("estimate");
+        let (raw, est) = estimate_vram_gb(d.path()).estimate.expect("estimate");
         assert!((raw - 3.2).abs() < 1e-9);
         assert!((est - 3.2).abs() < 1e-9, "{est}");
+    }
+
+    /// SF-2: backups (files and directories, any case) and a foreign `model_cache/` are not
+    /// counted, but reported; a weights file merely containing "old" in its name still counts.
+    #[test]
+    fn estimate_skips_backups_and_foreign_compile_caches() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path();
+        let sized = |rel: &str, len: u64| {
+            let f = std::fs::File::create(p.join(rel)).expect("create");
+            f.set_len(len).expect("set_len");
+        };
+        std::fs::create_dir(p.join("model_cache")).expect("mkdir");
+        std::fs::create_dir(p.join("unet.OLD")).expect("mkdir");
+        sized("openvino_model.bin", 2_000_000_000);
+        sized("golden_old_weights.bin", 100_000_000);
+        sized("openvino_model.bin.bak", 2_000_000_000);
+        sized("tokenizer.json.orig", 100_000_000);
+        sized("model_cache/blob.blob", 3_000_000_000);
+        sized("unet.OLD/w.bin", 1_000_000_000);
+        std::fs::create_dir_all(p.join(".git/lfs/objects")).expect("mkdir");
+        std::fs::create_dir_all(p.join("sub/model_cache")).expect("mkdir");
+        sized(".git/lfs/objects/w", 2_000_000_000);
+        sized("sub/model_cache/b.blob", 500_000_000);
+        sized("openvino_model.bin.part", 1_000_000_000);
+        sized("sub/model_cache.json", 1_000_000); // only a DIRECTORY named model_cache is skipped
+        let size = estimate_vram_gb(p);
+        let (raw, est) = size.estimate.expect("estimate");
+        assert!((raw - 2.101).abs() < 1e-9, "{raw}");
+        assert!((est - 2.1).abs() < 1e-9, "{est}");
+        assert!((size.skipped_gb - 9.6).abs() < 1e-9, "{}", size.skipped_gb);
+        for kind in ["backups", "model_cache/", ".git/", "partial downloads"] {
+            assert!(
+                size.skipped_kinds.contains(&kind),
+                "{:?}",
+                size.skipped_kinds
+            );
+        }
+        assert_eq!(size.skipped_kinds.len(), 4, "{:?}", size.skipped_kinds);
+    }
+
+    /// Only backups present: nothing to estimate from, as for an empty directory.
+    #[test]
+    fn estimate_of_a_dir_with_only_backups_is_none() {
+        let d = tempfile::tempdir().expect("tempdir");
+        std::fs::write(d.path().join("openvino_model.bin.bak"), b"x").expect("write");
+        let size = estimate_vram_gb(d.path());
+        assert!(size.estimate.is_none());
+        assert_eq!(size.skipped_kinds, ["backups"], "the reason is reported");
     }
 
     #[test]
     fn estimate_of_missing_or_empty_dir_is_none() {
         let d = tempfile::tempdir().expect("tempdir");
-        assert!(estimate_vram_gb(d.path()).is_none());
+        assert!(estimate_vram_gb(d.path()).estimate.is_none());
         std::fs::create_dir(d.path().join("empty_sub")).expect("mkdir");
-        assert!(estimate_vram_gb(d.path()).is_none());
-        assert!(estimate_vram_gb(&d.path().join("nope")).is_none());
+        assert!(estimate_vram_gb(d.path()).estimate.is_none());
+        assert!(estimate_vram_gb(&d.path().join("nope")).estimate.is_none());
     }
 
     #[test]

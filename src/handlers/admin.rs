@@ -81,17 +81,35 @@ pub struct HealthResponse {
     /// `"unknown"` for a build without a `.git` dir (e.g. a source tarball).
     /// Set at compile time by `build.rs` — see `emit_git_hash`.
     pub git_hash: &'static str,
+    /// `true` once the GPU context is poisoned (E-12): the process is alive but every
+    /// GPU model is unusable until a restart. `/health` keeps its 200 (it is a liveness
+    /// probe, and a supervisor must not kill a worker that is about to exit by itself);
+    /// this field is how a monitor or `rv status` learns the server cannot serve.
+    pub gpu_poisoned: bool,
+    /// `true` while a model load has not returned past its deadline (step 6b/6e): new loads on
+    /// that device are refused (`503 device_stalled`) until it does; loaded models keep serving.
+    /// Details (which device, model, how long): `GET /v1/admin/health/watchdog` or `rv status`.
+    pub device_stalled: bool,
 }
 
 /// GET /health — liveness probe.
 ///
-/// Returns `{"status":"ok","version":"<semver>","git_hash":"<12-char hex or \"unknown\">"}`.
-/// Never returns an error — if the server is alive enough to route here, it's healthy.
-pub async fn health() -> Json<HealthResponse> {
+/// Returns `{"status":"ok","version":"<semver>","git_hash":"<12-char hex or \"unknown\">","gpu_poisoned":false,"device_stalled":false}`.
+/// Never returns an error — if the server is alive enough to route here, it's healthy;
+/// `gpu_poisoned: true` is the one signal that it is alive but cannot serve GPU models.
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         git_hash: env!("RV_GIT_HASH"),
+        gpu_poisoned: state
+            .model_manager
+            .as_ref()
+            .is_some_and(|mm| mm.is_gpu_poisoned()),
+        device_stalled: state
+            .model_manager
+            .as_ref()
+            .is_some_and(|mm| !mm.stalled_loads().is_empty()),
     })
 }
 
@@ -112,6 +130,9 @@ pub struct HealthGenerateResponse {
 #[derive(Serialize)]
 struct HealthGenerateError {
     status: &'static str,
+    /// Machine-readable reason, present only for `"gpu_poisoned"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
     message: String,
 }
 
@@ -121,6 +142,7 @@ fn hg_err(status: StatusCode, message: impl Into<String>) -> Response {
         status,
         Json(HealthGenerateError {
             status: "error",
+            error: None,
             message: message.into(),
         }),
     )
@@ -318,6 +340,28 @@ pub async fn health_generate(State(state): State<AppState>) -> Response {
         return hg_err(StatusCode::SERVICE_UNAVAILABLE, "no model manager");
     };
 
+    // E-12: a poisoned GPU context can hang or lie to a probe inference; say so
+    // up front instead of probing.
+    if mm.is_gpu_poisoned() {
+        // G1 (step 7): a supervised worker on its way to a restart says so (and Retry-After), so a
+        // probe does not restart it a second time.
+        let (message, retry) = super::error::gpu_poisoned_reply_now();
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthGenerateError {
+                status: "error",
+                error: Some("gpu_poisoned"),
+                message: message.to_owned(),
+            }),
+        )
+            .into_response();
+        if let Some(v) = retry {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+        return resp;
+    }
+
     let Some(model_id) = select_probe_target(&mm.list_models()) else {
         return hg_err(StatusCode::SERVICE_UNAVAILABLE, "no ready models");
     };
@@ -384,11 +428,54 @@ pub async fn health_generate(State(state): State<AppState>) -> Response {
 
 // ---- /v1/admin/models (registry listing) ---------------------------
 
+/// E-09: the sentence that tells an operator the pool they got is not the pool they asked for,
+/// empty when it is. Read from the model's record after a load or resize.
+fn kv_pool_note(mm: &crate::model_manager::ModelManager, model_id: &str) -> String {
+    mm.list_models()
+        .into_iter()
+        .find(|m| m.id == model_id)
+        .and_then(|m| {
+            let (asked, by) = (m.kv_requested_gb?, m.kv_clamped_by?);
+            Some(format!(
+                "KV pool {} GiB (requested {} \u{2014} {})",
+                fmt_gib(m.kv_cache_gb),
+                fmt_gib(asked),
+                kv_clamp_phrase(by)
+            ))
+        })
+        .unwrap_or_default()
+}
+
+/// A GiB figure for the pool sentences: two decimals, except a value below 0.01 that would
+/// print as `0.00` (a request of 0.001 must not read as "requested 0.00").
+fn fmt_gib(v: f64) -> String {
+    if v > 0.0 && v < 0.01 {
+        format!("{v}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// How a [`KvClamp`](crate::model_manager::KvClamp) reads in the sentences `rv` prints.
+fn kv_clamp_phrase(by: crate::model_manager::KvClamp) -> String {
+    match by {
+        crate::model_manager::KvClamp::WholeGibFallback => "rounded up to whole GiB".to_owned(),
+        crate::model_manager::KvClamp::DeviceHeadroom => {
+            "a larger pool would leave too little free device memory for long prompts".to_owned()
+        }
+        other => format!("clamped by {}", other.label()),
+    }
+}
+
+/// State reported for a GPU-placed model while the GPU context is poisoned (E-12).
+const STATE_GPU_POISONED: &str = "unavailable (gpu_poisoned)";
+
 /// One entry in the `GET /v1/admin/models` registry response.
 #[derive(Serialize)]
 struct AdminModelEntry {
     id: String,
-    /// `"not_loaded"` | `"loading"` | `"ready"` | `"evicting"`
+    /// `"not_loaded"` | `"loading"` | `"ready"` | `"evicting"`, or
+    /// `"unavailable (gpu_poisoned)"` for a GPU-placed model while the GPU context is poisoned.
     state: &'static str,
     /// From `model_kinds` config; `"text_gen"` when not specified.
     kind: &'static str,
@@ -426,6 +513,14 @@ struct AdminModelEntry {
     /// KV cache pool actually reserved for this model at load time (GB).
     /// `0.0` before first load or once evicted.
     cache_size_gb: f64,
+    /// The explicit KV target the last load was given (GB); omitted when the load
+    /// asked for "all that fits" or the model is not loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_requested_gb: Option<f64>,
+    /// Why the pool differs from `kv_requested_gb` (E-09): `free_vram`,
+    /// `cache_size_gb`, `min_kv_cache_gb` or `whole_gib_fallback`. Omitted when it does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clamped_by: Option<&'static str>,
     /// The model's own native (trained/converted) context ceiling —
     /// `max_position_embeddings`, `rope_scaling`-adjusted. A hardware-
     /// independent model property: contrast with `max_prompt_tokens`, which
@@ -456,6 +551,53 @@ struct AdminModelEntry {
     /// this model. Omitted when not loaded or on an OS without DRM fdinfo.
     #[serde(skip_serializing_if = "Option::is_none")]
     gpu_memory_estimate_gb: Option<f64>,
+    /// The KV precision the engine was built with: `u4`, `i8`, `f16`, or `auto` when the plugin
+    /// decided and the server cannot say. Omitted until the first load and for models without a
+    /// KV engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_cache_precision: Option<&'static str>,
+    /// Who decided it: `per_model`, `global`, `ir_hint`, `auto_rule` or `passthrough`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_precision_source: Option<&'static str>,
+    /// KV bytes one token costs at that precision (from the model's layout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_bytes_per_token: Option<u64>,
+    /// How far the KV profile can be trusted: `high`, `medium` or `low` (low = legacy limit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_profile_confidence: Option<&'static str>,
+    /// How `max_prompt_tokens` was computed: `exact` or `legacy`; omitted when there is no gate.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    kv_gate_mode: &'static str,
+    /// What limits an exact `max_prompt_tokens`: `pool`, `native`, `ratchet` or
+    /// `device_headroom`. Omitted under the legacy estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_clamped_by: Option<&'static str>,
+    /// The KV pool in MiB as booked (the engine allocates exactly this for an exactly-sized
+    /// pool); `0` when not loaded.
+    kv_pool_mib: u64,
+    /// KV blocks of an exactly-sized pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pool_blocks: Option<u64>,
+    /// The device-headroom limit right now in tokens (vision model on a discrete GPU).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_headroom_cap_tokens: Option<usize>,
+    /// Weights as measured at the last load, MiB (device-memory delta minus the KV pool); absent
+    /// when that load's measurement window was not clean, and for a whole-GiB pool (F3-N-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram_measured_mib: Option<u64>,
+    /// F2-S-5 (E-16): `true` once a vision request with images was admitted since the last load
+    /// without its image tokens counted — the context limit then saw only the text.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    kv_admission_low_confidence: bool,
+    /// How many such requests (absent when none).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    uncounted_image_admissions: u64,
+}
+
+/// Serde helper: omit a zero counter.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes `&T`
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Response envelope for `GET /v1/admin/models`.
@@ -495,6 +637,16 @@ struct ServerInfo {
     /// every GPU model is unusable and only a process restart clears it.
     /// Always present, to every caller: it is state an operator must not miss.
     gpu_poisoned: bool,
+    /// The device-headroom state of each discrete GPU, to every caller (state, not identity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headroom: Option<crate::model_manager::headroom::HeadroomReport>,
+    /// Configuration problems found at boot that did not stop it (step 8). Key-validated callers
+    /// only (messages name paths); omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    startup_warnings: Vec<crate::startup::StartupWarning>,
+    /// GPU/NPU driver versions and the kernel release (step 8). Key-validated callers only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<crate::startup::PlatformInfo>,
 }
 
 impl ServerInfo {
@@ -518,6 +670,13 @@ impl ServerInfo {
             engine: "RustedVINO",
             engine_version: env!("CARGO_PKG_VERSION"),
             gpu_poisoned: false,
+            headroom: None,
+            startup_warnings: if with_host {
+                crate::startup::startup_warnings()
+            } else {
+                Vec::new()
+            },
+            platform: with_host.then(crate::startup::platform_info),
         }
     }
 }
@@ -556,16 +715,23 @@ pub async fn admin_list_models(
             .into_response();
     };
 
+    mm.reap_stalled_loads();
     let models = mm
         .list_models()
         .into_iter()
         .map(|info| AdminModelEntry {
             id: info.id,
-            state: match info.state {
-                crate::model_manager::ModelState::NotLoaded => "not_loaded",
-                crate::model_manager::ModelState::Loading => "loading",
-                crate::model_manager::ModelState::Ready => "ready",
-                crate::model_manager::ModelState::Evicting => "evicting",
+            state: if mm.gpu_unavailable(&info.device) {
+                STATE_GPU_POISONED
+            } else if info.stalled_secs.is_some() {
+                "stalled"
+            } else {
+                match info.state {
+                    crate::model_manager::ModelState::NotLoaded => "not_loaded",
+                    crate::model_manager::ModelState::Loading => "loading",
+                    crate::model_manager::ModelState::Ready => "ready",
+                    crate::model_manager::ModelState::Evicting => "evicting",
+                }
             },
             kind: info.kind.label(),
             vram_gb: info.vram_gb,
@@ -575,16 +741,63 @@ pub async fn admin_list_models(
             default_top_k: info.generation_defaults.top_k,
             max_prompt_tokens: info.max_prompt_tokens,
             cache_size_gb: info.kv_cache_gb,
+            kv_requested_gb: info.kv_requested_gb,
+            clamped_by: info.kv_clamped_by.map(crate::model_manager::KvClamp::label),
             native_context_limit: info.native_context_limit,
             kv_cache_usage_pct: info.kv_cache_usage_pct,
             kv_pressure_flagged: info.kv_pressure_flagged,
             gpu_memory_estimate_gb: info.gpu_memory_estimate_gb,
+            kv_cache_precision: info
+                .kv_resolution
+                .as_ref()
+                .map(|r| r.precision.unwrap_or("auto")),
+            kv_precision_source: info.kv_resolution.as_ref().map(|r| r.source),
+            kv_bytes_per_token: info.kv_resolution.as_ref().and_then(|r| r.bytes_per_token),
+            kv_profile_confidence: info
+                .kv_resolution
+                .as_ref()
+                .and_then(|r| r.profile_confidence),
+            kv_gate_mode: info.kv_gate_mode,
+            limit_clamped_by: info
+                .kv_gate_clamped_by
+                .map(crate::model_manager::GateClamp::label),
+            kv_pool_mib: mib_of_gib(info.kv_cache_gb),
+            kv_pool_blocks: info.kv_pool_blocks,
+            kv_headroom_cap_tokens: info.kv_headroom_cap_tokens,
+            vram_measured_mib: info.vram_measured_mib,
+            kv_admission_low_confidence: info.uncounted_image_admissions > 0,
+            uncounted_image_admissions: info.uncounted_image_admissions,
         })
         .collect();
 
     let mut server = ServerInfo::current(authenticated.is_some());
     server.gpu_poisoned = mm.is_gpu_poisoned();
+    // Shown to every caller of this route, like `gpu_poisoned`: it is operational state (what a
+    // long prompt can still be given), the VRAM totals are on `/metrics` anyway, and a keyless
+    // server would otherwise make `rv status` go quiet. Host, PID and uptime stay key-gated.
+    // The first reading scans /proc: keep it off the async threads.
+    let mm = std::sync::Arc::clone(mm);
+    server.headroom = tokio::task::spawn_blocking(move || mm.headroom_report())
+        .await
+        .ok()
+        .map(|mut report| {
+            if authenticated.is_none() {
+                // Whether a long request is running right now is activity, not state.
+                for d in &mut report.devices {
+                    d.leases_mib = None;
+                }
+            }
+            report
+        });
     Json(AdminModelsResponse { models, server }).into_response()
+}
+
+/// A pool in GiB as whole MiB (the unit the admin API and `rv` show).
+fn mib_of_gib(gib: f64) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (gib.max(0.0) * 1024.0).round() as u64
+    }
 }
 
 /// One model's entry in the `GET /v1/admin/models/completeness` audit.
@@ -665,9 +878,34 @@ pub async fn admin_models_completeness(State(state): State<AppState>) -> Respons
 /// Response for `GET /v1/admin/health/watchdog`.
 #[derive(Serialize)]
 struct AdminWatchdogResponse {
-    /// Age in seconds of the longest generation currently in flight across
-    /// every Ready model, or `null` if nothing is generating right now.
+    /// How many seconds the worst generation in flight is past its own time allowance (prompt
+    /// tokens at a floor prefill speed plus the answer budget at a floor decode speed), across
+    /// every Ready model: `0` while every one is inside its allowance, `null` if nothing is
+    /// generating right now. The supervisor kills the worker when this passes
+    /// `watchdog_hang_ceiling_secs`.
     oldest_generation_secs: Option<f64>,
+    /// The `ffi_watch` part of `oldest_generation_secs` alone (loads, transcriptions, CB steps):
+    /// seconds the worst of them is past its allowance, `null` when none runs (step 6e).
+    oldest_ffi_overdue_secs: Option<f64>,
+    /// `OpenVINO` calls in flight right now (`ffi_watch`: loads, transcriptions, CB steps, VLM
+    /// generations) — what a process exit would wait for, then report as exit 76.
+    in_flight: usize,
+    /// Loads past their deadline that have not returned (step 6b).
+    stalled: Vec<WatchdogStalled>,
+}
+
+/// One entry of [`AdminWatchdogResponse::stalled`].
+#[derive(Serialize)]
+struct WatchdogStalled {
+    device: String,
+    model: String,
+    /// Always `"load"` today (the only call that is booked as stalled).
+    kind: &'static str,
+    secs: u64,
+    /// What the operator can do if it never returns (D-04 S9): the GT reset command on a
+    /// discrete xe GPU with a known PCI address, otherwise advice for that kind of device.
+    /// `null` while the load is inside its deadline (stalled only because its client left).
+    recovery: Option<String>,
 }
 
 /// `GET /v1/admin/health/watchdog` — the supervisor's hang-detection signal.
@@ -680,7 +918,7 @@ struct AdminWatchdogResponse {
 /// engine-reset that `openvino_genai` never surfaced as an error). This
 /// endpoint reports the one signal that DOES see that: how long the oldest
 /// in-flight generation has been running, aggregated in-process via
-/// [`crate::model_manager::ModelManager::oldest_generation_age`].
+/// [`crate::model_manager::ModelManager::watchdog_age`].
 ///
 /// Always 200 — including when the model manager isn't initialised yet — so
 /// the supervisor's minimal hand-rolled HTTP/1.0 client (`supervisor.rs`,
@@ -690,10 +928,30 @@ pub async fn admin_watchdog(State(state): State<AppState>) -> Response {
     let oldest_generation_secs = state
         .model_manager
         .as_ref()
-        .and_then(|mm| mm.oldest_generation_age())
+        .and_then(|mm| mm.watchdog_age())
         .map(|d| d.as_secs_f64());
+    let watch = crate::ffi_watch::global();
+    let stalled = state
+        .model_manager
+        .as_ref()
+        .map(|mm| {
+            mm.stalled_loads()
+                .into_iter()
+                .map(|s| WatchdogStalled {
+                    recovery: s.overdue.then(|| mm.stall_recovery(&s.device)),
+                    device: s.device,
+                    model: s.model,
+                    kind: "load",
+                    secs: s.secs,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Json(AdminWatchdogResponse {
         oldest_generation_secs,
+        oldest_ffi_overdue_secs: watch.overdue().map(|d| d.as_secs_f64()),
+        in_flight: watch.in_flight_count(),
+        stalled,
     })
     .into_response()
 }
@@ -752,6 +1010,11 @@ pub struct ModelObject {
     /// (the project's internal engineering log).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
+    /// Present only as `"unavailable (gpu_poisoned)"`: the model is listed but cannot
+    /// serve until the server restarts (E-12). Omitted for a healthy model, so the
+    /// response is unchanged in normal operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<&'static str>,
 }
 
 /// Top-level /v1/models response envelope.
@@ -773,10 +1036,15 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
         .model_manager
         .as_ref()
         .map(|mm| {
+            // A stalled load that has returned shows up here as Ready (step 6b).
+            mm.reap_stalled_loads();
             mm.list_models()
                 .into_iter()
                 .filter(|info| info.state == crate::model_manager::ModelState::Ready)
-                .map(model_object)
+                .map(|info| {
+                    let unavailable = mm.gpu_unavailable(&info.device);
+                    model_object(info, unavailable)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -789,8 +1057,9 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
 
 /// Build the public `ModelObject` for one model; shared by the list and the retrieve route
 /// so the two cannot drift apart.
-fn model_object(info: crate::model_manager::ModelInfo) -> ModelObject {
+fn model_object(info: crate::model_manager::ModelInfo, unavailable: bool) -> ModelObject {
     ModelObject {
+        state: unavailable.then_some(STATE_GPU_POISONED),
         id: info.id,
         object: "model",
         created: server_created_ts(),
@@ -814,7 +1083,13 @@ pub async fn model_retrieve(
             .find(|info| info.id == id && info.state == crate::model_manager::ModelState::Ready)
     });
     match found {
-        Some(info) => Json(model_object(info)).into_response(),
+        Some(info) => {
+            let unavailable = state
+                .model_manager
+                .as_ref()
+                .is_some_and(|mm| mm.gpu_unavailable(&info.device));
+            Json(model_object(info, unavailable)).into_response()
+        }
         None => super::error::model_error_response(crate::model_manager::ModelError::NotFound(id)),
     }
 }
@@ -953,11 +1228,22 @@ pub async fn admin_load_model(
     };
 
     match mm.load_model_with_overrides(&model_id, overrides).await {
-        Ok(()) => (StatusCode::OK, format!("model '{model_id}' loaded")).into_response(),
+        Ok(()) => {
+            let note = kv_pool_note(mm, &model_id);
+            let sep = if note.is_empty() { "" } else { ". " };
+            (
+                StatusCode::OK,
+                format!("model '{model_id}' loaded{sep}{note}"),
+            )
+                .into_response()
+        }
         Err(e) => {
             // Downcast to ModelError for fine-grained HTTP status mapping.
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    ModelError::ConfigFileInvalid(_) => {
+                        return super::error::config_file_invalid_response(model_err);
+                    }
                     // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
                     // envelope.
                     ModelError::TargetBusy(_)
@@ -965,35 +1251,38 @@ pub async fn admin_load_model(
                     | ModelError::EvictionIncomplete(_) => {
                         return eviction_refusal(model_err);
                     }
+                    ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+                        return super::error::load_stall_response(model_err);
+                    }
                     ModelError::NotFound(_)
                     | ModelError::FilesMissing(_)
                     | ModelError::FilesIncomplete(..) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                        return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::Loading | ModelError::Evicting => {
-                        return (StatusCode::CONFLICT, e.to_string()).into_response();
+                        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
                     }
                     ModelError::InsufficientMemory(_) => {
-                        // A predictable capacity refusal (nothing was evicted), not a fault.
-                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                        // A capacity refusal, not a fault: the model can never fit, or GenAI found too little
+                        // free device memory (MR-2, retry later); models already evicted are named.
+                        return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+                    }
+                    // D-04 S2: the same 503 `server_stopping` envelope as the inference routes.
+                    ModelError::ShuttingDown => {
+                        return super::error::model_error_response(ModelError::ShuttingDown);
                     }
                     ModelError::GpuPoisoned => {
-                        // L3: OpenCL context poisoned by a prior OOM — operator must
-                        // restart the process; no retry will succeed. The restart
-                        // should be graceful: SIGTERM/`systemctl stop` now drains
-                        // in-flight requests and frees VRAM (T6.1) before exit.
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("{e} — restart rustedvino to recover (a graceful stop via SIGTERM/systemctl drains in-flight requests and frees VRAM first)"),
-                        )
-                            .into_response();
+                        // L3: OpenCL context poisoned by a prior OOM. G1 (step 7): a supervised
+                        // worker already on its way to a restart says so; otherwise the operator
+                        // must restart (gracefully: SIGTERM drains and frees VRAM, T6.1).
+                        return gpu_poisoned_admin(&e);
                     }
                     // WrongKind never originates from load_model; fall through to 500.
                     ModelError::NotLoaded | ModelError::WrongKind(_) => {} // fall through to 500
                 }
             }
             tracing::error!(model_id, error = %e, "admin_load_model failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
 }
@@ -1011,6 +1300,44 @@ struct ResizeRequest {
     /// (bounded) and what is left is aborted, and the reload is a forced load. Default `false`.
     #[serde(default)]
     force: bool,
+}
+
+/// The sentence a successful resize answers with. A pool sized exactly is whole KV blocks, so it
+/// is always a hair under the request: say what was built (and the request only when it visibly
+/// differs); a pool clamped by a setting names that setting.
+fn resize_message(
+    model_id: &str,
+    achieved: f64,
+    requested: f64,
+    blocks: Option<u64>,
+    clamped_by: Option<crate::model_manager::KvClamp>,
+) -> String {
+    if let (Some(blocks), None) = (blocks, clamped_by) {
+        if (achieved - requested).abs() < 0.005 {
+            format!(
+                "model '{model_id}' resized to {} GiB ({blocks} KV blocks)",
+                fmt_gib(achieved)
+            )
+        } else {
+            format!(
+                "model '{model_id}' resized to {} GiB ({blocks} KV blocks; requested {})",
+                fmt_gib(achieved),
+                fmt_gib(requested)
+            )
+        }
+    } else if (achieved - requested).abs() < 1e-9 {
+        format!("model '{model_id}' resized to {} GiB", fmt_gib(achieved))
+    } else {
+        let why = clamped_by.map_or_else(
+            || "clamped by free VRAM, cache_size_gb or the min_kv_cache_gb floor".to_owned(),
+            kv_clamp_phrase,
+        );
+        format!(
+            "model '{model_id}' resized to {} GiB (requested {} \u{2014} {why})",
+            fmt_gib(achieved),
+            fmt_gib(requested)
+        )
+    }
 }
 
 #[allow(clippy::doc_markdown)]
@@ -1081,16 +1408,11 @@ pub async fn admin_resize_model(
         // when it differs — echoing the request turned a clamped pool into a
         // silent full-size "success".
         Ok(achieved) => {
-            let msg = if (achieved - request.kv_cache_gb).abs() < 1e-9 {
-                format!("model '{model_id}' resized to {achieved} GB")
-            } else {
-                format!(
-                    "model '{model_id}' resized to {achieved} GB \
-                     (requested {} GB — clamped by free VRAM, cache_size_gb, \
-                     or the min_kv_cache_gb floor)",
-                    request.kv_cache_gb
-                )
-            };
+            let info = mm.list_models().into_iter().find(|m| m.id == model_id);
+            let (clamped_by, blocks) = info
+                .as_ref()
+                .map_or((None, None), |m| (m.kv_clamped_by, m.kv_pool_blocks));
+            let msg = resize_message(&model_id, achieved, request.kv_cache_gb, blocks, clamped_by);
             (StatusCode::OK, msg).into_response()
         }
         Err(e) => {
@@ -1100,11 +1422,14 @@ pub async fn admin_resize_model(
             // a new enum variant would ripple through every exhaustive
             // ModelError match in this file for one rare, purely-informational
             // rejection.
-            if e.to_string().contains("cooldown is") {
-                return (StatusCode::TOO_MANY_REQUESTS, e.to_string()).into_response();
+            if format!("{e:#}").contains("cooldown is") {
+                return (StatusCode::TOO_MANY_REQUESTS, format!("{e:#}")).into_response();
             }
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    ModelError::ConfigFileInvalid(_) => {
+                        return super::error::config_file_invalid_response(model_err);
+                    }
                     // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
                     // envelope.
                     ModelError::TargetBusy(_)
@@ -1112,22 +1437,26 @@ pub async fn admin_resize_model(
                     | ModelError::EvictionIncomplete(_) => {
                         return eviction_refusal(model_err);
                     }
+                    ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+                        return super::error::load_stall_response(model_err);
+                    }
                     ModelError::NotFound(_) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                        return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::NotLoaded | ModelError::Loading | ModelError::Evicting => {
-                        return (StatusCode::CONFLICT, e.to_string()).into_response();
+                        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
                     }
                     ModelError::InsufficientMemory(_) => {
-                        // A predictable capacity refusal (nothing was evicted), not a fault.
-                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                        // A capacity refusal, not a fault: the model can never fit, or GenAI found too little
+                        // free device memory (MR-2, retry later); models already evicted are named.
+                        return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+                    }
+                    // D-04 S2: the same 503 `server_stopping` envelope as the inference routes.
+                    ModelError::ShuttingDown => {
+                        return super::error::model_error_response(ModelError::ShuttingDown);
                     }
                     ModelError::GpuPoisoned => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("{e} — restart rustedvino to recover (a graceful stop via SIGTERM/systemctl drains in-flight requests and frees VRAM first)"),
-                        )
-                            .into_response();
+                        return gpu_poisoned_admin(&e);
                     }
                     // FilesMissing/FilesIncomplete/WrongKind never originate
                     // from resize_model_kv_cache — completeness is only
@@ -1138,7 +1467,7 @@ pub async fn admin_resize_model(
                 }
             }
             tracing::error!(model_id, error = %e, "admin_resize_model failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
 }
@@ -1191,6 +1520,9 @@ pub async fn admin_unload_model(
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    ModelError::ConfigFileInvalid(_) => {
+                        return super::error::config_file_invalid_response(model_err);
+                    }
                     // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
                     // envelope.
                     ModelError::TargetBusy(_)
@@ -1198,11 +1530,14 @@ pub async fn admin_unload_model(
                     | ModelError::EvictionIncomplete(_) => {
                         return eviction_refusal(model_err);
                     }
+                    ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+                        return super::error::load_stall_response(model_err);
+                    }
                     ModelError::NotFound(_) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                        return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::NotLoaded | ModelError::Evicting | ModelError::Loading => {
-                        return (StatusCode::CONFLICT, e.to_string()).into_response();
+                        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
                     }
                     // L3 gate, eviction side (2026-08-04,
                     // the project's internal engineering log):
@@ -1210,8 +1545,13 @@ pub async fn admin_unload_model(
                     // poisoned, so this arm is reachable — mapped the same way
                     // model_error_response maps it for the load path.
                     // InsufficientMemory: a predictable capacity refusal, not a fault.
-                    ModelError::GpuPoisoned | ModelError::InsufficientMemory(_) => {
-                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                    // D-04 S2: the same 503 `server_stopping` envelope as the inference routes.
+                    ModelError::ShuttingDown => {
+                        return super::error::model_error_response(ModelError::ShuttingDown);
+                    }
+                    ModelError::GpuPoisoned => return gpu_poisoned_admin(&e),
+                    ModelError::InsufficientMemory(_) => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
                     }
                     // WrongKind/FilesMissing/FilesIncomplete never originate
                     // from evict_model — completeness is only checked before a load.
@@ -1221,7 +1561,7 @@ pub async fn admin_unload_model(
                 }
             }
             tracing::error!(model_id, error = %e, "admin_unload_model failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
 }
@@ -1264,6 +1604,9 @@ pub async fn admin_deregister_model(
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    ModelError::ConfigFileInvalid(_) => {
+                        return super::error::config_file_invalid_response(model_err);
+                    }
                     // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
                     // envelope.
                     ModelError::TargetBusy(_)
@@ -1271,25 +1614,26 @@ pub async fn admin_deregister_model(
                     | ModelError::EvictionIncomplete(_) => {
                         return eviction_refusal(model_err);
                     }
+                    ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+                        return super::error::load_stall_response(model_err);
+                    }
                     ModelError::NotFound(_) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                        return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::Loading | ModelError::Evicting => {
-                        return (StatusCode::CONFLICT, e.to_string()).into_response();
+                        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
                     }
                     ModelError::InsufficientMemory(_) => {
-                        // A predictable capacity refusal (nothing was evicted), not a fault.
-                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                        // A capacity refusal, not a fault: the model can never fit, or GenAI found too little
+                        // free device memory (MR-2, retry later); models already evicted are named.
+                        return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+                    }
+                    // D-04 S2: the same 503 `server_stopping` envelope as the inference routes.
+                    ModelError::ShuttingDown => {
+                        return super::error::model_error_response(ModelError::ShuttingDown);
                     }
                     ModelError::GpuPoisoned => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!(
-                                "{e} — restart rustedvino to recover (a graceful stop via \
-                                 SIGTERM/systemctl drains in-flight requests and frees VRAM first)"
-                            ),
-                        )
-                            .into_response();
+                        return gpu_poisoned_admin(&e);
                     }
                     // deregister_model only ever evicts a Ready model — NotLoaded,
                     // WrongKind, FilesMissing, and FilesIncomplete never originate
@@ -1301,7 +1645,7 @@ pub async fn admin_deregister_model(
                 }
             }
             tracing::error!(model_id, error = %e, "admin_deregister_model failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
 }
@@ -1384,6 +1728,9 @@ pub async fn admin_patch_model(
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
+                    ModelError::ConfigFileInvalid(_) => {
+                        return super::error::config_file_invalid_response(model_err);
+                    }
                     // D3: busy-eviction refusals and an incomplete forced eviction carry the JSON
                     // envelope.
                     ModelError::TargetBusy(_)
@@ -1391,15 +1738,23 @@ pub async fn admin_patch_model(
                     | ModelError::EvictionIncomplete(_) => {
                         return eviction_refusal(model_err);
                     }
+                    ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+                        return super::error::load_stall_response(model_err);
+                    }
                     ModelError::NotFound(_) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                        return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::Loading | ModelError::Evicting => {
-                        return (StatusCode::CONFLICT, e.to_string()).into_response();
+                        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
                     }
                     ModelError::InsufficientMemory(_) => {
-                        // A predictable capacity refusal (nothing was evicted), not a fault.
-                        return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+                        // A capacity refusal, not a fault: the model can never fit, or GenAI found too little
+                        // free device memory (MR-2, retry later); models already evicted are named.
+                        return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+                    }
+                    // D-04 S2: the same 503 `server_stopping` envelope as the inference routes.
+                    ModelError::ShuttingDown => {
+                        return super::error::model_error_response(ModelError::ShuttingDown);
                     }
                     ModelError::GpuPoisoned
                     | ModelError::NotLoaded
@@ -1408,7 +1763,7 @@ pub async fn admin_patch_model(
                     | ModelError::FilesIncomplete(..) => {} // never originate from patch_model
                 }
             }
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("config_path not set") {
                 return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
             }
@@ -1481,6 +1836,14 @@ struct AdmissionCheckResponse {
     ram_avail_gb: Option<f64>,
     /// `true` if the model is already loaded — the check is moot.
     already_loaded: bool,
+    /// Why the device-headroom gate (vision models on a discrete GPU) refuses the load even
+    /// after every eviction, when that gate is the one refusing. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headroom_refusal: Option<String>,
+    /// Why the check could not apply the model's own part of the device-headroom gate (it has
+    /// not been loaded on this server yet). Omitted when the gate was fully previewed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headroom_not_previewed: Option<String>,
 }
 
 /// Query string of `POST /v1/admin/models/{id}/check`, `DELETE /v1/admin/models/{id}` and
@@ -1564,15 +1927,17 @@ pub async fn admin_check_model(
                 ram_needed_gb: check.ram_needed_gb,
                 ram_avail_gb: check.ram_avail_gb,
                 already_loaded: check.already_loaded,
+                headroom_refusal: check.headroom_refusal,
+                headroom_not_previewed: check.headroom_not_previewed,
             }),
         )
             .into_response(),
         Err(e) => {
             if let Some(ModelError::NotFound(_)) = e.downcast_ref::<ModelError>() {
-                return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+                return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
             }
             tracing::error!(model_id, error = %e, "admin_check_model failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
 }
@@ -1730,24 +2095,55 @@ pub async fn admin_add_model(
         .add_model(req.model_id.clone(), req.vram_gb, req.kind, req.policy)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            format!("model '{}' added to config and loaded", req.model_id),
-        )
-            .into_response(),
-        Err(e) => {
-            if let Some(model_err) = e.downcast_ref::<crate::model_manager::ModelError>()
-                && matches!(model_err, crate::model_manager::ModelError::GpuPoisoned)
-            {
+        Ok(outcome) => {
+            let note = kv_pool_note(mm, &req.model_id);
+            let sep = if note.is_empty() { "" } else { ". " };
+            let Some(cause) = outcome.persist_error else {
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     format!(
-                        "{e} — restart rustedvino to recover \
-                         (a graceful stop via SIGTERM/systemctl drains in-flight \
-                         requests and frees VRAM first)"
+                        "model '{}' added to config and loaded{sep}{note}",
+                        req.model_id
                     ),
                 )
                     .into_response();
+            };
+            // Loaded and serving, but not durable: say so instead of an error that `rv ps`
+            // would contradict.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "message": format!(
+                        "model '{}' loaded, but NOT persisted to config.json — it will be gone \
+                         after a restart: {cause}{sep}{note}",
+                        req.model_id
+                    ),
+                    "persisted": false,
+                    "persist_error": cause,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            if let Some(model_err @ crate::model_manager::ModelError::ConfigFileInvalid(_)) =
+                e.downcast_ref::<crate::model_manager::ModelError>()
+            {
+                return super::error::config_file_invalid_response(model_err);
+            }
+            if let Some(model_err) = e.downcast_ref::<crate::model_manager::ModelError>()
+                && matches!(model_err, crate::model_manager::ModelError::GpuPoisoned)
+            {
+                return gpu_poisoned_admin(&e);
+            }
+            // D-04 S2: the load that follows the registration was refused because the server is
+            // stopping (registration rolled back) — the same 503 `server_stopping` as `/load`.
+            if matches!(
+                e.downcast_ref::<crate::model_manager::ModelError>(),
+                Some(crate::model_manager::ModelError::ShuttingDown)
+            ) {
+                return super::error::model_error_response(
+                    crate::model_manager::ModelError::ShuttingDown,
+                );
             }
             // D3: the load that follows the registration was refused because the room is held
             // by busy models (or a forced eviction is still finishing). The registration was
@@ -1761,7 +2157,7 @@ pub async fn admin_add_model(
             {
                 return eviction_refusal(model_err);
             }
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("already registered") {
                 return (StatusCode::CONFLICT, msg).into_response();
             }
@@ -1823,7 +2219,9 @@ struct ConfigReloadResponse {
 /// `ModelManager::reload_config`'s doc comment for why the two are split.
 ///
 /// - 200 OK — JSON [`ConfigReloadResponse`] summarising what changed
-/// - 500 Internal Server Error — file unreadable/invalid, has deprecated
+/// - 422 Unprocessable Entity — `config.json` cannot be read, parsed or validated (e.g. an unsupported
+///   `kv_cache_precision`); nothing was changed
+/// - 500 Internal Server Error — file unreadable, has deprecated
 ///   inline `api_keys`/`admin_api_keys` (migration tripwire — move them to
 ///   the keys file), or placement failed for a newly-added entry (e.g. an
 ///   explicit `device` this `OpenVINO` build doesn't enumerate)
@@ -1852,9 +2250,14 @@ pub async fn admin_reload_config(State(state): State<AppState>) -> Response {
         )
             .into_response(),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("config_path not set") {
                 return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
+            }
+            if msg.starts_with(crate::model_manager::CONFIG_INVALID_PREFIX) {
+                // The edited file is wrong, the server is fine: a 4xx, not a server fault.
+                tracing::warn!(error = %e, "admin_reload_config: config.json is invalid");
+                return (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response();
             }
             tracing::error!(error = %e, "admin_reload_config failed");
             (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
@@ -1966,7 +2369,7 @@ pub async fn admin_set_preload(
         )
             .into_response(),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("config_path not set") {
                 return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
             }
@@ -2046,7 +2449,7 @@ pub async fn admin_reload_keys(State(state): State<AppState>) -> Response {
         )
             .into_response(),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("keys_file_path") || msg.contains("no auth handle wired") {
                 return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
             }
@@ -2127,7 +2530,7 @@ pub async fn admin_audit_config(State(state): State<AppState>) -> Response {
         )
             .into_response(),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{e:#}");
             if msg.contains("config_path not set") {
                 return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
             }
@@ -2167,6 +2570,32 @@ pub async fn admin_logs_tail(
 // ============================================================
 // Unit tests
 // ============================================================
+/// An admin route refused on a poisoned GPU context (plain-text body, as `rv` prints it). G1
+/// (step 7): while a supervised worker is on its way to a restart, "retry shortly" +
+/// `Retry-After: 30`; otherwise the operator has to restart it.
+fn gpu_poisoned_admin(e: &impl std::fmt::Display) -> Response {
+    if crate::startup::gpu_poison_exit_requested() {
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e} — the worker is restarting (supervised) — retry shortly"),
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            super::error::RETRY_AFTER_WORKER_RESTART,
+        );
+        return resp;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "{e} — restart rustedvino to recover (a graceful stop via SIGTERM/systemctl drains \
+             in-flight requests and frees VRAM first)"
+        ),
+    )
+        .into_response()
+}
+
 /// The response for a refusal caused by the eviction policy (D3): `409` when an operator's
 /// eviction of a busy model was refused ([`ModelError::TargetBusy`]); `503` when a load was
 /// refused because the only room is held by busy models ([`ModelError::BlockedByBusy`], code
@@ -2188,7 +2617,7 @@ fn eviction_refusal(e: &ModelError) -> Response {
             "model_busy",
         ),
     };
-    let mut resp = super::error::openai_error(status, e.to_string(), err_type, Some(code));
+    let mut resp = super::error::openai_error(status, format!("{e:#}"), err_type, Some(code));
     resp.headers_mut().insert(
         axum::http::header::RETRY_AFTER,
         super::error::RETRY_AFTER_TRANSIENT,
@@ -2201,6 +2630,53 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::model_manager::KvClamp;
+
+    /// D-04 S9 review #13b: the watchdog's stalled entry carries `recovery`, `null` while the
+    /// load is inside its deadline; `rv status` reads exactly these keys.
+    #[test]
+    fn watchdog_stalled_entry_shape() {
+        let entry = |recovery: Option<&str>| {
+            serde_json::to_value(WatchdogStalled {
+                device: "GPU.1".to_owned(),
+                model: "m".to_owned(),
+                kind: "load",
+                secs: 7,
+                recovery: recovery.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            entry(None),
+            serde_json::json!({"device": "GPU.1", "model": "m", "kind": "load", "secs": 7,
+                               "recovery": null})
+        );
+        assert_eq!(entry(Some("reboot"))["recovery"], "reboot");
+    }
+
+    /// The resize sentence: an exact pool says what was built (not a false clamp), a clamped one
+    /// names the setting, an untouched whole-GiB pool stays terse.
+    #[test]
+    fn resize_message_covers_exact_clamped_and_plain_pools() {
+        // Exact pool, a hair under the request: no clamp talk.
+        let m = resize_message("m", 3.999_98, 4.0, Some(3_192), None);
+        assert!(
+            m.contains("(3192 KV blocks)") && !m.contains("clamped"),
+            "{m}"
+        );
+        // Exact pool, visibly different (the budget was smaller than asked) and not clamped by
+        // a named setting: the request is shown next to what was built.
+        let m = resize_message("m", 2.5, 4.0, Some(2_000), None);
+        assert!(m.contains("2000 KV blocks; requested 4"), "{m}");
+        // Clamped exact pool: the setting is named.
+        let m = resize_message("m", 2.0, 4.0, Some(1_600), Some(KvClamp::CacheSizeGb));
+        assert!(m.contains("clamped by"), "{m}");
+        // Whole-GiB pool, as asked.
+        assert_eq!(
+            resize_message("m", 4.0, 4.0, None, None),
+            "model 'm' resized to 4.00 GiB"
+        );
+    }
 
     /// D3-S1.B4/E5: eviction refusals use the JSON envelope with a `Retry-After`: 409
     /// `model_busy` for an eviction of a busy model, 503 `model_busy` for a load blocked by busy
@@ -2227,7 +2703,7 @@ mod tests {
                 "eviction_incomplete",
             ),
         ] {
-            let text = e.to_string();
+            let text = format!("{e:#}");
             let resp = eviction_refusal(&e);
             assert_eq!(resp.status(), status);
             assert_eq!(
@@ -2244,6 +2720,40 @@ mod tests {
         }
     }
 
+    /// S281 defect (a): an already-invalid config.json answers 409 with its own code, so `rv`
+    /// does not read it as a bare 409 ("already registered — use rv load").
+    #[tokio::test]
+    async fn config_file_invalid_is_a_409_with_its_own_code() {
+        let e = ModelError::ConfigFileInvalid("config.json (/x) is already invalid: boom".into());
+        let resp = super::super::error::config_file_invalid_response(&e);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "config_file_invalid");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not caused by this request")
+        );
+    }
+
+    /// G1 (step 7): an unsupervised (or not-restarting) worker keeps telling the operator to restart;
+    /// no `Retry-After`. (The restarting branch reads a process-global flag set only under
+    /// `--supervise`; it is covered live, Test 10.)
+    #[test]
+    fn gpu_poisoned_admin_without_a_pending_restart_says_restart() {
+        let resp = gpu_poisoned_admin(&"GPU context poisoned (out of resources)");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
     /// `HealthResponse` serialises to the exact JSON shape clients expect.
     #[test]
     fn health_response_serialises_correctly() {
@@ -2251,15 +2761,19 @@ mod tests {
             status: "ok",
             version: "1.2.3",
             git_hash: "abc123def456",
+            gpu_poisoned: false,
+            device_stalled: false,
         };
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["version"], "1.2.3");
         assert_eq!(json["git_hash"], "abc123def456");
+        assert_eq!(json["gpu_poisoned"], false);
+        assert_eq!(json["device_stalled"], false);
         assert_eq!(
             json.as_object().unwrap().len(),
-            3,
-            "HealthResponse must have exactly 3 fields"
+            5,
+            "HealthResponse must have exactly 5 fields"
         );
     }
 
@@ -2281,15 +2795,98 @@ mod tests {
             default_top_k: None,
             max_prompt_tokens: 37_137,
             cache_size_gb: 3.0,
+            kv_requested_gb: None,
+            clamped_by: None,
             native_context_limit: Some(40_960),
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
+            kv_cache_precision: None,
+            kv_precision_source: None,
+            kv_bytes_per_token: None,
+            kv_profile_confidence: None,
+            kv_gate_mode: "",
+            limit_clamped_by: None,
+            kv_pool_mib: 0,
+            kv_pool_blocks: None,
+            kv_headroom_cap_tokens: None,
+            vram_measured_mib: None,
+            kv_admission_low_confidence: false,
+            uncounted_image_admissions: 0,
         };
         let json = serde_json::to_value(entry).unwrap();
         assert_eq!(json["max_prompt_tokens"], 37_137);
         assert!((json["cache_size_gb"].as_f64().unwrap() - 3.0).abs() < f64::EPSILON);
         assert_eq!(json["native_context_limit"], 40_960);
+    }
+
+    /// The KV decision fields: present when known, omitted (never `null`) when not, and the pool
+    /// is always shown in MiB.
+    #[test]
+    fn admin_model_entry_shows_the_kv_decision_and_omits_unknowns() {
+        let mut entry = AdminModelEntry {
+            id: "qwen3-8b".to_owned(),
+            state: "ready",
+            kind: "text_gen",
+            vram_gb: 5.5,
+            device: "GPU.1".to_owned(),
+            default_temperature: None,
+            default_top_p: None,
+            default_top_k: None,
+            max_prompt_tokens: 86_381,
+            cache_size_gb: 3.9999,
+            kv_requested_gb: None,
+            clamped_by: None,
+            native_context_limit: None,
+            kv_cache_usage_pct: 0.0,
+            kv_pressure_flagged: false,
+            gpu_memory_estimate_gb: None,
+            kv_cache_precision: Some("u4"),
+            kv_precision_source: Some("auto_rule"),
+            kv_bytes_per_token: Some(47_232),
+            kv_profile_confidence: Some("high"),
+            kv_gate_mode: "exact",
+            limit_clamped_by: Some("pool"),
+            kv_pool_mib: mib_of_gib(3.9999),
+            kv_pool_blocks: Some(5_683),
+            kv_headroom_cap_tokens: None,
+            vram_measured_mib: None,
+            kv_admission_low_confidence: false,
+            uncounted_image_admissions: 0,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["kv_cache_precision"], "u4");
+        assert_eq!(json["kv_precision_source"], "auto_rule");
+        assert_eq!(json["kv_bytes_per_token"], 47_232);
+        assert_eq!(json["kv_profile_confidence"], "high");
+        assert_eq!(json["kv_gate_mode"], "exact");
+        assert_eq!(json["limit_clamped_by"], "pool");
+        assert_eq!(json["kv_pool_mib"], 4096);
+        assert_eq!(json["kv_pool_blocks"], 5_683);
+        assert!(json.get("kv_headroom_cap_tokens").is_none());
+        // Not loaded: everything optional disappears, the pool reads 0.
+        entry.kv_cache_precision = None;
+        entry.kv_precision_source = None;
+        entry.kv_bytes_per_token = None;
+        entry.kv_profile_confidence = None;
+        entry.kv_gate_mode = "";
+        entry.limit_clamped_by = None;
+        entry.kv_pool_mib = 0;
+        entry.kv_pool_blocks = None;
+        let json = serde_json::to_value(&entry).unwrap();
+        let obj = json.as_object().unwrap();
+        for k in [
+            "kv_cache_precision",
+            "kv_precision_source",
+            "kv_bytes_per_token",
+            "kv_profile_confidence",
+            "kv_gate_mode",
+            "limit_clamped_by",
+            "kv_pool_blocks",
+        ] {
+            assert!(!obj.contains_key(k), "{k} must be omitted: {json}");
+        }
+        assert_eq!(json["kv_pool_mib"], 0);
     }
 
     /// `native_context_limit` is omitted entirely (not `null`) when the
@@ -2309,10 +2906,24 @@ mod tests {
             default_top_k: None,
             max_prompt_tokens: 0,
             cache_size_gb: 0.0,
+            kv_requested_gb: None,
+            clamped_by: None,
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
+            kv_cache_precision: None,
+            kv_precision_source: None,
+            kv_bytes_per_token: None,
+            kv_profile_confidence: None,
+            kv_gate_mode: "",
+            limit_clamped_by: None,
+            kv_pool_mib: 0,
+            kv_pool_blocks: None,
+            kv_headroom_cap_tokens: None,
+            vram_measured_mib: None,
+            kv_admission_low_confidence: false,
+            uncounted_image_admissions: 0,
         };
         let json = serde_json::to_value(entry).unwrap();
         assert!(
@@ -2328,6 +2939,24 @@ mod tests {
     /// `openvino_version` are individually omitted (never `null`) when
     /// unavailable — same "omit, don't fabricate" contract
     /// `generation_metadata` uses.
+    /// An open (keyless) server's `server` block still carries the headroom report next to
+    /// `gpu_poisoned`, while host, pid and uptime stay withheld (`ServerInfo::current(false)`).
+    #[test]
+    fn keyless_server_block_has_headroom_but_no_identity() {
+        let mut info = ServerInfo::current(false);
+        info.headroom = Some(crate::model_manager::headroom::HeadroomReport {
+            mode: "dynamic".to_owned(),
+            probe: "fdinfo",
+            margin_gib: 0.5,
+            devices: Vec::new(),
+        });
+        let v = serde_json::to_value(info).unwrap();
+        assert_eq!(v["headroom"]["mode"], "dynamic");
+        assert_eq!(v["headroom"]["probe"], "fdinfo");
+        assert!(v.get("host").is_none() && v.get("pid").is_none());
+        assert!(v.get("uptime_secs").is_none());
+    }
+
     #[test]
     fn server_info_omits_unavailable_optional_fields() {
         let info = ServerInfo {
@@ -2338,6 +2967,9 @@ mod tests {
             engine: "RustedVINO",
             engine_version: "1.2.3",
             gpu_poisoned: false,
+            headroom: None,
+            startup_warnings: Vec::new(),
+            platform: None,
         };
         let value = serde_json::to_value(info).unwrap();
         let obj = value.as_object().unwrap();
@@ -2369,6 +3001,8 @@ mod tests {
         assert!(value.get("host").is_none(), "{value}");
         assert!(value.get("pid").is_none(), "{value}");
         assert!(value.get("uptime_secs").is_none(), "{value}");
+        assert!(value.get("startup_warnings").is_none(), "{value}");
+        assert!(value.get("platform").is_none(), "{value}");
         assert_eq!(value["engine"], "RustedVINO");
     }
 
@@ -2393,6 +3027,7 @@ mod tests {
                 created: 1_700_000_000,
                 owned_by: "rustedvino",
                 max_model_len: Some(37_137),
+                state: None,
             }],
         };
         let json = serde_json::to_value(response).unwrap();
@@ -2420,6 +3055,7 @@ mod tests {
             created: 1_700_000_000,
             owned_by: "rustedvino",
             max_model_len: None,
+            state: None,
         };
         let json = serde_json::to_value(obj).unwrap();
         assert!(
@@ -2452,16 +3088,26 @@ mod tests {
         crate::model_manager::ModelInfo {
             id: id.to_owned(),
             state,
+            stalled_secs: None,
             kind,
             vram_gb: 0.0,
             device: "CPU".to_owned(),
             generation_defaults: crate::model_manager::template::GenerationDefaults::default(),
             max_prompt_tokens: 0,
             kv_cache_gb: 0.0,
+            kv_requested_gb: None,
+            kv_clamped_by: None,
+            kv_pool_blocks: None,
+            kv_resolution: None,
+            kv_headroom_cap_tokens: None,
+            vram_measured_mib: None,
+            kv_gate_mode: "",
+            kv_gate_clamped_by: None,
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
+            uncounted_image_admissions: 0,
         }
     }
 
@@ -2577,6 +3223,8 @@ mod tests {
             ram_needed_gb: None,
             ram_avail_gb: None,
             already_loaded: false,
+            headroom_refusal: None,
+            headroom_not_previewed: None,
         };
         let v = serde_json::to_value(r).unwrap();
         assert_eq!(v["model"], "qwen3-8b");
@@ -2590,6 +3238,35 @@ mod tests {
         // saw before this field pair existed.
         assert!(v.get("ram_needed_gb").is_none());
         assert!(v.get("ram_avail_gb").is_none());
+        // F1: the headroom keys appear only when they say something.
+        assert!(v.get("headroom_refusal").is_none());
+        assert!(v.get("headroom_not_previewed").is_none());
+    }
+
+    /// F1/A2: a headroom refusal and an unpreviewed headroom gate are both reported.
+    #[test]
+    fn admission_check_response_reports_the_headroom_gate() {
+        let r = AdmissionCheckResponse {
+            model: "qwen3.6-27b-int4-ov".to_owned(),
+            fits: false,
+            needed_gb: 19.7,
+            free_gb: 2.5,
+            vram_gated: true,
+            would_evict: Vec::new(),
+            busy_victims: Vec::new(),
+            blocked_by_busy: Vec::new(),
+            ram_needed_gb: None,
+            ram_avail_gb: None,
+            already_loaded: false,
+            headroom_refusal: Some("the device headroom leaves room for 0.91 GiB".to_owned()),
+            headroom_not_previewed: Some("not loaded here yet".to_owned()),
+        };
+        let v = serde_json::to_value(r).unwrap();
+        assert_eq!(
+            v["headroom_refusal"],
+            "the device headroom leaves room for 0.91 GiB"
+        );
+        assert_eq!(v["headroom_not_previewed"], "not loaded here yet");
     }
 
     /// UMA shape: when the RAM gate applies, both keys are present.
@@ -2607,6 +3284,8 @@ mod tests {
             ram_needed_gb: Some(24.0),
             ram_avail_gb: Some(23.0),
             already_loaded: false,
+            headroom_refusal: None,
+            headroom_not_previewed: None,
         };
         let v = serde_json::to_value(r).unwrap();
         assert_eq!(v["ram_needed_gb"], 24.0);
@@ -2728,6 +3407,265 @@ mod tests {
             crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
         );
         (app, permit, mm)
+    }
+
+    /// E-12 / U-27: a router over a mock manager with one GPU-placed and one CPU-placed model,
+    /// both loaded; the returned manager lets the test poison the GPU context.
+    async fn gpu_and_cpu_router() -> (
+        axum::Router,
+        std::sync::Arc<crate::model_manager::ModelManager>,
+    ) {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-admin-poison-models", "device": "GPU.1", "total_vram_gb": 22.5,
+            "models": { "gpu-m": {"vram_gb": 2.0}, "cpu-m": {"vram_gb": 1.0, "device": "CPU"} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        mm.load_model("gpu-m").await.unwrap();
+        mm.load_model("cpu-m").await.unwrap();
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        (app, mm)
+    }
+
+    /// E-12: before poisoning nothing changes; after, `/health` keeps 200 and says so,
+    /// `/health_generate` refuses before probing, GPU models read `unavailable
+    /// (gpu_poisoned)` in the admin list and `/v1/models`, CPU models stay `ready`.
+    #[tokio::test]
+    async fn gpu_poison_is_visible_on_health_probe_and_model_lists() {
+        let (app, mm) = gpu_and_cpu_router().await;
+
+        let (status, health) = send(&app, "GET", "/health", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["gpu_poisoned"], false);
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        let state_of = |v: &serde_json::Value, id: &str| {
+            v["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .map(|m| m["state"].clone())
+        };
+        assert_eq!(state_of(&admin, "gpu-m"), Some("ready".into()));
+        let (_, v1) = send(&app, "GET", "/v1/models", "").await;
+        assert!(
+            v1["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("state").is_none()),
+            "no state key on a healthy server: {v1}"
+        );
+
+        mm.poison_for_test();
+
+        let (status, health) = send(&app, "GET", "/health", "").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "liveness probe keeps its status code"
+        );
+        assert_eq!(health["gpu_poisoned"], true);
+        let (status, hg) = send(&app, "GET", "/health_generate", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hg["error"], "gpu_poisoned", "{hg}");
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        assert_eq!(
+            state_of(&admin, "gpu-m"),
+            Some("unavailable (gpu_poisoned)".into())
+        );
+        assert_eq!(state_of(&admin, "cpu-m"), Some("ready".into()));
+        let (_, v1) = send(&app, "GET", "/v1/models", "").await;
+        let v1_state = |id: &str| {
+            v1["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .map(|m| m.get("state").cloned())
+        };
+        assert_eq!(
+            v1_state("gpu-m"),
+            Some(Some("unavailable (gpu_poisoned)".into()))
+        );
+        assert_eq!(
+            v1_state("cpu-m"),
+            Some(None),
+            "CPU model carries no state key"
+        );
+        assert!(mm.metrics_snapshot().gpu_poisoned);
+    }
+
+    /// `add` validates a per-model `kv_cache_precision` (it used to refuse the key), and a tiny
+    /// pool request is not printed as 0.00.
+    #[tokio::test]
+    async fn add_takes_a_per_model_kv_cache_precision_and_small_pools_print_exactly() {
+        let models = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(models.path().join("x")).unwrap();
+        std::fs::create_dir_all(models.path().join("y")).unwrap();
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::new(
+                crate::model_manager::ModelManager::new(
+                    serde_json::from_value(serde_json::json!({
+                        "models_dir": models.path().to_str().unwrap(), "device": "CPU",
+                        "total_vram_gb": 0.0
+                    }))
+                    .unwrap(),
+                    std::sync::Arc::new(
+                        crate::model_manager::lifecycle::MockEngineFactory::default(),
+                    ),
+                )
+                .await
+                .unwrap(),
+            )),
+        );
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/add",
+            r#"{"model_id":"x","vram_gb":0.0,"kv_cache_precision":"u4"}"#,
+        )
+        .await;
+        // A per-model precision is a policy field now: an unknown value is refused with the
+        // accepted list (the model directory does not exist either way), a valid one is read.
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/add",
+            r#"{"model_id":"y","vram_gb":0.0,"kv_cache_precision":"bogus"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.as_str().unwrap().contains("kv_cache_precision"),
+            "{body}"
+        );
+        assert_eq!(fmt_gib(0.001), "0.001");
+        assert_eq!(fmt_gib(2.0), "2.00");
+        assert_eq!(fmt_gib(4.004), "4.00");
+        assert_eq!(fmt_gib(0.0), "0.00");
+    }
+
+    /// Family-smoke B1x / mismatch-cell M3b: an invalid `config.json` makes the reload answer 422
+    /// (not 500) with the accepted-values text, and a valid one 200.
+    #[tokio::test]
+    async fn reload_answers_422_for_an_invalid_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let write = |precision: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"models_dir":"/tmp/test-admin-reload-422","device":"CPU","total_vram_gb":0.0,"kv_cache_precision":"{precision}"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write("u8");
+        let mm = crate::model_manager::ModelManager::new(
+            crate::model_manager::Config::load(&path).unwrap(),
+            std::sync::Arc::new(crate::model_manager::lifecycle::MockEngineFactory::default()),
+        )
+        .await
+        .unwrap()
+        .with_config_path(path.clone());
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::new(mm)),
+        );
+        write("f32");
+        let (status, body) = send(&app, "POST", "/v1/admin/config/reload", "").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.as_str().unwrap().contains("accepted values"), "{body}");
+        write("u8");
+        let (status, body) = send(&app, "POST", "/v1/admin/config/reload", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// E-09: a request the server could not honour says so — in the load/add sentence and in
+    /// `/v1/admin/models` (`kv_requested_gb`, `clamped_by`) — instead of reporting plain success.
+    #[tokio::test]
+    async fn clamped_kv_pool_is_reported_on_load_and_in_the_model_list() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-admin-clamp-models", "device": "GPU.1", "total_vram_gb": 22.5,
+            "cache_size_gb": 2.0,
+            "models": { "big-ask": {"vram_gb": 2.0}, "no-ask": {"vram_gb": 2.0}, "frac-ask": {"vram_gb": 2.0} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/big-ask/load",
+            r#"{"kv_cache_gb": 4.0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body.as_str().unwrap();
+        assert!(
+            text.contains("KV pool 2.00 GiB (requested 4.00")
+                && text.contains("clamped by cache_size_gb"),
+            "{text}"
+        );
+        // A fractional request is rounded up, and the sentence says that (not "clamped").
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/frac-ask/load",
+            r#"{"kv_cache_gb": 1.21}"#,
+        )
+        .await;
+        let text = body.as_str().unwrap();
+        assert!(
+            text.contains("KV pool 2.00 GiB (requested 1.21")
+                && text.contains("rounded up to whole GiB"),
+            "{text}"
+        );
+        let (status, body) = send(&app, "POST", "/v1/admin/models/no-ask/load", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body, "model 'no-ask' loaded",
+            "no request, no clamp sentence"
+        );
+
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        let entry = |id: &str| {
+            admin["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let big = entry("big-ask");
+        assert_eq!(big["cache_size_gb"], 2.0);
+        assert_eq!(big["kv_requested_gb"], 4.0);
+        assert_eq!(big["clamped_by"], "cache_size_gb");
+        let none = entry("no-ask");
+        assert!(none.get("clamped_by").is_none() && none.get("kv_requested_gb").is_none());
     }
 
     async fn send(

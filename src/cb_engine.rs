@@ -94,6 +94,20 @@ const MAX_SETTLE_STEPS: usize = 16;
 /// real throughput shifts within a few steps.
 const TPS_EMA_ALPHA: f64 = 0.3;
 
+/// Prompt tokens one CB step may process: `GenAI`'s `SchedulerConfig::max_num_batched_tokens`
+/// default (256, with `dynamic_split_fuse` on), which `ov_bridge` does not override. A step is
+/// one decode iteration or one prefill chunk of at most this many tokens.
+const CB_PREFILL_CHUNK_TOKENS: u64 = 256;
+
+/// How long one CB step may run before the watchdog counts it (step 6d): one prefill chunk at
+/// the watchdog's prefill floor (the VLM clock's assumption), 1.28 s. The watchdog kills only
+/// past this plus `watchdog_hang_ceiling_secs`, so a slow but healthy step is never at risk.
+fn cb_step_allowance() -> Duration {
+    Duration::from_millis(
+        CB_PREFILL_CHUNK_TOKENS * 1000 / crate::vlm_engine::WATCHDOG_PREFILL_FLOOR_TOK_S,
+    )
+}
+
 /// Fold a fresh throughput sample into the running EMA.
 ///
 /// The first sample (when `current == 0.0`) seeds the average directly, so the
@@ -649,7 +663,8 @@ pub fn spawn_engine(
     let cache_usage_engine = Arc::clone(&cache_usage);
 
     // Resolve the metric label handles once, here, off the hot path.
-    let metrics = HotMetrics::new(ModelKind::TextGen, model_id, device);
+    let metrics =
+        HotMetrics::new(ModelKind::TextGen, model_id, device).with_kv_scheduler_drops(model_id);
 
     // Owned copies for the engine thread's lifecycle logs (model_id + kind on
     // every path — R2). These are off the per-token hot path.
@@ -665,13 +680,21 @@ pub fn spawn_engine(
                 device = device_log,
                 "CB engine thread started"
             );
+            // Step 6d: registered once per engine; each step is one atomic store at each end.
+            let step_slot = crate::ffi_watch::global().register_step_slot(
+                &model_id_log,
+                Some(&device_log),
+                cb_step_allowance(),
+            );
             engine_loop(
                 engine,
                 cmd_rx,
                 metrics,
                 shutting_down_engine,
                 cache_usage_engine,
+                &step_slot,
             );
+            drop(step_slot);
             tracing::info!(
                 model_id = model_id_log,
                 kind = ModelKind::TextGen.label(),
@@ -807,6 +830,7 @@ fn engine_loop<E: CbEngineOps>(
     metrics: HotMetrics,
     shutting_down: Arc<AtomicBool>,
     cache_usage: Arc<AtomicU64>,
+    step_slot: &crate::ffi_watch::StepSlot<'_>,
 ) {
     // request_id → routing + timing state for that request.
     let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
@@ -877,7 +901,7 @@ fn engine_loop<E: CbEngineOps>(
         //    or, if the channel is already closed, exit: nothing left to wait
         //    for.
         if engine.has_unfinished() {
-            step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema);
+            step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema, step_slot);
             // Slice 3a: publish live KV occupancy for /metrics. `get_metrics()`
             // is a cached-struct read, so this is negligible against the step
             // we just ran. On FFI failure keep the prior value (don't flap to 0).
@@ -922,7 +946,10 @@ fn engine_loop<E: CbEngineOps>(
     // settles (a cancelled-only batch steps quickly — no tokens generated).
     let mut settle = 0;
     while engine.has_unfinished() && settle < MAX_SETTLE_STEPS {
-        if let Err(e) = engine.step(|_, _, _, _, _| {}) {
+        let run = step_slot.running(Instant::now());
+        let settled = engine.step(|_, _, _, _, _| {});
+        drop(run);
+        if let Err(e) = settled {
             tracing::warn!(error = %e, "settle step failed during engine shutdown");
             break;
         }
@@ -1144,6 +1171,7 @@ fn step_and_route<E: CbEngineOps>(
     routes: &mut HashMap<u64, ActiveRequest>,
     metrics: &HotMetrics,
     tps_ema: &mut f64,
+    step_slot: &crate::ffi_watch::StepSlot<'_>,
 ) {
     let mut finished: Vec<u64> = Vec::new();
     let mut disconnected: Vec<u64> = Vec::new();
@@ -1151,6 +1179,8 @@ fn step_and_route<E: CbEngineOps>(
     let mut tokens_this_step: u64 = 0;
     let step_start = Instant::now();
 
+    // Step 6d: visible to the watchdog and the exit decision while the OpenVINO step runs.
+    let step_run = step_slot.running(step_start);
     let step_result = engine.step(|id, delta, new_tokens, finish, pool_exhausted| {
         // Captured before the `get_mut` borrow below (which would otherwise
         // conflict with a second borrow of `routes` for its length): how many
@@ -1184,6 +1214,7 @@ fn step_and_route<E: CbEngineOps>(
             }
             if let Some(reason) = finish {
                 if pool_exhausted {
+                    metrics.kv_scheduler_drop();
                     // 2026-08-21 (found live, instant-EOS-stall investigation):
                     // confirmed by direct instrumentation that requests here hit
                     // GenerationStatus::IGNORED — the CB scheduler's KV-pool ran
@@ -1226,6 +1257,15 @@ fn step_and_route<E: CbEngineOps>(
             finished.push(id);
         }
     });
+    drop(step_run);
+    #[cfg(feature = "fault-injection")]
+    let step_result = if crate::fault_injection::poison_this_step() {
+        Err(anyhow::anyhow!(
+            crate::fault_injection::INJECTED_POISON_TEXT
+        ))
+    } else {
+        step_result
+    };
 
     // Throughput sample: this step's aggregate tokens over its wall-time,
     // folded into the EMA gauge. One Instant read per step, off the token loop.
@@ -1302,6 +1342,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// 6d: the per-step allowance is one prefill chunk at the watchdog's prefill floor.
+    #[test]
+    fn cb_step_allowance_is_one_chunk_at_the_prefill_floor() {
+        assert_eq!(cb_step_allowance(), Duration::from_millis(1280));
+    }
 
     /// Deterministic stand-in for `OvCbEngine`, used only to exercise
     /// `engine_loop`'s draining logic without a real GPU pipeline.
@@ -1417,7 +1463,14 @@ mod tests {
         let thread = std::thread::spawn({
             let shutting_down = Arc::clone(&shutting_down);
             let cache_usage = Arc::clone(&cache_usage);
-            move || engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage)
+            move || {
+                let slot = crate::ffi_watch::global().register_step_slot(
+                    "fake-model",
+                    None,
+                    Duration::ZERO,
+                );
+                engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage, &slot);
+            }
         });
 
         // A request that needs 3 fake steps to finish (see FakeEngine's doc:
@@ -1502,7 +1555,14 @@ mod tests {
         let thread = std::thread::spawn({
             let shutting_down = Arc::clone(&shutting_down);
             let cache_usage = Arc::clone(&cache_usage);
-            move || engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage)
+            move || {
+                let slot = crate::ffi_watch::global().register_step_slot(
+                    "fake-model",
+                    None,
+                    Duration::ZERO,
+                );
+                engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage, &slot);
+            }
         });
 
         // A request that would need 100 fake steps to finish naturally.
@@ -2016,14 +2076,35 @@ mod tests {
         }
 
         let mut engine = PoolExhaustedFakeEngine { exhausted_id: 99 };
-        let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU");
+        let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU")
+            .with_kv_scheduler_drops("fake-model");
         let mut tps_ema = 0.0;
-        step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema);
+        let slot =
+            crate::ffi_watch::global().register_step_slot("fake-model", None, Duration::ZERO);
+        step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema, &slot);
 
         match rx.try_recv().unwrap() {
             StreamEvent::Error(msg) => msg,
             other => panic!("expected an Error event, got {other:?}"),
         }
+    }
+
+    /// A request the scheduler ignored for lack of pool room is counted (U-25) - once, for the
+    /// model that owns the engine.
+    #[test]
+    fn pool_exhaustion_increments_the_scheduler_drop_counter() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            // Two other requests share the step: only the exhausted one is counted.
+            let _ = run_pool_exhausted_step(1_000, 2);
+            let out = handle.render();
+            assert!(
+                out.lines()
+                    .any(|l| l == "rustedvino_kv_scheduler_drop_total{model=\"fake-model\"} 1"),
+                "{out}"
+            );
+        });
     }
 
     /// Solo failure (no other request in flight against this engine): the

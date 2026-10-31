@@ -87,6 +87,19 @@ pub fn manifest_root(ov_cache_dir: Option<&str>) -> Option<PathBuf> {
     default_cache_root().map(|base| base.join("cache_manifest"))
 }
 
+/// Where the learned KV-capacity ceilings (the ratchet) live: beside `ov_cache_dir` as
+/// `kv_ratchet/` when that is set, else in the per-user cache — never in the model library,
+/// which is shared between servers and builds and may be read-only.
+#[must_use]
+pub fn ratchet_root(ov_cache_dir: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = ov_cache_dir.filter(|d| !d.is_empty())
+        && let Some(parent) = Path::new(dir).parent()
+    {
+        return Some(parent.join("kv_ratchet"));
+    }
+    default_cache_root().map(|base| base.join("kv_ratchet"))
+}
+
 fn default_cache_root() -> Option<PathBuf> {
     user_cache_base(
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
@@ -163,42 +176,71 @@ pub fn write_device_blobs_entry(
     commit(root, model_id, &file);
 }
 
-/// A flat snapshot of file names directly inside `ov_cache_dir` — not
-/// recursive; `OpenVINO`'s own cache directory is a flat population of
-/// content-hash-named blob/kernel-cache files, no subdirectories
-/// (the project's internal engineering log, 2026-07-28 finding). Best-effort:
-/// an unreadable directory yields an empty snapshot rather than an error —
-/// blob attribution degrading to "nothing captured" must never fail a load.
+/// Names of the per-KV-precision blob-cache subdirectories (E-17). `OpenVINO`'s blob id does not
+/// include `KV_CACHE_PRECISION` on 2026.4.x, so a blob compiled for one precision is silently
+/// reused for another; keeping one directory per *passed* precision string avoids the clash.
+pub const KV_DIR_PREFIX: &str = "kv-";
+
+/// The cache subdirectory for the `KV_CACHE_PRECISION` string handed to the plugin.
+///
+/// The tag follows the **passed string**, never the precision the plugin would resolve: `""`
+/// (nothing passed, plugin default) is its own directory, so a wrong guess about the default
+/// can never put a blob in the wrong place. Lower-case only. No tag ends in `.bin` (`OpenVINO`
+/// treats a `CACHE_DIR` ending in `.bin` as single-file storage).
+///
+/// Whoever starts passing another `KEY_/VALUE_CACHE_*` property to the plugin must add it to the
+/// tag here; a test over `ov_bridge.cpp` fails when a new one appears.
+///
+/// # Errors
+/// Any string other than `""`, `u8`, `i8`, `u4`, `i4`, `f16`, `f32`.
+pub fn kv_cache_subdir(passed: &str) -> anyhow::Result<&'static str> {
+    Ok(match passed {
+        "" => "kv-auto",
+        "u8" | "i8" => "kv-i8",
+        "u4" | "i4" => "kv-u4",
+        "f16" => "kv-f16",
+        "f32" => "kv-f32",
+        other => anyhow::bail!("no blob-cache directory for KV precision {other:?}"),
+    })
+}
+
+/// `^kv-[a-z0-9]+$` - the only subdirectory names the cache walkers look into.
 #[must_use]
-pub fn snapshot_cache_dir(ov_cache_dir: &Path) -> std::collections::HashSet<String> {
-    let Ok(entries) = std::fs::read_dir(ov_cache_dir) else {
-        return std::collections::HashSet::new();
+pub fn is_kv_subdir(name: &str) -> bool {
+    name.strip_prefix(KV_DIR_PREFIX).is_some_and(|tag| {
+        !tag.is_empty()
+            && tag
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+/// The directory part of a manifest/walker file name: `Some("kv-u4")` for `"kv-u4/x.blob"`,
+/// `None` for a bare name (a file directly in the cache root).
+#[must_use]
+pub fn blob_dir(name: &str) -> Option<&str> {
+    name.split_once('/').map(|(dir, _)| dir)
+}
+
+/// Whether a manifest entry is a name this module could have produced: a bare file name or
+/// `kv-<tag>/<file>`, never absolute, never `..`, never a backslash path. Anything else is
+/// ignored by the owner index, so a hand-edited or corrupt manifest cannot point the prune
+/// pass outside the cache directory.
+fn is_valid_blob_name(name: &str) -> bool {
+    let plain = |part: &str| {
+        !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', '/', ':'])
     };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect()
+    match name.split_once('/') {
+        None => plain(name),
+        Some((dir, file)) => is_kv_subdir(dir) && plain(file),
+    }
 }
 
-/// One file found directly inside `ov_cache_dir` (name, size, mtime) — the
-/// prune pass (the project's internal engineering log) uses this to compute
-/// total size and pick eviction order among candidates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheDirEntry {
-    pub file_name: String,
-    pub size_bytes: u64,
-    pub mtime: std::time::SystemTime,
-}
-
-/// Lists every regular file directly inside `ov_cache_dir` with its size and
-/// mtime — not recursive, same "OV's cache dir is flat" basis as
-/// [`snapshot_cache_dir`]. Best-effort: an unreadable directory or a file
-/// whose metadata can't be read yields an empty/partial list, never an
-/// error — pruning must degrade to "did nothing this pass," not a crash.
-#[must_use]
-pub fn list_cache_dir_entries(ov_cache_dir: &Path) -> Vec<CacheDirEntry> {
-    let Ok(entries) = std::fs::read_dir(ov_cache_dir) else {
+/// Regular files directly inside `dir`, named `<prefix>/<file>` (or just `<file>` without a
+/// prefix). Best-effort: an unreadable directory or a file whose metadata cannot be read is
+/// skipped, never an error - blob attribution and pruning degrade to "did nothing".
+fn list_dir_files(dir: &Path, prefix: Option<&str>) -> Vec<CacheDirEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
@@ -208,8 +250,9 @@ pub fn list_cache_dir_entries(ov_cache_dir: &Path) -> Vec<CacheDirEntry> {
             if !meta.is_file() {
                 return None;
             }
+            let name = e.file_name().into_string().ok()?;
             Some(CacheDirEntry {
-                file_name: e.file_name().into_string().ok()?,
+                file_name: prefix.map_or(name.clone(), |p| format!("{p}/{name}")),
                 size_bytes: meta.len(),
                 mtime: meta.modified().ok()?,
             })
@@ -217,14 +260,88 @@ pub fn list_cache_dir_entries(ov_cache_dir: &Path) -> Vec<CacheDirEntry> {
         .collect()
 }
 
-/// Reverse index (blob file name → owning `model_id`), built by reading every
-/// manifest file under `root` and flattening each model's `devices` map.
-/// Best-effort: any manifest that fails to parse simply contributes nothing —
-/// its blobs fall back to "unattributed" for the prune pass, same as a blob
-/// from before this feature shipped.
+/// A snapshot of the file names directly inside `ov_cache_dir` - the root only, not the `kv-*`
+/// subdirectories. Used for the kinds that cache in the root (NPU, whisper, image, ...); a
+/// KV engine's directory is snapshotted with [`snapshot_cache_scope`]. Best-effort: an
+/// unreadable directory yields an empty snapshot rather than an error - blob attribution
+/// degrading to "nothing captured" must never fail a load.
 #[must_use]
-pub fn blob_owner_index(root: &Path) -> std::collections::HashMap<String, String> {
-    let mut index = std::collections::HashMap::new();
+pub fn snapshot_cache_dir(ov_cache_dir: &Path) -> std::collections::HashSet<String> {
+    snapshot_cache_scope(ov_cache_dir, None)
+}
+
+/// Like [`snapshot_cache_dir`] for the directory a load actually hands to the engine: the root
+/// (`subdir = None`) or `root/<subdir>`. Names carry the `<subdir>/` prefix, the form the
+/// manifest stores.
+#[must_use]
+pub fn snapshot_cache_scope(
+    ov_cache_dir: &Path,
+    subdir: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let dir = subdir.map_or_else(|| ov_cache_dir.to_path_buf(), |s| ov_cache_dir.join(s));
+    list_dir_files(&dir, subdir)
+        .into_iter()
+        .map(|e| e.file_name)
+        .collect()
+}
+
+/// One file found in the cache (name, size, mtime) - the prune pass (the project's internal
+/// engineering log) uses this to compute total size and pick eviction order among candidates.
+/// `file_name` is relative to `ov_cache_dir`, components joined with `/` on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDirEntry {
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub mtime: std::time::SystemTime,
+}
+
+/// Lists every regular file in `ov_cache_dir` with its size and mtime: the files of the root
+/// plus the files of its direct `kv-*` subdirectories (see [`is_kv_subdir`]). One level only,
+/// symlinked directories are not followed, any other subdirectory is ignored. Shared by the
+/// size gauge and the prune pass. Best-effort like [`snapshot_cache_dir`].
+#[must_use]
+pub fn list_cache_dir_entries(ov_cache_dir: &Path) -> Vec<CacheDirEntry> {
+    let mut out = list_dir_files(ov_cache_dir, None);
+    let Ok(entries) = std::fs::read_dir(ov_cache_dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        // `DirEntry::file_type` does not follow symlinks, so a link named `kv-x` is skipped.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if is_kv_subdir(&name) {
+            out.extend(list_dir_files(&entry.path(), Some(&name)));
+        }
+    }
+    out
+}
+
+/// Creates `root/<subdir>` and proves it is writable, so `OpenVINO` (which throws on a
+/// `CACHE_DIR` it cannot create) is never handed a directory that will fail.
+///
+/// # Errors
+/// The directory cannot be created or written to (e.g. a regular file has its name).
+pub fn ensure_writable_subdir(root: &Path, subdir: &str) -> std::io::Result<PathBuf> {
+    let dir = root.join(subdir);
+    std::fs::create_dir_all(&dir)?;
+    let probe = dir.join(".rv-write-probe");
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(dir)
+}
+
+/// Every `(model_id, device)` that the manifests under `root` attribute each blob name to.
+/// Names are as stored: bare for the cache root, `kv-<tag>/<file>` for a keyed directory.
+/// Entries that are not valid names (see [`is_valid_blob_name`]) are dropped. Best-effort: a
+/// manifest that fails to parse contributes nothing - its blobs are "unattributed".
+#[must_use]
+pub fn blob_owners(root: &Path) -> std::collections::HashMap<String, Vec<(String, String)>> {
+    let mut index: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return index;
     };
@@ -240,13 +357,31 @@ pub fn blob_owner_index(root: &Path) -> std::collections::HashMap<String, String
         let Some(file) = read(root, model_id) else {
             continue;
         };
-        for device_blobs in file.devices.values() {
-            for blob_name in &device_blobs.blob_file_names {
-                index.insert(blob_name.clone(), model_id.to_owned());
+        for (device, device_blobs) in &file.devices {
+            for blob_name in device_blobs
+                .blob_file_names
+                .iter()
+                .filter(|n| is_valid_blob_name(n))
+            {
+                index
+                    .entry(blob_name.clone())
+                    .or_default()
+                    .push((model_id.to_owned(), device.clone()));
             }
         }
     }
     index
+}
+
+/// Reverse index (blob name -> owning `model_id`), built from [`blob_owners`]. When several
+/// models claim one name the last one read wins (as before; the prune pass uses
+/// [`blob_owners`] and keeps every claimant).
+#[must_use]
+pub fn blob_owner_index(root: &Path) -> std::collections::HashMap<String, String> {
+    blob_owners(root)
+        .into_iter()
+        .filter_map(|(name, owners)| owners.last().map(|(m, _)| (name, m.clone())))
+        .collect()
 }
 
 /// Serializes `file` and commits it to `<root>/<model_id>.json` via temp
@@ -277,9 +412,23 @@ fn commit(root: &Path, model_id: &str, file: &ManifestFile) {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The ratchet sits beside `ov_cache_dir` when set, never in the model library.
+    #[test]
+    fn ratchet_root_is_beside_the_ov_cache_dir() {
+        assert_eq!(
+            ratchet_root(Some("/srv/rv/ovcache")),
+            Some(PathBuf::from("/srv/rv/kv_ratchet"))
+        );
+        assert_eq!(
+            ratchet_root(Some("")),
+            default_cache_root().map(|b| b.join("kv_ratchet"))
+        );
+    }
 
     fn sample_entry() -> ModelHashEntry {
         ModelHashEntry {
@@ -527,5 +676,202 @@ mod tests {
         assert_eq!(index.get("b1.blob"), Some(&"model-b".to_owned()));
         assert_eq!(index.get("b2.blob"), Some(&"model-b".to_owned()));
         assert_eq!(index.get("never-seen.blob"), None);
+    }
+
+    /// The tag follows the passed string, case-sensitively, and no tag can be read as a
+    /// single-file `*.bin` cache (U-C23).
+    #[test]
+    fn kv_cache_subdir_follows_the_passed_string() {
+        for (passed, tag) in [
+            ("", "kv-auto"),
+            ("u8", "kv-i8"),
+            ("i8", "kv-i8"),
+            ("u4", "kv-u4"),
+            ("i4", "kv-u4"),
+            ("f16", "kv-f16"),
+            ("f32", "kv-f32"),
+        ] {
+            let got = kv_cache_subdir(passed).unwrap();
+            assert_eq!(got, tag, "passed {passed:?}");
+            assert!(!got.to_ascii_lowercase().ends_with(".bin"));
+            assert!(is_kv_subdir(got));
+        }
+        assert!(kv_cache_subdir("bogus").is_err());
+        assert!(kv_cache_subdir("U8").is_err());
+        assert!(
+            kv_cache_subdir("auto").is_err(),
+            "auto is normalised to \"\" before the bridge"
+        );
+    }
+
+    /// Guard for the day another KV property is passed to the plugin (U-C24): the bridge sets
+    /// the KV precision in exactly three places (the text engine, and the vision pipeline in its
+    /// plain and per-role forms), all fed by `kv_precision_type`, which maps only the three
+    /// strings the tag knows - no string-named setting, no separate key/value cache properties.
+    #[test]
+    fn bridge_passes_no_kv_property_the_cache_tag_does_not_cover() {
+        let src = include_str!("../ov_bridge/ov_bridge.cpp");
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let code_text = code.join("\n");
+        // The three places that set the property.
+        assert_eq!(
+            code_text.matches("ov::hint::kv_cache_precision(").count(),
+            2
+        );
+        assert_eq!(
+            code_text
+                .matches("ov::hint::kv_cache_precision.name()")
+                .count(),
+            1
+        );
+        assert!(!code_text.contains("\"KV_CACHE_PRECISION\""));
+        // The mapping: three strings, nothing else.
+        let start = src.find("static bool kv_precision_type(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let mapping = &src[start..end];
+        assert_eq!(mapping.matches("p == \"").count(), 3);
+        for tag in ["\"i8\"", "\"u4\"", "\"f16\""] {
+            assert!(mapping.contains(&format!("p == {tag}")), "{tag}");
+        }
+        // Everything that mentions the parameter is the mapping, the two creators, or the
+        // record line; any other function reading it would be a new path to the plugin.
+        let outside_mapping = src.replace(mapping, "");
+        for line in outside_mapping
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+        {
+            let l = line.to_ascii_lowercase();
+            if !l.contains("kv_cache_precision") {
+                continue;
+            }
+            assert!(
+                l.contains("kv_precision_type(")
+                    || l.contains("const char* kv_cache_precision")
+                    || l.contains("kv_cache_precision ?")
+                    || l.contains("kv_cache_precision, kv_form")
+                    || l.contains("ov::hint::kv_cache_precision"),
+                "unexpected KV property use: {line}"
+            );
+        }
+        let lower = src.to_ascii_lowercase();
+        for banned in [
+            "key_cache_precision",
+            "value_cache_precision",
+            "key_cache_group_size",
+            "value_cache_group_size",
+        ] {
+            assert!(!lower.contains(banned), "{banned}");
+        }
+    }
+
+    /// Walker hygiene (U-14, U-C34): the root, plus the direct `kv-*` subdirectories; names
+    /// joined with `/`; look-alike directories, deeper levels and symlinked directories ignored.
+    #[test]
+    fn walker_lists_root_and_kv_subdirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let put = |rel: &str, n: usize| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0_u8; n]).unwrap();
+        };
+        put("a.blob", 1);
+        put("kv-u4/b.blob", 2);
+        put("kv-i8/c.blob", 3);
+        put("kv-i8/c.cl_cache", 4);
+        put("KV-U4/no.blob", 8);
+        put("kv-u4.bak/no.blob", 8);
+        put("kv-/no.blob", 8);
+        put("other/no.blob", 8);
+        put("kv-u4/sub/deep.blob", 8);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/", root.join("kv-x")).unwrap();
+
+        let mut names: Vec<String> = list_cache_dir_entries(root)
+            .into_iter()
+            .map(|e| e.file_name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.blob", "kv-i8/c.blob", "kv-i8/c.cl_cache", "kv-u4/b.blob"]
+        );
+        // The root-only snapshot sees neither.
+        assert_eq!(snapshot_cache_dir(root).len(), 1);
+        assert!(list_cache_dir_entries(&root.join("missing")).is_empty());
+    }
+
+    /// The load's before/after diff covers only the directory the engine was given (U-C28).
+    #[test]
+    fn scope_snapshot_covers_only_the_engines_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("kv-u4")).unwrap();
+        let before = snapshot_cache_scope(root, Some("kv-u4"));
+        assert!(before.is_empty());
+        std::fs::write(root.join("kv-u4/x.blob"), b"1").unwrap();
+        std::fs::write(root.join("kv-u4/k.cl_cache"), b"1").unwrap();
+        std::fs::write(root.join("w.blob"), b"1").unwrap(); // an unrelated engine, in the root
+        let mut new: Vec<String> = snapshot_cache_scope(root, Some("kv-u4"))
+            .difference(&before)
+            .cloned()
+            .collect();
+        new.sort();
+        assert_eq!(new, ["kv-u4/k.cl_cache", "kv-u4/x.blob"]);
+    }
+
+    /// A directory that cannot be made yields an error, not a panic (U-21, U-C27).
+    #[test]
+    fn ensure_writable_subdir_reports_a_blocked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = ensure_writable_subdir(dir.path(), "kv-u4").unwrap();
+        assert!(ok.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&ok).unwrap().count(),
+            0,
+            "probe file removed"
+        );
+        std::fs::write(dir.path().join("kv-i8"), b"a file").unwrap();
+        assert!(ensure_writable_subdir(dir.path(), "kv-i8").is_err());
+    }
+
+    /// The same basename in two directories has two owners (U-C29), and a manifest cannot name
+    /// a file outside the cache (U-C32).
+    #[test]
+    fn owners_keep_same_basename_apart_and_drop_unsafe_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_device_blobs_entry(dir.path(), "a", "GPU.1", &["123.blob".to_owned()]);
+        write_device_blobs_entry(dir.path(), "b", "GPU.1", &["kv-u4/123.blob".to_owned()]);
+        write_device_blobs_entry(
+            dir.path(),
+            "evil",
+            "GPU.1",
+            &[
+                "../../etc/passwd".to_owned(),
+                "/tmp/x.blob".to_owned(),
+                "kv-u4/../../y.blob".to_owned(),
+                "C:\\x.blob".to_owned(),
+                "kv-u4\\z.blob".to_owned(),
+                "other/q.blob".to_owned(),
+                "kv-u4/ok.blob".to_owned(),
+            ],
+        );
+        let owners = blob_owners(dir.path());
+        assert_eq!(owners["123.blob"], [("a".to_owned(), "GPU.1".to_owned())]);
+        assert_eq!(
+            owners["kv-u4/123.blob"],
+            [("b".to_owned(), "GPU.1".to_owned())]
+        );
+        assert_eq!(
+            owners.len(),
+            3,
+            "only 123.blob, kv-u4/123.blob and kv-u4/ok.blob: {owners:?}"
+        );
+        assert!(owners.contains_key("kv-u4/ok.blob"));
+        assert_eq!(blob_dir("kv-u4/ok.blob"), Some("kv-u4"));
+        assert_eq!(blob_dir("123.blob"), None);
     }
 }

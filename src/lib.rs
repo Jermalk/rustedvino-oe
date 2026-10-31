@@ -15,7 +15,12 @@ pub mod crash_handler;
 pub mod decision_engine;
 pub mod device_inventory;
 pub mod embed_engine;
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection;
+pub mod ffi_watch;
+pub mod gpu_driver;
 pub mod gpu_memory;
+pub mod gpu_probe;
 mod handlers;
 pub mod image_util;
 pub mod in_flight;
@@ -242,7 +247,7 @@ pub fn create_router_with_extension(
         .route("/v1/admin/keys/reload", post(admin_reload_keys))
         .route("/v1/admin/config/audit", get(admin_audit_config))
         .route("/v1/admin/logs/tail", get(admin_logs_tail))
-        .route("/v1/admin/health/watchdog", get(admin_watchdog))
+        .route(WATCHDOG_PATH, get(admin_watchdog))
         .route("/v1/admin/voice-pin", get(admin_voice_pin))
         .route("/v1/admin/realtime/sessions", get(admin_realtime_sessions))
         .route(
@@ -285,6 +290,7 @@ pub fn create_router_with_extension(
                 AuthMiddlewareState {
                     keys: Arc::clone(&state.auth),
                     admin_locked: state.admin_locked,
+                    watchdog_token: state.watchdog_token.clone(),
                 }
             },
             require_bearer_auth,
@@ -444,7 +450,8 @@ async fn attach_request_id(req: Request, next: Next) -> Response {
 
 /// Paths that bypass Bearer auth even when `api_keys` is non-empty.
 ///
-/// Only `/health` — the cheap, content-free liveness probe orchestrators
+/// Only `/health` — the cheap liveness probe (version, commit, and the
+/// `gpu_poisoned` flag; no model ids, devices or paths) orchestrators
 /// (k8s liveness/readiness) poll without credentials. Keeping it open is the
 /// standard posture and avoids wedging health checks behind the API key.
 /// Everything else requires a key once auth is enabled.
@@ -468,6 +475,12 @@ async fn attach_request_id(req: Request, next: Next) -> Response {
 /// though its URL isn't under `/v1/admin/` — moving the path would break
 /// every existing Prometheus scrape config for no benefit.
 const AUTH_EXEMPT_PATHS: [&str; 1] = ["/health"];
+
+/// The worker's watchdog read, polled by the supervisor (`supervisor::generation_watchdog`).
+pub const WATCHDOG_PATH: &str = "/v1/admin/health/watchdog";
+
+/// Header carrying the supervisor's per-spawn watchdog token (`startup::WATCHDOG_TOKEN_ENV`).
+pub const WATCHDOG_TOKEN_HEADER: &str = "x-rustedvino-watchdog-token";
 
 /// Path prefix for the admin model-management routes (load / unload). Requests
 /// here are gated by `admin_api_keys` when that list is configured (T4.3).
@@ -595,6 +608,8 @@ struct AuthMiddlewareState {
     /// no code path that can flip it after boot; see that field's doc
     /// comment for why).
     admin_locked: bool,
+    /// Mirrors [`app_state::AppState::watchdog_token`] — fixed at boot.
+    watchdog_token: Option<Arc<str>>,
 }
 
 /// Middleware: enforce `Authorization: Bearer <key>` with optional admin scope.
@@ -652,6 +667,10 @@ async fn require_bearer_auth(
 ) -> Response {
     // Infra probes are always reachable uncredentialed.
     if AUTH_EXEMPT_PATHS.contains(&req.uri().path()) {
+        return next.run(req).await;
+    }
+    // The supervisor's own probe, before the admin gate: that gate (401 / 503) blinded it.
+    if watchdog_token_admits(&req, auth.watchdog_token.as_deref()) {
         return next.run(req).await;
     }
 
@@ -747,6 +766,21 @@ async fn run_authenticated(mut req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     response.extensions_mut().insert(Authenticated);
     response
+}
+
+/// Whether `req` is the supervisor's watchdog probe: exactly [`WATCHDOG_PATH`] with a
+/// [`WATCHDOG_TOKEN_HEADER`] matching this worker's per-spawn `token`. Never admits anything
+/// else, and nothing at all for an unsupervised process (`token` is `None`).
+fn watchdog_token_admits(req: &Request, token: Option<&str>) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    req.uri().path() == WATCHDOG_PATH
+        && req
+            .headers()
+            .get(WATCHDOG_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|presented| key_matches(token, presented))
 }
 
 /// Constant-time equality for one configured key against one presented

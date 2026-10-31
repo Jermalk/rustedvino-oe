@@ -9,6 +9,10 @@ use serde_json::Value;
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Timeout for load/unload/deregister, which can legitimately take 10-60 s+.
 pub const MUTATE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout for a call that loads a model (`load`, `add`, `resize`): the server's default
+/// `load_timeout_secs` (600) + 30 s, so the server's own `504 load_timeout` arrives first. A box
+/// with a larger configured deadline may see rv give up first; the load continues server-side.
+pub const LOAD_TIMEOUT: Duration = Duration::from_secs(600 + 30);
 
 /// A response body: JSON when it parses, otherwise the raw text.
 #[derive(Debug, Clone, PartialEq)]

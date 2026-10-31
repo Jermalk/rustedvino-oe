@@ -62,6 +62,11 @@ struct PipelineMetrics {
     float inference_duration = 0.0;
 
     /**
+     * Duration of the sampling step in the last generation step in microseconds.
+     */
+    float sampling_duration = 0.0;
+
+    /**
     * Total allocated cache size in bytes across registered cache types, based on the total number of cache blocks.
      * This value represents reserved/allocated memory for the cache and does not
      * distinguish between used and unused portions in dynamic cache configurations.
@@ -74,6 +79,9 @@ struct PipelineMetrics {
      */
     size_t& kv_cache_size_in_bytes{cache_size_in_bytes};
 
+    /** High-water mark of the linear-attention pool size, including free blocks. */
+    size_t la_peak_pool_blocks = 0;
+
     PipelineMetrics() = default;
     ~PipelineMetrics() = default;
 
@@ -85,7 +93,8 @@ struct PipelineMetrics {
           avg_cache_usage{other.avg_cache_usage},
           inference_duration{other.inference_duration},
           cache_size_in_bytes{other.cache_size_in_bytes},
-          kv_cache_size_in_bytes{cache_size_in_bytes} {}
+          kv_cache_size_in_bytes{cache_size_in_bytes},
+          la_peak_pool_blocks{other.la_peak_pool_blocks} {}
 
     PipelineMetrics& operator=(const PipelineMetrics& other) {
         requests = other.requests;
@@ -95,6 +104,7 @@ struct PipelineMetrics {
         avg_cache_usage = other.avg_cache_usage;
         inference_duration = other.inference_duration;
         cache_size_in_bytes = other.cache_size_in_bytes;
+        la_peak_pool_blocks = other.la_peak_pool_blocks;
         return *this;
     }
 
@@ -106,7 +116,8 @@ struct PipelineMetrics {
           avg_cache_usage{std::move(other.avg_cache_usage)},
           inference_duration{std::move(other.inference_duration)},
           cache_size_in_bytes{std::move(other.cache_size_in_bytes)},
-          kv_cache_size_in_bytes{cache_size_in_bytes} {}
+          kv_cache_size_in_bytes{cache_size_in_bytes},
+          la_peak_pool_blocks{std::move(other.la_peak_pool_blocks)} {}
 
     PipelineMetrics& operator=(PipelineMetrics&& other) noexcept {
         requests = std::move(other.requests);
@@ -116,6 +127,7 @@ struct PipelineMetrics {
         avg_cache_usage = std::move(other.avg_cache_usage);
         inference_duration = std::move(other.inference_duration);
         cache_size_in_bytes = std::move(other.cache_size_in_bytes);
+        la_peak_pool_blocks = std::move(other.la_peak_pool_blocks);
         return *this;
     }
 };
@@ -127,17 +139,23 @@ protected:
 
     class ContinuousBatchingForSpeculativeDecodingImpl;
     class ContinuousBatchingForEagle3DecodingImpl;
+    class ContinuousBatchingForMtpDecodingImpl;
     class ContinuousBatchingForPromptLookupImpl;
     class SpeculativeDecodingImpl;
     class Eagle3DecodingImpl;
+    class DFlashDecodingImpl;
+    class MtpDecodingImpl;
     class PromptLookupImpl;
 
     friend class ContinuousBatchingForSpeculativeDecodingImpl;
-    
+
     friend class ContinuousBatchingForPromptLookupImpl;
     friend class ContinuousBatchingForEagle3DecodingImpl;
+    friend class ContinuousBatchingForMtpDecodingImpl;
     friend class SpeculativeDecodingImpl;
     friend class Eagle3DecodingImpl;
+    friend class DFlashDecodingImpl;
+    friend class MtpDecodingImpl;
     friend class PromptLookupImpl;
     friend class VLMPipeline;
     friend class ContinuousBatchingAdapter;
@@ -346,12 +364,22 @@ public:
     /**
     * @brief start chat with keeping history in kv cache.
     * @param system_message optional system message.
+    * @deprecated start_chat() / finish_chat() API is deprecated and will be removed in the next major release.
+    * Please, use generate() with ChatHistory argument.
     */
+    OPENVINO_DEPRECATED(
+        "start_chat() / finish_chat() API is deprecated and will be removed in the next major release. "
+        "Please, use generate() with ChatHistory argument.")
     void start_chat(const std::string& system_message = {});
 
     /**
     * @brief finish chat and clear kv cache.
+    * @deprecated start_chat() / finish_chat() API is deprecated and will be removed in the next major release.
+    * Please, use generate() with ChatHistory argument.
     */
+    OPENVINO_DEPRECATED(
+        "start_chat() / finish_chat() API is deprecated and will be removed in the next major release. "
+        "Please, use generate() with ChatHistory argument.")
     void finish_chat();
 };
 
@@ -367,6 +395,13 @@ OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> videos_batches(
 
 OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> videos_metadata_batches(
     const std::vector<std::vector<VideoMetadata>>& videos_metadata_batches
+);
+
+/// @brief Factory for audios_batches AnyMap entry.
+/// Audios must be encoded before text tokenization for Qwen3-Omni's interleaved layout.
+/// @note This is a preview API and is subject to change.
+OPENVINO_GENAI_EXPORTS std::pair<std::string, ov::Any> audios_batches(
+    const std::vector<std::vector<ov::Tensor>>& audios_batches
 );
 
 }

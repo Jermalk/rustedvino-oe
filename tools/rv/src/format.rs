@@ -68,6 +68,8 @@ pub fn state_glyph(style: Style, state: &str) -> String {
         "ready" => style.green(state),
         "loading" | "evicting" => style.yellow(state),
         "not_loaded" => style.dim(state),
+        "stalled" => style.red(state),
+        s if s.starts_with("unavailable") => style.red(state),
         _ => state.to_owned(),
     }
 }

@@ -31,12 +31,12 @@ uses OpenVINO's `ContinuousBatchingPipeline` to batch many users' decode steps i
 ```
 
 Validated across four Intel GPUs (Arc B50/B60/B70 — all Battlemage Xe2 — and Lunar Lake's
-integrated Xe2 GPU). A standardized, reproducible benchmark harness that anyone can run against
-their own hardware is planned — see [Benchmark](#benchmark) — until it lands, treat the numbers
-above as illustrative rather than independently reproducible.
-**Caveat:** the numbers above were measured with `kv_cache_precision: "u8"` explicitly set (now
-the server's own default, see [`CONFIG.md`](CONFIG.md)), not the OpenVINO plugin's native f16 —
-on the Lunar Lake iGPU the swing between the two was itself +21%, so treat `u8` as part of the
+integrated Xe2 GPU). The tools under [Benchmark](#benchmark) measure comparable workloads on your own
+hardware; until you have run them, treat the numbers above as illustrative.
+**Caveat:** the numbers above were measured with an 8-bit KV cache, `kv_cache_precision: "u8"` explicitly
+set (still the server's default; `"u8"` is the older spelling of `"i8"`, which the server stores and
+passes as `"i8"` — see [`CONFIG.md`](CONFIG.md)), not the OpenVINO plugin's native f16 — on the Lunar
+Lake iGPU the swing between the two was itself +21%, so treat the KV precision as part of the
 configuration under test, not a free variable.
 
 ---
@@ -54,8 +54,8 @@ included.
 
 | Endpoint | Status |
 |---|---|
-| `GET /health`, `GET /v1/models`, `GET /v1/models/{id}` | ✅ |
-| `GET /health_generate` — 1-token GPU deep-readiness probe | ✅ |
+| `GET /health` (liveness; body carries `gpu_poisoned`), `GET /v1/models`, `GET /v1/models/{id}` | ✅ |
+| `GET /health_generate` — 1-token GPU deep-readiness probe (503 `gpu_poisoned` before probing once the GPU context is poisoned) | ✅ |
 | `GET /metrics` — Prometheus endpoint (same port); full metric reference in [`METRICS.md`](METRICS.md) | ✅ |
 | `POST /v1/chat/completions` (SSE streaming + non-streaming) | ✅ |
 | `POST /v1/completions` — legacy raw-prompt completions | ✅ |
@@ -125,7 +125,7 @@ included.
 | VRAM estimator: STT/embed/image charge weight-only (no KV pool reservation) | ✅ |
 | LRU auto-eviction when a new model doesn't fit | ✅ |
 | `domain_budgets` — per-memory-domain VRAM budget overrides, keyed by domain id (a GPU's device name, or `"system"`) | ✅ |
-| STT placement under `default_placement: "auto"` — CPU first, then a discrete GPU; NPU / iGPU only when you name them | ✅ |
+| STT placement under `default_placement: "auto"` — CPU first, then a discrete GPU, then an integrated GPU as a last resort; never the NPU unless you name it | ✅ |
 | Capability-based device placement (`placement.rs` tier preference, no hardcoded names) | ✅ |
 | Self-managing OpenVINO compile-cache — size-reported always, size-bounded and self-pruning when `ov_cache_max_gb` is set (see [Compile-cache management](#compile-cache-management)) | ✅ |
 
@@ -159,7 +159,7 @@ included.
 
 **Test coverage**
 
-1089 tests pass (993 lib + 93 integration + 3 supervisor integration). A further 10 are `#[ignore]`d: 6 lib tests needing a real model or real hardware, the 2 golden-template tests, and 2 doc-tests. Run them with `--ignored`.
+Unit and integration tests run with `scripts/rv-cargo.sh test`. They need no GPU and no model (the mock engine path covers the HTTP surface), only the OpenVINO runtime from step 1 for the build. Tests that need a real model or real hardware are `#[ignore]`d; run them with `--ignored`.
 
 ---
 
@@ -212,13 +212,15 @@ description in **[`INTERFACE.md`](INTERFACE.md)**.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# OpenVINO (user-level pip; match your Python version)
-pip install openvino==2026.2.1 openvino-genai==2026.2.1 openvino-tokenizers==2026.2.1.0
-
 # A C++17 compiler — build.rs compiles the OpenVINO bridge (ov_bridge/ov_bridge.cpp)
 # via the `cc` crate. Missing g++/clang++ fails with a cc-crate error that does not
-# name the real cause.
-sudo apt install build-essential    # or your distro's equivalent
+# name the real cause. python3-venv is for the OpenVINO venv below.
+sudo apt install build-essential python3-venv    # or your distro's equivalent
+
+# OpenVINO runtime + GenAI, in a venv (plain `pip install` is blocked on Ubuntu 24.04 /
+# Mint 22: "externally-managed-environment"). scripts/rv-cargo.sh finds a ~/ov*/ venv
+# on its own; no activation needed.
+python3 -m venv ~/ov && ~/ov/bin/pip install openvino==2026.4.1 openvino-genai==2026.4.1 openvino-tokenizers==2026.4.1.0
 ```
 
 **Rust version.** The crate is `edition = "2024"` and declares
@@ -230,9 +232,9 @@ hit anything odd on an older compiler. There is deliberately no
 upstream development tree but wrong for a public crate, where it would override
 whatever you have installed.
 
-**A note on the OpenVINO version.** The pip pins above (2026.2.1) are the runtime
+**A note on the OpenVINO version.** The pip pins above (2026.4.1) are the runtime
 this is developed against. The vendored GenAI headers under `ov_bridge/include/`
-are 2026.2.0 — `build.rs` synthesises unversioned symlinks precisely so the exact
+are 2026.4.1.0 — `build.rs` synthesises unversioned symlinks precisely so the exact
 patch level of the installed runtime does not have to match.
 
 ### 2. Clone and build
@@ -318,13 +320,7 @@ step 6):
   98 % of the words of a real Polish lecture. Only large-v3 supports `/v1/audio/translations`, which turns
   speech into **English** only (it will not translate English into another language). Don't run turbo on
   the NPU yet: a request hung one machine's NPU until the server was restarted.
-- **Vision on a GPU.** Qwen3.5 / Qwen3.6 are hybrid linear-attention models. On a GPU the server turns prefix caching
-  off for them (OpenVINO GenAI 2026.2 returns wrong continuations on a prefix-cache hit). Since 0.8.4 they load that way
-  without any flag: `./rv add qwen3.6-27b-int4-ov --device GPU.n` (58 s on an Arc Pro B60). The price is a smaller usable
-  context: the KV pool of that 27B with the default 2 GB `cache_size_gb` holds about 13,900 tokens, and a longer prompt is refused up front with a
-  clean 400 `context_length_exceeded` (4k, 8k and 12k prompts answered). Do not pass `--enable-prefix-caching` for these
-  models unless you accept the upstream bug. Tested on one card (B60) and the 27B and 35B-A3B models; other GPUs and the 9B
-  are not verified. Without `--device` these models go to the CPU (the bundle default, and also `default_placement: "auto"`, which never puts a hybrid model on a GPU); name `--device GPU.n` to use a GPU.
+- **Vision on a GPU.** Qwen3.5 / Qwen3.6 / Qwen3.8 are hybrid linear-attention models. On OpenVINO GenAI 2026.4.1 they run on a GPU with the normal settings, prefix caching included: `./rv add qwen3.6-27b-int4-ov --device GPU.n`. The KV pool of the 27B with the default 2 GB `cache_size_gb` is small (about 13,900 tokens on the 0.8.4 line), and a longer prompt is refused up front with a clean 400 `context_length_exceeded`. Check the numbers for your card; the 0.8.x measurements were taken on one Arc Pro B60. From 0.9.0 the pool of a hybrid model is sized in whole blocks and counts only its attention layers (a 4 GiB u4 pool of the 27B holds about 203,000 tokens), but with prefix caching on, which halves a hybrid model's capacity, and for vision models on a GPU without a readable free-memory probe, the context limit stays on the conservative estimate; `rv ps` marks an estimate with `~` and a limit that follows the free device memory with `*`.
 - **Memory:** a model's "RAM in use" is on top of the OS and your other programs, and the server keeps
   4 GB free for the OS. When RAM runs short, loading a model **unloads the least recently used ones** to make
   room (the server log says `LRU eviction`), and requests to an unloaded model then fail with `model is not
@@ -550,6 +546,12 @@ scripts/rv-cargo.sh build --release
 # Listens on :11437
 ```
 
+To run it as a service, start `rustedvino --supervise` under systemd with
+`scripts/rustedvino.user.service.example` (the Linux bundle ships it as `rustedvino.user.service.example`).
+Keep its `KillSignal=SIGTERM` and `TimeoutStopSec=720`: a stop waits up to 600 s for a model load that is
+still running, and systemd's default 90 s would SIGKILL the server in the middle of that load, which can leave
+the GPU driver stuck (seen on an Arc Pro B60).
+
 ### 7. Load a model and chat
 
 ```bash
@@ -631,9 +633,9 @@ rv voice-pin               # the realtime voice-flow model pin
 rv sessions                # live realtime sessions   (also: rv session ID, rv session-kill ID -y)
 ```
 
-`resize`, `completeness`, `reload-keys`, `voice-pin`, `sessions`, `session` and `session-kill` exist
-only in the native `rv`. Commands that evict, deregister, resize or close something ask for
-confirmation; `-y` skips the prompt, and without a terminal they refuse (exit 2) instead of guessing.
+`start`, `stop`, `restart`, `version`, `resize`, `completeness`, `reload-keys`, `voice-pin`, `sessions`,
+`session` and `session-kill` exist only in the native `rv`; the Python script covers the other commands.
+Commands that evict, deregister, resize or close something ask for confirmation; `-y` skips the prompt, and without a terminal they refuse (exit 2) instead of guessing.
 `--json` gives machine-readable output where it makes sense (`status`, `list`, `ps`, `check`,
 `reload-config`, `patch`, `preload`, `completeness`, `reload-keys`, `voice-pin`, `sessions`); other
 commands accept the flag and ignore it.
@@ -686,9 +688,43 @@ gigabytes. RustedVINO manages it for you.
 {
   "ov_cache_dir": "/opt/rustedvino/ov_cache",  // unset = no caching at all
   "ov_cache_max_gb": 20.0,                      // 0.0 = report size, never prune
-  "ov_cache_sweep_interval_secs": 21600          // default 6h
+  "ov_cache_sweep_interval_secs": 21600,         // default 6h
+  "ov_cache_layout": "keyed"                     // "flat" = the 0.8.x layout
 }
 ```
+
+**One directory per KV precision.** On OpenVINO 2026.4.x a compiled blob does not record
+the KV-cache precision, so a blob compiled under one precision is silently reused under
+another, or fails at the first request with `Incorrect block size`. With the default
+`"keyed"` layout the text models (including a draft model) and the vision models on GPU
+and CPU compile into `ov_cache_dir/kv-<tag>/`, one directory per `kv_cache_precision`
+string passed to the plugin: `kv-auto` (nothing passed), `kv-i8`, `kv-u4`, `kv-f16`. Vision
+models on a GPU pass their resolved precision (a per-model value, else the IR hint, else
+`kv-u4` for int4 weights and `kv-i8` for the rest); on the CPU, with `kv_precision_pass:
+"plugin"`, or when the server cannot read the model's layout with confidence, they pass none
+(`kv-auto`).
+Whisper, image, TTS, embedding and NPU models stay in the directory itself. Every
+directory holds a full compiled copy of its models, so trying several precisions costs
+that much disk per precision. `"flat"` restores the 0.8.x paths **and the precision mixing described above**: it is a
+rollback, not a safe setting, and blobs left in the root by an earlier flat run are reused
+without a recompile. A keyed directory the server cannot write to (a read-only cache) is not
+used; those models compile without a blob cache. Use one `ov_cache_dir` per instance, host and OpenVINO version when
+`ov_cache_max_gb` is set: two builds on different OpenVINO versions sharing a directory
+rewrite each other's blobs.
+
+**If a model loads but every request fails with `Incorrect block size`.** The compiled blob
+in its cache directory was built for another KV precision (a blob copied between `kv-*`
+directories, or `ov_cache_layout: "flat"` with a changed `kv_cache_precision`). The server
+stays healthy and deletes nothing; it logs one WARN per model that names the directory.
+Stop the server, delete the `*.blob` files there (they are read-only files, mode 0440; the
+directory is yours to clean), and start it again.
+
+**Two notes.** *Windows:* permissions you set on `ov_cache_dir` with `icacls ... /T` or
+with `(OI)(CI)` inheritance flags are inherited by the `kv-*` subdirectories; nothing extra
+to configure. *Weights are not hashed:* OpenVINO keys a blob by the model's graph and the
+device, not by the weight values, so replacing a model's weights in place (same topology,
+same files and layout) can reuse a stale blob. Delete that model's blobs, or the cache
+directory, after swapping weights. This predates the keyed layout.
 
 **What the sweep does.** It runs once at startup and then every
 `ov_cache_sweep_interval_secs`, on a blocking thread (it stats every file and can
@@ -697,16 +733,23 @@ reports the cache's total on-disk size — *unconditionally*, even with
 `ov_cache_max_gb` unset, so you get size visibility without opting into pruning.
 Only if the total exceeds the budget does it delete anything.
 
-**What it will not delete.** Blobs belonging to a model that is `Ready` or
-`Loading` are protected. A `Loading` model may be reading or rewriting that exact
-file at that moment, and deleting it underneath is the failure this guard exists to
-prevent. `Evicting` and `NotLoaded` models do no cache I/O, so their blobs stay
-eligible.
+**What it will not delete.** The blobs a `Ready` or `Loading` model is using: those it
+owns on the device it runs on, in the directory it compiles into (the cache root or its
+`kv-<tag>/` directory). A `Loading` model may be reading or rewriting that exact file at
+that moment, and deleting it underneath is the failure this guard exists to prevent.
+Everything else a text or vision model owns is eligible, including 0.8.x blobs left in the
+root after the move to `kv-<tag>/` and the directories of other precisions. (Whisper, image,
+TTS and NPU models cache in the root itself, so all their blobs there count as in use while
+the model is.) An unattributed file
+younger than 30 minutes is left alone too (a compile may still be writing it). Kernel
+caches (`*.cl_cache`) are never deleted. `Evicting` and `NotLoaded` models do no cache
+I/O, so their blobs stay eligible.
 
 **Eviction order**, most disposable first, oldest-modified first within each tier:
 
 1. blobs whose owning model is **no longer in your config** at all
-2. blobs for a **configured but not currently resident** model
+2. blobs for a **configured model that is not using them** (not resident, another
+   device, an older layout or precision)
 3. **unattributed** blobs — anything the server cannot map to a model, including
    files predating this feature
 
@@ -715,7 +758,8 @@ It stops as soon as the cache is back under budget.
 **Metrics** (`/metrics`): `rustedvino_ov_cache_bytes` is the last measured total,
 updated per sweep rather than at scrape time; `rustedvino_ov_cache_pruned_bytes_total`
 and `rustedvino_ov_cache_pruned_files_total` are cumulative counters since process
-start, and only move when a budget is set and was exceeded. Full reference in
+start, and only move when a budget is set and was exceeded. The size covers the root and
+the `kv-*` directories. Full reference in
 [`METRICS.md`](METRICS.md).
 
 ---
@@ -752,7 +796,7 @@ plain `GPU` (no suffix), plus `NPU`.
 
 **NPU (Lunar Lake "AI Boost") constraints:**
 - STT (Whisper) compiles on the NPU, but `default_placement: "auto"` does **not** send it there: whisper-large-v3-turbo
-  hung the NPU on a clip over ~60 s (until the server was restarted), so STT defaults to the CPU, then a discrete GPU.
+  hung the NPU on a clip over ~60 s (until the server was restarted), so STT defaults to the CPU, then a discrete GPU (an integrated GPU only as a last resort).
   Put a small Whisper (e.g. `whisper-tiny-fp16-ov`) on the NPU yourself with `"device": "NPU"` if you want it.
 - Embeddings (`TextEmbeddingPipeline`) and LLM (`ContinuousBatchingPipeline`) cannot compile on
   NPU at all — both tiers omit NPU; an LLM on a Lunar Lake box lands on the CPU by default (name the Arc iGPU with
@@ -791,15 +835,17 @@ plain `GPU` (no suffix), plus `NPU`.
 
 ## Benchmark
 
-A standardized, provenance-stamped cross-fleet benchmark tool is planned but not yet part of
-this repo — see **[`ROADMAP.md`](ROADMAP.md)**. Until it lands, the headline numbers under
-[Why](#why) above are the current reference point.
+Two stdlib-only Python tools live in [`tools/bench/`](tools/bench/): `rvbench.py` produces the per-model
+figures in the starter-set table (`python3 tools/bench/rvbench.py --help`), and `cmpbench.py` + `cmptable.py`
+run the same chat workload against RustedVINO, OVMS and OpenArc on your own card (see
+[`CMPBENCH.md`](tools/bench/CMPBENCH.md)). Re-run them on your hardware rather than quoting the headline
+numbers under [Why](#why).
 
 ---
 
 ## Project structure
 
-Module-to-purpose map (`src/`, `ov_bridge/`, `scripts/rv-cargo.sh`/`rv`, `tests/`): **[`STRUCTURE.md`](STRUCTURE.md)**.
+Module-to-purpose map (`src/`, `ov_bridge/`, `scripts/rv-cargo.sh`/`rv`, `tools/`, `tests/`): **[`STRUCTURE.md`](STRUCTURE.md)**.
 
 ---
 
@@ -848,7 +894,7 @@ runs completely on its own; nothing here depends on Bear Edition to function.
 
 `rustedvino-oe` is a periodic export of a private development repo, not the primary working
 tree. Commits here are squashed on export — the granular commit-by-commit history (and the
-private `dev/` engineering log it references) lives upstream and isn't public. If you open a
+private engineering log it references) lives upstream and isn't public. If you open a
 PR, it'll be reviewed and, once accepted, folded upstream by hand and re-exported here rather
 than merged directly — expect that round-trip instead of a same-repo merge.
 

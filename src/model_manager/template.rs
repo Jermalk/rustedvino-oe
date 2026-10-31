@@ -33,8 +33,14 @@ use std::path::Path;
 /// `ModelManager::spawn_kv_wedge_recovery`'s runtime ratchet exists — the
 /// formula only needs to be roughly right on first contact, since the ratchet
 /// corrects it from a real observed ceiling after at most one wedge per
-/// model. Do not attempt another static per-architecture correction here
-/// without new data — see the ratchet's own doc comment.
+/// model.
+///
+/// Since 0.9.0 this is the **legacy estimate** only: a model whose KV layout the server can
+/// describe (`kv_profile`: per-layer geometry from `config.json` and the IR, the linear-attention
+/// state of hybrids, the precision's real byte layout) is sized and gated by `kv_capacity` /
+/// `ModelManager::compute_exact_gate` instead, which counts only the attention layers. The legacy
+/// formula remains for `kv_gate_mode: "legacy"` and for every model the exact path does not
+/// cover (see `CONFIG.md`); do not extend it, extend the profile.
 ///
 /// The caller divides by the actual element size to get the precision-adjusted
 /// per-token cost: `bytes_per_token = result * precision_bytes / 2`.
@@ -46,7 +52,7 @@ use std::path::Path;
 /// Returns `0` when `config.json` is absent or any required field cannot be
 /// parsed — the caller should disable the L0 gate for this model and log a
 /// warning rather than treating it as a fatal error.
-pub(crate) fn read_kv_bytes_per_token_f16(model_dir: &Path) -> usize {
+pub(crate) fn legacy_bytes_per_token_f16(model_dir: &Path) -> usize {
     kv_bytes_impl(model_dir).unwrap_or(0)
 }
 
@@ -89,7 +95,7 @@ fn kv_bytes_impl(model_dir: &Path) -> Option<usize> {
 /// if this is a Mixture-of-Experts model, or `None` for dense models.
 ///
 /// `MoE` is detected by the presence of `num_experts` (or `moe_num_experts`) with
-/// a value > 1.  The same nested-block fallback as [`read_kv_bytes_per_token_f16`]
+/// a value > 1.  The same nested-block fallback as [`legacy_bytes_per_token_f16`]
 /// is applied — some VLM configs nest these fields under `text_config` /
 /// `llm_config` / `language_config`.
 ///
@@ -149,7 +155,7 @@ pub(crate) fn read_vocab_size(model_dir: &Path) -> Option<u64> {
 /// Read `config.json` from `model_dir` and return the model's **native**
 /// (trained/converted) context ceiling — `max_position_embeddings`, adjusted
 /// for `rope_scaling`/`YaRN` extension when present. This is a hardware-
-/// independent model property, unrelated to [`read_kv_bytes_per_token_f16`]'s
+/// independent model property, unrelated to [`legacy_bytes_per_token_f16`]'s
 /// VRAM-derived `max_prompt_tokens` formula: a model's KV pool can easily
 /// afford more tokens than the model was ever trained on (confirmed live
 /// 2026-08-23, the project's internal engineering log —
@@ -252,6 +258,11 @@ struct KvCapacityRatchet {
     /// was measured — needed to scale the ratchet if `cache_size_gb` changes
     /// later (see this struct's doc comment on [`read_kv_capacity_ratchet`]).
     kv_cache_gb_at_learn: f64,
+    /// The pool was sized exactly (blocks-first), so `kv_cache_gb_at_learn` is the pool the engine
+    /// really had. Files written before that hold the unrounded request of a pool the engine
+    /// rounded up to whole GiB, which the reader compensates for with a ceil.
+    #[serde(default)]
+    exact_pool: bool,
 }
 
 /// Read a previously-learned KV-capacity ceiling for `model_dir`, if this
@@ -289,7 +300,16 @@ pub(crate) fn read_kv_capacity_ratchet(model_dir: &Path, current_kv_gb: f64) -> 
     {
         return None;
     }
-    let scale = current_kv_gb / entry.kv_cache_gb_at_learn;
+    // Files written before the whole-GiB booking (0.9.0-pre and earlier) record the
+    // UNROUNDED pool (e.g. 1.21) although the engine had `ceil` of it (2 GiB); scaling by
+    // the raw figure would grow the learned ceiling by 65 % on the very pool that wedged.
+    // A whole-number value (any file written by this build) is unchanged by the ceil.
+    let learned_gb = if entry.exact_pool {
+        entry.kv_cache_gb_at_learn
+    } else {
+        entry.kv_cache_gb_at_learn.ceil()
+    };
+    let scale = current_kv_gb / learned_gb;
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -310,10 +330,12 @@ pub(crate) fn write_kv_capacity_ratchet(
     model_dir: &Path,
     observed_prompt_tokens: usize,
     kv_cache_gb_at_learn: f64,
+    exact_pool: bool,
 ) {
     let entry = KvCapacityRatchet {
         observed_prompt_tokens,
         kv_cache_gb_at_learn,
+        exact_pool,
     };
     let Ok(serialized) = serde_json::to_string_pretty(&entry) else {
         tracing::warn!(
@@ -979,7 +1001,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- read_kv_bytes_per_token_f16 ------------------------------------
+    // ---- legacy_bytes_per_token_f16 ------------------------------------
 
     fn tmp_dir(suffix: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("rv-kv-{}-{}", std::process::id(), suffix));
@@ -998,7 +1020,7 @@ mod tests {
             r#"{"num_hidden_layers":28,"num_attention_heads":32,"num_key_value_heads":8,"hidden_size":4096}"#,
         )
         .unwrap();
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 28 * 8 * 128 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 28 * 8 * 128 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1012,7 +1034,7 @@ mod tests {
         )
         .unwrap();
         // head_dim=64 (explicit), not 128 (derived)
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 40 * 8 * 64 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 40 * 8 * 64 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1026,7 +1048,7 @@ mod tests {
         )
         .unwrap();
         // head_dim = 2048/16 = 128; kv_heads = 16 (= num_heads)
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 32 * 16 * 128 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 32 * 16 * 128 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1041,7 +1063,7 @@ mod tests {
             r#"{"model_type":"qwen3_vl","vision_config":{"depth":27},"text_config":{"num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,"hidden_size":4096,"head_dim":128}}"#,
         )
         .unwrap();
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 36 * 8 * 128 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 36 * 8 * 128 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1055,7 +1077,7 @@ mod tests {
         )
         .unwrap();
         // head_dim = 2048/16 = 128; kv_heads = 16 (= num_heads)
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 32 * 16 * 128 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 32 * 16 * 128 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1070,7 +1092,7 @@ mod tests {
         )
         .unwrap();
         // Uses top-level layers=28, not text_config's 99. head_dim = 3584/28 = 128.
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 28 * 4 * 128 * 4);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 28 * 4 * 128 * 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1083,7 +1105,7 @@ mod tests {
             r#"{"num_attention_heads":32,"hidden_size":4096}"#, // num_hidden_layers absent
         )
         .unwrap();
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 0);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1092,7 +1114,7 @@ mod tests {
     fn kv_bytes_missing_file_returns_zero() {
         let dir = tmp_dir("no-file");
         // Don't create config.json
-        assert_eq!(read_kv_bytes_per_token_f16(&dir), 0);
+        assert_eq!(legacy_bytes_per_token_f16(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1111,7 +1133,7 @@ mod tests {
     #[test]
     fn ratchet_round_trip_same_pool_size() {
         let dir = tmp_dir("ratchet-round-trip");
-        write_kv_capacity_ratchet(&dir, 4665, 1.0);
+        write_kv_capacity_ratchet(&dir, 4665, 1.0, false);
         assert_eq!(read_kv_capacity_ratchet(&dir, 1.0), Some(4665));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1125,7 +1147,7 @@ mod tests {
     #[test]
     fn ratchet_scales_with_pool_size_increase() {
         let dir = tmp_dir("ratchet-scale-up");
-        write_kv_capacity_ratchet(&dir, 4665, 1.0);
+        write_kv_capacity_ratchet(&dir, 4665, 1.0, false);
         // Pool raised 7.5x → learned ceiling should scale 7.5x too.
         assert_eq!(read_kv_capacity_ratchet(&dir, 7.5), Some(34_987));
         std::fs::remove_dir_all(&dir).ok();
@@ -1136,8 +1158,9 @@ mod tests {
     #[test]
     fn ratchet_scales_with_pool_size_decrease() {
         let dir = tmp_dir("ratchet-scale-down");
-        write_kv_capacity_ratchet(&dir, 34_987, 7.5);
-        assert_eq!(read_kv_capacity_ratchet(&dir, 1.0), Some(4_664));
+        // Whole-GiB pools: learned at 8 GiB (the engine's pool for a 7.5 request).
+        write_kv_capacity_ratchet(&dir, 34_987, 8.0, false);
+        assert_eq!(read_kv_capacity_ratchet(&dir, 1.0), Some(4_373));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1147,7 +1170,7 @@ mod tests {
     #[test]
     fn ratchet_zero_tokens_is_treated_as_absent() {
         let dir = tmp_dir("ratchet-zero-tokens");
-        write_kv_capacity_ratchet(&dir, 0, 1.0);
+        write_kv_capacity_ratchet(&dir, 0, 1.0, false);
         assert_eq!(read_kv_capacity_ratchet(&dir, 7.5), None);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1158,7 +1181,7 @@ mod tests {
     #[test]
     fn ratchet_degenerate_learn_pool_size_is_treated_as_absent() {
         let dir = tmp_dir("ratchet-degenerate-pool");
-        write_kv_capacity_ratchet(&dir, 4665, 0.0);
+        write_kv_capacity_ratchet(&dir, 4665, 0.0, false);
         assert_eq!(read_kv_capacity_ratchet(&dir, 7.5), None);
         std::fs::remove_dir_all(&dir).ok();
     }

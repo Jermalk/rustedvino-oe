@@ -79,6 +79,8 @@ unsafe extern "C" {
     ) -> std::ffi::c_int;
 
     fn ov_last_error() -> *const std::ffi::c_char;
+
+    fn ov_last_props() -> *const std::ffi::c_char;
 }
 
 // ── Helper: read the thread-local C error buffer ─────────────────────────────
@@ -100,6 +102,23 @@ pub(crate) fn last_error() -> String {
         let ptr = ov_last_error();
         if ptr.is_null() {
             return "(no error)".to_owned();
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+}
+
+/// The properties the last engine constructor on this thread was given, as the bridge
+/// recorded them (device, scheduler figures, KV precision, the `AnyMap` handed to
+/// `OpenVINO`). Read right after a constructor call, on the same thread, to log what the
+/// engine really received.
+pub(crate) fn last_props() -> String {
+    // SAFETY: ov_last_props returns a pointer into a thread-local std::string that stays
+    // valid until the next constructor call on this thread; it is never null. It is copied
+    // into a Rust String before any further ov_ call.
+    unsafe {
+        let ptr = ov_last_props();
+        if ptr.is_null() {
+            return String::new();
         }
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }

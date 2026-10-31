@@ -76,6 +76,39 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     /// the factory — the manager owns "what kind is this model."
     fn detect_kind(&self, model_dir: &Path) -> ModelKind;
 
+    /// The `KV_CACHE_PRECISION` string a load of this model hands the engine (`""` = plugin
+    /// default; also the tag of its blob-cache directory), or `None` when the factory does not
+    /// resolve one (test factories): callers then use the normalised global string. Must agree
+    /// with what [`load`](Self::load) passes, since the prune pass uses it to find the directory
+    /// a model's live blobs are in.
+    fn kv_passed(&self, _model_path: &Path, _kind: ModelKind, _device: &str) -> Option<String> {
+        None
+    }
+
+    /// What exact (blocks-first) pool sizing needs for this model: its KV profile and the
+    /// precision the engine will be given. `None` = the factory has no such knowledge (test
+    /// factories, kinds without a KV cache, no readable `config.json`): the caller sizes the pool
+    /// the old way, in whole GiB. Blocking file I/O: not for the async runtime.
+    fn kv_pool_inputs(
+        &self,
+        _model_path: &Path,
+        _kind: ModelKind,
+        _device: &str,
+    ) -> Option<KvPoolInputs> {
+        None
+    }
+
+    /// The linked `OpenVINO` and `GenAI` build strings, `None` when either is unknown. Gates exact
+    /// pool sizing to the engine versions the layouts were verified on. Overridden by test
+    /// factories so the result does not depend on the SDK a test machine happens to link.
+    fn engine_versions(&self) -> Option<(String, String)> {
+        crate::ov_cb::openvino_version().zip(crate::ov_cb::genai_version())
+    }
+
+    /// Record the exact KV block count the next load of `model_id` must build its pool with
+    /// (`None` = size from the GiB budget as before). Set right before each load.
+    fn register_kv_blocks_hint(&self, _model_id: &str, _blocks: Option<u64>) {}
+
     /// Record an explicit kind hint for `model_id`, so a later [`detect_kind`]
     /// call recognizes it without directory sniffing.
     ///
@@ -103,6 +136,10 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     /// ([`resolve_prefix_caching`]). Default no-op: test factories build stub
     /// engines that have no prefix cache.
     fn register_prefix_caching_hint(&self, _model_id: &str, _value: Option<bool>) {}
+
+    /// Record the per-model `kv_cache_precision` override (already normalised: `""` = auto, `i8`,
+    /// `u4`, `f16`; `None` = no override) the next load of `model_id` resolves with.
+    fn register_kv_precision_hint(&self, _model_id: &str, _value: Option<&'static str>) {}
 
     /// Record a `max_prompt_len` (NPU `MAX_PROMPT_LEN`) hint for `model_id` so
     /// an NPU-routed load compiles its `LLMPipeline` with that ceiling instead
@@ -191,6 +228,17 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)>;
 }
 
+/// Inputs of exact pool sizing, from [`EngineFactory::kv_pool_inputs`].
+#[derive(Clone, Debug)]
+pub(crate) struct KvPoolInputs {
+    /// The model's KV layout.
+    pub profile: std::sync::Arc<super::kv_profile::KvProfile>,
+    /// The precision decision (the engine is given `resolution.passed`).
+    pub resolution: super::kv_precision::KvResolution,
+    /// Which engine builds the pool (decides the linear-attention reservation).
+    pub path: super::kv_precision::EnginePath,
+}
+
 // ---- Production implementation ----------------------------------------
 
 /// Production engine factory: loads via [`OvCbEngine`] + [`spawn_engine`].
@@ -198,8 +246,9 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
 /// `admission_queue_timeout_ms` is fixed at construction time. `cache_size_gb`
 /// and `max_num_seqs` are passed per-load from `ModelManager` (co-residency
 /// Slice 2 resolves them per-model from config policy / overrides).
+#[allow(clippy::struct_excessive_bools)] // independent load-time switches from the config
 pub(crate) struct OvEngineFactory {
-    /// `KV_CACHE_PRECISION` property; `""` = plugin default, `"u8"` = compress.
+    /// `KV_CACHE_PRECISION` property; `""` = plugin default, `"i8"`/`"u4"`/`"f16"` = explicit (normalised from the config).
     pub kv_cache_precision: String,
     /// Max wait for an inference slot before returning HTTP 429.
     pub admission_queue_timeout_ms: u64,
@@ -246,9 +295,171 @@ pub(crate) struct OvEngineFactory {
     /// `None` = caching disabled (plugin default). Non-empty: compiled blobs are
     /// written on first load and read on subsequent loads, cutting JIT time.
     pub ov_cache_dir: Option<String>,
+    /// `Config::ov_cache_layout == "keyed"`: the KV engines compile into `ov_cache_dir/kv-<tag>/`.
+    pub ov_cache_keyed: bool,
     /// Reuse KV blocks across CB requests sharing an identical prompt prefix
     /// (from `Config::enable_prefix_caching`). Only affects prefill/TTFT.
     pub enable_prefix_caching: bool,
+    /// `Config::kv_warmup`: run a one-token generation after each GPU load of a KV engine.
+    pub kv_warmup: bool,
+    /// Per-model `kv_cache_precision` overrides (normalised), set before each load.
+    pub kv_precision_overrides: std::sync::RwLock<HashMap<String, &'static str>>,
+    /// `Config::kv_precision_pass`: who decides the engines' KV precision.
+    pub kv_pass_mode: super::kv_precision::PassMode,
+    /// The string each model was last resolved to, by (model path, device): read by the prune
+    /// pass through [`EngineFactory::kv_passed`] so it need not re-parse the IR.
+    pub kv_resolved: std::sync::Mutex<HashMap<(std::path::PathBuf, String), &'static str>>,
+    /// Exact KV block count for the next load, by model ID, set through
+    /// [`EngineFactory::register_kv_blocks_hint`].
+    pub kv_blocks_hints: std::sync::RwLock<HashMap<String, u64>>,
+}
+
+impl OvEngineFactory {
+    /// The per-model precision override registered for the model in `model_path` (its leaf
+    /// directory name is the model id).
+    fn per_model_precision(&self, model_path: &Path) -> Option<&'static str> {
+        let id = model_path.file_name().and_then(|s| s.to_str())?;
+        self.kv_precision_overrides
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .copied()
+    }
+
+    /// Whether a speculative-decoding draft is registered for the model in `model_path` (its leaf
+    /// directory name is the model id). Such a model keeps the 0.8.x pass-through: the draft
+    /// engine inherits the main engine's properties and may run on another device.
+    fn has_draft_model(&self, model_path: &Path) -> bool {
+        model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|id| {
+                self.draft_hints
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(id)
+            })
+    }
+
+    /// Resolve (and remember) the KV precision of one model about to load, and log the profile.
+    /// Called from `load`, which runs on a blocking thread: it reads `config.json` and the IR.
+    fn resolve_kv(
+        &self,
+        model_path: &Path,
+        model_id: &str,
+        kind: ModelKind,
+        device: &str,
+    ) -> super::kv_precision::KvResolution {
+        use super::kv_precision::{
+            EnginePath, KvResolution, PrecisionSource, resolve_kv_precision,
+        };
+        let path = match kind {
+            ModelKind::TextGen => EnginePath::Cb,
+            ModelKind::Vision => EnginePath::Vlm,
+            // No KV cache engine: nothing to resolve or pass.
+            _ => {
+                return KvResolution {
+                    precision: None,
+                    rule_guess: None,
+                    source: PrecisionSource::LegacyPassthrough,
+                    passed: "",
+                };
+            }
+        };
+        // NPU engines take no KV precision: nothing to read.
+        let sd = self.has_draft_model(model_path);
+        let profile = (!sd && !device.to_ascii_uppercase().starts_with("NPU"))
+            .then(|| super::kv_profile::KvProfile::read(model_path, device))
+            .flatten();
+        let res = if sd {
+            super::kv_precision::legacy_resolution(path, &self.kv_cache_precision)
+        } else {
+            resolve_kv_precision(
+                profile.as_ref(),
+                path,
+                device,
+                self.per_model_precision(model_path),
+                &self.kv_cache_precision,
+                self.kv_pass_mode,
+            )
+        };
+        self.kv_resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((model_path.to_path_buf(), device.to_owned()), res.passed);
+        tracing::info!(
+            model_id,
+            kv_precision = ?res.precision,
+            kv_rule_guess = ?res.rule_guess,
+            kv_precision_source = ?res.source,
+            kv_passed = res.passed,
+            kv_bytes_per_token = profile
+                .as_ref()
+                .zip(res.precision)
+                .map(|(p, prec)| p.kv_bytes_per_token(prec)),
+            kv_profile_confidence = ?profile.as_ref().map(|p| p.confidence),
+            engine_path = ?path,
+            "kv profile"
+        );
+        warn_vlm_ignores_global_once(model_id, path, res, &self.kv_cache_precision);
+        if let (Some(hint), Some(resolved)) =
+            (profile.as_ref().and_then(|p| p.ir_kv_hint), res.precision)
+            && hint != resolved
+            && matches!(
+                res.source,
+                super::kv_precision::PrecisionSource::PerModel
+                    | super::kv_precision::PrecisionSource::GlobalExplicit
+            )
+        {
+            // E-14: the IR's own runtime option names another precision (f16 for an fp16 model);
+            // the operator's explicit setting wins, and this line says so.
+            tracing::info!(
+                model_id,
+                ir_hint = ?hint,
+                resolved = ?resolved,
+                source = ?res.source,
+                "ir_hint overridden by an explicit KV precision setting"
+            );
+        }
+        if let Some(p) = self
+            .per_model_precision(model_path)
+            .filter(|p| !p.is_empty())
+            && res.source != super::kv_precision::PrecisionSource::PerModel
+        {
+            tracing::warn!(
+                model_id,
+                requested = p,
+                device,
+                source = ?res.source,
+                "this model's kv_cache_precision override is ignored (it applies on a plain GPU \
+                 device with kv_precision_pass \"explicit\", not to CPU, NPU, HETERO/AUTO, \
+                 speculative-decoding models or plugin mode)"
+            );
+        }
+        res
+    }
+}
+
+/// One WARN per process when the global `kv_cache_precision` names a precision a vision model
+/// does not get (they resolve their own; the global key applies to text models only).
+fn warn_vlm_ignores_global_once(
+    model_id: &str,
+    path: super::kv_precision::EnginePath,
+    res: super::kv_precision::KvResolution,
+    global: &str,
+) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if super::kv_precision::vlm_ignores_global(path, res, global)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            model_id,
+            global,
+            resolved = ?res.precision,
+            source = ?res.source,
+            "the global kv_cache_precision does not apply to vision models; vision models resolve their own (this one: see resolved)"
+        );
+    }
 }
 
 /// Resolve the device an embedding model should load on.
@@ -371,6 +582,17 @@ impl EngineFactory for OvEngineFactory {
         };
     }
 
+    fn register_kv_precision_hint(&self, model_id: &str, value: Option<&'static str>) {
+        let mut hints = self
+            .kv_precision_overrides
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match value {
+            Some(v) => hints.insert(model_id.to_owned(), v),
+            None => hints.remove(model_id),
+        };
+    }
+
     fn register_prefix_caching_hint(&self, model_id: &str, value: Option<bool>) {
         let mut hints = self
             .prefix_caching_overrides
@@ -448,6 +670,97 @@ impl EngineFactory for OvEngineFactory {
             .unwrap_or(ModelKind::TextGen)
     }
 
+    fn register_kv_blocks_hint(&self, model_id: &str, blocks: Option<u64>) {
+        let mut hints = self
+            .kv_blocks_hints
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match blocks {
+            Some(b) => hints.insert(model_id.to_owned(), b),
+            None => hints.remove(model_id),
+        };
+    }
+
+    fn kv_pool_inputs(
+        &self,
+        model_path: &Path,
+        kind: ModelKind,
+        device: &str,
+    ) -> Option<KvPoolInputs> {
+        let path = match kind {
+            ModelKind::TextGen => super::kv_precision::EnginePath::Cb,
+            ModelKind::Vision => super::kv_precision::EnginePath::Vlm,
+            _ => return None,
+        };
+        if device.to_ascii_uppercase().starts_with("NPU") || self.has_draft_model(model_path) {
+            return None;
+        }
+        let profile = super::kv_profile::KvProfile::read(model_path, device)?;
+        let resolution = super::kv_precision::resolve_kv_precision(
+            Some(&profile),
+            path,
+            device,
+            self.per_model_precision(model_path),
+            &self.kv_cache_precision,
+            self.kv_pass_mode,
+        );
+        // The prune pass asks which directory this model's blobs are in before it ever loads.
+        self.kv_resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (model_path.to_path_buf(), device.to_owned()),
+                resolution.passed,
+            );
+        Some(KvPoolInputs {
+            profile: std::sync::Arc::new(profile),
+            resolution,
+            path,
+        })
+    }
+
+    fn kv_passed(&self, model_path: &Path, kind: ModelKind, device: &str) -> Option<String> {
+        if !matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+            return None;
+        }
+        let cached = self
+            .kv_resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(model_path.to_path_buf(), device.to_owned()))
+            .copied();
+        if let Some(p) = cached {
+            return Some(p.to_owned());
+        }
+        // Not loaded yet in this process (a candidate model the prune pass asks about):
+        // resolve it the way a load would, without logging, and remember the answer so a
+        // sweep does not parse the IR again.
+        let path = if kind == ModelKind::Vision {
+            super::kv_precision::EnginePath::Vlm
+        } else {
+            super::kv_precision::EnginePath::Cb
+        };
+        let passed = if self.has_draft_model(model_path) {
+            super::kv_precision::legacy_resolution(path, &self.kv_cache_precision).passed
+        } else {
+            let profile = super::kv_profile::KvProfile::read(model_path, device);
+            super::kv_precision::resolve_kv_precision(
+                profile.as_ref(),
+                path,
+                device,
+                self.per_model_precision(model_path),
+                &self.kv_cache_precision,
+                self.kv_pass_mode,
+            )
+            .passed
+        };
+        self.kv_resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((model_path.to_path_buf(), device.to_owned()), passed);
+        Some(passed.to_owned())
+    }
+
     // Dispatch on ModelKind — one arm per variant; naturally grows with new kinds.
     #[allow(clippy::too_many_lines)]
     fn load(
@@ -468,41 +781,14 @@ impl EngineFactory for OvEngineFactory {
             .unwrap_or(device);
 
         // Effective prefix-caching flag for this model: the per-model override,
-        // else the hybrid linear-attention guard, else the global flag.
-        let (prefix_caching, prefix_caching_source) = {
-            let model_override = self
-                .prefix_caching_overrides
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(model_id)
-                .copied();
-            resolve_prefix_caching(
-                self.enable_prefix_caching,
-                model_override,
-                is_linear_attention_model(model_path),
-                device,
-            )
-        };
-        if prefix_caching_source == PrefixCachingSource::HybridGuard {
-            tracing::warn!(
-                model_id,
-                device,
-                "prefix caching forced OFF for this hybrid linear-attention model on GPU: \
-                 OpenVINO GenAI 2026.2.x returns wrong continuations on a prefix-cache hit \
-                 (fixed upstream in 2026.4.1). Repeated long prompts lose the \
-                 prefill speed-up. Set \
-                 models['{model_id}'].enable_prefix_caching=true to override."
-            );
-        }
-        // Applied where the engine is built (the `?` in those arms returns from
-        // this function, so nothing after the `match` would ever see the error).
-        let guard_hint = |e: anyhow::Error| {
-            if prefix_caching_source == PrefixCachingSource::HybridGuard {
-                hint_if_hybrid_guard_pool_too_small(e, model_id)
-            } else {
-                e
-            }
-        };
+        // else the global flag.
+        let prefix_caching = self
+            .prefix_caching_overrides
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(model_id)
+            .copied()
+            .unwrap_or(self.enable_prefix_caching);
 
         // OV compile-cache blob attribution (the project's internal engineering log):
         // snapshot `ov_cache_dir` before dispatch, diff after, so any new files
@@ -513,14 +799,36 @@ impl EngineFactory for OvEngineFactory {
         // `ov_cache_dir` concurrently. Kinds that don't pass `ov_cache_dir` to
         // their engine constructor (Embedding, Reranking) simply produce no
         // diff — harmless, not special-cased below.
-        let cache_dir_path = self
-            .ov_cache_dir
+        let kind = self.detect_kind(model_path);
+        let kv = self.resolve_kv(model_path, model_id, kind, device);
+        // Exact block count from blocks-first sizing (0 = size from the GiB budget).
+        let kv_blocks = self
+            .kv_blocks_hints
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(model_id)
+            .copied()
+            .unwrap_or(0);
+        let CachePlan {
+            engine_dir: kv_cache_dir,
+            scope_subdir,
+            attribution_root: cache_dir_path,
+        } = plan_cache_dir(
+            self.ov_cache_dir.as_deref(),
+            kind,
+            device,
+            kv.passed,
+            self.ov_cache_keyed,
+        );
+        // E-17: the KV engines compile into `<root>/kv-<tag>/`, created and proven writable
+        // before the engine call (OpenVINO throws on a `CACHE_DIR` it cannot create). When it
+        // cannot be made the engine gets no cache at all - never the root, where blobs of
+        // another precision would be picked up again.
+        let blobs_before = cache_dir_path
             .as_deref()
-            .filter(|d| !d.is_empty())
-            .map(Path::new);
-        let blobs_before = cache_dir_path.map(crate::cache_manifest::snapshot_cache_dir);
+            .map(|r| crate::cache_manifest::snapshot_cache_scope(r, scope_subdir));
 
-        let result = match self.detect_kind(model_path) {
+        let result = match kind {
             ModelKind::Vision => {
                 // VLMPipeline runs a ContinuousBatchingPipeline internally
                 // (VLMContinuousBatchingAdapter — confirmed via a live gdb
@@ -535,7 +843,7 @@ impl EngineFactory for OvEngineFactory {
                 // resent-full-history chat pattern
                 // (the project's internal engineering log —
                 // two distinct bugs found in the same investigation).
-                let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
+                let cache_dir = kv_cache_dir.as_str();
                 let registered = self
                     .concurrent_streams
                     .read()
@@ -570,6 +878,7 @@ impl EngineFactory for OvEngineFactory {
                     device,
                     cache_dir,
                     cache_size_gb,
+                    kv_blocks,
                     prefix_caching,
                     // The vision engine thread runs one generation at a time (`run_generate` in
                     // `vlm_engine::spawn_vlm_engine`), so the scheduler needs room for one
@@ -577,8 +886,14 @@ impl EngineFactory for OvEngineFactory {
                     // them and made a hybrid model fail to load without prefix caching (D-02).
                     // If the vision engine ever becomes concurrent, raise this with it.
                     1,
-                )
-                .map_err(guard_hint)?;
+                    kv.passed,
+                )?;
+                if self.kv_warmup
+                    && warm_up_applies(device)
+                    && let Err(e) = warm_up_vlm(&engine, model_id)
+                {
+                    return Err(leak_if_poisoned(engine, e, model_id));
+                }
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
                 // A tokenizer of its own, so /tokenize does not queue behind a generation (D-13).
@@ -603,7 +918,7 @@ impl EngineFactory for OvEngineFactory {
                 Ok((EngineHandleKind::Vision(handle), thread))
             }
             ModelKind::TextGen => {
-                if device == "NPU" {
+                if device.starts_with("NPU") {
                     // NPU LLM: static LLMPipeline, single-stream. CB cannot target
                     // the NPU (proven empirically on a Lunar Lake NPU box). Requires
                     // a channel-wise int4 IR; group-wise fails NPU compile.
@@ -649,12 +964,13 @@ impl EngineFactory for OvEngineFactory {
                     self.attribute_new_blobs(
                         model_id,
                         device,
-                        cache_dir_path,
+                        cache_dir_path.as_deref(),
+                        scope_subdir,
                         blobs_before.as_ref(),
                     );
                     return Ok((EngineHandleKind::NpuTextGen(handle), thread));
                 }
-                let cache_dir = self.ov_cache_dir.as_deref().unwrap_or("");
+                let cache_dir = kv_cache_dir.as_str();
                 if cache_size_gb <= 0.0 && prefix_caching {
                     // The OPPOSITE silent failure mode from the Vision arm's
                     // equivalent warning above, and the more dangerous of the
@@ -698,33 +1014,43 @@ impl EngineFactory for OvEngineFactory {
                     ),
                     None => ("", "", 0),
                 };
-                let engine = match draft_hint.as_ref().filter(|h| h.verify_on_load) {
+                let mut engine = match draft_hint.as_ref().filter(|h| h.verify_on_load) {
                     Some(hint) => verify_speculative_pairing(
                         path_str,
                         device,
                         max_num_seqs,
                         cache_size_gb,
-                        &self.kv_cache_precision,
+                        kv.passed,
                         cache_dir,
                         prefix_caching,
                         hint,
                         model_id,
                     )
-                    .map_err(|e| guard_hint(hint_if_ambiguous_kind(e, model_path)))?,
+                    .map_err(|e| hint_if_ambiguous_kind(e, model_path))?,
                     None => crate::ov_cb::OvCbEngine::new(
                         path_str,
                         device,
                         max_num_seqs,
                         cache_size_gb,
-                        &self.kv_cache_precision,
+                        kv_blocks,
+                        kv.passed,
                         cache_dir,
                         prefix_caching,
                         draft_path,
                         draft_device,
                         num_assistant_tokens,
                     )
-                    .map_err(|e| guard_hint(hint_if_ambiguous_kind(e, model_path)))?,
+                    .map_err(|e| hint_if_ambiguous_kind(e, model_path))?,
                 };
+                // A draft-attached engine already ran probe generations (`verify_on_load`) or is
+                // not worth a different warm-up; everything else gets its pool materialised now.
+                if self.kv_warmup
+                    && warm_up_applies(device)
+                    && draft_hint.is_none()
+                    && let Err(e) = warm_up_cb(&mut engine, model_id)
+                {
+                    return Err(leak_if_poisoned(engine, e, model_id));
+                }
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
                 let (handle, thread) = crate::cb_engine::spawn_engine(
@@ -945,7 +1271,13 @@ impl EngineFactory for OvEngineFactory {
         };
 
         if result.is_ok() {
-            self.attribute_new_blobs(model_id, device, cache_dir_path, blobs_before.as_ref());
+            self.attribute_new_blobs(
+                model_id,
+                device,
+                cache_dir_path.as_deref(),
+                scope_subdir,
+                blobs_before.as_ref(),
+            );
         }
 
         result
@@ -961,12 +1293,13 @@ impl OvEngineFactory {
         model_id: &str,
         device: &str,
         cache_dir_path: Option<&Path>,
+        scope_subdir: Option<&str>,
         blobs_before: Option<&std::collections::HashSet<String>>,
     ) {
         let (Some(cache_dir_path), Some(blobs_before)) = (cache_dir_path, blobs_before) else {
             return;
         };
-        let blobs_after = crate::cache_manifest::snapshot_cache_dir(cache_dir_path);
+        let blobs_after = crate::cache_manifest::snapshot_cache_scope(cache_dir_path, scope_subdir);
         let new_blobs: Vec<String> = blobs_after.difference(blobs_before).cloned().collect();
         if !new_blobs.is_empty()
             && let Some(root) = crate::cache_manifest::manifest_root(self.ov_cache_dir.as_deref())
@@ -996,6 +1329,107 @@ impl OvEngineFactory {
                     .copied()
             }
         })
+    }
+}
+
+/// The blob-cache subdirectory (relative to `ov_cache_dir`) a model of `kind` on `device`
+/// compiles into: `Ok(None)` for the root (E-17).
+///
+/// Keyed only for the engines whose KV precision the plugin hashes out of the blob id: the
+/// continuous-batching text engine and the vision pipeline (tag = the precision string the
+/// loader passes, `passed_kv`; `kv-auto` when it passes none), on GPU and CPU. The NPU engines and every
+/// kind without a KV cache keep the root, as does `flat` layout. Used by the loader and by the
+/// prune pass, so both agree on where a model's active blobs live.
+///
+/// # Errors
+/// A precision string with no tag. The caller must then give the engine no cache at all: the
+/// root is where blobs of every precision mix.
+pub(crate) fn kv_cache_subdir_for(
+    kind: ModelKind,
+    device: &str,
+    passed_kv: &str,
+    keyed: bool,
+) -> anyhow::Result<Option<&'static str>> {
+    if !keyed || device.starts_with("NPU") {
+        return Ok(None);
+    }
+    if !matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+        return Ok(None);
+    }
+    crate::cache_manifest::kv_cache_subdir(passed_kv).map(Some)
+}
+
+/// What a load hands the engine and what it attributes afterwards.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CachePlan {
+    /// The `CACHE_DIR` string for the engine; `""` = no cache.
+    pub engine_dir: String,
+    /// The keyed subdirectory the engine compiles into, if any.
+    pub scope_subdir: Option<&'static str>,
+    /// The cache root the load's before/after diff runs against; `None` = attribute nothing.
+    pub attribution_root: Option<std::path::PathBuf>,
+}
+
+/// Chooses (and creates) the cache directory for one load. A keyed directory that cannot be
+/// created or written, or a precision without a tag, yields no cache at all - never the root.
+pub(crate) fn plan_cache_dir(
+    ov_cache_dir: Option<&str>,
+    kind: ModelKind,
+    device: &str,
+    passed_kv: &str,
+    keyed: bool,
+) -> CachePlan {
+    let none = CachePlan {
+        engine_dir: String::new(),
+        scope_subdir: None,
+        attribution_root: None,
+    };
+    let Some(root) = ov_cache_dir.filter(|d| !d.is_empty()).map(Path::new) else {
+        return none;
+    };
+    let sub = match kv_cache_subdir_for(kind, device, passed_kv, keyed) {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::warn!(error = %e, "OV blob cache disabled for this model");
+            return none;
+        }
+    };
+    let Some(sub) = sub else {
+        return CachePlan {
+            engine_dir: root.to_string_lossy().into_owned(),
+            scope_subdir: None,
+            attribution_root: Some(root.to_path_buf()),
+        };
+    };
+    match crate::cache_manifest::ensure_writable_subdir(root, sub) {
+        Ok(dir) => CachePlan {
+            engine_dir: dir.to_string_lossy().into_owned(),
+            scope_subdir: Some(sub),
+            attribution_root: Some(root.to_path_buf()),
+        },
+        Err(e) => {
+            warn_unusable_cache_dir_once(&root.join(sub), &e);
+            none
+        }
+    }
+}
+
+/// One WARN per (directory, process) when a keyed cache directory cannot be made.
+fn warn_unusable_cache_dir_once(dir: &Path, err: &std::io::Error) {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(dir.to_path_buf());
+    if first {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %err,
+            "OV blob cache directory is unusable - this model compiles without a blob cache"
+        );
     }
 }
 
@@ -1132,111 +1566,6 @@ fn hint_if_ambiguous_kind(err: anyhow::Error, model_dir: &Path) -> anyhow::Error
     err
 }
 
-/// Where the effective `enable_prefix_caching` value for a load came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrefixCachingSource {
-    /// `Config::enable_prefix_caching`, no per-model decision applied.
-    Global,
-    /// The model's own `enable_prefix_caching` policy field.
-    ModelOverride,
-    /// Forced off by the hybrid linear-attention guard (see
-    /// [`resolve_prefix_caching`]).
-    HybridGuard,
-}
-
-/// Decide whether a load enables prefix caching.
-///
-/// Precedence: the model's explicit override, then the **hybrid guard**, then
-/// the global flag. The guard forces caching off when the model has
-/// linear-attention layers and loads on a GPU device, because `OpenVINO` `GenAI`
-/// 2026.2.x returns wrong continuations on a prefix-cache hit for those models
-/// on GPU (reproduced with bare `GenAI` on 2026.2.0 and 2026.2.1, absent on CPU
-/// and fixed in 2026.4.1).
-/// Correct output beats a faster prefill, and the override is always available.
-///
-/// A free function so the precedence is unit-testable without a GPU.
-pub(crate) fn resolve_prefix_caching(
-    global: bool,
-    model_override: Option<bool>,
-    linear_attention: bool,
-    device: &str,
-) -> (bool, PrefixCachingSource) {
-    if let Some(v) = model_override {
-        return (v, PrefixCachingSource::ModelOverride);
-    }
-    if global && linear_attention && device.starts_with("GPU") {
-        return (false, PrefixCachingSource::HybridGuard);
-    }
-    (global, PrefixCachingSource::Global)
-}
-
-/// Whether automatic placement must keep a model off every GPU: it has
-/// linear-attention layers and does not carry an explicit
-/// `enable_prefix_caching: true` (the guard in [`resolve_prefix_caching`] would
-/// force caching off on a GPU, and the model then fails to load there).
-pub(crate) fn hybrid_banned_from_gpu(linear_attention: bool, model_override: Option<bool>) -> bool {
-    linear_attention && model_override != Some(true)
-}
-
-/// Whether `model_dir/config.json` declares any `linear_attention` layer
-/// (`layer_types`, at the top level or under `text_config`). Unreadable or
-/// unparsable config counts as "no" — the guard then simply does not fire.
-pub(crate) fn is_linear_attention_model(model_dir: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(model_dir.join("config.json")) else {
-        return false;
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    [
-        cfg.get("layer_types"),
-        cfg.pointer("/text_config/layer_types"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(serde_json::Value::as_array)
-    .flatten()
-    .any(|t| t.as_str() == Some("linear_attention"))
-}
-
-/// With prefix caching forced off, a hybrid model's linear-attention state is
-/// budgeted from `kv_cache_gb` and can exceed it (measured: Qwen3.5-9B failed
-/// to load at 4 and 6 GB, loaded at 8). Say so instead of surfacing the bare
-/// C++ check failure.
-/// Replaces any absolute path of the machine `OpenVINO` was built on (build-farm home paths, as C++
-/// check failures quote them) with a neutral phrase: build-farm paths mean nothing to a user.
-fn strip_build_paths(msg: &str) -> String {
-    msg.split_inclusive(char::is_whitespace)
-        .map(|tok| {
-            let word = tok.trim_end();
-            if word.starts_with("/home/") {
-                let tail = &tok[word.len()..];
-                let colon = if word.ends_with(':') { ":" } else { "" };
-                format!("the OpenVINO GenAI source{colon}{tail}")
-            } else {
-                tok.to_owned()
-            }
-        })
-        .collect()
-}
-
-fn hint_if_hybrid_guard_pool_too_small(err: anyhow::Error, model_id: &str) -> anyhow::Error {
-    let msg = err.to_string();
-    if msg.contains("reserved_la_bytes") || msg.contains("linear attention cache") {
-        return anyhow::anyhow!(
-            "{}\n\nHint: prefix caching was forced off for '{model_id}' (hybrid \
-             linear-attention model on GPU; see enable_prefix_caching), and without it the \
-             linear-attention state no longer fits. Either accept the upstream prefix-cache bug \
-             for this model (`rv add {model_id} --device GPU.n --enable-prefix-caching`, or \
-             enable_prefix_caching=true in its config entry), or raise BOTH kv_cache_gb and the \
-             global cache_size_gb - cache_size_gb (2.0 in the release bundle) caps every model's \
-             KV pool, so a larger kv_cache_gb alone changes nothing. Or load it on the CPU.",
-            strip_build_paths(&msg)
-        );
-    }
-    err
-}
-
 /// Two-layer VLM concurrency resolution: layer 2 (`registered`, a per-model
 /// `max_concurrent_streams` hint) wins if set, else layer 1 (`max_num_seqs`,
 /// the pipeline default — `0` means "not set"), else `None` (caller falls
@@ -1289,6 +1618,87 @@ fn run_probe(
     Ok(output)
 }
 
+/// Whether a load on `device` gets the KV warm-up: GPU-class devices only (the pool of a CPU or
+/// NPU engine is host memory or a fixed compiled shape, and nothing there can poison a GPU).
+fn warm_up_applies(device: &str) -> bool {
+    device.to_ascii_uppercase().starts_with("GPU")
+}
+
+/// A GPU context poisoned by an out-of-resources failure must show at load, not at the first
+/// request; any other warm-up failure is logged and the load goes on (the first real request
+/// will report a real problem with a real prompt).
+fn warm_up_outcome(
+    model_id: &str,
+    started: std::time::Instant,
+    r: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match r {
+        Ok(()) => {
+            tracing::info!(
+                model_id,
+                warm_up_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "KV warm-up generation complete (pool materialised)"
+            );
+            Ok(())
+        }
+        Err(e) if crate::model_manager::is_gpu_poison_error(&format!("{e:#}")) => {
+            Err(e.context("KV warm-up generation hit an out-of-resources failure"))
+        }
+        // MR-2: a vision pool is built at its first generate (this one); GenAI refusing it for
+        // device memory must fail the load, not leave a Ready model whose first request 500s.
+        Err(e) if crate::model_manager::is_genai_memory_budget_error(&format!("{e:#}")) => {
+            Err(e.context("KV warm-up generation: GenAI refused the KV cache"))
+        }
+        Err(e) => {
+            tracing::warn!(model_id, error = %format!("{e:#}"), "KV warm-up generation failed; continuing");
+            Ok(())
+        }
+    }
+}
+
+/// A failed load-time probe's engine (warm-up, speculative self-check): on a GPU-poison failure
+/// it is leaked, not dropped. Destroying a pipeline on a poisoned context is the destructor path the poison exit avoids (it can hang or
+/// abort); the process gives the memory back when it exits, and every GPU model is unavailable
+/// until then anyway (0.9.0 review F). Any other failure drops it normally.
+fn leak_if_poisoned<E>(engine: E, e: anyhow::Error, model_id: &str) -> anyhow::Error {
+    if crate::model_manager::is_gpu_poison_error(&format!("{e:#}")) {
+        tracing::warn!(
+            model_id,
+            "GPU context poisoned during a load-time probe (KV warm-up or speculative \
+             self-check) — the engine is left alive on purpose \
+             (not destroyed on the poisoned context); its memory is released when the process \
+             exits"
+        );
+        std::mem::forget(engine);
+    } else {
+        drop(engine);
+    }
+    e
+}
+
+/// One-token generation on a freshly built text engine: materialises the pool and shows a broken
+/// GPU at load time.
+fn warm_up_cb(engine: &mut crate::ov_cb::OvCbEngine, model_id: &str) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let r = run_probe(engine, "Hello", 1).map(|_| ());
+    warm_up_outcome(model_id, started, r)
+}
+
+/// One-token text-only generation on a freshly built vision engine (the pool of a vision model is
+/// allocated at its first generate, not at construction).
+fn warm_up_vlm(engine: &crate::ov_vlm::OvVlmEngine, model_id: &str) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let params = crate::ov_cb::GenParams {
+        max_new_tokens: 1,
+        ..Default::default()
+    };
+    let messages = [serde_json::json!({"role": "user", "content": "Hello"})];
+    let r = engine
+        .generate(&messages, &[], None, None, &params, |_| false)
+        .map(|_| ());
+    warm_up_outcome(model_id, started, r)
+}
+
 /// Speculative decoding load-time greedy-equivalence self-check (Part 7 of
 /// the project's internal engineering log, design question 5's
 /// safety net). Builds a plain engine, probes it, drops it (synchronous VRAM
@@ -1328,6 +1738,7 @@ fn verify_speculative_pairing(
         device,
         max_num_seqs,
         cache_size_gb,
+        0,
         kv_cache_precision,
         cache_dir,
         enable_prefix_caching,
@@ -1336,12 +1747,17 @@ fn verify_speculative_pairing(
         0,
     )
     .context("speculative self-check: failed to build the plain probe engine")?;
-    let plain_output = run_probe(
+    // A poison found here must not run the engine's destructor on the poisoned context.
+    let plain_output = match run_probe(
         &mut plain_engine,
         SPECULATIVE_PROBE_PROMPT,
         SPECULATIVE_PROBE_MAX_NEW_TOKENS,
     )
-    .context("speculative self-check: plain probe generation failed")?;
+    .context("speculative self-check: plain probe generation failed")
+    {
+        Ok(out) => out,
+        Err(e) => return Err(leak_if_poisoned(plain_engine, e, model_id)),
+    };
     drop(plain_engine);
 
     let mut draft_engine = crate::ov_cb::OvCbEngine::new(
@@ -1349,6 +1765,7 @@ fn verify_speculative_pairing(
         device,
         max_num_seqs,
         cache_size_gb,
+        0,
         kv_cache_precision,
         cache_dir,
         enable_prefix_caching,
@@ -1357,12 +1774,17 @@ fn verify_speculative_pairing(
         hint.num_assistant_tokens,
     )
     .context("speculative self-check: failed to build the draft-attached engine")?;
-    let assisted_output = run_probe(
+    // A poison found here must not run the engine's destructor on the poisoned context.
+    let assisted_output = match run_probe(
         &mut draft_engine,
         SPECULATIVE_PROBE_PROMPT,
         SPECULATIVE_PROBE_MAX_NEW_TOKENS,
     )
-    .context("speculative self-check: assisted probe generation failed")?;
+    .context("speculative self-check: assisted probe generation failed")
+    {
+        Ok(out) => out,
+        Err(e) => return Err(leak_if_poisoned(draft_engine, e, model_id)),
+    };
 
     anyhow::ensure!(
         plain_output == assisted_output,
@@ -1403,10 +1825,47 @@ pub(crate) struct MockEngineFactory {
     /// When `true`, `load()` returns a `CL_OUT_OF_RESOURCES` error, simulating
     /// the GPU context-poisoning OOM that triggers the L3 gate.
     pub fail_with_oom: bool,
+    /// `(path substring, message)`: `load()` of a model whose path contains the substring fails
+    /// with that message (a real C++ error text), every other load succeeds.
+    pub fail_message_for: Option<(String, String)>,
+    /// What [`EngineFactory::kv_passed`] answers (`None` = the trait default: the manager falls
+    /// back to the global string). Lets a test give a model its own blob-cache directory.
+    pub kv_passed: Option<String>,
+    /// What [`EngineFactory::kv_pool_inputs`] answers (`None` = no exact sizing).
+    pub pool_inputs: Option<KvPoolInputs>,
+    /// The block counts passed to [`EngineFactory::register_kv_blocks_hint`], in order.
+    pub blocks_hints: std::sync::Mutex<Vec<Option<u64>>>,
 }
 
 #[cfg(test)]
 impl EngineFactory for MockEngineFactory {
+    fn kv_passed(&self, _model_path: &Path, _kind: ModelKind, _device: &str) -> Option<String> {
+        self.kv_passed.clone()
+    }
+
+    fn kv_pool_inputs(
+        &self,
+        _model_path: &Path,
+        _kind: ModelKind,
+        _device: &str,
+    ) -> Option<KvPoolInputs> {
+        self.pool_inputs.clone()
+    }
+
+    fn engine_versions(&self) -> Option<(String, String)> {
+        Some((
+            "2026.4.1-22982-e213a147257".to_owned(),
+            "2026.4.1.0-3408-ab01d1771e4".to_owned(),
+        ))
+    }
+
+    fn register_kv_blocks_hint(&self, _model_id: &str, blocks: Option<u64>) {
+        self.blocks_hints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(blocks);
+    }
+
     /// Name-based kind detection (no GPU): the model id's leaf name selects the
     /// kind by a `-`/`_`-delimited **segment** prefix — a segment beginning with
     /// `vlm`→`Vision`, `embed`→`Embedding`, `stt`→`Stt`, `tts`→`Tts`,
@@ -1470,6 +1929,11 @@ impl EngineFactory for MockEngineFactory {
         }
         if self.should_fail {
             return Err(anyhow::anyhow!("mock load failure (should_fail = true)"));
+        }
+        if let Some((needle, msg)) = &self.fail_message_for
+            && model_path.to_string_lossy().contains(needle.as_str())
+        {
+            return Err(anyhow::anyhow!("{msg}"));
         }
 
         match self.detect_kind(model_path) {
@@ -1586,59 +2050,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    // ── prefix-caching resolution (hybrid linear-attention guard) ───────────
-
+    /// 0.9.0 review F: a poison-class warm-up failure leaks the engine (no destructor on the
+    /// poisoned context); any other failure drops it.
     #[test]
-    fn prefix_caching_guard_forces_off_for_hybrid_on_gpu_only() {
-        use PrefixCachingSource::{Global, HybridGuard};
-        // Hybrid + GPU (any GPU index, or bare "GPU") + global on -> guard.
-        for dev in ["GPU", "GPU.0", "GPU.1"] {
-            assert_eq!(
-                resolve_prefix_caching(true, None, true, dev),
-                (false, HybridGuard),
-                "{dev}"
-            );
+    fn leak_if_poisoned_skips_the_destructor_only_on_poison() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
         }
-        // CPU / NPU were not shown broken: untouched.
-        for dev in ["CPU", "NPU"] {
-            assert_eq!(
-                resolve_prefix_caching(true, None, true, dev),
-                (true, Global)
-            );
-        }
-        assert!(hybrid_banned_from_gpu(true, None));
-        assert!(hybrid_banned_from_gpu(true, Some(false)));
-        assert!(!hybrid_banned_from_gpu(true, Some(true)));
-        assert!(!hybrid_banned_from_gpu(false, None));
-        // Non-hybrid models are never touched.
-        assert_eq!(
-            resolve_prefix_caching(true, None, false, "GPU.1"),
-            (true, Global)
-        );
-        // Global already off: nothing to force, and it is not the guard's doing.
-        assert_eq!(
-            resolve_prefix_caching(false, None, true, "GPU.1"),
-            (false, Global)
-        );
-    }
-
-    #[test]
-    fn prefix_caching_model_override_beats_guard_and_global() {
-        use PrefixCachingSource::ModelOverride;
-        // Opt back in for a hybrid model (the escape hatch once the runtime is fixed).
-        assert_eq!(
-            resolve_prefix_caching(true, Some(true), true, "GPU.1"),
-            (true, ModelOverride)
-        );
-        // Force off for a non-hybrid model, and over a global-off.
-        assert_eq!(
-            resolve_prefix_caching(true, Some(false), false, "GPU.1"),
-            (false, ModelOverride)
-        );
-        assert_eq!(
-            resolve_prefix_caching(false, Some(true), false, "CPU"),
-            (true, ModelOverride)
-        );
+        let poison = anyhow::anyhow!("[GPU] clEnqueue failed: CL_OUT_OF_RESOURCES");
+        let e = leak_if_poisoned(Counted, poison, "m");
+        assert!(format!("{e:#}").contains("CL_OUT_OF_RESOURCES"));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0, "poisoned: not dropped");
+        let _ = leak_if_poisoned(Counted, anyhow::anyhow!("tokenizer said no"), "m");
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1, "other failure: dropped");
     }
 
     fn model_dir_with_config(json: &str) -> tempfile::TempDir {
@@ -1715,71 +2144,6 @@ mod tests {
             detect_kind_from_markers(whisper.path()),
             Some(ModelKind::Stt)
         );
-    }
-
-    #[test]
-    fn build_farm_paths_are_stripped_from_the_hybrid_hint() {
-        let cpp = anyhow::anyhow!(
-            "ov_vlm_create failed: Check reserved_la_bytes <= budget_in_bytes failed at \
-             /home/jenkins/agent/workspace/x/cache_orchestrator.hpp:764: Requested linear attention \
-             cache allocation exceeds the configured cache size."
-        );
-        let hinted = hint_if_hybrid_guard_pool_too_small(cpp, "m").to_string();
-        assert!(!hinted.contains("/home/"), "{hinted}");
-        assert!(hinted.contains("the OpenVINO GenAI source:"), "{hinted}");
-    }
-
-    #[test]
-    fn linear_attention_detected_at_top_level_and_under_text_config() {
-        let top = model_dir_with_config(
-            r#"{"layer_types":["linear_attention","linear_attention","full_attention"]}"#,
-        );
-        assert!(is_linear_attention_model(top.path()));
-        // Qwen3.5-style multimodal config nests the text model.
-        let nested = model_dir_with_config(
-            r#"{"model_type":"qwen3_5","text_config":{"layer_types":["full_attention","linear_attention"]}}"#,
-        );
-        assert!(is_linear_attention_model(nested.path()));
-    }
-
-    #[test]
-    fn linear_attention_not_detected_for_dense_or_unreadable_configs() {
-        let dense =
-            model_dir_with_config(r#"{"layer_types":["full_attention","sliding_attention"]}"#);
-        assert!(!is_linear_attention_model(dense.path()));
-        let no_field = model_dir_with_config(r#"{"model_type":"qwen3","num_hidden_layers":36}"#);
-        assert!(!is_linear_attention_model(no_field.path()));
-        let garbage = model_dir_with_config("{ not json");
-        assert!(!is_linear_attention_model(garbage.path()));
-        // Missing config.json and missing directory: guard stays off, no panic.
-        let empty = tempfile::tempdir().unwrap();
-        assert!(!is_linear_attention_model(empty.path()));
-        assert!(!is_linear_attention_model(Path::new("/nonexistent/model")));
-        // layer_types of the wrong JSON shape is ignored, not an error.
-        let odd = model_dir_with_config(r#"{"layer_types":"linear_attention"}"#);
-        assert!(!is_linear_attention_model(odd.path()));
-    }
-
-    #[test]
-    fn hybrid_guard_pool_hint_only_on_the_linear_attention_budget_error() {
-        let cpp = anyhow::anyhow!(
-            "ov_vlm_create failed: Check 'reserved_la_bytes <= budget_in_bytes' failed at x.hpp:764:\n\
-             Requested linear attention cache allocation exceeds the configured cache size."
-        );
-        let hinted = hint_if_hybrid_guard_pool_too_small(cpp, "qwen3.5-9b").to_string();
-        assert!(
-            hinted.contains("--enable-prefix-caching") && hinted.contains("cache_size_gb"),
-            "{hinted}"
-        );
-        assert!(hinted.contains("qwen3.5-9b"), "{hinted}");
-        assert!(
-            hinted.contains("reserved_la_bytes"),
-            "original error is kept: {hinted}"
-        );
-        // An unrelated failure is passed through untouched.
-        let other =
-            hint_if_hybrid_guard_pool_too_small(anyhow::anyhow!("out of device memory"), "m");
-        assert_eq!(other.to_string(), "out of device memory");
     }
 
     fn kind_of(name: &str) -> ModelKind {
@@ -1911,9 +2275,177 @@ mod tests {
         let _ = kind_of("embedding-stt-test");
     }
 
+    /// The warm-up fails a load for a GPU out-of-resources failure (and, since MR-2, for `GenAI`'s
+    /// device-memory refusal: see the test below); anything else is logged and the load goes on.
+    /// Only GPU devices are warmed.
+    #[test]
+    fn warm_up_fails_the_load_for_a_poisoned_gpu_not_for_other_errors() {
+        let t = std::time::Instant::now();
+        assert!(warm_up_outcome("m", t, Ok(())).is_ok());
+        assert!(warm_up_outcome("m", t, Err(anyhow::anyhow!("template exploded"))).is_ok());
+        let err = warm_up_outcome(
+            "m",
+            t,
+            Err(anyhow::anyhow!("clEnqueueWriteBuffer: CL_OUT_OF_RESOURCES")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("out-of-resources"), "{err:#}");
+        assert!(warm_up_applies("GPU.1") && warm_up_applies("gpu"));
+        assert!(!warm_up_applies("CPU") && !warm_up_applies("NPU"));
+    }
+
+    /// A per-model precision override beats the global key and the rule on a plain GPU device,
+    /// and is ignored (global string, pass-through) on CPU; clearing it restores the default.
+    #[test]
+    fn a_per_model_precision_override_wins_on_gpu_and_is_ignored_on_cpu() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m-8b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"num_hidden_layers":4,"num_attention_heads":8,"num_key_value_heads":8,
+                "head_dim":128,"hidden_size":1024}"#,
+        )
+        .unwrap();
+        let mut f = test_factory();
+        f.kv_cache_precision = "i8".to_owned();
+        f.register_kv_precision_hint("m-8b", Some("u4"));
+        let gpu_inputs = f
+            .kv_pool_inputs(&model, ModelKind::TextGen, "GPU.1")
+            .unwrap();
+        assert_eq!(
+            (gpu_inputs.resolution.passed, gpu_inputs.resolution.source),
+            (
+                "u4",
+                crate::model_manager::kv_precision::PrecisionSource::PerModel
+            )
+        );
+        assert_eq!(
+            f.kv_passed(&model, ModelKind::TextGen, "GPU.1").as_deref(),
+            Some("u4")
+        );
+        let cpu_inputs = f.kv_pool_inputs(&model, ModelKind::TextGen, "CPU").unwrap();
+        assert_eq!(
+            cpu_inputs.resolution.passed, "i8",
+            "the CPU keeps the global string"
+        );
+        // An explicit per-model "auto" opts this model out of the global key (Block B2b): the
+        // IR hint or the rule decides, whatever the global says.
+        f.register_kv_precision_hint("m-8b", Some(""));
+        let auto = f
+            .kv_pool_inputs(&model, ModelKind::TextGen, "GPU.1")
+            .unwrap()
+            .resolution;
+        assert_eq!(
+            auto.source,
+            crate::model_manager::kv_precision::PrecisionSource::AutoRule,
+            "not the global key"
+        );
+        // No per-model value inherits the global key again.
+        f.register_kv_precision_hint("m-8b", None);
+        assert_eq!(
+            f.kv_pool_inputs(&model, ModelKind::TextGen, "GPU.1")
+                .unwrap()
+                .resolution
+                .passed,
+            "i8"
+        );
+    }
+
+    /// Fable review 2: a PATCH of a Ready model's precision registers a new hint but changes
+    /// nothing the running engine was built with; the directory the prune pass protects (what
+    /// `kv_passed` answers) stays the one the engine compiled into until the next load resolves it
+    /// afresh.
+    #[test]
+    fn a_precision_patch_keeps_the_old_blob_directory_protected_until_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m-8b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"num_hidden_layers":4,"num_attention_heads":8,"num_key_value_heads":8,
+                "head_dim":128,"hidden_size":1024}"#,
+        )
+        .unwrap();
+        let f = test_factory();
+        f.register_kv_precision_hint("m-8b", Some("u4"));
+        // The load resolves and remembers what it passed.
+        let loaded = f.resolve_kv(&model, "m-8b", ModelKind::TextGen, "GPU.1");
+        assert_eq!(loaded.passed, "u4");
+        // PATCH: the hint changes; the engine does not.
+        f.register_kv_precision_hint("m-8b", Some("i8"));
+        assert_eq!(
+            f.kv_passed(&model, ModelKind::TextGen, "GPU.1").as_deref(),
+            Some("u4"),
+            "the running engine still compiles into kv-u4: that directory stays protected"
+        );
+        // The next load resolves afresh and the answer moves.
+        let reloaded = f.resolve_kv(&model, "m-8b", ModelKind::TextGen, "GPU.1");
+        assert_eq!(reloaded.passed, "i8");
+        assert_eq!(
+            f.kv_passed(&model, ModelKind::TextGen, "GPU.1").as_deref(),
+            Some("i8")
+        );
+    }
+
+    /// A model with a speculative-decoding draft keeps the 0.8.x pass-through: the draft engine
+    /// inherits the main engine's properties, so nothing about the precision is decided for it
+    /// (owner decision P6), it is never sized exactly, and the prune pass is told the same string.
+    #[test]
+    fn a_model_with_a_draft_keeps_the_legacy_pass_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("main-8b");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"num_hidden_layers":4,"num_attention_heads":8,"num_key_value_heads":8,
+                "head_dim":128,"hidden_size":1024}"#,
+        )
+        .unwrap();
+        for (global, want) in [("", ""), ("i8", "i8")] {
+            let mut f = test_factory();
+            f.kv_cache_precision = global.to_owned();
+            f.draft_hints.write().unwrap().insert(
+                "main-8b".to_owned(),
+                DraftHint {
+                    draft_path: "/x/draft".to_owned(),
+                    draft_device: "GPU.1".to_owned(),
+                    num_assistant_tokens: 4,
+                    verify_on_load: false,
+                },
+            );
+            assert_eq!(
+                f.kv_passed(&model, ModelKind::TextGen, "GPU.1").as_deref(),
+                Some(want)
+            );
+            assert!(
+                f.kv_pool_inputs(&model, ModelKind::TextGen, "GPU.1")
+                    .is_none()
+            );
+            let r = f.resolve_kv(&model, "main-8b", ModelKind::TextGen, "GPU.1");
+            assert_eq!(r.passed, want);
+            assert_eq!(
+                r.source,
+                crate::model_manager::kv_precision::PrecisionSource::LegacyPassthrough
+            );
+            // Without the draft the same model is resolved by the rule (no IR here: i8 passes
+            // only when the profile is trusted, which an IR-less profile is not).
+            f.draft_hints.write().unwrap().clear();
+            assert!(
+                f.kv_pool_inputs(&model, ModelKind::TextGen, "GPU.1")
+                    .is_some()
+            );
+        }
+    }
+
     fn test_factory() -> OvEngineFactory {
         OvEngineFactory {
             kv_cache_precision: String::new(),
+            kv_pass_mode: crate::model_manager::kv_precision::PassMode::Explicit,
+            kv_resolved: std::sync::Mutex::new(HashMap::new()),
+            kv_blocks_hints: std::sync::RwLock::new(HashMap::new()),
+            kv_warmup: false,
+            kv_precision_overrides: std::sync::RwLock::new(HashMap::new()),
             admission_queue_timeout_ms: 0,
             model_kinds: std::sync::RwLock::new(HashMap::new()),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
@@ -1925,6 +2457,7 @@ mod tests {
             embedding_pooling: crate::ov_embed::Pooling::Mean,
             embedding_normalize: false,
             ov_cache_dir: None,
+            ov_cache_keyed: false,
             enable_prefix_caching: true,
         }
     }
@@ -2046,5 +2579,111 @@ mod tests {
         let err = anyhow::anyhow!("CL_OUT_OF_RESOURCES (-5) from ProgramBuilder build failed");
         let hinted = hint_if_ambiguous_kind(err, dir.path());
         assert!(!hinted.to_string().contains("Hint:"));
+    }
+
+    /// MR-2: a vision pool is built at the warm-up generate; `GenAI` refusing it for device memory
+    /// fails the load (not a Ready model whose first request 500s). Other failures still pass.
+    #[test]
+    fn a_genai_memory_budget_refusal_at_warm_up_fails_the_load() {
+        let raw = "Check 'budget_in_bytes <= total_available_memory' failed at \
+                   /home/jenkins/agent/src/cache_orchestrator.hpp:759";
+        let r = warm_up_outcome("vlm", std::time::Instant::now(), Err(anyhow::anyhow!(raw)));
+        let e = r.expect_err("must fail the load");
+        assert!(crate::model_manager::is_genai_memory_budget_error(
+            &format!("{e:#}")
+        ));
+        let other = anyhow::anyhow!("some unrelated generate failure");
+        assert!(warm_up_outcome("vlm", std::time::Instant::now(), Err(other)).is_ok());
+    }
+
+    /// Which engines compile into a `kv-<tag>` directory (U-20): the KV engines on GPU and
+    /// CPU, by the passed string (the vision pipeline too: `kv-auto` when it passes none, as on
+    /// CPU or with `kv_precision_pass: plugin`); NPU, kinds without a KV cache
+    /// and the flat layout stay in the root; an untagged precision is an error, not the root.
+    #[test]
+    fn kv_engines_get_a_directory_per_passed_precision() {
+        use ModelKind::*;
+        let f = |k, d, p, keyed| kv_cache_subdir_for(k, d, p, keyed).unwrap();
+        assert_eq!(f(TextGen, "GPU.1", "", true), Some("kv-auto"));
+        assert_eq!(f(TextGen, "GPU.1", "i8", true), Some("kv-i8"));
+        assert_eq!(f(TextGen, "GPU.1", "u4", true), Some("kv-u4"));
+        assert_eq!(f(TextGen, "GPU.1", "f16", true), Some("kv-f16"));
+        assert_eq!(f(TextGen, "CPU", "i8", true), Some("kv-i8"));
+        assert_eq!(f(TextGen, "HETERO:GPU.0,GPU.1", "u4", true), Some("kv-u4"));
+        assert_eq!(f(Vision, "GPU.1", "u4", true), Some("kv-u4"));
+        assert_eq!(f(Vision, "GPU.1", "", true), Some("kv-auto"));
+        assert_eq!(f(Vision, "CPU", "", true), Some("kv-auto"));
+        assert_eq!(f(TextGen, "NPU", "i8", true), None);
+        assert_eq!(f(TextGen, "NPU.0", "i8", true), None);
+        assert_eq!(f(Vision, "NPU", "", true), None);
+        for kind in [Embedding, Stt, Tts, Decision] {
+            assert_eq!(f(kind, "GPU.1", "i8", true), None, "{kind:?}");
+        }
+        assert_eq!(f(TextGen, "GPU.1", "i8", false), None);
+        assert_eq!(f(Vision, "GPU.1", "", false), None);
+        assert!(kv_cache_subdir_for(TextGen, "GPU.1", "bf16", true).is_err());
+    }
+
+    /// What the loader actually hands the engine (U-C26, U-C27, U-21): per kind and layout, the
+    /// directory and the attribution scope; a blocked directory means no cache and no
+    /// attribution, never the root.
+    #[test]
+    fn loader_cache_plan_follows_kind_device_and_layout() {
+        use ModelKind::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let plan = |k, d, p, keyed| plan_cache_dir(Some(root), k, d, p, keyed);
+
+        let cb = plan(TextGen, "GPU.1", "u4", true);
+        assert_eq!(cb.engine_dir, format!("{root}/kv-u4"));
+        assert_eq!(cb.scope_subdir, Some("kv-u4"));
+        assert_eq!(cb.attribution_root.as_deref(), Some(tmp.path()));
+        assert!(tmp.path().join("kv-u4").is_dir(), "created up front");
+
+        let vlm = plan(Vision, "GPU.1", "u4", true);
+        assert_eq!(vlm.engine_dir, format!("{root}/kv-u4"));
+        assert_eq!(vlm.scope_subdir, Some("kv-u4"));
+        let vlm_plugin = plan(Vision, "GPU.1", "", true);
+        assert_eq!(vlm_plugin.engine_dir, format!("{root}/kv-auto"));
+
+        for (kind, dev) in [
+            (TextGen, "NPU"),
+            (Vision, "NPU"),
+            (Stt, "GPU.1"),
+            (Tts, "CPU"),
+            (Embedding, "GPU.0"),
+        ] {
+            let p = plan(kind, dev, "i8", true);
+            assert_eq!(
+                (p.engine_dir.as_str(), p.scope_subdir),
+                (root, None),
+                "{kind:?} {dev}"
+            );
+        }
+        let flat = plan(TextGen, "GPU.1", "i8", false);
+        assert_eq!((flat.engine_dir.as_str(), flat.scope_subdir), (root, None));
+
+        // A regular file in the way: no cache, nothing to attribute, root untouched.
+        std::fs::write(tmp.path().join("kv-i8"), b"x").unwrap();
+        let blocked = plan(TextGen, "GPU.1", "i8", true);
+        assert_eq!(
+            blocked,
+            CachePlan {
+                engine_dir: String::new(),
+                scope_subdir: None,
+                attribution_root: None
+            }
+        );
+        // A precision without a tag: also no cache.
+        assert_eq!(plan(TextGen, "GPU.1", "bf16", true).engine_dir, "");
+        // No cache directory configured.
+        assert_eq!(
+            plan_cache_dir(None, TextGen, "GPU.1", "i8", true).engine_dir,
+            ""
+        );
+        assert_eq!(
+            plan_cache_dir(Some(""), TextGen, "GPU.1", "i8", true).engine_dir,
+            ""
+        );
     }
 }

@@ -32,7 +32,12 @@ use rustedvino::log_ring::LogRingBuffer;
 /// process still didn't exit 25+ minutes later. `Runtime::shutdown_timeout`
 /// bounds that wait explicitly; process exit right after forces an
 /// `exit_group`, which tears down every thread — including a spinning one —
-/// regardless of whether it cooperates.
+/// regardless of whether it cooperates. Careful: returning from `main` is NOT a bare
+/// `exit_group`; it first runs libc `exit()` and with it the C++ static destructors, which race an
+/// engine thread still inside the pipeline. `main` therefore leaves through
+/// `startup::exit_without_destructors` on every exit once model construction started (D-01, D-04 S7),
+/// so this bounded wait is reached only by exits before any engine existed (config errors, a port
+/// clash, the device-query flags) — kept as the backstop for a task that never finishes.
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handles the device-query CLI flags that print and exit before any config
@@ -112,6 +117,11 @@ fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::SUCCESS;
     }
+    // `--gpu-probe`: the supervisor's GPU readiness probe child: no config, no
+    // signal thread, no runtime; prints one line per GPU and exits 0 / 2.
+    if std::env::args().skip(1).any(|a| a == "--gpu-probe") {
+        return std::process::ExitCode::from(rustedvino::gpu_probe::run());
+    }
     // Take SIGTERM/SIGINT on a dedicated sigwait thread so a foreign
     // (IGC/NEO) signal handler can never run for them - see
     // `shutdown_signals`. Must come before the runtime builds any thread, and
@@ -138,38 +148,57 @@ fn main() -> std::process::ExitCode {
 
     let result = rt.block_on(async_main());
 
-    // Consumes `rt` — bounds the wait for any outstanding `spawn_blocking`
-    // task instead of blocking forever. See `PROCESS_EXIT_TIMEOUT` doc.
-    rt.shutdown_timeout(PROCESS_EXIT_TIMEOUT);
-
-    match result {
-        Ok(()) if rustedvino::startup::gpu_poison_exit_requested() => {
-            std::process::ExitCode::from(rustedvino::startup::EXIT_GPU_POISONED)
-        }
-        Ok(()) => std::process::ExitCode::SUCCESS,
+    let poison = rustedvino::startup::gpu_poison_exit_requested();
+    let abandoned = matches!(&result, Err(e)
+        if e.downcast_ref::<rustedvino::startup::ShutdownDuringStartup>().is_some());
+    let normal_code: u8 = match &result {
+        Ok(()) if poison => rustedvino::startup::EXIT_GPU_POISONED,
+        Ok(()) => 0,
         // A stop requested while models were still loading is a clean stop.
-        Err(e)
-            if e.downcast_ref::<rustedvino::startup::ShutdownDuringStartup>()
-                .is_some() =>
-        {
-            std::process::ExitCode::SUCCESS
-        }
+        Err(_) if abandoned => 0,
         Err(e) => {
             eprintln!("Error: {e:?}");
             if e.downcast_ref::<rustedvino::startup::ConfigFatal>()
                 .is_some()
             {
-                std::process::ExitCode::from(rustedvino::startup::EXIT_CONFIG_FATAL)
+                rustedvino::startup::EXIT_CONFIG_FATAL
             } else {
-                std::process::ExitCode::FAILURE
+                1
             }
         }
+    };
+
+    // D-01: returning from `main` runs libc `exit()`, which runs the C++ static destructors; with an
+    // engine thread still inside a pipeline the two overlap and corrupt the heap (SIGABRT, seen 7 of
+    // 7 times in QA). D-04 S7: once model construction has started every exit leaves without them
+    // (`engines_started`), also after a clean teardown (decided 2026-10-29). `exit_decision` is the one
+    // predicate; with OpenVINO calls still in flight (`ffi_watch`) a clean stop exits 76.
+    let in_flight = if poison {
+        0
+    } else {
+        rustedvino::startup::settle_ffi_calls(result.is_ok())
+    };
+    let decision = rustedvino::startup::exit_decision(
+        normal_code,
+        rustedvino::startup::engines_started(),
+        rustedvino::startup::teardown_incomplete(),
+        poison,
+        in_flight,
+    );
+    if decision.skip_destructors {
+        rt.shutdown_background();
+        rustedvino::startup::exit_without_destructors(decision.code);
     }
+
+    // Consumes `rt` — bounds the wait for any outstanding `spawn_blocking`
+    // task instead of blocking forever. See `PROCESS_EXIT_TIMEOUT` doc.
+    rt.shutdown_timeout(PROCESS_EXIT_TIMEOUT);
+    std::process::ExitCode::from(decision.code)
 }
 
 #[allow(clippy::too_many_lines)]
 async fn async_main() -> anyhow::Result<()> {
-    // Recent-log tail for `GET /v1/admin/logs/tail` (e.g. a Pyramu panel) —
+    // Recent-log tail for `GET /v1/admin/logs/tail` (e.g. a UI panel) —
     // built here so it can be installed as the tracing writer below *and*
     // handed to `AppState` later via `with_log_buffer`, the same instance
     // either way. ANSI colour is disabled globally: it makes the buffered
@@ -196,7 +225,8 @@ async fn async_main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--supervise") {
         #[cfg(unix)]
         {
-            let config_path = rustedvino::startup::resolve_config_path()?;
+            let config_path = rustedvino::startup::resolve_config_path()
+                .map_err(|e| rustedvino::startup::config_fatal(&e))?;
             return rustedvino::supervisor::run(&config_path).await;
         }
         #[cfg(not(unix))]
@@ -236,5 +266,5 @@ async fn async_main() -> anyhow::Result<()> {
     // Bind address/port come from config (`bind_addr`/`port`; default
     // loopback:11437 — secure by default, T4.2). stormVINO owns 11435;
     // cutover day: RustedVINO takes 11435 (Part 9).
-    rustedvino::startup::serve(app, setup.addr, &setup.model_manager).await
+    rustedvino::startup::serve(app, setup.addr, setup.socket, &setup.model_manager).await
 }

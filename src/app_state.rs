@@ -113,6 +113,11 @@ pub struct AppState {
     /// "key material only enters via a filesystem write" invariant the
     /// keys-file split itself rests on).
     pub admin_locked: bool,
+
+    /// The supervisor's per-spawn watchdog token (`startup::WATCHDOG_TOKEN_ENV`), or `None` when
+    /// this process is not supervised. Admits only the watchdog read (`crate::WATCHDOG_PATH`),
+    /// fixed at boot like [`admin_locked`](Self::admin_locked).
+    pub watchdog_token: Option<Arc<str>>,
 }
 
 impl Default for AppState {
@@ -129,6 +134,7 @@ impl Default for AppState {
                 admin_api_keys: Vec::new(),
             }))),
             admin_locked: false,
+            watchdog_token: None,
         }
     }
 }
@@ -214,6 +220,13 @@ impl AppState {
     #[must_use]
     pub fn with_admin_locked(mut self, admin_locked: bool) -> Self {
         self.admin_locked = admin_locked;
+        self
+    }
+
+    /// Sets the supervisor's watchdog token — see [`watchdog_token`](Self::watchdog_token).
+    #[must_use]
+    pub fn with_watchdog_token(mut self, watchdog_token: Option<Arc<str>>) -> Self {
+        self.watchdog_token = watchdog_token;
         self
     }
 

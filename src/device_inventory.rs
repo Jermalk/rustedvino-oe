@@ -145,6 +145,9 @@ pub struct DeviceInfo {
     /// Total device memory in GiB, when reported (`GPU_DEVICE_TOTAL_MEM_SIZE`,
     /// GPUs only). `None` for devices that do not expose a memory figure.
     pub total_mem_gb: Option<f64>,
+    /// PCI address (`"0000:03:00.0"`) as the DRM fdinfo reports it, for GPUs that expose
+    /// `DEVICE_PCI_INFO`; ties a device name to the other processes' memory on it.
+    pub pdev: Option<String>,
 }
 
 /// The startup snapshot of all compute devices.
@@ -184,6 +187,10 @@ impl DeviceInventory {
                     ov_cb::device_property(&name, "DEVICE_TYPE").as_deref(),
                 );
                 let total_mem_gb = query_total_mem_gb(&name, kind);
+                let pdev = matches!(kind, DeviceKind::DiscreteGpu | DeviceKind::IntegratedGpu)
+                    .then(|| ov_cb::device_property(&name, "DEVICE_PCI_INFO"))
+                    .flatten()
+                    .and_then(|info| crate::gpu_memory::pdev_from_pci_info(&info));
 
                 let (tier, learned) = resolve_tier(&name, &full_name, kind, overrides, &cache);
                 if let Some(t) = learned {
@@ -205,6 +212,7 @@ impl DeviceInventory {
                     tier,
                     domain_id,
                     total_mem_gb,
+                    pdev,
                 }
             })
             .collect();
@@ -531,6 +539,7 @@ mod tests {
             tier: DeviceTier::Fallback,
             domain_id: name.to_owned(),
             total_mem_gb: None,
+            pdev: None,
         }
     }
 
@@ -674,5 +683,27 @@ mod tests {
         );
         assert_eq!(tier, DeviceTier::StrongIgpu);
         assert_eq!(learned, None, "a cache hit must not re-mark for caching");
+    }
+}
+
+#[cfg(test)]
+mod pdev_probe_tests {
+    /// Needs a GPU plugin: the device's PCI info reaches `pdev` in the form the DRM fdinfo uses.
+    /// Run by hand on a box with a GPU: `cargo test --lib pdev_comes_from -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "queries the GPU plugin"]
+    fn pdev_comes_from_the_device_pci_info() {
+        let inv = super::DeviceInventory::probe();
+        for d in inv.devices() {
+            eprintln!(
+                "DEVICE {} pdev={:?} total={:?}",
+                d.name, d.pdev, d.total_mem_gb
+            );
+            if let (Some(probe), Some(pdev)) = (crate::gpu_memory::LinuxFdinfoProbe::new(), &d.pdev)
+            {
+                use crate::gpu_memory::VramProbe as _;
+                eprintln!("  outside={:?}", probe.outside_used_bytes(pdev));
+            }
+        }
     }
 }

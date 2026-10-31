@@ -5,11 +5,11 @@
 # needs the OV_*_DIR vars pointed at the real OpenVINO install, plus
 # OPENVINO_TOKENIZERS_PATH_GENAI and a matching LD_LIBRARY_PATH at runtime —
 # otherwise build.rs relinks against its fallback default and the binary dies at
-# load with `libopenvino_genai.so.2620: cannot open shared object file`. This
+# load with `libopenvino_genai.so.2641: cannot open shared object file`. This
 # wrapper centralises that recipe so it is one command, not a multi-line export
 # block.
 #
-# REQUIRES: OpenVINO GenAI 2026.2 installed via pip into some Python venv
+# REQUIRES: OpenVINO GenAI 2026.4.1 installed (0.9.0 line; 0.8.x needs 2026.2.x) via pip into some Python venv
 # (`pip install openvino openvino-genai openvino-tokenizers`). Point this
 # script at that venv's site-packages directory — auto-detected below, or set
 # RV_OV_VENV / activate the venv first.
@@ -61,7 +61,7 @@ VENV="$RV_OV_VENV"
 export OV_GENAI_DIR="$VENV/openvino_genai"
 export OV_DIR="$VENV/openvino/libs"
 export OV_TOKENIZERS_DIR="$VENV/openvino_tokenizers/lib"
-# Base OpenVINO headers — build.rs reads OV_INCLUDE_DIR (2026.2 headers live in
+# Base OpenVINO headers — build.rs reads OV_INCLUDE_DIR (the headers live in
 # the venv, not ~/.local). Override with OV_INCLUDE_DIR if they move.
 export OV_INCLUDE_DIR="${OV_INCLUDE_DIR:-$VENV/openvino/include}"
 export OPENVINO_TOKENIZERS_PATH_GENAI="$OV_TOKENIZERS_DIR/libopenvino_tokenizers.so"

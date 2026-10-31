@@ -88,5 +88,15 @@ pub fn run(ctx: &Ctx, model: &str) -> i32 {
             s.yellow("  does not fit even after evicting everything evictable")
         );
     }
+    // The device-headroom gate (vision models on a discrete GPU). Older servers omit both keys.
+    if let Some(why) = body["headroom_refusal"].as_str() {
+        println!("{}", s.yellow(&format!("  device headroom: {why}")));
+    }
+    if let Some(why) = body["headroom_not_previewed"].as_str() {
+        println!(
+            "{}",
+            s.yellow(&format!("  device headroom not previewed: {why}"))
+        );
+    }
     i32::from(!fits)
 }

@@ -6,6 +6,161 @@ All notable changes to RustedVINO are recorded here. The format follows
 semver claim). Full release notes, with measurements and download instructions, are on each
 [GitHub release](https://github.com/Jermalk/rustedvino-oe/releases).
 
+## [0.9.0] — 2026-10-29
+
+Linux bundle only. Windows: not published in this release (the Windows changes are in the source).
+
+### Highlights
+- Runs on **OpenVINO GenAI 2026.4.1** (0.8.4 shipped 2026.2.1).
+- The **context limit is computed from each model's real KV-cache layout**, and KV pools are sized in whole KV blocks.
+- **Per-model KV-cache precision**, an automatic rule (u4 for 4-bit weights, otherwise i8), and a validated `kv_cache_precision`.
+- **A device-headroom limit for vision models on a discrete GPU** (Linux): a long prompt no longer exhausts device memory and poisons the GPU.
+- **A stop during a model load waits for the load**: no crash at exit, and no Arc Pro B60 left unusable until a GPU reset.
+- **Model loads have a deadline** (600 s by default); a late load is booked as stalled and the server names the recovery step.
+- **A poisoned GPU context is visible** on `/health`, `rv status`, the model lists and a metric; a supervised worker answers a retryable 503 while it restarts.
+- **The supervisor's watchdog fires on servers with admin keys** and no longer kills long legitimate vision requests.
+- **Hybrid Qwen3.5 / 3.6 / 3.8 models keep prefix caching on a GPU.**
+
+### Upgrade notes from 0.8.4
+
+**Required actions**
+- **Set `TimeoutStopSec=720` in installed systemd units**, then `systemctl daemon-reload`. A stop now waits for a running load (up to 600 s) and then tears down (up to 8 s per engine; 720 s covers 14 models). With 120 s or less, systemd SIGKILLs the server mid-load, which is what leaves a B60 stuck (see Known issues). The bundle ships `rustedvino.user.service.example` with the right settings.
+- **Every model recompiles once** (new OpenVINO version). Text and vision models now compile into `ov_cache_dir/kv-<tag>/`; 0.8.x blobs stay in the cache root until pruned. Set `ov_cache_max_gb`, or delete stale `*.blob` files by hand (the root still holds live Whisper, image, TTS and NPU blobs). With `ov_cache_max_gb: 0` the server logs how much is left behind. With pruning on (`ov_cache_max_gb` > 0), use one `ov_cache_dir` per instance, host and OpenVINO version.
+- **`kv_cache_precision` is validated.** Accepted: `"auto"` (or `""`), `"i8"`, `"u4"`, `"f16"`; `"u8"` is a deprecated alias of `"i8"` (logged once at INFO). Any other value stops startup with the accepted list. `"f32"`, which 0.8.4 accepted and passed to the plugin, is withdrawn: a config that sets it must change it. Other spellings, which 0.8.4 ignored silently, now stop startup too.
+- **If a discrete GPU is your global `device` and `total_vram_gb` is `0.0`, that GPU is now VRAM-gated** at the memory it reports. Models that used to over-commit it now evict each other, or are refused when they can never fit. Check `rv status` after the upgrade; set `total_vram_gb`, or opt out with `domain_budgets` (see Behaviour changes).
+- **An unknown global `device` with `default_placement: "device"` stops startup with exit 78** (no model without its own `device` could load). With `"auto"` it stays a startup warning.
+
+**Behaviour changes**
+- The global `kv_cache_precision` built-in default stays `"u8"` (= i8; the shipped example config writes it as `"i8"`), so text models keep 0.8.4's 8-bit cache. Set it to `"auto"` to let each model's IR hint or the rule decide (for int4-weight models an explicit i8 is about 1.8× larger per token than u4). The global key never reached vision models (0.8.4 passed them nothing); they now get the per-model value, the IR hint or the rule.
+- Vision models on a GPU (and text models under `"auto"`) now pass their resolved precision, so they compile into `kv-u4`, `kv-i8` or `kv-f16`; this is part of the one-time recompile. The precision itself matches what the plugin picked on its own.
+- Model loads time out at 600 s (`504 load_timeout`); `load_timeout_secs: 0` restores 0.8.4's wait without limit.
+- Context limits move: up for models the old estimate under-promised (hybrid models), down a few percent for dense int8 models it over-promised. Vision prompts now count the chat template and the `tools` schema, and `max_tokens` is lowered to what the pool can still hold.
+- The memory accounting unit is the GiB: `rustedvino_vram_total_bytes` / `_used_bytes` read about 7 % higher (× 2^30, was 10^9) and `gpu_memory_estimate_gb` about 7 % lower. `total_vram_gb`, `vram_gb`, `kv_cache_gb`, `cache_size_gb`, `vram_safety_margin_gb` and `min_kv_cache_gb` are GiB; no admission arithmetic changed.
+- Pools the server cannot size in KV blocks (CPU, HETERO/AUTO, `kv_precision_pass: "plugin"`, speculative drafts, an unverified version pair, a model it cannot describe) are booked at the whole GiB the engine allocates: up to just under 1 GiB more than a fractional `kv_cache_gb` in 0.8.4, with `max_model_len` rising to match.
+- Learned context limits leave the model folder for a per-user directory. `.rustedvino_kv_ratchet.json` files in model folders are ignored (never deleted); each model relearns at its next KV overflow.
+- An image-generation model on the CPU is charged its real working set, and a request above `cpu_image_gen_max_pixels` is a 400.
+- `POST /v1/admin/models/add` answers a JSON body, not plain text. `POST /v1/admin/config/reload` with an invalid `config.json` answers 422 (was 500).
+- `rv start --supervise` with a broken config exits 78 (was 1).
+- **`total_vram_gb: 0.0` no longer switches VRAM gating off for a discrete GPU set as the global `device`**: that GPU is budgeted at the memory it reports, as any other discrete GPU already was. As with any configured budget, a load that does not fit evicts idle models first (least recently used), and a model that can never fit is refused by every path (`rv add`, `rv load`, preload: a refused preload is skipped, logged and shown as a startup warning, and startup goes on). To keep the old ungated behaviour on purpose, set `domain_budgets` with the device name `--device-info` prints: `{"GPU": 0.0}` on a one-GPU box, `{"GPU.1": 0.0}` on a two-GPU one. CPU, integrated-GPU, NPU and composite (`HETERO:`…) inference devices are unchanged. An explicit `total_vram_gb` above what the device reports is now capped at the reported GiB (it was converted to decimal GB, about 7 % looser).
+
+**New configuration keys**
+
+| Key | Default | What it does |
+|---|---|---|
+| `load_timeout_secs` | `600` | Load deadline; `0` = none, otherwise at least `60`. Also per model. |
+| `kv_gate_mode` | `"exact"` | `"legacy"` = the 0.8.x context-limit estimate everywhere (pools stay in blocks). |
+| `kv_gate_exact_on_unknown_engine` | `false` | Use the exact gate on an unverified OpenVINO/GenAI pair. |
+| `kv_precision_pass` | `"explicit"` | `"plugin"` = leave the KV precision to the plugin, as 0.8.x did. |
+| `kv_warmup` | `true` | One-token warm-up after every GPU load of a KV engine. |
+| `kv_headroom_mode` | `"dynamic"` | `"off"` disables the vision device-headroom limit. |
+| `kv_transient_factor` | `2.0` | Multiplier on a prompt token's transient device-memory cost. |
+| `kv_headroom_margin_gib` | `0.5` | Device memory kept free for processes the server cannot see. |
+| `kv_headroom_min_tokens` | `4096` | Floor of the headroom limit; a load that cannot keep it is shrunk or refused. |
+| `kv_headroom_inflight_tokens` | `32768` | Vision requests longer than this hold a device-memory reservation while they run. |
+| `ov_cache_layout` | `"keyed"` | `"flat"` = the 0.8.x cache paths (also brings back precision mixing). Restart-only. |
+| `cpu_image_gen_max_pixels` | `1048576` | Largest CPU image request (`n × width × height`); sizes the memory charge. |
+| `models[id].kv_cache_precision` | `null` | Per-model precision; `"auto"` opts this model out of the global key. |
+| `supervisor.gpu_probe_deadline_secs` | `15` | GPU readiness probe after a crash exit; `0` disables it. |
+| `supervisor.gpu_first_load_deadline_secs` | `180` | Deadline for the first GPU load after a crash exit; `0` disables it. |
+
+### Added
+**KV cache and admission**
+- **Exact context limit.** For a text model on a GPU with a known precision, `max_model_len` = min(95 % of the pool's token capacity, native context, a limit learned for exactly this pool), counting only attention layers, hybrid models' linear-attention state, the precision's byte layout and block rounding. On a plain GPU whose layout the server knows, pools are sized in KV blocks (`num_kv_blocks`) under either gate mode and booked as built: a requested 4.2 GiB books about 4.2 GiB.
+- The legacy estimate stays for vision models on shared-memory GPUs, CPU and HETERO/AUTO devices, speculative-decoding models, an unverified OpenVINO/GenAI pair, models the server cannot describe with confidence, and `kv_precision_pass: "plugin"`. A pool too small for one block (or a hybrid model's per-stream state) is refused before anything is evicted.
+- **Per-model KV precision** (`models[id].kv_cache_precision`: auto / i8 / u4 / f16), also via `models/add` and `PATCH`, from the next load. Resolution under `kv_precision_pass: "explicit"`: per-model > global (text only) > the IR's own hint > u4 for 4-bit weights, otherwise i8.
+- **Device-headroom limit for vision models on a discrete GPU (Linux).** The context limit is also capped at `free / (hidden size × 4 × kv_transient_factor)` tokens, where free is the card's memory minus other processes (from `/proc/*/fdinfo`), every booking, running long requests and `kv_headroom_margin_gib`. It follows live free memory, shrinks or refuses a load that would break `kv_headroom_min_tokens`, and its 400 names the free memory.
+- Without a readable probe (non-Linux, shared-memory GPU, `kv_headroom_mode: "off"`) vision models keep the legacy limit, with a one-time warning. Without this limit, a 27B vision model with a 6 GiB pool and 3 GiB of free device memory failed at a 164,960-token prompt.
+- **Vision requests are admitted on the whole prompt**: about 5 tokens per message for the template, the `tools` schema at 125 % of its JSON tokens; token counting does not wait behind a running generation. `max_tokens` is clamped to the pool, keeping 1 % (at least 32 tokens) spare (`rustedvino_kv_max_tokens_clamped_total`); under 16 tokens of room is a 400.
+- Images are not counted yet: a vision model that admitted such requests reports `kv_admission_low_confidence` and `uncounted_image_admissions`, and `rv ps` / `rv status` add `!` to its CTX cell. A too-long-prompt 400 names the limit and the knob that moves it.
+- **KV warm-up** (`kv_warmup`): a one-token generation after every GPU load builds the pool at load time, so a broken GPU shows then. A GPU out-of-resources failure there fails the load and marks the context poisoned: the worker stays up degraded (no automatic restart) and the engine is not destroyed on the poisoned context.
+
+**Load lifecycle**
+- **Load deadline** (`load_timeout_secs`, default 600). A load past it answers `504 load_timeout` and keeps running booked as stalled: its memory stays reserved, loaded models keep serving, and new loads on that device get `503 device_stalled` until it returns (committed, or discarded on an error). A load whose client disconnects is booked the same way.
+- Under `--supervise` a load still running after its deadline + `watchdog_hang_ceiling_secs` restarts the worker. A `models/add` past its deadline keeps the model registered but unsaved: `ready` if the load succeeds (a `PATCH` saves it), else `not_loaded` until deregistered.
+- **A stalled load names its recovery step** past its deadline, in `rv status`, the watchdog body (`stalled[].recovery`) and the log: a GPU reset for a discrete Intel GPU on the xe driver, a reboot for other GPUs and the NPU, a server restart for the CPU. `503 device_stalled` points to `rv status`.
+- **GPU readiness probe after a crash exit** (exit 75/76, a signal, a hang or deadline kill): the supervisor runs `rustedvino --gpu-probe` (tiny compile + inference per GPU, 15 s, up to 3 tries) before the next worker. That worker's first GPU load gets a deadline (`gpu_first_load_deadline_secs`, 180 s or the load's own if longer; with `load_timeout_secs: 0`, `watchdog_hang_ceiling_secs` if longer); past it the worker is respawned once.
+- `models/add` of a model that loaded but could not be saved answers 200 with `"persisted": false` and `persist_error`. `models/add` and deregister refuse with `409 config_file_invalid` when `config.json` is already invalid.
+
+**Observability**
+- `GET /v1/admin/models`: the KV decision (`kv_cache_precision`, `kv_precision_source`, `kv_bytes_per_token`, `kv_profile_confidence`, `kv_gate_mode`, `limit_clamped_by`, `kv_pool_mib`, `kv_pool_blocks`, `kv_headroom_cap_tokens`), `kv_requested_gb` / `clamped_by`, `vram_measured_mib`, and `server.headroom` per discrete GPU (lease total for key-validated callers only).
+- `rv ps` / `rv status` get `CTX` and `KV PREC` columns; `rv status` adds a headroom line (`off` / `unknown` when it has none), `Loads`, `Stalled` and `In flight` lines, and `Driver` lines.
+- `/health` gains `gpu_poisoned` and `device_stalled` (still always 200). `GET /v1/admin/health/watchdog` gains `in_flight`, `stalled[]`, `oldest_ffi_overdue_secs` and the overrun beyond a request's allowance.
+- Startup configuration warnings (unknown global device, unwritable cache or config paths, dynamic KV with prefix caching) are kept as `startup_warnings` and printed by `rv start` and `rv status`. GPU/NPU driver versions and the kernel release are logged at boot and shown in the admin server block (key-validated callers only).
+- Metrics: `rustedvino_kv_gate_mode{model,mode}`, `rustedvino_kv_scheduler_drop_total{model}` (requests lost to KV-pool admission), `rustedvino_kv_max_tokens_clamped_total`, `rustedvino_gpu_poisoned`. See `METRICS.md`.
+- `fill-config-defaults.py --check` reports keys missing inside the `supervisor` block.
+
+### Changed
+- **OpenVINO GenAI 2026.4.1.**
+- **Hybrid linear-attention models (Qwen3.5 / 3.6 / 3.8) keep prefix caching on a GPU**, and `default_placement: "auto"` may place them on a GPU again. The 2026.2.x wrong-continuation bug is not present on 2026.4.1 (checked on an Arc 140V); the guard, its warning and the GPU ban are gone; per-model `enable_prefix_caching` stays an override. This also lifts 0.8.4's smaller context for hybrid vision models.
+- **One compile-cache directory per KV precision** (`kv-auto`, `kv-i8`, `kv-u4`, `kv-f16`) for text, draft and vision models on GPU and CPU, because a 2026.4.x blob does not record the precision. Pruning covers the subdirectories and protects only what a running model uses. An unwritable keyed directory is skipped (no blob cache).
+- **Learned context limits are keyed by the exact configuration** (pool, precision, prefix setting, streams, engine path, versions, device) in `.rustedvino_kv_ratchet.v2.json`; the legacy gate keeps the one-number file. Both live beside `ov_cache_dir` as `kv_ratchet/`, else in `~/.cache/rustedvino/kv_ratchet/`, so a model library can be shared and mounted read-only.
+- **Measured-footprint learning** also runs on a discrete GPU for an exactly-sized pool; a load that starts while a generation runs is not used to learn a weight.
+- A device spec that includes the CPU (`CPU`, `HETERO:GPU.1,CPU`, `AUTO:GPU,CPU`, `MULTI:…`) still gets the 8-bit cache as `u8`, which the CPU plugin requires (elsewhere it is passed as `i8`).
+- **Input checks:** `models/add` refuses an unknown per-model `kv_cache_precision` (400); a wrong JSON type for `kv_cache_precision` or `ov_cache_layout` names the key; `rv add` / `rv load` refuse a non-finite or non-positive `--kv-cache-gb`; a pool below 0.01 GiB prints exactly.
+- **A stale compiled blob is named in the log.** On the GPU plugin's `Incorrect block size`, one WARN per model names the directory to clean; nothing is deleted.
+- The documentation of `kv_cache_precision` matches 2026.4.1: the plugin default is u4 for int4-weight models, and the global key applies to the text engine only.
+
+### Fixed
+**Stop and shutdown**
+- **A stop while a model was loading crashed the process** (heap corruption, SIGABRT, in most stops during startup). An abandoned load tears its engine down first, and the exit skips C++ destructors when needed; exit code 0. 24 stops into a CPU load after the fix: no crash.
+- **A stop during a GPU load could leave an Arc Pro B60 unusable until a GPU reset** (later loads hung 100 s to 3 h 37 min). A stop now waits for the load (up to 600 s, logging `stop requested while a model load is running - waiting for it to finish`), tears down, exits 0, and refuses new loads (`503 server_stopping`).
+- The port is reserved before the preload (a taken port fails at once, exit 1) and closed at stop. The supervisor, `rv stop` (waits up to 12 min and prints "do not kill it" while the server waits for a load) and `rv start` wait for the worker instead of killing it. Measured on a B60: 8 stops 1.5-30 s into loads exited 0 in 16-150 s, and the next GPU load worked.
+
+**Supervisor and watchdog**
+- **With admin keys, the generation watchdog never fired**: its probe was refused and read as "no hang". It now authenticates with a per-worker token; a probe that cannot read the worker logs an ERROR.
+- **A watchdog kill waits at least 48 s** (the worker's drain + teardown + slack) before SIGKILL, not 10 s; repeated watchdog kills stop at `max_restarts`. `rv stop` no longer suggests `kill -9`.
+- **The watchdog no longer kills a long legitimate vision request** (a 92k-token prompt with a 6k answer outlasted the flat 600 s). Each request has an allowance (prompt tokens / 200 + `max_tokens` / 5 s) and `watchdog_hang_ceiling_secs` is slack beyond it, counted from when the engine starts it.
+- **A supervised preload longer than `health_timeout_secs` (90 s) was killed as hung on every respawn.** The worker reports preload progress; the 90 s limit applies only to a worker that shows none.
+- `kill -9` of the supervisor no longer leaves the worker serving orphaned (Linux: it gets SIGTERM and drains).
+
+**GPU poisoning**
+- **A poisoned GPU context was reported healthy.** `/health` adds `gpu_poisoned`, `/health_generate` answers 503, GPU models show `unavailable (gpu_poisoned)` (an extra `state` key in `GET /v1/models`), `rv status` prints a red "restart required" line, and `rustedvino_gpu_poisoned` is 1. CPU and NPU models stay `ready`.
+- Under `--supervise`, while the worker restarts after a request poisoned the context, requests get a retryable 503 with `Retry-After: 30` (streaming: the text in the error frame). The first poisoning logs one ERROR line with the memory state.
+- A GPU out-of-resources failure during a load is recognised when the error carries a context message; the worker stays up degraded and needs a manual restart, also under `--supervise`.
+
+**Memory admission**
+- **A model larger than a discrete GPU loaded onto it when that GPU was the global `device`** with the shipped `total_vram_gb: 0.0` (0.0 meant "no gate" for the inference device). On a 16 GB Arc Pro B50 a 26B model loaded through a preload and faulted the GPU (engine reset, a request that hung). The GPU is now budgeted at the memory it reports. Present since 0.6.x.
+- **A CPU model made room appear that was not there.** The CPU plugin copies weights into anonymous memory at the first request; the live RAM gate now subtracts what each Ready CPU model is charged but not measured to hold (Linux only).
+- **An impossible CPU load evicted every resident model before being refused.** The eviction credit is capped at min(MemTotal, `system_ram_budget_gb`), and eviction stops once the rest cannot make room.
+- **A vision load on a discrete GPU could evict models and then be refused.** The eviction plan applies the device-headroom check and waits up to 20 s for the driver's late release (which also fixes "0.00 GiB free" right after an unload). A refusal after evictions names the models evicted. `rv check` previews it (`headroom_refusal`, or `headroom_not_previewed` before a first load).
+- **A GenAI device-memory refusal at load is `503 insufficient_memory`**, not a raw 500 with a build path; it names models already evicted. Without a warm-up a vision model refused at its first request gets the same 503 with `Retry-After: 5`.
+- **CPU image generation is charged its real working set** (`vram_gb` + the family's working set at `cpu_image_gen_max_pixels`: at 1024×1024 SD 1.5 +8.9 GiB to SD 3.5 +21.3 GiB). Larger requests are `400 size_exceeds_cpu_limit`.
+- **Shared-memory GPUs under-counted models that took more than booked.** Such a model is re-booked at its measured footprint for the rest of the run, with a warning when free memory ends below the OS reservation. Set `vram_gb` that high to book it right from the first load; a restart forgets the figure.
+- **A requested KV pool that was clamped was reported as success.** Loads, adds and resizes say "KV pool 2.00 GiB (requested 4.00 — clamped by cache_size_gb)" and log a WARN; `clamped_by` is `free_vram`, `cache_size_gb`, `min_kv_cache_gb`, `whole_gib_fallback` or `device_headroom` (a vision model on a discrete GPU).
+- **Pools not sized in KV blocks under-booked what the engine allocates** (always whole GiB, about 1 GiB per model unbooked); they are booked at the whole GiB (rounded down when that would not fit, with a WARN above 10 % round-up).
+- **Two concurrent admissions could deadlock the model manager** (present since 0.8.x).
+- A load blocked only by another model's eviction-grace window is refused as transient ("retry in N s"); this fixes 0.8.4's misleading refusal right after a load.
+
+**API, streaming and audio**
+- **Vision `usage.completion_tokens` and token metrics undercounted** (one streamer callback can carry several tokens: 6,425 reported as 4,678); the pipeline's own count feeds `usage`, `rustedvino_tokens_generated_total` and the tok/s gauge.
+- **A vision chat template that rejects the messages answers `400 template_rejected`** with the template's reason, not `500`.
+- **A per-model `chat_template` set through `models/add` or `PATCH` was ignored until the next restart**; it now applies from the next load.
+- **`chat_template_kwargs.enable_thinking` is honoured** when the top-level field is absent; a non-boolean value is `400 invalid_chat_template_kwargs`.
+- **Invalid UTF-8 from the text engine** keeps its valid part with U+FFFD and a warning; a stream frame that cannot be serialised becomes a `frame_serialize_failed` error frame.
+- **An NPU Whisper request without `language` on audio over 30 s hung until restart.** Language detection uses the first 30 s only.
+- **A realtime utterance over 30 s could lose its first 30 s** (whisper-large-v3-turbo on 2026.4.1 returns 1-2 words at exactly 30 s). The VAD auto-commit is at 29.5 s; the rest starts the next utterance.
+
+**CLI and packaging**
+- `rv add` without `--vram-gb` skips backups, partial downloads, `.git/`, caches and another server's `model_cache/`, and prints what it skipped. `rv list` shows `/bundle/models`, not `/bundle/./models`.
+- **The bundle carries ONNX Runtime's licence.** ONNX Runtime 1.24.2 (MIT; linked for the Kokoro, Piper and VITS voices) shipped without its licence and notices up to 0.8.4; the Linux bundle has them under `licenses/onnxruntime/`, and `THIRD-PARTY.md` lists it.
+- Tools: `tools/bench/cmpbench.py` no longer SIGKILLs RustedVINO 60 s after a stop; it waits up to 720 s, then warns.
+
+### Known issues
+- **A process killed mid-GPU-work can still leave an Arc Pro B60 stuck.** A `kill -9`, OOM kill or crash cannot be caught; the xe driver logs an engine `CAT error` and the next load on that GPU can hang for minutes to hours. The server books it stalled, keeps serving, and `rv status` shows the recovery step. A GPU reset (`sudo cat /sys/kernel/debug/dri/<PCI address>/gt0/force_reset_sync`) fixed it in milliseconds, verified once on kernel 7.0 (older kernels may use `dri/<N>`). Loaded models may need reloading; a restart is not reliable, a reboot is. Under `--supervise` the worker restarts `watchdog_hang_ceiling_secs` after the deadline: reset before that.
+- **A supervised worker poisoned by a request exits 75 without tearing its engines down.** On a B60 that exit may hit the same stuck-driver state; the GPU readiness probe runs before the next worker loads anything.
+- **After an engine teardown that ran out of time, every stop exits 76** until that thread really exits; a supervised restart then takes the probe path.
+- **Windows (built from source): the exit still runs the C++ destructors**, so the stop-during-load crash fix is not active there yet.
+- **Memory learning can over-book for the rest of the run.** A generation on another model during a load counts into that load's footprint; a CPU model's first request with a long prompt counts its KV pages into the weight. Later loads may evict more or be refused; a restart forgets it.
+- **Two long vision prompts at the same moment can exhaust one GPU** when they go to two vision models on that GPU while the first prompt is still being tokenised. `kv_headroom_mode: "off"` (not `kv_gate_mode: "legacy"`) turns the headroom load gate off.
+- **On a discrete GPU, a load admitted after an idle gap uses the outside-memory reading from the previous load**, so memory other processes took since then is covered only by `kv_headroom_margin_gib`. A WARN "device-memory probe keeps failing" can appear although the probe works. Fixed in the next release.
+- **A hung vision generation reaches the watchdog late**: allowance + ceiling can exceed half an hour without `max_tokens`. Set `max_tokens` on vision requests.
+- **A vision KV wedge repeats when the learned limit cannot be saved** (unwritable `kv_ratchet/` directory): each repeat evicts and reloads the model.
+- **Invalid UTF-8 from a vision model is still dropped silently.**
+- **Stop edges.** A stop gives up on a load at 600 s; a load that commits later can still be in teardown at exit. A forced eviction with a stuck generation makes a stop wait the full 600 s.
+- **Stalled-load edges.** A KV resize on a device with a stalled load cannot reload the model until that load returns. `/health` shows `device_stalled: true` for a client-gone load that is still running normally. `GPU` and `GPU.0` on a one-GPU box do not block each other.
+- **`rv` edges.** `rv add` / `load` / `resize` give up after 630 s while a longer load goes on (check `rv ps`). `rv add` exits 0 when the model loaded but was not saved. `rv stop` can report a slow many-model teardown as failed after 90 s when the log level hides the wait line (also stopping `rv restart`); `rv restart` during a preload drops `--supervise`.
+- **Carried over from 0.8.4, not re-tested on 2026.4.1:** `rv deregister` / `rv save-defaults` without a terminal need `-y`; gemma-4-e4b-it-int8-ov does not load as a vision model; unloading the reranker can crash the process on some CPU setups.
+
 ## [0.8.4] — 2026-10-16
 
 The release after 0.8.0. Versions 0.8.1, 0.8.2 and 0.8.3 were internal test builds and were never published; everything they

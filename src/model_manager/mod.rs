@@ -39,8 +39,16 @@
 
 pub mod config;
 pub mod engine;
+pub(crate) mod headroom;
+pub(crate) mod image_footprint;
+pub(crate) mod kv_capacity;
+pub(crate) mod kv_headroom;
+pub(crate) mod kv_precision;
+pub(crate) mod kv_profile;
+pub(crate) mod kv_ratchet;
 pub(crate) mod lifecycle;
 pub(crate) mod placement;
+pub(crate) mod poison_diag;
 pub mod stub_engines;
 pub(crate) mod template;
 mod vram;
@@ -54,6 +62,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use anyhow::Result;
 
+use config::normalize_kv_precision;
 pub use config::{Config, ReasoningParser, SupervisorConfig};
 pub use engine::{EngineHandleKind, ManagedEngine, ModelKind};
 
@@ -78,6 +87,27 @@ pub(crate) fn is_gpu_poison_error(msg: &str) -> bool {
     msg.contains("CL_OUT_OF_RESOURCES")
         || msg.contains("CL_INVALID_EVENT")
         || (msg.contains("intel_gpu") && msg.contains("could not execute a primitive"))
+}
+
+/// True when `msg` is `GenAI`'s own device-memory refusal from building the KV cache
+/// (`cache_orchestrator.hpp`: `Check 'budget_in_bytes <= total_available_memory' failed`, or the
+/// `total_requested_bytes` form). Seen when a load beside a resident model passed admission but
+/// the device had less free memory than the tracker assumed (MR-2, 0.8.4 D-01). A capacity
+/// refusal, not poison: the context stays usable. `reserved_la_bytes <= budget_in_bytes` is a
+/// pool-sizing problem, not free memory, and is not matched.
+pub(crate) fn is_genai_memory_budget_error(msg: &str) -> bool {
+    msg.contains("budget_in_bytes <= total_available_memory")
+        || msg.contains("total_requested_bytes <= total_available_memory")
+}
+
+/// The clean refusal for [`is_genai_memory_budget_error`]: no C++ text or build path.
+fn genai_memory_budget_refusal(model_id: &str) -> ModelError {
+    ModelError::InsufficientMemory(format!(
+        "insufficient memory: loading {model_id} failed because the device reported less free \
+         memory than its KV cache needs (other processes, or memory not yet released); retry in \
+         a few seconds (an unloaded model's memory can take 10-20 s to come back), or unload a \
+         model or lower kv_cache_gb"
+    ))
 }
 
 /// Substring marker for a CB-scheduler KV-pool-exhaustion error
@@ -184,7 +214,12 @@ pub(crate) fn is_vlm_kv_wedge_error(msg: &str) -> bool {
 /// it) via [`EVICT_DRAIN_DEADLINE`] below, so the thread should exit almost
 /// immediately — this deadline is purely a backstop against a *wedged*
 /// thread, not a busy one.
-const JOIN_DEADLINE: Duration = Duration::from_secs(8);
+///
+/// D-04 S6: also the per-engine share of the stop's teardown budget
+/// (`startup::teardown_budget`). Measured: the 30B coder on the B60 tears down in ~0.7 s
+/// (T17, 2026-10-29), so 8 s is ~11x; other cards (B50, B70) and the worst cases (right after a
+/// load, mid-generation abort) are still to be measured — every eviction logs `teardown_ms`.
+pub(crate) const JOIN_DEADLINE: Duration = Duration::from_secs(8);
 
 /// How long a FORCED eviction of an engine that cannot be aborted (everything but the
 /// continuous-batching text engine) waits for its thread to finish the request it is running
@@ -220,11 +255,19 @@ use lifecycle::{EngineFactory, OvEngineFactory};
 use vram::MemoryTracker;
 
 use crate::cb_engine::EngineHandle;
-use crate::device_inventory::{DOMAIN_SYSTEM, DeviceInfo, DeviceInventory, DeviceTier};
+use crate::device_inventory::{DOMAIN_SYSTEM, DeviceInfo, DeviceInventory, DeviceKind, DeviceTier};
 use crate::os_memory;
 use crate::prompt_builder::ModelFamily;
 
 // ---- Error type -------------------------------------------------------
+
+/// What [`ModelManager::add_model`] did once the model loaded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AddOutcome {
+    /// `Some(cause)` when the model is loaded and serving but its `config.json` entry could not
+    /// be written, so the registration will not survive a restart.
+    pub persist_error: Option<String>,
+}
 
 /// Reasons a [`ModelManager::get_handle`] or related call can fail.
 ///
@@ -265,14 +308,20 @@ pub enum ModelError {
     /// the process is restarted. Existing loaded models may still serve requests.
     /// → HTTP 503
     GpuPoisoned,
+    /// A stop was requested (SIGTERM/ctrl-C or `request_shutdown`): no new load starts, because
+    /// the process would have to wait for it before leaving (D-04 S2). Not retryable here.
+    /// → HTTP 503 `server_stopping`
+    ShuttingDown,
     /// The model is Ready but its kind does not support the requested operation
     /// (e.g. a [`ModelKind::Vision`] model on a text-only endpoint such as
     /// `/tokenize` or `/v1/completions`). The message names the mismatch.
     /// → HTTP 400
     WrongKind(String),
-    /// The load was refused before anything was evicted because the model can never
-    /// fit (system RAM floor or VRAM budget); the message names the numbers. A
-    /// predictable capacity refusal, not a server fault.
+    /// The load was refused for memory: before anything was evicted because the model can
+    /// never fit (system RAM floor or VRAM budget; the message names the numbers), or by
+    /// `GenAI`'s own free-memory check after admission (MR-2; transient, retry after an
+    /// unload). Models already evicted for the load are named (F1). A capacity refusal, not a
+    /// server fault.
     /// → HTTP 503
     InsufficientMemory(String),
     /// A **non-forced** eviction of this model was refused because it has that many
@@ -294,6 +343,31 @@ pub enum ModelError {
     /// `Evicting`; a detached waiter reconciles it when the thread finally exits. Retry later.
     /// Carries the model id. → HTTP 503 `eviction_incomplete` + `Retry-After`
     EvictionIncomplete(String),
+    /// `config.json` was already invalid before this request changed anything (another entry
+    /// is broken, e.g. a model stanza without `vram_gb`), so a change that persists to it is
+    /// refused before anything is loaded or evicted. Carries the path and the full cause.
+    /// → admin HTTP 409 `config_file_invalid`
+    ConfigFileInvalid(String),
+    /// The load did not return within `load_timeout_secs` (step 6b). The load is booked as
+    /// stalled: its memory stays reserved and a late result is still committed or discarded.
+    /// → HTTP 504 `load_timeout`
+    LoadTimeout {
+        /// The model being loaded.
+        model: String,
+        /// The deadline that expired, seconds.
+        secs: u64,
+    },
+    /// A load on this device has not returned for longer than its deadline (step 6b); new loads
+    /// there are refused until it does. Requests to models already Ready are still served.
+    /// → HTTP 503 `device_stalled` + `Retry-After`
+    DeviceStalled {
+        /// The device the stalled load runs on.
+        device: String,
+        /// The model whose load is stalled.
+        model: String,
+        /// How long that load has been running, seconds.
+        secs: u64,
+    },
 }
 
 impl std::fmt::Display for ModelError {
@@ -314,13 +388,34 @@ impl std::fmt::Display for ModelError {
             Self::Evicting => write!(f, "model is being evicted"),
             Self::GpuPoisoned => write!(
                 f,
-                "GPU context poisoned by a previous failed load — process restart required"
+                "GPU context poisoned (out of resources) — process restart required"
             ),
+            Self::ShuttingDown => write!(f, "the server is stopping — no new model loads"),
             Self::WrongKind(msg) | Self::InsufficientMemory(msg) => write!(f, "{msg}"),
             Self::EvictionIncomplete(id) => write!(
                 f,
                 "model '{id}' is still finishing the request it was running, so its memory is \
                  not free yet — it will be released when that request ends; retry shortly"
+            ),
+            Self::LoadTimeout { model, secs } => write!(
+                f,
+                "load of '{model}' did not return within {secs} s (load_timeout_secs) — it is \
+                 booked as stalled; its device takes no new loads until it returns (`rv status` shows the \
+                 recovery step)"
+            ),
+            Self::DeviceStalled {
+                device,
+                model,
+                secs,
+            } => write!(
+                f,
+                "load of '{model}' on {device} has not returned for {secs} s — no new loads on \
+                 {device} until it does (`rv status` shows the recovery step)"
+            ),
+            Self::ConfigFileInvalid(why) => write!(
+                f,
+                "{why} — not caused by this request; nothing was changed. Fix the file, check it \
+                 with `rv reload-config`, then retry"
             ),
             Self::TargetBusy(n) => write!(
                 f,
@@ -375,8 +470,47 @@ pub enum ModelState {
 
 // ---- Internal record --------------------------------------------------
 
+/// Text the GPU plugin puts in a request failure when the compiled blob in use was built for a
+/// different KV precision than the one the engine now asks for (E-17).
+pub(crate) const KV_BLOB_MISMATCH_MARKER: &str = "Incorrect block size";
+
+/// Whether an engine error is the E-17 precision mismatch between a cached blob and the engine.
+pub(crate) fn is_kv_blob_mismatch_error(msg: &str) -> bool {
+    msg.contains(KV_BLOB_MISMATCH_MARKER)
+}
+
+/// The operator advice logged once when [`is_kv_blob_mismatch_error`] fires.
+pub(crate) fn kv_blob_mismatch_hint(model_id: &str, dir: Option<&str>) -> String {
+    let where_ = dir.map_or_else(
+        || "the OpenVINO blob cache (no ov_cache_dir is configured, so this is not a stale cache blob - check kv_cache_precision)".to_owned(),
+        |d| format!("the *.blob files in {d}"),
+    );
+    format!(
+        "model '{model_id}': the compiled blob in use was built for a different KV-cache precision \
+         than the one configured (OpenVINO 2026.4 blobs do not record it, E-17). Every request to \
+         this model will fail until the stale blob is removed: stop the server, delete {where_}, \
+         and start it again. Usual causes: a blob copied between kv-* directories, or \
+         ov_cache_layout \"flat\" with a changed kv_cache_precision."
+    )
+}
+
+/// Start of the error `reload_config` returns when `config.json` does not parse or validate;
+/// the admin handler maps it to 422.
+pub(crate) const CONFIG_INVALID_PREFIX: &str = "config.json is invalid: ";
+
+/// An unattributed `.blob` younger than this is never pruned (it may belong to a compile that
+/// is still running).
+const UNATTRIBUTED_BLOB_GRACE: std::time::Duration = std::time::Duration::from_mins(30);
+
 struct ModelRecord {
     state: ModelState,
+    /// The running load's result slot while a load is in its blocking engine construction
+    /// (step 6b). Cleared when `execute_load` (or the reaper) takes the result.
+    pending_load: Option<Arc<LoadSlot>>,
+    /// The pending load outlived its caller (deadline or client gone): its memory stays booked,
+    /// its device takes no new loads, and [`ModelManager::reap_stalled_loads`] commits or
+    /// discards the result when it arrives. State stays `Loading`.
+    load_stalled: bool,
     /// The typed submit handle — `Some` only when `state == Ready`.
     /// R1: [`EngineHandleKind::TextGen`] or [`EngineHandleKind::Vision`]; the
     /// enum is the seam that lets later phases store embedding / media handles
@@ -391,6 +525,28 @@ struct ModelRecord {
     /// KV cache pool actually allocated at load time (GB).
     /// Set by `execute_load`; used by the L0 prompt-length gate.
     kv_cache_gb: f64,
+    /// What the load asked for and why the pool differs (E-09); cleared on eviction.
+    kv_requested_gb: Option<f64>,
+    kv_clamped_by: Option<KvClamp>,
+    /// KV blocks of the pool the engine was built with (blocks-first sizing); `None` when the
+    /// pool was sized from the GiB budget.
+    kv_pool_blocks: Option<u64>,
+    /// How `max_prompt_tokens` was computed: `exact`, `legacy` or `""` (no gate).
+    kv_gate_mode: &'static str,
+    /// What limits the exact gate (`None` under the legacy estimate).
+    kv_gate_clamped_by: Option<GateClamp>,
+    /// Ratchet key of an exactly-sized pool; a wedge on it is learned under this key.
+    kv_ratchet_key: Option<kv_ratchet::RatchetKey>,
+    /// What a too-long-prompt refusal says about the limit.
+    kv_gate_detail: Option<GateDetail>,
+    /// The device-headroom facts of a vision model on a discrete GPU (its limit follows the free
+    /// device memory); `None` for every other model.
+    headroom: Option<headroom::HeadroomRecord>,
+    /// F1/A2: the headroom facts of this model's last load, kept after it is unloaded so the
+    /// admission preview (`rv check`) can apply the device-headroom gate before a reload.
+    last_headroom_spec: Option<headroom::HeadroomSpec>,
+    /// The KV precision decision of the last load, for the admin API.
+    kv_resolution: Option<KvResolutionInfo>,
     /// Maximum prompt length in tokens before the L0 gate rejects the request.
     /// `0` means the gate is disabled (model's `config.json` could not be parsed).
     /// Formula: `kv_cache_gb × 1 GiB / bytes_per_token(precision)`.
@@ -443,9 +599,29 @@ struct ModelRecord {
     /// first measured load or where the OS can't measure. An estimate: a
     /// concurrent load of another model lands in the same window.
     gpu_load_delta_bytes: Option<i64>,
+    /// D-07: weight footprint (GB) learned from a measured load on the shared-memory
+    /// `system` domain when it came out clearly above what admission charged: measured
+    /// change in device memory minus the KV pool reserved by that load. `None` until such
+    /// a load; kept across eviction so the next admission of this model charges what it
+    /// really took ([`ModelManager::budget_weight_gb`] uses the larger of this and `vram_gb`).
+    /// In memory only: a restart forgets it and the first load is charged `vram_gb` again.
+    learned_weight_gb: Option<f64>,
+    /// CPU over-admission: what a model on `CPU` really holds in this process's anonymous memory,
+    /// bytes, as `(change across its load, largest change across one solo request since)`. The
+    /// CPU plugin copies the weights into anonymous memory at the first request, so until then
+    /// most of the charge is not yet out of `MemAvailable`; the live gate subtracts the rest
+    /// ([`ModelManager::cpu_outstanding_gb`]). `None` load delta = unmeasured (0). Reset per load.
+    cpu_resident: (Option<u64>, u64),
+    /// D-06: the diffusion pipeline family of an image-generation model (`model_index.json`),
+    /// read at registration; `None` for other kinds. Sizes its CPU working-set charge.
+    image_family: Option<image_footprint::ImageFamily>,
     /// Set once the "measured memory exceeds `vram_gb`" warning has fired for
     /// the current load, so it logs once per load rather than per scrape.
     gpu_over_budget_warned: std::sync::atomic::AtomicBool,
+    /// F2-S-5 (E-16): vision requests with images admitted since this model's last load. Image
+    /// tokens are not counted by the gate yet, so each was admitted on its text alone (low
+    /// confidence). Reset at every load; an atomic so the request path only needs a read lock.
+    uncounted_image_admissions: std::sync::atomic::AtomicU64,
     /// Co-residency Slice 1: when `true`, this model is never an eviction victim
     /// (`select_eviction_victim` hard-excludes it). Set once at registration
     /// from `config.model_policies`; static for the process lifetime.
@@ -514,6 +690,70 @@ fn measured_exceeds_charge(measured_gb: f64, charged_gb: f64) -> bool {
     charged_gb > 0.0 && measured_gb > charged_gb + (0.05 * charged_gb).max(0.75)
 }
 
+/// D-07: the weight footprint (GB) to charge from now on, learned from one measured load, or `None`
+/// when the load needs no correction. `measured_gb` is the change in device memory across the load
+/// (weights and the KV pool it allocated), `kv_gb` the pool that load reserved, `charged_weight_gb`
+/// what admission charged for the weights. Corrects upward only, and only for an overshoot that
+/// [`measured_exceeds_charge`] counts as more than noise.
+fn learned_weight_gb(measured_gb: f64, kv_gb: f64, charged_weight_gb: f64) -> Option<f64> {
+    let kv = kv_gb.max(0.0);
+    measured_exceeds_charge(measured_gb, charged_weight_gb + kv).then_some(measured_gb - kv)
+}
+
+/// CPU over-admission: the weight footprint (GiB) to charge a `CPU` model from now on, learned from
+/// what it was measured to hold, or `None` when that is within the dead band of its weight charge.
+/// Unlike [`learned_weight_gb`] the KV pool is not subtracted: the CPU plugin allocates it lazily,
+/// so after a short request `resident_gb` is the weights plus a few touched pages, and the pool
+/// the model fills later must stay charged on top.
+fn cpu_learned_weight_gb(resident_gb: f64, charged_weight_gb: f64) -> Option<f64> {
+    measured_exceeds_charge(resident_gb, charged_weight_gb).then_some(resident_gb)
+}
+
+/// CPU over-admission: whether this process's anonymous memory can be read (Linux). Without it
+/// nothing is measured and nothing is subtracted, the behaviour before the fix.
+fn cpu_rss_measurable() -> bool {
+    static MEASURABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEASURABLE.get_or_init(|| os_memory::process_rss_anon_bytes().is_some())
+}
+
+/// What evicting a model is credited to give back to the live system-RAM gate, GiB. Off `CPU`
+/// its weights: a KV pool is reserved in the tracker but allocated lazily. On `CPU`
+/// (`cpu_resident_gb` is `Some`) the larger of its tracker allocation and what it was measured to
+/// hold: the eviction frees the resident memory and also ends the not-yet-resident rest that
+/// [`ModelManager::cpu_outstanding_gb`] subtracts for it, and the two together are exactly that.
+/// Every credit site goes through here, so the dry-run, the stop rule and the release wait agree.
+fn ram_credit_gb(weight_gb: f64, allocated_gb: f64, cpu_resident_gb: Option<f64>) -> f64 {
+    cpu_resident_gb.map_or(weight_gb, |resident| allocated_gb.max(resident))
+}
+
+/// What a closed [`SoloWindow`] measured, bytes: the change in anonymous memory, but only when
+/// no other request was handed out since it opened (`starts_now` unchanged) and the window is
+/// `clean` (no load, eviction or late release in it). `None` = not a solo measurement.
+fn solo_request_delta(
+    w: &SoloWindow,
+    starts_now: u64,
+    clean: bool,
+    rss_after: Option<u64>,
+) -> Option<u64> {
+    if w.starts != starts_now || !clean {
+        return None;
+    }
+    rss_after.map(|after| after.saturating_sub(w.rss_before))
+}
+
+/// CPU over-admission: one request measured on its own. Opened when a request for a `CPU` model
+/// is handed out with nothing in flight; closed (lazily, at the next handout or live-RAM read)
+/// once nothing is in flight again. The change in anonymous memory counts only when no other
+/// request was handed out meanwhile and no load or eviction touched the window.
+#[derive(Debug)]
+struct SoloWindow {
+    model_id: String,
+    /// `request_starts` right after this request was counted.
+    starts: u64,
+    rss_before: u64,
+    window: crate::gpu_memory::MeasureWindow,
+}
+
 impl ModelRecord {
     /// Pick the reasoning parser from the chat template when the policy did not set one (see
     /// [`template::auto_reasoning_parser`]) and say so in the log.
@@ -531,17 +771,60 @@ impl ModelRecord {
         }
     }
 
+    /// D-07 / T7b: after a successful load, learn the weight footprint when the measured change in
+    /// this process's device memory is clearly above what admission charged (`charged_weight_gb`
+    /// for the weights plus the `kv_gb` pool). On the shared-memory `system` domain always; on a
+    /// discrete GPU only for an exactly-sized pool, whose bytes are known to the byte and were
+    /// materialised by the warm-up, so `measured - pool` is the weights. Figures are GiB, the
+    /// tracker's unit. Returns `(domain, learned weight GiB, measured GiB)` for the caller to
+    /// re-book the tracker.
+    fn learn_from_load(
+        &mut self,
+        kv_gb: f64,
+        charged_weight_gb: f64,
+        exact_pool: bool,
+    ) -> Option<(String, f64, f64)> {
+        if self.domain != DOMAIN_SYSTEM && !exact_pool {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let measured_gb = self.gpu_load_delta_bytes? as f64 / GIB_F64;
+        let weight = learned_weight_gb(measured_gb, kv_gb, charged_weight_gb)?;
+        self.learned_weight_gb = Some(weight);
+        Some((self.domain.clone(), weight, measured_gb))
+    }
+
+    /// CPU over-admission: GiB this model is known to hold in anonymous memory (its load delta
+    /// plus the largest solo request delta since), when it runs on `CPU` and that can be
+    /// measured; `None` otherwise.
+    fn cpu_resident_gb(&self) -> Option<f64> {
+        (self.device == "CPU" && cpu_rss_measurable()).then(|| {
+            let (load, peak) = self.cpu_resident;
+            #[allow(clippy::cast_precision_loss)] // memory sizes are far below 2^52 bytes
+            let bytes = load.unwrap_or(0).saturating_add(peak) as f64;
+            bytes / GIB_F64
+        })
+    }
+
     /// Record the measured device-memory change across a just-finished load
     /// (`before` = the reading taken before it started) and re-arm the
     /// over-budget warning for this load. The delta is `None` (unknown) when
     /// the window wasn't clean — another model loaded or was evicted during
     /// it, or recently enough that the kernel was still releasing memory —
     /// or when it came out negative, which only such pollution produces.
-    fn note_gpu_load(&mut self, before: Option<u64>, window: crate::gpu_memory::MeasureWindow) {
+    /// `after` is the reading taken right after the load, before the models lock: on a discrete
+    /// GPU only this card's dedicated memory counts (system-memory regions, the iGPU and the NPU
+    /// move for reasons that are not this load); elsewhere the process total.
+    fn note_gpu_load(
+        &mut self,
+        before: Option<u64>,
+        after: Option<u64>,
+        window: crate::gpu_memory::MeasureWindow,
+    ) {
         #[allow(clippy::cast_possible_wrap)] // device memory < 2^63 bytes
         {
             self.gpu_load_delta_bytes = before
-                .zip(crate::gpu_memory::process_total_bytes())
+                .zip(after)
                 .map(|(b, a)| a as i64 - b as i64)
                 .filter(|&d| d >= 0 && window.is_clean());
         }
@@ -622,6 +905,11 @@ pub struct ChatContext {
     /// Maximum prompt length in tokens before the L0 gate rejects the request.
     /// `0` means the gate is disabled (model's `config.json` could not be parsed).
     pub max_prompt_tokens: usize,
+    /// How the limit above was computed (`exact`, `legacy`, `""`): the exact gate also unlocks the
+    /// vision path's `max_tokens` clamp against the pool.
+    pub kv_gate_mode: &'static str,
+    /// What the 400 for a too-long prompt says about the limit (E-10).
+    pub gate_detail: Option<GateDetail>,
     /// Raw, unclamped KV-pool token capacity — see
     /// `ModelRecord::pool_capacity_tokens`'s doc comment. Used by the
     /// concurrent-admission check, not the per-request L0 gate.
@@ -645,11 +933,549 @@ pub struct ChatContext {
 
 // ---- Public info type (for /v1/models) --------------------------------
 
+/// Why a model's KV pool differs from what was asked for (E-09, T8).
+///
+/// Reported as `clamped_by` in the admin API and in the sentence `rv add` /
+/// `rv resize` print, so an operator who asks for 4 GiB and gets 2 learns which
+/// setting decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvClamp {
+    /// Less VRAM was free after the weights and the safety margin.
+    FreeVram,
+    /// The global `cache_size_gb` cap.
+    CacheSizeGb,
+    /// The `min_kv_cache_gb` floor raised the pool above the request.
+    MinKvCacheGb,
+    /// The engine allocates whole GiB; the pool was rounded to one (E-13).
+    WholeGibFallback,
+    /// A larger pool would leave the device too little free memory for the context limit's
+    /// floor (vision model on a discrete GPU).
+    DeviceHeadroom,
+}
+
+impl KvClamp {
+    /// Stable `snake_case` label used in JSON and log fields.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FreeVram => "free_vram",
+            Self::CacheSizeGb => "cache_size_gb",
+            Self::MinKvCacheGb => "min_kv_cache_gb",
+            Self::WholeGibFallback => "whole_gib_fallback",
+            Self::DeviceHeadroom => "device_headroom",
+        }
+    }
+}
+
+/// The KV pool a load reserves: the size, what was asked for, and why they differ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct KvPoolPlan {
+    /// GiB booked in the tracker and handed to the engine (whole GiB for a CB pool).
+    pub gb: f64,
+    /// The explicit per-model/override target (`> 0`), `None` for "all that fits".
+    pub requested_gb: Option<f64>,
+    /// Why `gb` differs from `requested_gb`, if an explicit request was made and it does.
+    pub clamped_by: Option<KvClamp>,
+    /// The pool before the whole-GiB rounding, when rounding changed it (for the load log).
+    pub rounded_from_gb: Option<f64>,
+    /// Blocks-first: the exact KV block count the engine is built with (`num_kv_blocks`).
+    /// `None` = the pool is sized from `gb` by the engine, rounded up to whole GiB.
+    pub blocks: Option<u64>,
+    /// Blocks-first: the bytes the engine allocates for that pool (`gb` is this in GiB).
+    pub bytes_allocated: Option<u64>,
+}
+
+/// Everything exact (blocks-first) pool sizing needs, decided before the load.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactPoolSpec {
+    /// The model's KV layout.
+    pub profile: Arc<kv_profile::KvProfile>,
+    /// The precision the engine is passed.
+    pub precision: kv_profile::KvPrecision,
+    /// Prefix caching for this load.
+    pub prefix_caching: bool,
+    /// How many linear-attention state blocks the engine reserves.
+    pub la_rule: kv_capacity::LaBlocksRule,
+    /// The `KV_CACHE_PRECISION` string the engine is passed (`i8`, `u4`, `f16`).
+    pub passed: &'static str,
+    /// `cb` or `vlm`.
+    pub engine_path: &'static str,
+    /// The scheduler's `max_num_seqs` this pool was sized for.
+    pub max_num_seqs: usize,
+    /// The device the engine runs on.
+    pub device: String,
+    /// Normalised `OpenVINO` and `GenAI` versions.
+    pub versions: (String, String),
+    /// The device-headroom facts when this is a vision model on a discrete GPU whose free device
+    /// memory can be read; `None` otherwise.
+    pub headroom: Option<headroom::HeadroomSpec>,
+}
+
+impl ExactPoolSpec {
+    /// The ratchet key of a pool of `blocks` blocks built under this spec (no draft model: those
+    /// loads are never exact).
+    pub(crate) fn ratchet_key(&self, blocks: u64) -> kv_ratchet::RatchetKey {
+        kv_ratchet::RatchetKey::new(
+            blocks,
+            self.passed,
+            self.prefix_caching,
+            self.max_num_seqs,
+            self.engine_path,
+            (&self.versions.0, &self.versions.1),
+            &self.device,
+            "",
+        )
+    }
+}
+
+/// What sizing one load learned about the model: the exact-sizing spec if the load qualified, the
+/// profile and precision the factory resolved (for the refusal text even when it did not), and
+/// the effective prefix-caching flag.
+#[derive(Debug, Default)]
+struct SizingOutcome {
+    spec: Option<ExactPoolSpec>,
+    inputs: Option<lifecycle::KvPoolInputs>,
+    prefix_caching: bool,
+}
+
+/// Everything the context limit of a finished load is computed from.
+#[derive(Debug)]
+struct GateSource {
+    exact: Option<ExactGate>,
+    inputs: Option<lifecycle::KvPoolInputs>,
+    prefix_caching: bool,
+}
+
+impl GateSource {
+    fn new(sizing: SizingOutcome, plan: Option<KvPoolPlan>) -> Self {
+        Self {
+            exact: ExactGate::new(sizing.spec, plan),
+            inputs: sizing.inputs,
+            prefix_caching: sizing.prefix_caching,
+        }
+    }
+}
+
+/// An exactly-sized pool as the gate needs it: the spec it was sized under and the block count.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactGate {
+    /// What the pool was sized from.
+    pub spec: ExactPoolSpec,
+    /// The pool's KV block count.
+    pub blocks: u64,
+}
+
+impl ExactGate {
+    /// The gate of a load that was sized exactly (a spec and a block count), else `None`.
+    fn new(spec: Option<ExactPoolSpec>, plan: Option<KvPoolPlan>) -> Option<Self> {
+        spec.zip(plan.and_then(|p| p.blocks))
+            .map(|(spec, blocks)| Self { spec, blocks })
+    }
+}
+
+/// A per-model `kv_cache_precision` as the factory takes it (`""` = auto, `i8`, `u4`, `f16`);
+/// `None` for no override or a value that does not validate (validation refuses those earlier).
+fn normalized_kv_override(raw: Option<&str>) -> Option<&'static str> {
+    raw.and_then(|p| normalize_kv_precision(p).ok())
+}
+
+/// The KV precision decision of a loaded model, as the admin API shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvResolutionInfo {
+    /// The precision the engine builds (`"u4"`, `"i8"`, `"f16"`), `None` when the plugin decides
+    /// and the server cannot say.
+    pub precision: Option<&'static str>,
+    /// `per_model`, `global`, `ir_hint`, `auto_rule` or `passthrough`.
+    pub source: &'static str,
+    /// What the engine was passed (`""` = the plugin default, shown as `auto`).
+    pub passed: &'static str,
+    /// KV bytes one token costs at that precision, from the model's layout.
+    pub bytes_per_token: Option<u64>,
+    /// How far the KV profile can be trusted (`high`, `medium`, `low`).
+    pub profile_confidence: Option<&'static str>,
+}
+
+impl KvResolutionInfo {
+    fn from_inputs(inputs: &lifecycle::KvPoolInputs) -> Self {
+        let res = inputs.resolution;
+        Self {
+            precision: res.precision.map(kv_precision::precision_str),
+            source: res.source.label(),
+            passed: res.passed,
+            bytes_per_token: res.precision.map(|p| inputs.profile.kv_bytes_per_token(p)),
+            profile_confidence: Some(inputs.profile.confidence.label()),
+        }
+    }
+}
+
+/// What limits a model's context (`max_prompt_tokens`) under the exact gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateClamp {
+    /// 95 % of the pool's token capacity (the rest is block rounding).
+    Pool,
+    /// The model's native context length.
+    Native,
+    /// A learned ratchet from an earlier wedge on exactly this configuration.
+    Ratchet,
+    /// The free device memory the pool leaves for prompt-sized transients (VLM, Linux).
+    DeviceHeadroom,
+}
+
+impl GateClamp {
+    /// Stable name used in the admin API and error messages.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Native => "native",
+            Self::Ratchet => "ratchet",
+            Self::DeviceHeadroom => "device_headroom",
+        }
+    }
+}
+
+/// Why a model's context limit is what it is, for the 400 a too-long prompt gets (E-10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateDetail {
+    /// The KV pool the model was built with (GiB, as booked).
+    pub kv_cache_gb: f64,
+    /// The `KV_CACHE_PRECISION` string the engine was built with (`""` = plugin default).
+    pub precision: &'static str,
+    /// Prefix caching on for this model.
+    pub prefix_caching: bool,
+    /// The model has linear-attention layers (prefix caching halves its capacity).
+    pub hybrid: bool,
+    /// What limits the exact gate; `None` under the legacy estimate.
+    pub clamped_by: Option<GateClamp>,
+    /// Free device memory behind a device-headroom limit, GiB (set when that limit binds).
+    pub device_free_gib: Option<f64>,
+}
+
+/// Weights as measured at a load, MiB: the device-memory delta over the load minus the KV pool the
+/// load allocated (`pool_gb`, GiB). `None` without a clean measurement or when the pool is larger
+/// than the delta (a polluted window).
+fn measured_weights_mib(load_delta_bytes: Option<i64>, pool_gb: f64) -> Option<u64> {
+    let delta = u64::try_from(load_delta_bytes?).ok()?;
+    let weights = delta.checked_sub(gib_to_bytes(pool_gb.max(0.0)))?;
+    Some(weights >> 20)
+}
+
+/// Share of the pool's capacity a single prompt may use: the rest covers block rounding.
+const GATE_POOL_FRACTION_PERCENT: usize = 95;
+
+/// The file-derived inputs of a load's context limit (F2-S-7): the model's `config.json` (native
+/// context limit, the legacy bytes-per-token estimate) and the learned limits (the v2 ratchet for
+/// an exact pool, the v1 one for the legacy estimate). Read on the blocking pool before a load is
+/// committed, so the commit ([`compute_exact_gate`], `compute_max_prompt_tokens`) does no file
+/// I/O on the async runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GateFiles {
+    /// `config.json`'s native context limit, if any.
+    native_context: Option<usize>,
+    /// The learned limit for the exact pool's ratchet key, if any.
+    ratchet_v2: Option<usize>,
+    /// The legacy estimate's f16 K+V bytes per token from `config.json` (`0` = unknown).
+    legacy_bytes_f16: usize,
+    /// The legacy estimate's learned limit for this pool size, if any.
+    ratchet_v1: Option<usize>,
+}
+
+impl GateFiles {
+    /// Read them (blocking file I/O: call from `spawn_blocking`). Nothing is read for a load
+    /// without a KV pool. Also notes, once, ratchet files left in the model library (never read
+    /// since option B).
+    fn read(
+        model_dir: &std::path::Path,
+        ratchet_dir: Option<&std::path::Path>,
+        gate: Option<&ExactGate>,
+        kv_gb: f64,
+    ) -> Self {
+        if kv_gb == 0.0 && gate.is_none() {
+            return Self::default();
+        }
+        kv_ratchet::note_library_ratchets_ignored(model_dir, ratchet_dir);
+        Self {
+            native_context: template::read_native_context_limit(model_dir),
+            ratchet_v2: gate.and_then(|g| {
+                ratchet_dir
+                    .and_then(|dir| kv_ratchet::read_ratchet_v2(dir, &g.spec.ratchet_key(g.blocks)))
+            }),
+            legacy_bytes_f16: template::legacy_bytes_per_token_f16(model_dir),
+            ratchet_v1: ratchet_dir.and_then(|dir| template::read_kv_capacity_ratchet(dir, kv_gb)),
+        }
+    }
+}
+
+/// The per-model files a load commit needs besides the limit's: the chat template (override or
+/// shipped, else the generic fallback), the special tokens and the shipped sampling defaults. Read on
+/// the blocking pool with [`GateFiles`], so the commit does no file I/O on the async runtime.
+#[derive(Clone, Debug)]
+struct ModelFiles {
+    /// The chat template; [`template::FALLBACK_TEMPLATE`] for media kinds or when none loads.
+    template: String,
+    /// `(eos_token, bos_token)` from `tokenizer_config.json` (empty when absent).
+    special_tokens: (String, String),
+    /// `generation_config.json` sampling defaults (text and vision models only).
+    generation_defaults: template::GenerationDefaults,
+}
+
+impl ModelFiles {
+    /// What a commit uses when the files could not be read at all (the blocking task failed):
+    /// the generic template, never an empty one.
+    fn fallback() -> Self {
+        Self {
+            template: template::FALLBACK_TEMPLATE.to_owned(),
+            special_tokens: (String::new(), String::new()),
+            generation_defaults: template::GenerationDefaults::default(),
+        }
+    }
+
+    /// Read them (blocking file I/O: call from `spawn_blocking`). The template and the sampling
+    /// defaults only for text and vision models (media models ship neither); an unreadable
+    /// template warns and falls back to the generic one.
+    fn read(
+        model_id: &str,
+        model_dir: &std::path::Path,
+        kind: ModelKind,
+        template_override: Option<&std::path::Path>,
+    ) -> Self {
+        let generates = matches!(kind, ModelKind::TextGen | ModelKind::Vision);
+        let template = if generates {
+            template::load_chat_template_with_override(model_dir, template_override)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        model_id,
+                        error = %e,
+                        "no chat template found — using generic fallback (tool calling will be degraded)"
+                    );
+                    template::FALLBACK_TEMPLATE.to_owned()
+                })
+        } else {
+            template::FALLBACK_TEMPLATE.to_owned()
+        };
+        Self {
+            template,
+            special_tokens: template::load_special_tokens(model_dir),
+            generation_defaults: if generates {
+                template::load_generation_defaults(model_dir)
+            } else {
+                template::GenerationDefaults::default()
+            },
+        }
+    }
+}
+
+/// The exact context limit of an exactly-sized pool: `(max_prompt_tokens, pool_capacity_tokens,
+/// what limits it)`, from the pool and the pre-read [`GateFiles`] (no I/O). `None` when the pool
+/// cannot be described (the caller falls back to the legacy estimate).
+fn compute_exact_gate(
+    model_id: &str,
+    files: &GateFiles,
+    gate: &ExactGate,
+) -> Option<(usize, usize, GateClamp)> {
+    let spec = &gate.spec;
+    let plan = spec
+        .profile
+        .plan_for_blocks(
+            gate.blocks,
+            spec.precision,
+            spec.prefix_caching,
+            spec.la_rule,
+            None,
+        )
+        .ok()?;
+    let capacity = usize::try_from(plan.capacity_tokens).ok()?;
+    let mut limit = capacity / 100 * GATE_POOL_FRACTION_PERCENT
+        + capacity % 100 * GATE_POOL_FRACTION_PERCENT / 100;
+    let mut by = GateClamp::Pool;
+    if let Some(native) = files.native_context
+        && native > 0
+        && native < limit
+    {
+        limit = native;
+        by = GateClamp::Native;
+    }
+    if let Some(ratchet) = files.ratchet_v2
+        && ratchet > 0
+        && ratchet < limit
+    {
+        tracing::info!(
+            model_id,
+            pool_limit = limit,
+            ratchet,
+            "context limit: applying the learned ratchet for exactly this pool"
+        );
+        limit = ratchet;
+        by = GateClamp::Ratchet;
+    }
+    Some((limit, capacity, by))
+}
+
+const GIB_F64: f64 = 1_073_741_824.0;
+
+/// A tracker figure (GiB) as bytes. The tracker's unit is the GiB (the pools it books are, and
+/// the inventory reports device memory in GiB), whatever the config docs called it before.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn gib_to_bytes(gib: f64) -> u64 {
+    (gib.max(0.0) * GIB_F64) as u64
+}
+
+/// The refusal for a pool the capacity model cannot build, in MiB and with the knob that helps.
+#[allow(clippy::cast_precision_loss)]
+fn capacity_refusal(model_id: &str, e: &kv_capacity::CapacityError) -> ModelError {
+    const MIB: f64 = 1_048_576.0;
+    ModelError::InsufficientMemory(match e {
+        kv_capacity::CapacityError::LaExceedsBudget { needed, budget } => format!(
+            "cannot load {model_id}: the linear-attention state its concurrent streams reserve \
+             needs {:.0} MiB but the KV pool is only {:.0} MiB; raise kv_cache_gb or lower \
+             max_concurrent_streams (nothing was evicted)",
+            *needed as f64 / MIB,
+            *budget as f64 / MIB
+        ),
+        kv_capacity::CapacityError::BudgetTooSmall { needed, budget } => format!(
+            "cannot load {model_id}: a KV pool of {:.0} MiB holds no block ({:.0} MiB needed); \
+             raise kv_cache_gb",
+            *budget as f64 / MIB,
+            *needed as f64 / MIB
+        ),
+        other => format!("cannot size the KV pool for {model_id}: {other}"),
+    })
+}
+
+/// The context limits a load computed, with how they were computed.
+#[derive(Debug)]
+struct TokenLimits {
+    max_prompt_tokens: usize,
+    pool_capacity_tokens: usize,
+    /// `exact`, `legacy`, or `""` (no gate: NPU, media, unreadable config).
+    mode: &'static str,
+    /// What limits the exact gate; `None` under the legacy estimate.
+    clamped_by: Option<GateClamp>,
+    /// The ratchet key of an exactly-sized pool, used when a wedge teaches a new ceiling.
+    ratchet_key: Option<kv_ratchet::RatchetKey>,
+    /// What the refusal message says about the limit.
+    detail: Option<GateDetail>,
+    /// The device-headroom facts of a vision model on a discrete GPU.
+    headroom: Option<headroom::HeadroomRecord>,
+}
+
+/// Whether the exact pool model may size this load; `Err` names why not (logged, and the load
+/// keeps the whole-GiB sizing).
+pub(crate) fn exact_pool_spec(
+    inputs: &lifecycle::KvPoolInputs,
+    prefix_caching: bool,
+    max_num_seqs: usize,
+    speculative: bool,
+    versions: Option<(String, String)>,
+    device: &str,
+    allow_unknown_engine: bool,
+) -> Result<ExactPoolSpec, &'static str> {
+    let Some(precision) = inputs.resolution.precision else {
+        return Err("the precision the engine builds is not known to the server");
+    };
+    if inputs.resolution.source == kv_precision::PrecisionSource::LegacyPassthrough {
+        // CPU, NPU, HETERO/AUTO/MULTI specs, plugin mode: the layouts modelled here are the
+        // plain-GPU ones.
+        return Err("the device is not a plain GPU (the precision is passed through unresolved)");
+    }
+    if inputs.resolution.passed.is_empty() {
+        // The plugin decides (plugin mode, untrusted profile): the bytes per block would be a guess.
+        return Err("the engine is not given an explicit KV precision");
+    }
+    if inputs.profile.confidence == kv_profile::Confidence::Low {
+        return Err("the KV profile of this model is low-confidence");
+    }
+    if inputs.profile.block_tokens != kv_profile::GPU_BLOCK_TOKENS {
+        return Err("only the GPU block layout is modelled");
+    }
+    if speculative {
+        return Err("speculative decoding splits the pool with a draft model");
+    }
+    let hybrid = inputs.profile.linear_state_bytes_per_seq > 0;
+    // With an exact block count the engine no longer guards the configured budget, so the
+    // booking is only as good as the linear-attention figure: read from the IR (High), not
+    // derived from config.json (Medium).
+    if hybrid && inputs.profile.confidence != kv_profile::Confidence::High {
+        return Err("the linear-attention state is derived from config.json, not read from the IR");
+    }
+    let Some(versions) = versions else {
+        return Err("the OpenVINO / GenAI versions are unknown");
+    };
+    let versions = kv_profile::engine_pair(&versions.0, &versions.1);
+    let known =
+        kv_capacity::KNOWN_ENGINE_PAIRS.contains(&(versions.0.as_str(), versions.1.as_str()));
+    if !known && !allow_unknown_engine {
+        return Err("the OpenVINO / GenAI versions are not the ones the layouts were verified on");
+    }
+    if !known {
+        warn_unverified_engine_once(&versions);
+    }
+    let la_rule = match inputs.path {
+        kv_precision::EnginePath::Cb => {
+            kv_capacity::LaBlocksRule::MaxNumSeqs(if max_num_seqs == 0 {
+                256 // GenAI's own default
+            } else {
+                max_num_seqs
+            })
+        }
+        kv_precision::EnginePath::Vlm => kv_capacity::LaBlocksRule::One,
+    };
+    Ok(ExactPoolSpec {
+        profile: Arc::clone(&inputs.profile),
+        precision,
+        prefix_caching,
+        la_rule,
+        passed: inputs.resolution.passed,
+        engine_path: match inputs.path {
+            kv_precision::EnginePath::Cb => "cb",
+            kv_precision::EnginePath::Vlm => "vlm",
+        },
+        max_num_seqs,
+        device: device.to_owned(),
+        versions,
+        headroom: None,
+    })
+}
+
+/// One warning per process: vision models on a discrete GPU keep the legacy context limit.
+fn warn_vision_without_headroom_cap_once(model_id: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            model_id,
+            "vision model on a discrete GPU: the context limit stays on the legacy estimate \
+             (the exact limit needs the device-headroom cap, which this build does not have); \
+             logged once per process for the first such model"
+        );
+    }
+}
+
+/// One warning per engine version pair when `kv_gate_exact_on_unknown_engine` runs the exact
+/// layout model on a release it was not verified on.
+fn warn_unverified_engine_once(pair: &(String, String)) {
+    static SEEN: std::sync::OnceLock<Mutex<HashSet<(String, String)>>> = std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(pair.clone());
+    if first {
+        tracing::warn!(
+            openvino = %pair.0,
+            genai = %pair.1,
+            "kv_gate_exact_on_unknown_engine: sizing and gating with the exact KV layout model on an \
+             OpenVINO/GenAI pair it was not verified on"
+        );
+    }
+}
+
 /// Snapshot of a model's state, returned by [`ModelManager::list_models`].
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: String,
     pub state: ModelState,
+    /// `Some(seconds running)` while this model's load is stalled (step 6b; state `Loading`).
+    pub stalled_secs: Option<u64>,
     pub kind: ModelKind,
     pub vram_gb: f64,
     /// The `OpenVINO` device this model is (or will be) placed on — e.g.
@@ -676,6 +1502,29 @@ pub struct ModelInfo {
     /// `max_prompt_tokens` — together they answer "how much context can I
     /// send, and how much pool is that costing."
     pub kv_cache_gb: f64,
+    /// The explicit KV target the load was given (`None` = all that fits). With
+    /// [`kv_clamped_by`](Self::kv_clamped_by) it answers "why is my pool smaller
+    /// than I asked" (E-09).
+    pub kv_requested_gb: Option<f64>,
+    /// Why the pool differs from the request; `None` when it does not.
+    pub kv_clamped_by: Option<KvClamp>,
+    /// KV blocks of the pool when it was sized exactly (blocks-first); `None` for a whole-GiB pool.
+    pub kv_pool_blocks: Option<u64>,
+    /// The KV precision decision of the last load (`None` before the first load and for models
+    /// without a KV engine).
+    pub kv_resolution: Option<KvResolutionInfo>,
+    /// The device-headroom cap right now (vision model on a discrete GPU), tokens, before the pool
+    /// limit is applied: it can be far above `max_prompt_tokens` when the pool binds.
+    pub kv_headroom_cap_tokens: Option<usize>,
+    /// Weights as measured at the last load, MiB: the process's device-memory delta over that load
+    /// minus the KV pool it allocated. `None` when the load window was not clean (another load or
+    /// an eviction nearby), for a pool sized in whole GiB (its real size is not known to the byte),
+    /// on a model without a measurement, or while not Ready.
+    pub vram_measured_mib: Option<u64>,
+    /// How `max_prompt_tokens` was computed: `exact`, `legacy`, or `""` when there is no gate.
+    pub kv_gate_mode: &'static str,
+    /// What limits the exact gate; `None` under the legacy estimate.
+    pub kv_gate_clamped_by: Option<GateClamp>,
     /// The model's native (trained/converted) context ceiling —
     /// `max_position_embeddings`, `rope_scaling`-adjusted (see
     /// [`template::read_native_context_limit`]). Contrast with
@@ -704,6 +1553,9 @@ pub struct ModelInfo {
     /// `vram_gb` (see `ModelManager::gpu_memory_estimate_bytes`). `None`
     /// when not loaded or where the OS can't measure.
     pub gpu_memory_estimate_gb: Option<f64>,
+    /// F2-S-5: vision requests with images admitted since the last load without their image
+    /// tokens counted (the gate's low-confidence case); `0` for every other model.
+    pub uncounted_image_admissions: u64,
 }
 
 /// Result of the dry-run admission check ("what fits"), returned by
@@ -725,6 +1577,9 @@ struct RamGate {
     needed: Option<f64>,
     /// OS reservation, in GB, that the gate must leave untouched.
     floor: f64,
+    /// Most RAM evictions can ever make available, GB (see
+    /// [`ModelManager::ram_ceiling_gb`]); `None` = uncapped.
+    ceiling: Option<f64>,
 }
 
 impl RamGate {
@@ -733,9 +1588,11 @@ impl RamGate {
     /// availability on every retry rather than deciding once.
     fn admits(&self, freed: f64) -> bool {
         match (self.avail, self.needed) {
-            (Some(avail), Some(need)) => {
-                os_memory::ram_floor_admits(avail + freed, need, self.floor)
-            }
+            (Some(avail), Some(need)) => os_memory::ram_floor_admits(
+                os_memory::credited_avail_gb(avail, freed, self.ceiling),
+                need,
+                self.floor,
+            ),
             _ => true,
         }
     }
@@ -744,6 +1601,15 @@ impl RamGate {
 /// How long [`ModelManager::await_ram_release`] waits for the OS to return an
 /// evicted model's memory.
 const RAM_RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// F1 step B / D-02: how long [`ModelManager::await_vram_release`] waits for the driver to report
+/// unloaded engines' device memory released before carrying on. Measured on the B60 (xe, 2026-10-28):
+/// an unloaded LLM/VLM gives back most of its memory at once and the last ~1.8 GiB 10-13 s later.
+const VRAM_RELEASE_WAIT: Duration = Duration::from_secs(20);
+
+/// This process's unbooked device memory that still counts as "released" (driver bookkeeping
+/// noise, scratch buffers; an idle server shows about 0.12 GiB).
+const VRAM_RELEASE_SLACK_BYTES: u64 = 256 << 20;
 
 /// Poll interval of [`poll_until_released`].
 const RAM_RELEASE_POLL: Duration = Duration::from_millis(100);
@@ -818,6 +1684,31 @@ struct EvictionTail {
     policy: JoinPolicy,
     /// How long to wait for it.
     deadline: Duration,
+    /// The engine's device, for the `ffi_watch` teardown entry (`None` if the record had none).
+    device: Option<String>,
+}
+
+/// Join one engine thread taken from `slot`, tracked in `ffi_watch` as a teardown for the whole
+/// join (D-04 S6: the pipeline destructor runs on that thread at its exit). `false` when the
+/// thread panicked or the slot was already empty.
+fn join_tracked(
+    slot: &std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    model_id: &str,
+    device: Option<&str>,
+) -> bool {
+    let teardown = crate::ffi_watch::global().arm(
+        crate::ffi_watch::FfiKind::Teardown,
+        model_id,
+        device,
+        Duration::MAX,
+    );
+    let thread = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let clean = thread.is_some_and(|t| t.join().is_ok());
+    drop(teardown);
+    clean
 }
 
 /// What an eviction does when the engine thread outlives the join deadline (D3-S1.E5).
@@ -832,6 +1723,52 @@ enum JoinPolicy {
     /// the thread has really exited. Past the deadline report [`TailOutcome::Incomplete`]; the
     /// join helper thread reconciles whenever the engine finally exits.
     HoldUntilJoined,
+}
+
+/// The engine thread did not exit cleanly during an eviction: it panicked or its bounded join timed
+/// out. Record and tracker are reconciled either way; a typed error so [`ModelManager::shutdown`]
+/// can tell it from a benign failure without matching on text.
+#[derive(Debug)]
+struct UncleanEngineExit;
+
+impl std::fmt::Display for UncleanEngineExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("engine thread did not exit cleanly during eviction (panic or join timeout)")
+    }
+}
+
+impl std::error::Error for UncleanEngineExit {}
+
+/// Whether a failed eviction may have left its engine thread inside the plugin.
+fn engine_may_still_run(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<UncleanEngineExit>().is_some()
+        || matches!(
+            e.downcast_ref::<ModelError>(),
+            Some(ModelError::EvictionIncomplete(_))
+        )
+}
+
+/// A load past its caller (deadline or client gone) whose engine construction is still running
+/// (step 6b) — reported by `/health` (`device_stalled`), the watchdog endpoint and `rv status`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StalledLoad {
+    /// The device that takes no new loads until it returns.
+    pub device: String,
+    /// The model being loaded.
+    pub model: String,
+    /// How long the load has been running, seconds.
+    pub secs: u64,
+    /// Whether it is past its own deadline (`load_timeout_secs`, or the 600 s stop cap when it
+    /// has none). A load booked stalled only because its client went away is not, and must not
+    /// be shown a recovery step (D-04 S9 review #1).
+    pub overdue: bool,
+}
+
+/// What [`ModelManager::shutdown`] could not tear down cleanly.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Models whose engine thread may still be running (see [`ModelManager::shutdown`]).
+    pub unclean: Vec<String>,
 }
 
 /// How an [`EvictionTail`] ended.
@@ -861,24 +1798,59 @@ impl EvictionTail {
             vram,
             policy,
             deadline,
+            device,
         } = self;
         let hold = policy == JoinPolicy::HoldUntilJoined;
-        // `JoinHandle::join` has no timeout: join on a helper thread and wait on a channel.
+        let started = Instant::now();
+        // `JoinHandle::join` has no timeout: join on a helper thread and wait on a channel. The
+        // handle sits in a shared slot so this thread can still join it if the helper cannot
+        // be started (D-04 S6 review).
+        let slot = Arc::new(std::sync::Mutex::new(Some(thread)));
         let (tx, rx) = std::sync::mpsc::channel();
-        let (helper_models, helper_vram, helper_id) =
-            (Arc::clone(&models), Arc::clone(&vram), model_id.clone());
-        std::thread::spawn(move || {
-            let clean = thread.join().is_ok();
-            if hold {
-                ModelManager::reconcile_evicted(&helper_models, &helper_vram, &helper_id);
-                crate::gpu_memory::note_release_event();
-                tracing::info!(
-                    model_id = %helper_id,
-                    "engine thread finally exited — evicted model's memory released"
-                );
+        let helper = {
+            let (slot, models, vram) = (Arc::clone(&slot), Arc::clone(&models), Arc::clone(&vram));
+            let (model_id, device) = (model_id.clone(), device.clone());
+            move || {
+                let clean = join_tracked(&slot, &model_id, device.as_deref());
+                let teardown_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if hold {
+                    ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                    crate::gpu_memory::note_release_event();
+                    tracing::info!(
+                        model_id = %model_id,
+                        teardown_ms,
+                        "engine thread finally exited — evicted model's memory released"
+                    );
+                }
+                // The receiver is gone once `run` stopped waiting: this is a late exit.
+                if tx.send(clean).is_err() && !hold {
+                    tracing::warn!(
+                        model_id = %model_id,
+                        teardown_ms,
+                        clean,
+                        "engine thread exited after its eviction stopped waiting for it"
+                    );
+                }
             }
-            let _ = tx.send(clean);
-        });
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("rv-evict-join".to_owned())
+            .spawn(helper)
+        {
+            tracing::error!(
+                model_id,
+                error = %e,
+                "could not start the eviction join thread — joining here, without a deadline"
+            );
+            let clean = join_tracked(&slot, &model_id, device.as_deref());
+            ModelManager::reconcile_evicted(&models, &vram, &model_id);
+            crate::gpu_memory::note_release_event();
+            return if clean {
+                TailOutcome::Clean
+            } else {
+                TailOutcome::Unclean
+            };
+        }
         match rx.recv_timeout(deadline) {
             Ok(clean) => {
                 if !hold {
@@ -953,8 +1925,17 @@ impl Drop for EvictGuard {
             if handle.as_managed().active() > 0 {
                 handle.request_shutdown();
             }
+            let model_id = tail.model_id.clone();
+            let teardown_started = Instant::now();
             drop(handle);
-            tail.run();
+            let outcome = tail.run();
+            tracing::info!(
+                model_id = %model_id,
+                ?outcome,
+                teardown_ms = u64::try_from(teardown_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                "background eviction finished"
+            );
         });
     }
 }
@@ -967,7 +1948,7 @@ struct BusyExcluded {
     id: String,
     /// Weights plus reserved KV pool (what the VRAM tracker releases).
     allocated_gb: f64,
-    /// Weights alone (what live system RAM is credited).
+    /// What live system RAM is credited ([`ram_credit_gb`]): its weights, or more on `CPU`.
     weight_gb: f64,
 }
 
@@ -1019,18 +2000,164 @@ fn plan_evictions(
     needed_gb: f64,
     ram_admits: impl Fn(f64) -> bool,
 ) -> (Vec<String>, bool) {
+    plan_evictions_gated(candidates, free_gb, needed_gb, ram_admits, |_, _| true)
+}
+
+/// [`plan_evictions`] with one more gate the real load applies: `extra_admits(victims, vram_back)`
+/// is asked with the victims so far and the tracked VRAM they free (F1: the device-headroom gate
+/// of a vision load on a discrete GPU, which the tracker figures alone do not show).
+fn plan_evictions_gated(
+    candidates: &[EvictionCandidate],
+    free_gb: f64,
+    needed_gb: f64,
+    ram_admits: impl Fn(f64) -> bool,
+    extra_admits: impl Fn(&[String], f64) -> bool,
+) -> (Vec<String>, bool) {
     let (mut vram_back, mut ram_back) = (0.0, 0.0);
     let mut would_evict = Vec::new();
+    let admits = |victims: &[String], vram_back: f64, ram_back: f64| {
+        free_gb + vram_back >= needed_gb && ram_admits(ram_back) && extra_admits(victims, vram_back)
+    };
     for c in candidates {
-        if free_gb + vram_back >= needed_gb && ram_admits(ram_back) {
+        if admits(&would_evict, vram_back, ram_back) {
             break;
         }
         vram_back += c.allocated_gb;
         ram_back += c.weight_gb;
         would_evict.push(c.id.clone());
     }
-    let fits = free_gb + vram_back >= needed_gb && ram_admits(ram_back);
+    let fits = admits(&would_evict, vram_back, ram_back);
     (would_evict, fits)
+}
+
+/// F1: what the device-headroom gate of a real load reads, handed to the eviction preview so the
+/// preview plans for that gate too. Borrowed from one iteration of `ensure_vram_for`; no lock is
+/// held while it is built.
+struct HeadroomPreview<'a> {
+    /// The loading model's own headroom facts (`None` = not a vision model on a discrete GPU).
+    spec: Option<&'a headroom::HeadroomSpec>,
+    /// Other Ready vision models on the domain, whose floors the load may not break.
+    others: &'a [(String, headroom::HeadroomSpec)],
+    /// Memory outside the tracker's bookings, per device (other processes + own unbooked).
+    outsides: &'a HashMap<String, u64>,
+    /// The loading model's charged weights (GiB).
+    weight_gb: f64,
+    /// The pool the load asks for (0 = grab what fits), as `compute_kv_pool` takes it.
+    kv_target_gb: f64,
+    /// `false` for STT / embedding / image / TTS: weights only, no pool.
+    needs_kv_pool: bool,
+    /// As `ensure_vram_for` sizes the pool.
+    round_whole_gib: bool,
+    /// The exact sizing facts, as `compute_kv_pool` takes them.
+    exact: Option<&'a ExactPoolSpec>,
+}
+
+/// MR2-6: a resize unloads the model itself before reloading it with the new pool, so a
+/// memory refusal of that reload must say the model is now unloaded (it is not in the reload's
+/// own eviction list). Other errors pass through unchanged.
+fn resize_reload_refused(model_id: &str, err: anyhow::Error) -> anyhow::Error {
+    if err.chain().count() != 1 {
+        return err;
+    }
+    match err.downcast::<ModelError>() {
+        Ok(ModelError::InsufficientMemory(msg)) => ModelError::InsufficientMemory(format!(
+            "{msg} — {model_id} was unloaded for the KV resize and stays unloaded; load it \
+             again (with its previous kv_cache_gb) if it is still needed"
+        ))
+        .into(),
+        Ok(other) => other.into(),
+        Err(err) => err,
+    }
+}
+
+/// F1: the text of a load refused after it had already evicted `evicted` for itself.
+fn refused_after_eviction(model_id: &str, evicted: &[String], reason: &str) -> String {
+    format!(
+        "loading {model_id} was refused after evicting {} for it (they stay unloaded): {reason} — \
+         reload them if they are still needed; a new load attempt plans its evictions afresh",
+        evicted.join(", ")
+    )
+}
+
+/// F1: an `InsufficientMemory` refusal returned after a load already evicted models names them,
+/// keeping the error's kind (and so its HTTP status). Other kinds (busy, eviction incomplete,
+/// timeouts: their payload is an id list or fixed text) and errors with context attached pass
+/// through unchanged; the warning names the evicted models either way (worded as a failure, not
+/// a refusal: since MR-2 it also sees timeouts, panics and engine errors).
+fn annotate_refusal_after_eviction(
+    model_id: &str,
+    evicted: &[String],
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if evicted.is_empty() {
+        return err;
+    }
+    tracing::warn!(
+        loading = model_id,
+        evicted = ?evicted,
+        reason = %format!("{err:#}"),
+        "load failed after evicting models for it"
+    );
+    if err.chain().count() != 1 {
+        return err;
+    }
+    match err.downcast::<ModelError>() {
+        Ok(ModelError::InsufficientMemory(msg)) => {
+            ModelError::InsufficientMemory(refused_after_eviction(model_id, evicted, &msg)).into()
+        }
+        Ok(other) => other.into(),
+        Err(err) => err,
+    }
+}
+
+/// The preview's candidates (`(id, weight, busy)` in eviction order) with what evicting each
+/// frees in the tracker (its whole allocation: weights + reserved KV) and is credited to give
+/// back to live RAM ([`ram_credit_gb`]; `cpu_residents` from [`ModelManager::cpu_residents`]).
+fn eviction_plan_candidates(
+    vram: &MemoryTracker,
+    candidates: &[(String, f64, bool)],
+    cpu_residents: &HashMap<String, f64>,
+) -> Vec<EvictionCandidate> {
+    candidates
+        .iter()
+        .map(|(id, weight_gb, _)| {
+            let allocated_gb = vram.allocated_gb(id);
+            EvictionCandidate {
+                id: id.clone(),
+                allocated_gb,
+                weight_gb: ram_credit_gb(*weight_gb, allocated_gb, cpu_residents.get(id).copied()),
+            }
+        })
+        .collect()
+}
+
+/// F1: the full sweep `would_evict` did not admit the load. When it does satisfy the tracker and
+/// live-RAM gates, the device-headroom gate is what refuses: its reason. `None` otherwise (the
+/// tracker or RAM figures explain the refusal).
+fn sweep_headroom_refusal(
+    plan: &[EvictionCandidate],
+    would_evict: &[String],
+    free_gb: f64,
+    needed_gb: f64,
+    ram_admits: impl Fn(f64) -> bool,
+    headroom_gate: impl Fn(&[String], f64) -> std::result::Result<(), String>,
+) -> Option<String> {
+    let swept = plan.iter().filter(|c| would_evict.contains(&c.id));
+    let (vram_back, ram_back) = swept.fold((0.0, 0.0), |(v, r), c| {
+        (v + c.allocated_gb, r + c.weight_gb)
+    });
+    if free_gb + vram_back >= needed_gb && ram_admits(ram_back) {
+        headroom_gate(would_evict, vram_back).err()
+    } else {
+        None
+    }
+}
+
+impl HeadroomPreview<'_> {
+    /// `true` when the preview has a headroom gate to apply at all.
+    fn applies(&self) -> bool {
+        self.spec.is_some() || !self.others.is_empty()
+    }
 }
 
 /// [`ModelManager::check_admission`] (co-residency Slice 1).
@@ -1097,6 +2224,41 @@ pub struct AdmissionCheck {
     /// `true` if the model is already `Ready` — the check is moot (it is
     /// resident now), reported as `fits` with no eviction.
     pub already_loaded: bool,
+    /// F1: why the device-headroom gate (a vision model on a discrete GPU, or the floors of the
+    /// resident vision models) refuses this load even after every eviction, when that gate is
+    /// the one refusing; `None` otherwise.
+    pub headroom_refusal: Option<String>,
+    /// F1/A2: why the preview could not apply this model's own part of the device-headroom gate
+    /// although the load will be subject to it (its headroom facts are known only after a load
+    /// on this server); the resident models' floors are still checked. `None` = fully previewed.
+    pub headroom_not_previewed: Option<String>,
+}
+
+impl AdmissionCheck {
+    /// A check that admits the model as things stand: nothing to evict, nothing blocking.
+    fn fits_now(
+        needed_gb: f64,
+        free_gb: f64,
+        vram_gated: bool,
+        ram_needed_gb: Option<f64>,
+        ram_avail_gb: Option<f64>,
+        already_loaded: bool,
+    ) -> Self {
+        Self {
+            fits: true,
+            needed_gb,
+            free_gb,
+            vram_gated,
+            would_evict: Vec::new(),
+            busy_victims: Vec::new(),
+            blocked_by_busy: Vec::new(),
+            ram_needed_gb,
+            ram_avail_gb,
+            already_loaded,
+            headroom_refusal: None,
+            headroom_not_previewed: None,
+        }
+    }
 }
 
 /// Outcome of an on-demand load attempt from the chat path
@@ -1110,6 +2272,10 @@ pub enum OnDemandLoad {
     /// started: the caller should answer the original `NotLoaded` 503, which a
     /// `Retry-After`-less response signals will not self-resolve.
     NotApplicable,
+    /// A stop was requested ([`ModelManager::is_shutting_down`]): no load is started and the
+    /// caller answers [`ModelError::ShuttingDown`] (503 `server_stopping`, no `Retry-After`) —
+    /// this process will not serve the model (D-04 S2).
+    ShuttingDown,
 }
 
 /// RTCC: which realtime slot a resolution request is for
@@ -1485,6 +2651,9 @@ pub struct ModelMetrics {
     /// stored on the record (`rustedvino_kv_cache_pool_gb`). `0.0` when unloaded
     /// (eviction zeroes it), so the gauge tracks the live reservation.
     pub kv_cache_pool_gb: f64,
+    /// How the model's context limit was computed (`rustedvino_kv_gate_mode{mode}`): `exact`,
+    /// `legacy`, or `""` (no gate). Empty once unloaded.
+    pub kv_gate_mode: &'static str,
     /// Operator `pinned` policy (`rustedvino_model_pinned`, 1/0). Static for the
     /// process lifetime, so it reports the same value loaded or evicted.
     pub pinned: bool,
@@ -1533,12 +2702,14 @@ pub struct ModelMetrics {
 /// and one [`ModelMetrics`] per Ready model.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
+    /// The GPU context is poisoned (`rustedvino_gpu_poisoned` = 1); only a restart clears it.
+    pub gpu_poisoned: bool,
     /// `OpenVINO` device string (the `device` Prometheus label, e.g. `"GPU.1"`).
     pub device: String,
-    /// Configured total VRAM in GB (`rustedvino_vram_total_bytes` = ×1e9).
+    /// Configured total VRAM in GiB (`rustedvino_vram_total_bytes` = ×2^30).
     pub total_vram_gb: f64,
     /// VRAM currently reserved across all loaded models of every kind
-    /// (`rustedvino_vram_used_bytes` = ×1e9). The sum tracked by `VramTracker`,
+    /// (`rustedvino_vram_used_bytes` = ×2^30). The sum tracked by `VramTracker`,
     /// so it returns to zero once everything is evicted (R2 alloc==free).
     pub used_vram_gb: f64,
     /// One entry per model that has been loaded at least once this process
@@ -1708,6 +2879,9 @@ pub struct ModelManager {
     config: Config,
     models: Arc<RwLock<HashMap<String, ModelRecord>>>,
     vram: Arc<RwLock<MemoryTracker>>,
+    /// The physical probe of other processes' device memory, its cache and the transient leases of
+    /// running long vision requests (device-headroom limit).
+    headroom: headroom::HeadroomRuntime,
     /// The memory domain every model is charged to until the Phase-C placement
     /// engine routes per-model. Pre-placement all models load on `config.device`,
     /// so this is that device's domain id (a discrete GPU's own name today; the
@@ -1722,6 +2896,19 @@ pub struct ModelManager {
     /// poisoned, `load_model` refuses any new loads with `ModelError::GpuPoisoned`
     /// (HTTP 503) rather than attempting a doomed GPU call.
     gpu_poisoned: AtomicBool,
+    /// Set by [`ModelManager::begin_shutdown`]; [`ModelManager::is_shutting_down`] also reads the
+    /// process-wide stop request. While set, `begin_load` refuses new loads (D-04 S2).
+    shutting_down: AtomicBool,
+    /// CPU over-admission: requests handed out so far ([`ModelManager::get_chat_context`]), so a
+    /// solo-request measurement can tell that no other request ran inside its window.
+    request_starts: AtomicU64,
+    /// The open solo-request measurement window, if any ([`SoloWindow`]).
+    solo_window: Mutex<Option<SoloWindow>>,
+    /// The first poisoning's reaction (step 7): `startup::on_gpu_poisoned` + the G2 diagnostics,
+    /// run once. Every `mark_gpu_poisoned*` caller goes through `get_or_init`, so a concurrent
+    /// caller blocks until the reaction finished and the G1 reply it builds next reads the final
+    /// `gpu_poison_exit_requested()` (Fable review: the losers of one failed CB step raced it).
+    poison_reaction: std::sync::OnceLock<()>,
     /// D3: whether a model with requests running is a hard-excluded eviction victim (unless
     /// the eviction is forced). Built from [`BUSY_PROTECTS_DEFAULT`]; D3-S1.E2 turns that on,
     /// tests flip it with `set_busy_protects_for_test`. An internal switch, not a setting.
@@ -1739,6 +2926,9 @@ pub struct ModelManager {
     /// committed. An async [`tokio::sync::Mutex`] because the section spans
     /// `.await` points (the eviction join, the `spawn_blocking` engine load).
     load_lock: tokio::sync::Mutex<()>,
+    /// Root of the per-model learned KV-capacity ceilings (`cache_manifest::ratchet_root`);
+    /// `None` when no cache directory can be determined (nothing is learned across restarts).
+    ratchet_root: Option<std::path::PathBuf>,
     /// Device inventory captured at startup — used for device validation and
     /// `ModelRecord` construction when models are added dynamically at runtime.
     inventory: Arc<DeviceInventory>,
@@ -1967,35 +3157,13 @@ fn apply_dgpu_size_ceiling(
             .filter(|d| d.tier == DeviceTier::Heavy)
             .filter_map(|d| d.total_mem_gb)
             .reduce(f64::max)
-            .map(|gib| gib * GIB_TO_GB)
+        // GiB, the tracker's unit, like `vram_gb`
     };
     if config.dgpu_size_ceiling_fraction < 1.0
         && let Some(budget) = dgpu_budget_gb
         && vram_estimate >= budget * config.dgpu_size_ceiling_fraction
     {
         pref.retain(|t| *t != DeviceTier::Heavy);
-    }
-}
-
-/// D-01 (0.8.3): a hybrid linear-attention model cannot load on a GPU with the
-/// prefix-cache guard in force (see `resolve_prefix_caching`), so `auto` must not
-/// hand it a GPU. The model's own `enable_prefix_caching: true` lifts the ban.
-fn drop_gpu_tiers_for_hybrid(
-    pref: &mut Vec<DeviceTier>,
-    model_id: &str,
-    policy: Option<&config::ModelPolicy>,
-    config: &Config,
-) {
-    if lifecycle::hybrid_banned_from_gpu(
-        lifecycle::is_linear_attention_model(&config.models_dir.join(model_id)),
-        policy.and_then(|p| p.enable_prefix_caching),
-    ) {
-        tracing::debug!(
-            model_id,
-            "hybrid linear-attention model: GPU tiers excluded from automatic placement \
-             (loads on the CPU); set enable_prefix_caching=true on the model to allow a GPU"
-        );
-        pref.retain(|t| *t == DeviceTier::Fallback);
     }
 }
 
@@ -2080,7 +3248,6 @@ fn resolve_model_device(
         };
         let mut pref =
             placement::default_tier_preference(resolved_kind, vram_estimate, light_max_gb);
-        drop_gpu_tiers_for_hybrid(&mut pref, model_id, policy, config);
         apply_dgpu_size_ceiling(&mut pref, vram_estimate, config, inventory);
         let resolved = placement::place_with_fit(model_id, &pref, vram_estimate, inventory, fits)?;
         // Budget contention from an *earlier*, immovable (pinned/non-evictable)
@@ -2178,7 +3345,8 @@ fn system_domain_budget_gb(config: &Config) -> f64 {
 /// 2. the **inference** domain → `config.total_vram_gb` (the legacy knob is, by
 ///    definition, the budget for the device we run on → single-dGPU unchanged),
 ///    **capped** at what the inference device itself reports
-///    ([`cap_to_device_reported`]),
+///    ([`cap_to_device_reported`]); when that is `0.0` and the inference device is a
+///    discrete GPU, the VRAM it reports ([`inference_dgpu_reported_gb`]) — as in rule 4,
 /// 3. the **system** domain → `system_budget_gb` (RAM − reservation),
 /// 4. any other (secondary discrete GPU) domain → that device's reported VRAM,
 ///    or `0.0` (disabled) when it exposed no memory figure.
@@ -2195,7 +3363,8 @@ fn assemble_domain_budgets(
         if let Some(&o) = config.domain_budgets.get(domain) {
             o
         } else if domain == inference_domain {
-            cap_to_device_reported(config, inventory)
+            inference_dgpu_reported_gb(config, inventory, domain)
+                .unwrap_or_else(|| cap_to_device_reported(config, inventory))
         } else if domain == DOMAIN_SYSTEM {
             system_budget_gb
         } else {
@@ -2223,9 +3392,30 @@ fn assemble_domain_budgets(
     budgets.into_iter().collect()
 }
 
-/// Bytes per "GB" in the budget tracker (decimal, like every figure the tracker
-/// and `/metrics` report) over bytes per GiB: converts what the driver reports.
-const GIB_TO_GB: f64 = 1.073_741_824;
+/// The inference domain's budget when it is a **discrete GPU** and `total_vram_gb` is `0.0`:
+/// the VRAM that GPU reports, exactly as a secondary discrete GPU is budgeted.
+///
+/// Why: `0.0` used to switch the inference domain's gate off, so a user who made the dGPU the
+/// global `device` and kept the shipped `0.0` could load any size by every path (preload,
+/// `rv load`, `rv add`). On a 16 GB B50 a 26B model went in and faulted the GPU (T17U
+/// BIG-01, 2026-10-31). Gating it like a secondary dGPU closes that; an explicit
+/// `domain_budgets {"GPU.n": 0.0}` (handled by the caller first) stays the deliberate opt-out.
+/// `None` — keep the old rule — for a configured budget, an integrated GPU (its memory is
+/// shared system RAM), CPU/NPU, or a dGPU that reports no figure.
+fn inference_dgpu_reported_gb(
+    config: &Config,
+    inventory: &DeviceInventory,
+    domain: &str,
+) -> Option<f64> {
+    if config.total_vram_gb != 0.0 {
+        return None;
+    }
+    let d = inventory.get(domain)?;
+    if d.kind != DeviceKind::DiscreteGpu {
+        return None;
+    }
+    d.total_mem_gb.filter(|g| g.is_finite() && *g > 0.0)
+}
 
 /// The inference domain's budget: `config.total_vram_gb`, but never more than the
 /// memory the inference device reports for itself.
@@ -2250,7 +3440,9 @@ fn cap_to_device_reported(config: &Config, inventory: &DeviceInventory) -> f64 {
     else {
         return configured;
     };
-    let cap_gb = device_gib * GIB_TO_GB;
+    // GiB, the tracker's unit (it was converted to decimal GB before the accounting moved to GiB,
+    // which left an explicit value ~7 % looser than the cap meant).
+    let cap_gb = device_gib;
     if configured > 0.0 && configured > cap_gb {
         tracing::warn!(
             device = %config.device,
@@ -2273,7 +3465,45 @@ fn resolve_domain_budgets(
     inference_domain: &str,
 ) -> Vec<(String, f64)> {
     let system_budget = system_domain_budget_gb(config);
+    let domains = inventory.domains();
+    for key in config.domain_budgets.keys() {
+        if key != DOMAIN_SYSTEM && key != inference_domain && !domains.contains(key) {
+            let known = domains.join(", ");
+            tracing::warn!(
+                key = %key,
+                known = %known,
+                "domain_budgets names a memory domain this host does not have - the entry does \
+                 nothing (use a device name as --device-info prints it, or \"system\")"
+            );
+            crate::startup::push_startup_warning(
+                "domain_budgets_unknown",
+                format!(
+                    "domain_budgets entry '{key}' names no memory domain on this host \
+                     (known: {known}, system) and does nothing"
+                ),
+            );
+        }
+    }
+    if !config.domain_budgets.contains_key(inference_domain)
+        && let Some(gb) = inference_dgpu_reported_gb(config, inventory, inference_domain)
+    {
+        tracing::info!(
+            domain = inference_domain,
+            budget_gb = %format!("{gb:.2}"),
+            "total_vram_gb is 0.0 on a discrete GPU: admission budget is the VRAM it reports \
+             (set domain_budgets {{\"<device>\": 0.0}} to switch VRAM gating off deliberately)"
+        );
+    }
     assemble_domain_budgets(config, inventory, inference_domain, system_budget)
+}
+
+/// Whether an `OpenVINO` device spec places work on a GPU: `GPU`, `GPU.1`, or a
+/// composite such as `HETERO:GPU.1,CPU` / `MULTI:GPU.0,GPU.1` / `AUTO:GPU,CPU`
+/// where any component is a GPU.
+#[must_use]
+pub fn device_uses_gpu(device: &str) -> bool {
+    let list = device.split_once(':').map_or(device, |(_, rest)| rest);
+    list.split(',').any(|d| d.trim().starts_with("GPU"))
 }
 
 impl ModelManager {
@@ -2313,7 +3543,10 @@ impl ModelManager {
         let factory = OvEngineFactory {
             // cache_size_gb and max_num_seqs are resolved per-load by
             // load_model (co-residency Slice 2) — not factory fields.
-            kv_cache_precision: config.kv_cache_precision.clone(),
+            // Validated at config load; the fallback only serves struct-literal configs.
+            kv_cache_precision: normalize_kv_precision(&config.kv_cache_precision)
+                .unwrap_or_default()
+                .to_owned(),
             admission_queue_timeout_ms: config.admission_queue_timeout_ms,
             model_kinds: std::sync::RwLock::new(model_kinds),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
@@ -2325,9 +3558,18 @@ impl ModelManager {
             embedding_pooling: crate::ov_embed::Pooling::from_config(&config.embedding_pooling),
             embedding_normalize: config.embedding_normalize,
             ov_cache_dir: config.ov_cache_dir.clone(),
+            ov_cache_keyed: config.ov_cache_layout == "keyed",
             enable_prefix_caching: config.enable_prefix_caching,
+            kv_pass_mode: kv_precision::PassMode::from_config(&config.kv_precision_pass),
+            kv_resolved: std::sync::Mutex::new(HashMap::new()),
+            kv_blocks_hints: std::sync::RwLock::new(HashMap::new()),
+            kv_warmup: config.kv_warmup,
+            kv_precision_overrides: std::sync::RwLock::new(HashMap::new()),
         };
-        Self::new_with_inventory(config, Arc::new(factory), inventory).await
+        let probe = crate::gpu_memory::LinuxFdinfoProbe::new()
+            .map(|p| Arc::new(p) as Arc<dyn crate::gpu_memory::VramProbe>);
+        let mm = Self::new_with_inventory(config, Arc::new(factory), inventory).await?;
+        Ok(mm.with_vram_probe(probe))
     }
 
     /// Set the config file path used to persist dynamically-added model entries.
@@ -2338,6 +3580,17 @@ impl ModelManager {
     #[must_use]
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_path = Some(path);
+        self
+    }
+
+    /// Attach the physical probe of other processes' device memory (`None` where it cannot be read:
+    /// the vision models of a discrete GPU then keep the legacy context limit).
+    #[must_use]
+    pub(crate) fn with_vram_probe(
+        mut self,
+        probe: Option<Arc<dyn crate::gpu_memory::VramProbe>>,
+    ) -> Self {
+        self.headroom = headroom::HeadroomRuntime::new(probe);
         self
     }
 
@@ -2462,6 +3715,16 @@ impl ModelManager {
             last_used: Instant::now(),
             vram_gb: entry.vram_gb,
             kv_cache_gb: 0.0,
+            kv_requested_gb: None,
+            kv_clamped_by: None,
+            kv_pool_blocks: None,
+            kv_gate_mode: "",
+            kv_gate_clamped_by: None,
+            kv_ratchet_key: None,
+            kv_gate_detail: None,
+            headroom: None,
+            last_headroom_spec: None,
+            kv_resolution: None,
             max_prompt_tokens: 0,
             pool_capacity_tokens: 0,
             max_concurrent_streams: 0,
@@ -2473,7 +3736,15 @@ impl ModelManager {
             last_kind: None,
             last_load_duration_secs: None,
             gpu_load_delta_bytes: None,
+            learned_weight_gb: None,
+            cpu_resident: (None, 0),
+            image_family: (resolved_kind == ModelKind::ImageGen).then(|| {
+                image_footprint::ImageFamily::detect(&self.config.models_dir.join(model_id))
+            }),
             gpu_over_budget_warned: std::sync::atomic::AtomicBool::new(false),
+            uncounted_image_admissions: std::sync::atomic::AtomicU64::new(0),
+            pending_load: None,
+            load_stalled: false,
             pinned: entry.policy.pinned,
             priority: entry.policy.priority,
             evictable: entry.policy.evictable,
@@ -2520,11 +3791,14 @@ impl ModelManager {
     /// - Any `policy` field fails [`config::validate_model_entry`]'s invariants
     ///   (e.g. `max_concurrent_streams: 0`, `speculative` without `vram_gb > 0.0`).
     /// - Model ID already registered.
+    /// - `config.json` already invalid ([`ModelError::ConfigFileInvalid`]) — checked before
+    ///   the load, so nothing is loaded or evicted.
     /// - Immediate load failure — registration is rolled back, nothing persists.
-    /// - Config persistence failure — rare (disk write/rename), and only
-    ///   possible once the load has already succeeded, so the model is
-    ///   `Ready` and serving even though this call still returns `Err`; the
-    ///   registration just won't survive a restart until retried or fixed.
+    ///
+    /// A config persistence failure *after* a successful load is not an error: the model is
+    /// `Ready` and serving, so the call succeeds and [`AddOutcome::persist_error`] says why the
+    /// registration will not survive a restart (S281 defect a: answering an error while
+    /// `rv ps` shows the model contradicted itself).
     #[allow(clippy::too_many_lines)]
     pub async fn add_model(
         &self,
@@ -2532,7 +3806,7 @@ impl ModelManager {
         vram_gb: f64,
         kind: Option<String>,
         policy: config::ModelPolicy,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AddOutcome> {
         // ── Validate inputs ────────────────────────────────────────────────
         // The id names a folder inside `models_dir`. A separator, `..` or an absolute path would
         // point outside it (and turn the "directory not found" answer into a probe of the
@@ -2605,6 +3879,10 @@ impl ModelManager {
              use POST /v1/admin/models/{model_id}/load to load it"
         );
 
+        // The registration ends by persisting to config.json: a file that is already invalid
+        // would fail that write after a full load (and maybe evictions), so refuse first.
+        self.ensure_config_file_valid()?;
+
         // ── Resolve device/domain and build the record ──────────────────────
         let record = self.build_not_loaded_record(&model_id, &entry)?;
 
@@ -2659,6 +3937,26 @@ impl ModelManager {
         // correctly stays registered — that's `abort_load`'s job, not this
         // one's). ────────────────────────────────────────────────────────────
         if let Err(e) = self.load_model(&model_id).await {
+            // A load past its deadline is booked as stalled: its record holds the memory booking
+            // and the device's stall gate, so removing it would leak the booking and reopen the
+            // device to new loads (0.9.0 review D). Reap first, so a result that arrived since
+            // the deadline is committed or discarded (freeing its booking) now; then keep the
+            // record (in memory only; nothing is persisted) while the load still runs or has
+            // committed, and roll back only a record left with nothing pending.
+            self.reap_stalled_loads();
+            let still_running = self
+                .read_models("add_model:stalled?")
+                .get(&model_id)
+                .is_some_and(|r| r.pending_load.is_some() || r.state == ModelState::Ready);
+            if still_running {
+                tracing::warn!(
+                    model_id = %model_id,
+                    "added model's load is past its deadline — kept registered (not saved to \
+                     config.json); it becomes ready if the load returns: PATCH it to save it, \
+                     or deregister it to retry the add"
+                );
+                return Err(e);
+            }
             self.write_models("add_model:rollback").remove(&model_id);
             self.dynamic_entries
                 .write()
@@ -2669,7 +3967,16 @@ impl ModelManager {
 
         // ── Persist to config only now that the load has actually
         // succeeded — a durable entry means a durably-working one. ─────────
-        self.persist_model_entry(&model_id, &entry)
+        let persist_error = self.persist_model_entry(&model_id, &entry).err().map(|e| {
+            let cause = format!("{e:#}");
+            tracing::error!(
+                model_id = %model_id,
+                error = %cause,
+                "model loaded but its config entry was not persisted"
+            );
+            cause
+        });
+        Ok(AddOutcome { persist_error })
     }
 
     /// Partially update an *already-registered* model's [`config::ModelEntry`]
@@ -2868,6 +4175,10 @@ impl ModelManager {
             .register_concurrent_streams_hint(model_id, merged.policy.max_concurrent_streams);
         self.factory
             .register_prefix_caching_hint(model_id, merged.policy.enable_prefix_caching);
+        self.factory.register_kv_precision_hint(
+            model_id,
+            normalized_kv_override(merged.policy.kv_cache_precision.as_deref()),
+        );
         self.factory
             .register_max_prompt_len_hint(model_id, merged.policy.max_prompt_len);
         self.factory
@@ -3012,21 +4323,53 @@ impl ModelManager {
     ) -> anyhow::Result<bool> {
         let raw = config::read_json_text(config_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        // The file as it is now must already be valid; otherwise the error below would blame
+        // this request for another entry's breakage (S281 defect a).
+        Self::validate_config_value(&value)
+            .map_err(|e| Self::config_file_invalid(config_path, &e))?;
 
         if !mutate(&mut value)? {
             return Ok(false);
         }
 
-        let patched: config::Config = serde_json::from_value(value.clone())
-            .context("patched config no longer deserializes as a valid Config")?;
-        patched
-            .validate()
-            .context("patched config failed validation — nothing written")?;
+        Self::validate_config_value(&value)
+            .context("this change would make config.json invalid — nothing written")?;
 
         let tmp = config_path.with_extension("json.tmp");
         std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&value)?))?;
         std::fs::rename(&tmp, config_path)?;
         Ok(true)
+    }
+
+    /// Deserialize `value` as a whole [`config::Config`] and validate it.
+    fn validate_config_value(value: &serde_json::Value) -> anyhow::Result<()> {
+        let parsed: config::Config = serde_json::from_value(value.clone())
+            .context("config.json does not deserialize as a valid Config")?;
+        parsed.validate().context("config.json fails validation")
+    }
+
+    /// [`ModelError::ConfigFileInvalid`] for `config_path` with the full cause chain.
+    fn config_file_invalid(config_path: &std::path::Path, cause: &anyhow::Error) -> anyhow::Error {
+        ModelError::ConfigFileInvalid(format!(
+            "config.json ({}) is already invalid: {cause:#}",
+            config_path.display()
+        ))
+        .into()
+    }
+
+    /// Refuses with [`ModelError::ConfigFileInvalid`] when `config.json` is already invalid, so a
+    /// change that ends by persisting to it fails before it loads or evicts anything. `Ok` when
+    /// no config path is set (nothing will be persisted). The file can still change between
+    /// this check and the write; the write re-checks.
+    fn ensure_config_file_valid(&self) -> anyhow::Result<()> {
+        let Some(ref config_path) = self.config_path else {
+            return Ok(());
+        };
+        let check = || -> anyhow::Result<()> {
+            let raw = config::read_json_text(config_path)?;
+            Self::validate_config_value(&serde_json::from_str(&raw)?)
+        };
+        check().map_err(|e| Self::config_file_invalid(config_path, &e))
     }
 
     /// Fully remove `model_id` from the live registry and, if it was durably
@@ -3078,6 +4421,9 @@ impl ModelManager {
             Some(ModelState::Loading) => return Err(ModelError::Loading.into()),
             Some(ModelState::Evicting) => return Err(ModelError::Evicting.into()),
             Some(ModelState::Ready) => {
+                // Before the eviction: a file that cannot be rewritten would leave the model
+                // unloaded but still in config.json, back on the next restart (S281 defect a).
+                self.ensure_config_file_valid()?;
                 if force {
                     self.evict_model_forced(model_id).await?;
                 } else {
@@ -3108,6 +4454,9 @@ impl ModelManager {
         // covering the registry removal, the overlay removal, and the file
         // removal, so a same-id `patch_model` can't interleave and
         // resurrect the entry (see `persist_model_removal`'s doc comment).
+        // A NotLoaded/unregistered model skipped the check above: refuse here, before the
+        // registry removal, rather than half-apply.
+        self.ensure_config_file_valid()?;
         let _guard = self
             .config_mutation_lock
             .lock()
@@ -3182,7 +4531,8 @@ impl ModelManager {
             .config_mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let file_config = config::Config::load(config_path)?;
+        let file_config = config::Config::load(config_path)
+            .map_err(|e| anyhow::anyhow!("{CONFIG_INVALID_PREFIX}{e:#}"))?;
         anyhow::ensure!(
             file_config.api_keys.is_empty() && file_config.admin_api_keys.is_empty(),
             "config.json has inline api_keys/admin_api_keys — these are deprecated and no \
@@ -3674,6 +5024,8 @@ impl ModelManager {
             // harmless (load() would independently re-derive the identical
             // answer) and keeps the factory and this record in agreement.
             factory.register_kind_hint(model_id, kind);
+            let image_family = (kind == ModelKind::ImageGen)
+                .then(|| image_footprint::ImageFamily::detect(&model_dir));
             let device = resolve_model_device(
                 model_id,
                 vram_estimate,
@@ -3690,12 +5042,8 @@ impl ModelManager {
             // Evictable models do NOT reserve — eviction reclaims them at load, so
             // they still stack on the preferred device and are sorted at runtime.
             if is_immovable(entry) {
-                // Charged at the same figure admission will use (NPU footprint factor).
-                let charged = if device.starts_with("NPU") {
-                    vram_estimate * config.npu_footprint_factor
-                } else {
-                    vram_estimate
-                };
+                // Charged at the same figure admission will use (footprint factors).
+                let charged = config.weight_charge_gb(vram_estimate, &device, kind, image_family);
                 *projected.entry(domain.clone()).or_insert(0.0) += charged;
             }
             records.insert(
@@ -3710,6 +5058,16 @@ impl ModelManager {
                     last_used: Instant::now(),
                     vram_gb: vram_estimate,
                     kv_cache_gb: 0.0,
+                    kv_requested_gb: None,
+                    kv_clamped_by: None,
+                    kv_pool_blocks: None,
+                    kv_gate_mode: "",
+                    kv_gate_clamped_by: None,
+                    kv_ratchet_key: None,
+                    kv_gate_detail: None,
+                    headroom: None,
+                    last_headroom_spec: None,
+                    kv_resolution: None,
                     max_prompt_tokens: 0,
                     pool_capacity_tokens: 0,
                     max_concurrent_streams: 0,
@@ -3721,7 +5079,13 @@ impl ModelManager {
                     last_kind: None,
                     last_load_duration_secs: None,
                     gpu_load_delta_bytes: None,
+                    learned_weight_gb: None,
+                    cpu_resident: (None, 0),
+                    image_family,
                     gpu_over_budget_warned: std::sync::atomic::AtomicBool::new(false),
+                    uncounted_image_admissions: std::sync::atomic::AtomicU64::new(0),
+                    pending_load: None,
+                    load_stalled: false,
                     pinned: policy.pinned,
                     priority: policy.priority,
                     evictable: policy.evictable,
@@ -3759,16 +5123,30 @@ impl ModelManager {
         // RAM, secondary GPUs) get their own budgets.
         let mm = Self {
             vram: Arc::new(RwLock::new(MemoryTracker::new(budgets))),
+            headroom: headroom::HeadroomRuntime::new(None),
             inference_domain,
             factory,
             next_request_id: Arc::new(AtomicU64::new(0)),
             models: Arc::new(RwLock::new(records)),
             gpu_poisoned: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            request_starts: AtomicU64::new(0),
+            solo_window: Mutex::new(None),
+            poison_reaction: std::sync::OnceLock::new(),
             busy_protects: AtomicBool::new(BUSY_PROTECTS_DEFAULT),
             forced_join_deadline_ms: AtomicU64::new(
                 u64::try_from(FORCED_EVICT_JOIN_DEADLINE.as_millis()).unwrap_or(u64::MAX),
             ),
             load_lock: tokio::sync::Mutex::new(()),
+            // Unit tests never write into the real per-user cache.
+            ratchet_root: if cfg!(test) && config.ov_cache_dir.is_none() {
+                Some(
+                    std::env::temp_dir()
+                        .join(format!("rustedvino-test-kv-ratchet-{}", std::process::id())),
+                )
+            } else {
+                crate::cache_manifest::ratchet_root(config.ov_cache_dir.as_deref())
+            },
             config,
             inventory: Arc::clone(&inventory),
             dynamic_entries: RwLock::new(HashMap::new()),
@@ -3797,18 +5175,147 @@ impl ModelManager {
     /// (and the server itself) down with it — see the 2026-07-14 incident,
     /// the project's internal engineering log.
     async fn load_preload_models(&self) {
-        for model_id in self.config.preload.clone() {
-            if let Err(e) = self.load_model(&model_id).await {
+        let preload = self.config.preload.clone();
+        for (i, model_id) in preload.iter().enumerate() {
+            // D-04 S2: a stop during preload lets the current load finish and skips the rest.
+            if self.is_shutting_down() {
+                tracing::info!(
+                    skipped = ?&preload[i..],
+                    "stop requested during preload — not loading the remaining models"
+                );
+                break;
+            }
+            // G-1: the supervisor's health deadline follows the preload (the listener is not up
+            // yet); `Done` after every outcome, so a timed-out preload does not look hung.
+            let allowance = self.load_timeout(model_id).map_or(0, |d| d.as_secs());
+            // `rv start` follows this line (its text and the `load_timeout_s` field name).
+            tracing::info!(
+                model = %model_id,
+                load_timeout_s = allowance,
+                "{}",
+                crate::startup::PRELOAD_LOG
+            );
+            crate::startup::note_preload(crate::startup::PreloadNote::Started(allowance));
+            let result = self.load_model(model_id).await;
+            crate::startup::note_preload(crate::startup::PreloadNote::Done);
+            if let Err(e) = result {
                 tracing::warn!(
                     model = %model_id,
                     error = %e,
                     "preload failed — model left NotLoaded, server continues"
+                );
+                crate::startup::push_startup_warning(
+                    "preload_failed",
+                    format!("preload of '{model_id}' failed, the server runs without it: {e}"),
                 );
             }
         }
     }
 
     // ---- Public API ---------------------------------------------------
+
+    /// How many models are `Ready` — what the stop's teardown will evict (D-04 S6 budget).
+    #[must_use]
+    pub fn ready_count(&self) -> usize {
+        self.read_models("ready_count")
+            .values()
+            .filter(|r| r.state == ModelState::Ready)
+            .count()
+    }
+
+    /// Refuses every load from now on ([`ModelError::ShuttingDown`]); loads already running
+    /// finish. Idempotent (D-04 S2).
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    /// D-04 S4: the loads and evictions that have not finished, as `"load <id> on <device>"` /
+    /// `"evict <id> on <device>"`, sorted; empty when nothing is running. A record counts while
+    /// it is `Loading` or `Evicting` or still holds a pending load slot (a stalled load). Reaps
+    /// finished stalled loads first, so a late result is committed (and later torn down) instead
+    /// of waited for. Takes the models lock: never call it while holding it.
+    #[must_use]
+    pub fn unsettled_loads(&self) -> Vec<String> {
+        // When a late result has landed this commits it synchronously (`finish_load`, file reads)
+        // on the calling runtime thread — acceptable on the stop path, where nothing else runs.
+        self.reap_stalled_loads();
+        let mut out: Vec<String> = self
+            .read_models("unsettled_loads")
+            .iter()
+            .filter_map(|(id, r)| {
+                // Same shape as `ffi_watch::in_flight_models` ("load <id> on <device>"), so both
+                // stop-wait sites log one format.
+                let what = match r.state {
+                    ModelState::Evicting => "evict",
+                    ModelState::Loading => "load",
+                    _ if r.pending_load.is_some() => "load",
+                    _ => return None,
+                };
+                Some(format!("{what} {id} on {}", r.device))
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// D-04 S4: wait until [`Self::unsettled_loads`] is empty, polling every
+    /// [`crate::startup::LOAD_SETTLE_POLL`] under [`crate::startup::settle_step`]: give up when
+    /// `overdue` (the `ffi_watch` probe, injected for tests) reports a call past its allowance or
+    /// `cap` has passed since `since`. Logs every [`crate::startup::LOAD_SETTLE_LOG_EVERY`] while
+    /// waiting. Returns [`Settle::Done`](crate::startup::Settle::Done) at once when nothing runs.
+    pub async fn wait_for_loads_to_settle(
+        &self,
+        since: Instant,
+        cap: Duration,
+        overdue: impl Fn() -> Option<Duration>,
+    ) -> crate::startup::Settle {
+        use crate::startup::Settle;
+        let mut last_log: Option<Instant> = None;
+        let mut declared = false;
+        loop {
+            let pending = self.unsettled_loads();
+            let waited = since.elapsed();
+            match crate::startup::settle_step(!pending.is_empty(), overdue(), waited, cap) {
+                Settle::Done => {
+                    if last_log.is_some() {
+                        tracing::info!(
+                            waited_s = waited.as_secs(),
+                            "model loads finished - tearing down"
+                        );
+                    }
+                    return Settle::Done;
+                }
+                Settle::Wait => {
+                    if !declared {
+                        // D-04 S8: the supervisor waits this out before any SIGKILL.
+                        declared = true;
+                        let engines = self.ready_count() + pending.len();
+                        crate::startup::note_stop_budget(crate::startup::stop_remaining(
+                            cap.saturating_sub(waited),
+                            engines,
+                        ));
+                    }
+                    if last_log.is_none_or(|t| t.elapsed() >= crate::startup::LOAD_SETTLE_LOG_EVERY)
+                    {
+                        crate::startup::log_stop_wait(&pending, waited);
+                        last_log = Some(Instant::now());
+                    }
+                    tokio::time::sleep(crate::startup::LOAD_SETTLE_POLL).await;
+                }
+                outcome @ (Settle::Overdue | Settle::Cap) => {
+                    crate::startup::log_settle_given_up(outcome, &pending, waited);
+                    return outcome;
+                }
+            }
+        }
+    }
+
+    /// Whether loads are refused: [`Self::begin_shutdown`] was called or the process received a
+    /// stop request ([`crate::startup::shutdown_requested`]).
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire) || crate::startup::shutdown_requested()
+    }
 
     /// Returns a cloneable engine handle for `model_id` if it is Ready.
     ///
@@ -4006,6 +5513,29 @@ impl ModelManager {
         }
     }
 
+    /// F2-S-5 (E-16): count a vision request with images that the gate admitted without counting
+    /// its image tokens. Shown per model until its next load; a no-op for an unknown id.
+    pub fn note_uncounted_image_admission(&self, model_id: &str) {
+        if let Some(r) = self
+            .read_models("note_uncounted_image_admission")
+            .get(model_id)
+        {
+            r.uncounted_image_admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// D-06: the largest request (total pixels, `n x width x height`) `model_id` may serve,
+    /// when it is an image-generation model on a CPU device ([`Config::cpu_image_gen_max_pixels`],
+    /// the size its memory charge was sized for); `None` for any other model or an unknown id.
+    #[must_use]
+    pub fn cpu_image_pixel_limit(&self, model_id: &str) -> Option<u64> {
+        let models = self.read_models("cpu_image_pixel_limit");
+        let r = models.get(model_id)?;
+        config::is_cpu_image_gen(&r.device, r.configured_kind)
+            .then_some(self.config.cpu_image_gen_max_pixels)
+    }
+
     /// Returns the [`ImageHandle`](crate::pipelines::image::ImageHandle) for a
     /// Ready text-to-image model, updating `last_used` for LRU tracking.
     ///
@@ -4135,6 +5665,35 @@ impl ModelManager {
     /// Same as [`get_handle`](Self::get_handle): `NotFound` / `NotLoaded` /
     /// `Loading` / `Evicting`.
     pub fn get_chat_context(&self, model_id: &str) -> std::result::Result<ChatContext, ModelError> {
+        let (mut ctx, headroom) = self.chat_context_and_headroom(model_id)?;
+        self.note_request_start(model_id);
+        // A vision model on a discrete GPU: the limit follows the free device memory right now.
+        if let Some(rec) = headroom {
+            // The limit moves both ways with the device: the pool limit and the live cap, whichever
+            // is lower, whatever the load-time figure was.
+            let limit = self.headroom_limit_now(&rec);
+            ctx.max_prompt_tokens = limit;
+            let by_device = limit < rec.pool_limit_tokens;
+            #[allow(clippy::cast_precision_loss)] // device sizes are far below 2^52 bytes
+            let free_gib = self.headroom_free_bytes_now(&rec) as f64 / GIB_F64;
+            if let Some(d) = ctx.gate_detail.as_mut() {
+                d.clamped_by = Some(if by_device {
+                    GateClamp::DeviceHeadroom
+                } else {
+                    rec.pool_clamp
+                });
+                d.device_free_gib = by_device.then_some(free_gib);
+            }
+        }
+        Ok(ctx)
+    }
+
+    /// The part of [`get_chat_context`](Self::get_chat_context) that reads the record, with the
+    /// headroom facts to apply once the models lock is released.
+    fn chat_context_and_headroom(
+        &self,
+        model_id: &str,
+    ) -> std::result::Result<(ChatContext, Option<headroom::HeadroomRecord>), ModelError> {
         let mut guard = self.write_models("get_chat_context");
         match guard.get_mut(model_id) {
             None => Err(ModelError::NotFound(model_id.to_owned())),
@@ -4145,18 +5704,23 @@ impl ModelManager {
                     // Set before Ready in execute_load; taken before Evicting
                     // in begin_evict. If somehow None, report NotLoaded.
                     if let Some(h) = r.handle.clone() {
-                        Ok(ChatContext {
-                            handle: h,
-                            template: Arc::clone(&r.template),
-                            family: r.family,
-                            eos_token: Arc::clone(&r.eos_token),
-                            bos_token: Arc::clone(&r.bos_token),
-                            max_prompt_tokens: r.max_prompt_tokens,
-                            pool_capacity_tokens: r.pool_capacity_tokens,
-                            max_concurrent_streams: r.max_concurrent_streams,
-                            reasoning_parser: r.reasoning_parser,
-                            generation_defaults: r.generation_defaults,
-                        })
+                        Ok((
+                            ChatContext {
+                                handle: h,
+                                template: Arc::clone(&r.template),
+                                family: r.family,
+                                eos_token: Arc::clone(&r.eos_token),
+                                bos_token: Arc::clone(&r.bos_token),
+                                max_prompt_tokens: r.max_prompt_tokens,
+                                kv_gate_mode: r.kv_gate_mode,
+                                gate_detail: r.kv_gate_detail.clone(),
+                                pool_capacity_tokens: r.pool_capacity_tokens,
+                                max_concurrent_streams: r.max_concurrent_streams,
+                                reasoning_parser: r.reasoning_parser,
+                                generation_defaults: r.generation_defaults,
+                            },
+                            r.headroom.clone(),
+                        ))
                     } else {
                         Err(ModelError::NotLoaded)
                     }
@@ -4230,6 +5794,12 @@ impl ModelManager {
         // this load's reservation already committed. Held until the function
         // returns (covers `ensure_vram_for`'s eviction and `execute_load`).
         let _load_guard = self.load_lock.lock().await;
+        // D-04 S2 (review): a load queued here passed `begin_load` before the stop; refuse it now
+        // rather than start a fresh engine build the stop would have to wait out. Nothing is
+        // reserved yet, and the cancel guard resets the record to `NotLoaded`.
+        if self.is_shutting_down() {
+            return Err(ModelError::ShuttingDown.into());
+        }
 
         // Resolve effective model entry (dynamic overlay wins — see
         // `effective_entry`'s doc comment). Cloned already, so nothing here
@@ -4255,10 +5825,7 @@ impl ModelManager {
             model_id,
             entry.as_ref().and_then(|e| e.policy.max_concurrent_streams),
         );
-        self.factory.register_prefix_caching_hint(
-            model_id,
-            entry.as_ref().and_then(|e| e.policy.enable_prefix_caching),
-        );
+        self.register_kv_policy_hints(model_id, entry.as_ref());
         self.factory.register_max_prompt_len_hint(
             model_id,
             entry.as_ref().and_then(|e| e.policy.max_prompt_len),
@@ -4365,36 +5932,391 @@ impl ModelManager {
         // per-model KV target (`0.0` = unbounded grab-all).  For models with
         // vram_gb=0.0 (unknown) we bypass VRAM gating: honour an explicit KV
         // target if one was resolved, else fall back to the configured cap.
-        let kv_gb = if weight_gb > 0.0 {
-            match self
-                .ensure_vram_for(
-                    model_id,
-                    weight_gb + draft_vram_gb,
-                    params.kv_cache_gb,
-                    needs_kv_pool,
-                    overrides.force,
-                )
-                .await
-            {
-                Ok(kv) => kv,
-                Err(e) => {
-                    guard.disarm();
-                    self.abort_load(model_id);
-                    return Err(e);
-                }
+        let (kv_plan, sizing, evicted) = match self
+            .reserve_kv_pool(
+                model_id,
+                weight_gb + draft_vram_gb,
+                needs_kv_pool,
+                &params,
+                max_num_seqs,
+                entry.as_ref(),
+                speculative_spec.is_some(),
+                overrides.force,
+            )
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                guard.disarm();
+                self.abort_load(model_id);
+                return Err(e);
             }
-        } else if params.kv_cache_gb > 0.0 {
-            params.kv_cache_gb
-        } else {
-            self.config.cache_size_gb
         };
+        let kv_gb = kv_plan.map_or_else(|| self.ungated_kv_gb(params.kv_cache_gb), |plan| plan.gb);
 
-        let result = self.execute_load(model_id, kv_gb, max_num_seqs).await;
+        let gate = GateSource::new(sizing, kv_plan);
+        // F1 for the engine's own refusal (MR-2): the models evicted for room are named.
+        let result = self
+            .execute_load(model_id, kv_gb, max_num_seqs, gate, kv_plan)
+            .await
+            .map_err(|e| annotate_refusal_after_eviction(model_id, &evicted, e));
         guard.disarm();
         if result.is_err() {
             self.abort_load(model_id);
         }
         result
+    }
+
+    /// Per device the headroom gate of a load reads (the loading model's `spec`, the `others`):
+    /// everything on it that the tracker's bookings do not cover — other processes plus this
+    /// process's own unbooked memory — so the never-0 pool shrink and the others-floor check see
+    /// the real free memory. A device whose probe fails is left out. Not under the tracker lock:
+    /// the first reading scans /proc.
+    fn headroom_outsides(
+        &self,
+        domain: &str,
+        spec: Option<&headroom::HeadroomSpec>,
+        others: &[(String, headroom::HeadroomSpec)],
+    ) -> HashMap<String, u64> {
+        spec.map(|h| h.pdev.clone())
+            .into_iter()
+            .chain(others.iter().map(|(_, s)| s.pdev.clone()))
+            .filter_map(|pdev| {
+                self.headroom.outside_bytes(&pdev).map(|b| {
+                    let unbooked = self.unbooked_own_bytes(domain, &pdev);
+                    (pdev, b.saturating_add(unbooked))
+                })
+            })
+            .collect()
+    }
+
+    /// The headroom facts of every Ready vision model charged to `domain` other than `except`.
+    fn vision_headrooms_on(
+        &self,
+        domain: &str,
+        except: &str,
+    ) -> Vec<(String, headroom::HeadroomSpec)> {
+        self.read_models("vision_headrooms_on")
+            .iter()
+            .filter(|(id, r)| {
+                id.as_str() != except
+                    && r.state == ModelState::Ready
+                    && r.headroom.as_ref().is_some_and(|h| h.domain == domain)
+            })
+            .filter_map(|(id, r)| r.headroom.as_ref().map(|h| (id.clone(), h.spec.clone())))
+            .collect()
+    }
+
+    /// Largest KV pool (GiB) a vision load may take so that its own limit stays at or above the
+    /// floor, given the weights already booked (GiB, this model's included) and the leases of
+    /// running long requests. `Ok(None)` = no headroom limit applies to this load.
+    ///
+    /// # Errors
+    /// Even a zero pool leaves the device too little free memory for the floor.
+    #[allow(clippy::cast_precision_loss)] // GiB figures of a device are far below 2^52
+    fn headroom_pool_ceiling(
+        &self,
+        spec: Option<&headroom::HeadroomSpec>,
+        domain: &str,
+        booked_gb: f64,
+        outsides: &HashMap<String, u64>,
+    ) -> std::result::Result<Option<f64>, String> {
+        let Some(h) = spec else {
+            return Ok(None);
+        };
+        let outside = outsides.get(&h.pdev).copied().unwrap_or(0);
+        let inputs = h.inputs(
+            outside,
+            gib_to_bytes(booked_gb),
+            self.headroom.lease_bytes(domain, None),
+        );
+        let Some(bytes) = inputs.max_pool_bytes_for_floor(0, h.floor_tokens) else {
+            return Err(format!(
+                "the device has only {:.2} GiB free after the weights, other processes and the \
+                 safety margin, which cannot hold even the {}-token floor of long vision prompts \
+                 (kv_headroom_min_tokens); free device memory or lower kv_headroom_margin_gib",
+                inputs.free_bytes() as f64 / GIB_F64,
+                h.floor_tokens
+            ));
+        };
+        let max_gb = bytes as f64 / GIB_F64;
+        if max_gb < self.config.min_kv_cache_gb {
+            return Err(format!(
+                "the device headroom (long vision prompts of at least {} tokens) leaves room for \
+                 a KV pool of only {max_gb:.2} GiB, below min_kv_cache_gb {:.2}; free device \
+                 memory, lower min_kv_cache_gb or kv_headroom_min_tokens",
+                h.floor_tokens, self.config.min_kv_cache_gb
+            ));
+        }
+        Ok(Some(max_gb))
+    }
+
+    /// After a load of `total_booked_gb` in all (the tracker's commitments including the new
+    /// model's weights and pool), every other Ready vision model on the domain must keep a limit
+    /// at or above its floor.
+    ///
+    /// # Errors
+    /// Names the model that would fall below its floor.
+    fn headroom_check_others(
+        &self,
+        domain: &str,
+        total_booked_gb: f64,
+        others: &[(String, headroom::HeadroomSpec)],
+        outsides: &HashMap<String, u64>,
+    ) -> std::result::Result<(), String> {
+        for (id, spec) in others {
+            let outside = outsides.get(&spec.pdev).copied().unwrap_or(0);
+            let cap = spec
+                .inputs(
+                    outside,
+                    gib_to_bytes(total_booked_gb),
+                    self.headroom.lease_bytes(domain, Some(id)),
+                )
+                .cap_tokens();
+            if cap < spec.floor_tokens {
+                return Err(format!(
+                    "it would leave {id} (a resident vision model) room for only {cap} tokens of \
+                     long prompts, below its floor of {} (kv_headroom_min_tokens); unload {id} \
+                     first, or give this load a smaller kv_cache_gb",
+                    spec.floor_tokens
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// F1: would the device-headroom gate admit this load once `victims` are evicted? The same
+    /// two checks `ensure_vram_for` runs after its tracker gate passes — the loading model's own
+    /// ceiling ([`Self::headroom_pool_ceiling`]) and every remaining vision model's floor
+    /// ([`Self::headroom_check_others`]) — on the figures the evictions would leave:
+    /// `booked_now_gb` / `free_now_gb` are the domain's booked and tracker-free GiB before them.
+    ///
+    /// # Errors
+    /// The refusal text the real load would give.
+    fn headroom_preview_admits(
+        &self,
+        p: &HeadroomPreview<'_>,
+        domain: &str,
+        booked_now_gb: f64,
+        free_now_gb: f64,
+        victims: &[String],
+        vram_back_gb: f64,
+    ) -> std::result::Result<(), String> {
+        let booked_gb = (booked_now_gb - vram_back_gb).max(0.0) + p.weight_gb;
+        let others: Vec<(String, headroom::HeadroomSpec)> = p
+            .others
+            .iter()
+            .filter(|(id, _)| !victims.contains(id))
+            .cloned()
+            .collect();
+        if !p.needs_kv_pool {
+            return self.headroom_check_others(domain, booked_gb, &others, p.outsides);
+        }
+        let max_pool_gb = self.headroom_pool_ceiling(p.spec, domain, booked_gb, p.outsides)?;
+        if others.is_empty() {
+            return Ok(());
+        }
+        // Size the pool as the real load would, so the others' floors see the same booking.
+        let Ok(plan) = Self::compute_kv_pool(
+            free_now_gb + vram_back_gb - p.weight_gb,
+            p.kv_target_gb,
+            &self.config,
+            p.round_whole_gib,
+            p.exact,
+            max_pool_gb,
+        ) else {
+            // A pool that cannot be sized is the capacity gate's refusal, not this one's.
+            return Ok(());
+        };
+        self.headroom_check_others(domain, booked_gb + plan.gb, &others, p.outsides)
+    }
+
+    /// Register the per-model KV policy (prefix caching, precision override) with the factory for
+    /// the load about to run; `None` entries clear a stale hint.
+    fn register_kv_policy_hints(&self, model_id: &str, entry: Option<&config::ModelEntry>) {
+        self.factory.register_prefix_caching_hint(
+            model_id,
+            entry.and_then(|e| e.policy.enable_prefix_caching),
+        );
+        self.factory.register_kv_precision_hint(
+            model_id,
+            normalized_kv_override(entry.and_then(|e| e.policy.kv_cache_precision.as_deref())),
+        );
+    }
+
+    /// Reserve the weights and size the KV pool of one load (`None` for a model with no known
+    /// weight footprint, which is not gated). Exact block sizing is tried first for models the
+    /// factory can describe; everything else keeps the whole-GiB sizing. Also returns the models
+    /// evicted for room (F1 naming, should the engine construction refuse).
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve_kv_pool(
+        &self,
+        model_id: &str,
+        weight_gb: f64,
+        needs_kv_pool: bool,
+        params: &ResolvedRuntimeParams,
+        max_num_seqs: usize,
+        entry: Option<&config::ModelEntry>,
+        speculative: bool,
+        force: bool,
+    ) -> Result<(Option<KvPoolPlan>, SizingOutcome, Vec<String>)> {
+        let prefix_caching = entry
+            .and_then(|e| e.policy.enable_prefix_caching)
+            .unwrap_or(self.config.enable_prefix_caching);
+        if weight_gb <= 0.0 {
+            self.factory.register_kv_blocks_hint(model_id, None);
+            return Ok((
+                None,
+                SizingOutcome {
+                    prefix_caching,
+                    ..SizingOutcome::default()
+                },
+                Vec::new(),
+            ));
+        }
+        let sizing = if needs_kv_pool {
+            self.exact_pool_spec_for(model_id, prefix_caching, max_num_seqs, speculative)
+                .await
+        } else {
+            SizingOutcome {
+                prefix_caching,
+                ..SizingOutcome::default()
+            }
+        };
+        let (plan, evicted) = self
+            .ensure_vram_for(
+                model_id,
+                weight_gb,
+                params.kv_cache_gb,
+                needs_kv_pool,
+                force,
+                sizing.spec.as_ref(),
+            )
+            .await?;
+        // The exact block count for the engine (`None` clears a stale hint from an earlier load).
+        self.factory.register_kv_blocks_hint(model_id, plan.blocks);
+        Ok((Some(plan), sizing, evicted))
+    }
+
+    /// The exact-sizing inputs for one load, or `None` (logged) when the model keeps the
+    /// whole-GiB sizing. Reads the model's config and IR on a blocking thread.
+    async fn exact_pool_spec_for(
+        &self,
+        model_id: &str,
+        prefix_caching: bool,
+        max_num_seqs: usize,
+        speculative: bool,
+    ) -> SizingOutcome {
+        let none = SizingOutcome {
+            prefix_caching,
+            ..SizingOutcome::default()
+        };
+        let Some((kind, device)) = ({
+            let models = self.read_models("exact_pool_spec_for");
+            models
+                .get(model_id)
+                .map(|r| (r.configured_kind, r.device.clone()))
+        }) else {
+            return none;
+        };
+        if !matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+            return none;
+        }
+        let factory = Arc::clone(&self.factory);
+        let model_path = self.config.models_dir.join(model_id);
+        let dev = device.clone();
+        let Some(inputs) =
+            tokio::task::spawn_blocking(move || factory.kv_pool_inputs(&model_path, kind, &dev))
+                .await
+                .ok()
+                .flatten()
+        else {
+            return none;
+        };
+        let versions = self.factory.engine_versions();
+        let spec = match exact_pool_spec(
+            &inputs,
+            prefix_caching,
+            max_num_seqs,
+            speculative,
+            versions,
+            &device,
+            self.config.kv_gate_exact_on_unknown_engine,
+        ) {
+            Ok(mut spec) => {
+                // The first probe scan walks /proc and the native-context read opens config.json:
+                // do both on the blocking pool, so the spec below finds them cached.
+                let rt = self.headroom.clone();
+                let pdevs: Vec<String> = self
+                    .inventory
+                    .devices()
+                    .iter()
+                    .filter_map(|d| d.pdev.clone())
+                    .collect();
+                let dir = self.config.models_dir.join(model_id);
+                let native = tokio::task::spawn_blocking(move || {
+                    for pdev in &pdevs {
+                        rt.outside_bytes(pdev);
+                    }
+                    template::read_native_context_limit(&dir).filter(|n| *n > 0)
+                })
+                .await
+                .ok()
+                .flatten();
+                spec.headroom = self.headroom_spec_for(&spec, native);
+                Some(spec)
+            }
+            Err(why) => {
+                tracing::info!(
+                    model_id,
+                    reason = why,
+                    "KV pool sized in whole GiB (exact block sizing not used)"
+                );
+                None
+            }
+        };
+        SizingOutcome {
+            spec,
+            inputs: Some(inputs),
+            prefix_caching,
+        }
+    }
+
+    /// The device-headroom facts for a vision model on a discrete GPU whose free memory can be
+    /// read (Linux probe, PCI address and total known, `kv_headroom_mode` not `off`); `None`
+    /// for everything else, which keeps the legacy limit.
+    fn headroom_spec_for(
+        &self,
+        spec: &ExactPoolSpec,
+        native: Option<usize>,
+    ) -> Option<headroom::HeadroomSpec> {
+        if spec.engine_path != "vlm"
+            || self.config.kv_headroom_mode != "dynamic"
+            || !spec.device.starts_with("GPU")
+        {
+            return None;
+        }
+        let dev = self
+            .inventory
+            .devices()
+            .iter()
+            .find(|d| d.name == spec.device)?;
+        if dev.kind != crate::device_inventory::DeviceKind::DiscreteGpu {
+            return None;
+        }
+        let pdev = dev.pdev.clone()?;
+        let total_gb = dev.total_mem_gb?;
+        // The probe must work now, or the limit would be computed from a guess.
+        self.headroom.outside_bytes(&pdev)?;
+        let min_tokens = self.config.kv_headroom_min_tokens;
+        Some(headroom::HeadroomSpec {
+            hidden_size: spec.profile.hidden_size,
+            pdev,
+            total_bytes: gib_to_bytes(total_gb),
+            factor: self.config.kv_transient_factor,
+            margin_bytes: gib_to_bytes(self.config.kv_headroom_margin_gib),
+            floor_tokens: native.map_or(min_tokens, |n| n.min(min_tokens)),
+        })
     }
 
     /// `POST /v1/admin/models/{id}/resize`
@@ -4532,7 +6454,8 @@ impl ModelManager {
                 force,
             },
         )
-        .await?;
+        .await
+        .map_err(|e| resize_reload_refused(model_id, e))?;
 
         // Report what the allocator delivered, not what was asked for. The
         // load path stores `ensure_vram_for`'s return (the `compute_kv_pool_gb`
@@ -4644,7 +6567,8 @@ impl ModelManager {
     /// Returns [`OnDemandLoad::Loading`] when a load was started (or one is
     /// already in flight) so the caller answers 503 + `Retry-After`;
     /// [`OnDemandLoad::NotApplicable`] for an eager (or unknown) model, leaving
-    /// today's bare-503 behaviour intact.
+    /// today's bare-503 behaviour intact; [`OnDemandLoad::ShuttingDown`] once a
+    /// stop was requested.
     pub fn request_on_demand_load(self: &Arc<Self>, model_id: &str) -> OnDemandLoad {
         // Eager (or no policy) ⇒ no auto-load. Overlay-first via
         // `effective_entry` — this used to read `self.config.models` only,
@@ -4659,6 +6583,11 @@ impl ModelManager {
             == config::LoadPolicy::OnDemand;
         if !on_demand {
             return OnDemandLoad::NotApplicable;
+        }
+        // D-04 S2: a stopping server neither starts the load nor tells the client to retry it —
+        // also when one is already in flight, since the process exits once it returns.
+        if self.is_shutting_down() {
+            return OnDemandLoad::ShuttingDown;
         }
 
         // Only spawn from a genuine NotLoaded state. If the model has since moved
@@ -4700,6 +6629,10 @@ impl ModelManager {
     /// engine is ever built. A no-op (returns without spawning) for an unknown
     /// model id, or one already `Loading`/`Ready`/`Evicting`.
     fn spawn_background_load(self: &Arc<Self>, model_id: &str) {
+        // D-04 S2: `begin_load` would refuse it anyway; skip the dead spawn and its warning.
+        if self.is_shutting_down() {
+            return;
+        }
         match self
             .read_models("resolve_realtime_llm:spawn_load")
             .get(model_id)
@@ -5124,6 +7057,10 @@ impl ModelManager {
                 thread,
                 models: Arc::clone(&self.models),
                 vram: Arc::clone(&self.vram),
+                device: self
+                    .read_models("evict:device")
+                    .get(model_id)
+                    .map(|r| r.device.clone()),
                 policy: if hold {
                     JoinPolicy::HoldUntilJoined
                 } else {
@@ -5189,6 +7126,9 @@ impl ModelManager {
         let Some((handle, tail)) = guard.disarm() else {
             return Err(anyhow::anyhow!("eviction guard was already disarmed"));
         };
+        // D-04 S6: channel close -> engine exit -> pipeline destructor -> join, logged per eviction
+        // so every QA box (B50/B60/B70, iGPU, CPU) yields teardown times for the join budget.
+        let teardown_started = Instant::now();
         drop(handle);
 
         // The tail — a bounded join of the engine thread (#36: a wedged FFI step must not hang
@@ -5203,6 +7143,7 @@ impl ModelManager {
             let _ = done_tx.send(tail.run());
         });
         let outcome = done_rx.await.unwrap_or(TailOutcome::Unclean);
+        let teardown_ms = u64::try_from(teardown_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if outcome == TailOutcome::Incomplete {
             crate::metrics::record_eviction_refusal("incomplete");
             return Err(ModelError::EvictionIncomplete(model_id.to_owned()).into());
@@ -5213,15 +7154,14 @@ impl ModelManager {
             tracing::error!(
                 model_id,
                 kind = kind.label(),
+                teardown_ms,
                 "engine thread did not exit cleanly during eviction — tracker reconciled, \
                  record reset to NotLoaded"
             );
-            return Err(anyhow::anyhow!(
-                "engine thread did not exit cleanly during eviction (panic or join timeout)"
-            ));
+            return Err(UncleanEngineExit.into());
         }
 
-        tracing::info!(model_id, kind = kind.label(), "model evicted");
+        tracing::info!(model_id, kind = kind.label(), teardown_ms, "model evicted");
         if let Some(vp) = &self.voice_pin {
             vp.clear_if_llm(model_id);
         }
@@ -5249,7 +7189,12 @@ impl ModelManager {
     ///
     /// Best-effort: a failed eviction is logged and the remaining models are
     /// still evicted (shutdown must not wedge on one bad engine).
-    pub async fn shutdown(&self) {
+    ///
+    /// Returns the models whose engine thread may still be inside the plugin
+    /// (join timed out, panicked, or still running): process exit must then
+    /// skip the C++ destructors (D-01, step 6a). A model that simply left
+    /// `Ready` meanwhile is not in the list.
+    pub async fn shutdown(&self) -> ShutdownReport {
         // A poisoned GPU context refuses every eviction (`begin_evict`: tearing a
         // pipeline down on a broken context can `std::terminate`), so the loop
         // below would only log one failure per model. Process exit releases the
@@ -5258,8 +7203,12 @@ impl ModelManager {
             tracing::info!(
                 "GPU context poisoned - skipping engine teardown; process exit releases device memory"
             );
-            return;
+            return ShutdownReport::default();
         }
+        // A stalled load that has returned is committed now, so it is evicted below rather than
+        // dropped with the manager; one still running keeps its `ffi_watch` token (exit 76).
+        self.reap_stalled_loads();
+        let mut report = ShutdownReport::default();
         for info in self.list_models() {
             // `abort_inflight = true`: process shutdown must not wait out a long
             // in-flight generation — terminate it cleanly (T1.3) and tear down (#7).
@@ -5269,8 +7218,12 @@ impl ModelManager {
                     .await
             {
                 tracing::warn!(model_id = %info.id, error = %e, "eviction during shutdown failed");
+                if engine_may_still_run(&e) {
+                    report.unclean.push(info.id.clone());
+                }
             }
         }
+        report
     }
 
     /// Returns a snapshot of all known models and their current states.
@@ -5290,19 +7243,54 @@ impl ModelManager {
                 ModelInfo {
                     id: id.clone(),
                     state: r.state,
+                    stalled_secs: r
+                        .load_stalled
+                        .then(|| {
+                            r.pending_load
+                                .as_ref()
+                                .map(|s| s.started.elapsed().as_secs())
+                        })
+                        .flatten(),
                     kind: r.configured_kind,
                     vram_gb: r.vram_gb,
                     device: r.device.clone(),
                     generation_defaults: r.generation_defaults,
-                    max_prompt_tokens: r.max_prompt_tokens,
+                    // A vision model on a discrete GPU follows the free device memory right now.
+                    max_prompt_tokens: r
+                        .headroom
+                        .as_ref()
+                        .filter(|_| r.state == ModelState::Ready)
+                        .map_or(r.max_prompt_tokens, |h| self.headroom_limit_now(h)),
                     kv_cache_gb: r.kv_cache_gb,
+                    kv_requested_gb: r.kv_requested_gb,
+                    kv_clamped_by: r.kv_clamped_by,
+                    kv_pool_blocks: r.kv_pool_blocks,
+                    kv_resolution: r.kv_resolution.clone(),
+                    kv_headroom_cap_tokens: r
+                        .headroom
+                        .as_ref()
+                        .filter(|_| r.state == ModelState::Ready)
+                        .map(|h| self.headroom_cap_now(h)),
+                    // Only an exactly-sized pool is known to the byte; a whole-GiB pool may have been
+                    // built larger than booked, which would make the subtraction wrong.
+                    vram_measured_mib: measured_weights_mib(
+                        (r.state == ModelState::Ready && r.kv_pool_blocks.is_some())
+                            .then_some(r.gpu_load_delta_bytes)
+                            .flatten(),
+                        r.kv_cache_gb,
+                    ),
+                    kv_gate_mode: r.kv_gate_mode,
+                    kv_gate_clamped_by: r.kv_gate_clamped_by,
                     native_context_limit: r.native_context_limit,
                     kv_cache_usage_pct: live.map_or(0.0, ManagedEngine::cache_usage_pct),
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
                     #[allow(clippy::cast_precision_loss)]
                     gpu_memory_estimate_gb: self
                         .gpu_memory_estimate_bytes(id, r)
-                        .map(|b| b as f64 / 1e9),
+                        .map(|b| b as f64 / GIB_F64),
+                    uncounted_image_admissions: r
+                        .uncounted_image_admissions
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 }
             })
             .collect()
@@ -5399,6 +7387,16 @@ impl ModelManager {
             .filter_map(|r| r.handle.as_ref())
             .filter_map(|h| h.as_managed().oldest_generation_age())
             .max()
+    }
+
+    /// The supervisor watchdog's signal: [`Self::oldest_generation_age`] combined with the
+    /// `ffi_watch` registry's overdue time (loads, transcriptions, CB steps — measured from the
+    /// calling thread, so a call whose record left Ready is still seen). Kept apart from
+    /// `oldest_generation_age`, whose other callers mean "a generation is running".
+    #[must_use]
+    pub fn watchdog_age(&self) -> Option<Duration> {
+        self.oldest_generation_age()
+            .max(crate::ffi_watch::global().overdue())
     }
 
     /// Whether every `Ready` model currently has zero in-flight requests.
@@ -5530,6 +7528,236 @@ impl ModelManager {
         }
     }
 
+    /// The `ov_cache_dir` subdirectory a model of `kind` on `device` compiles into (`None` =
+    /// the root), from the same rule the loader applies. Globals are restart-only, so this
+    /// answers for the running process.
+    fn active_cache_subdir(
+        &self,
+        model_id: &str,
+        kind: ModelKind,
+        device: &str,
+    ) -> Option<&'static str> {
+        // The string the loader passes this model (per model since the precision is resolved
+        // from its IR); a factory that does not resolve one falls back to the global string.
+        let passed = self
+            .factory
+            .kv_passed(&self.config.models_dir.join(model_id), kind, device)
+            .unwrap_or_else(|| {
+                normalize_kv_precision(&self.config.kv_cache_precision)
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+        // `Err` = the loader gives that model no cache, so it has no active blobs to protect.
+        lifecycle::kv_cache_subdir_for(
+            kind,
+            device,
+            &passed,
+            self.config.ov_cache_layout == "keyed",
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// The `.blob` files the prune pass may delete, most disposable first: everything except
+    /// what a `Ready` or `Loading` model uses and unattributed files too young to judge.
+    fn prune_candidates<'a>(
+        &self,
+        entries: &'a [crate::cache_manifest::CacheDirEntry],
+        manifest_root: &std::path::Path,
+    ) -> Vec<&'a crate::cache_manifest::CacheDirEntry> {
+        let owners = crate::cache_manifest::blob_owners(manifest_root);
+        // Protect what a Ready (serving) or Loading (mid-compile, possibly reading/reusing the
+        // file right now) model is using: its blobs on its own device, in the directory it
+        // actually compiles into (E-17: the root or one `kv-<tag>` directory). Anything else it
+        // owns - 0.8.x blobs in the root, another precision's directory, an old NPU shape - is
+        // an ordinary candidate. Evicting/NotLoaded do no cache_dir I/O, so they are
+        // correctly left eligible.
+        //
+        // The directory lookup can parse a model's IR (a model the factory has not resolved
+        // yet), so it runs on a snapshot, never while the models lock is held.
+        let snapshot: Vec<(String, ModelState, String, ModelKind)> = self
+            .read_models("prune_candidates")
+            .iter()
+            .map(|(id, r)| {
+                (
+                    id.clone(),
+                    r.state,
+                    r.device.clone(),
+                    r.last_kind.unwrap_or(r.configured_kind),
+                )
+            })
+            .collect();
+        let subdir_of =
+            |id: &str, kind: ModelKind, device: &str| self.active_cache_subdir(id, kind, device);
+        let active: Vec<(String, String, Option<&'static str>)> = snapshot
+            .iter()
+            .filter(|(_, state, _, _)| matches!(state, ModelState::Ready | ModelState::Loading))
+            .map(|(id, _, device, kind)| (id.clone(), device.clone(), subdir_of(id, *kind, device)))
+            .collect();
+        let is_protected = |name: &str| {
+            owners.get(name).is_some_and(|claimants| {
+                claimants.iter().any(|(model, device)| {
+                    active.iter().any(|(id, dev, sub)| {
+                        id == model
+                            && dev == device
+                            && *sub == crate::cache_manifest::blob_dir(name)
+                    })
+                })
+            })
+        };
+        // A Loading model's compile may write several blobs (a vision encoder, then the LM) that
+        // stay unattributed until the load succeeds, so nothing unclaimed in its directory goes.
+        let loading_dirs: Vec<Option<&'static str>> = snapshot
+            .iter()
+            .filter(|(_, state, _, _)| *state == ModelState::Loading)
+            .map(|(id, _, device, kind)| subdir_of(id, *kind, device))
+            .collect();
+        let in_loading_dir =
+            |name: &str| loading_dirs.contains(&crate::cache_manifest::blob_dir(name));
+        // A file nobody has claimed yet may be a compile that is still running (an abandoned
+        // load keeps compiling after its lock is released): leave young ones alone.
+        let recent = std::time::SystemTime::now()
+            .checked_sub(UNATTRIBUTED_BLOB_GRACE)
+            .unwrap_or(std::time::UNIX_EPOCH);
+
+        let mut candidates: Vec<&crate::cache_manifest::CacheDirEntry> = entries
+            .iter()
+            .filter(|e| {
+                std::path::Path::new(&e.file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
+            })
+            .filter(|e| !is_protected(&e.file_name))
+            .filter(|e| {
+                owners.contains_key(&e.file_name)
+                    || (e.mtime < recent && !in_loading_dir(&e.file_name))
+            })
+            .collect();
+        candidates.sort_by_key(|e| {
+            let tier = match owners.get(&e.file_name) {
+                None => 2, // unattributed - a pre-existing blob from before this feature shipped
+                Some(c) if c.iter().all(|(m, _)| !self.known_model(m)) => 0, // no longer configured
+                Some(_) => 1, // configured, just not currently in use
+            };
+            (tier, e.mtime)
+        });
+        candidates
+    }
+
+    /// Count and total size of the attributed `.blob` files that no configured model compiles
+    /// into any more: every claimant is a model that is gone, or is placed on another device
+    /// now (e.g. moved from GPU.0 to GPU.1), or compiles into a different directory.
+    fn blobs_outside_active_dirs(
+        &self,
+        entries: &[crate::cache_manifest::CacheDirEntry],
+        manifest_root: &std::path::Path,
+    ) -> (usize, u64) {
+        let owners = crate::cache_manifest::blob_owners(manifest_root);
+        let current: HashMap<String, (String, ModelKind)> = self
+            .read_models("blobs_outside_active_dirs")
+            .iter()
+            .map(|(id, r)| {
+                (
+                    id.clone(),
+                    (r.device.clone(), r.last_kind.unwrap_or(r.configured_kind)),
+                )
+            })
+            .collect();
+        // One directory lookup per model, not per blob (a lookup can parse the model's IR).
+        let mut subdirs: HashMap<String, Option<&'static str>> = HashMap::new();
+        let (mut count, mut bytes) = (0_usize, 0_u64);
+        for e in entries.iter().filter(|e| {
+            std::path::Path::new(&e.file_name)
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("blob"))
+        }) {
+            let Some(claimants) = owners.get(&e.file_name) else {
+                continue;
+            };
+            let outside = claimants.iter().all(|(model, device)| {
+                current.get(model).is_none_or(|(now_device, kind)| {
+                    now_device != device
+                        || *subdirs
+                            .entry(model.clone())
+                            .or_insert_with(|| self.active_cache_subdir(model, *kind, device))
+                            != crate::cache_manifest::blob_dir(&e.file_name)
+                })
+            });
+            if outside {
+                count += 1;
+                bytes += e.size_bytes;
+            }
+        }
+        (count, bytes)
+    }
+
+    /// Logs the E-17 advice the first time `model_id` fails with the blob/precision mismatch
+    /// (once per model per process; the per-request error is logged by the caller). Returns
+    /// whether this call logged it.
+    pub(crate) fn note_kv_blob_mismatch(&self, model_id: &str) -> bool {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let first = SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(model_id.to_owned());
+        if !first {
+            return false;
+        }
+        let placement = self
+            .read_models("note_kv_blob_mismatch")
+            .get(model_id)
+            .map(|r| (r.last_kind.unwrap_or(r.configured_kind), r.device.clone()));
+        let dir = self
+            .config
+            .ov_cache_dir
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(|root| match placement {
+                Some((kind, device)) => self
+                    .active_cache_subdir(model_id, kind, &device)
+                    .map_or_else(|| root.to_owned(), |sub| format!("{root}/{sub}")),
+                None => root.to_owned(),
+            });
+        tracing::warn!("{}", kv_blob_mismatch_hint(model_id, dir.as_deref()));
+        true
+    }
+
+    /// With no `ov_cache_max_gb` nothing is ever pruned, so say once per process how much
+    /// attributed blob data sits where no configured model compiles any more (0.8.x blobs in the
+    /// root once the KV engines moved to `kv-<tag>/`, another precision's directory, a model that
+    /// left the config). Quiet when there is none.
+    fn note_blobs_outside_active_dirs(&self, entries: &[crate::cache_manifest::CacheDirEntry]) {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        if NOTED.is_completed() {
+            return;
+        }
+        let Some(manifest_root) =
+            crate::cache_manifest::manifest_root(self.config.ov_cache_dir.as_deref())
+        else {
+            return;
+        };
+        let (count, bytes) = self.blobs_outside_active_dirs(entries, &manifest_root);
+        if count > 0 {
+            NOTED.call_once(|| {
+                #[allow(clippy::cast_precision_loss)]
+                let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                let dir = self.config.ov_cache_dir.as_deref().unwrap_or_default();
+                tracing::info!(
+                    blobs = count,
+                    gb = format!("{gb:.1}"),
+                    dir,
+                    "ov cache: {count} blob file(s), {gb:.1} GB, in {dir} sit where no configured \
+                     model compiles any more (earlier layout or precision, a moved device, or \
+                     removed models). ov_cache_max_gb is 0, so they are never pruned: set \
+                     ov_cache_max_gb, or delete the stale *.blob files under {dir} yourself (its \
+                     root also holds the live blobs of Whisper, image, TTS and NPU models)"
+                );
+            });
+        }
+    }
+
     /// If `ov_cache_dir`'s total on-disk size exceeds `ov_cache_max_gb`,
     /// deletes `.blob` files (never `.cl_cache`/`.onednn.cl_cache` — those are
     /// shared `OpenCL`/oneDNN kernel caches, not per-model, per the
@@ -5559,6 +7787,8 @@ impl ModelManager {
 
         let entries = crate::cache_manifest::list_cache_dir_entries(cache_dir);
         if entries.is_empty() {
+            // An emptied cache must read 0, not the last non-empty figure.
+            crate::metrics::record_ov_cache_bytes(0);
             return;
         }
         let total_bytes: u64 = entries.iter().map(|e| e.size_bytes).sum();
@@ -5568,6 +7798,7 @@ impl ModelManager {
         crate::metrics::record_ov_cache_bytes(total_bytes);
 
         if self.config.ov_cache_max_gb <= 0.0 {
+            self.note_blobs_outside_active_dirs(&entries);
             return;
         }
         #[allow(clippy::cast_precision_loss)]
@@ -5582,40 +7813,7 @@ impl ModelManager {
         else {
             return;
         };
-        let owner_index = crate::cache_manifest::blob_owner_index(&manifest_root);
-        // Protect Ready (serving requests) AND Loading (mid-compile, possibly
-        // reading/reusing this exact file right now) — deleting either's
-        // blob out from under it is the failure mode this function exists to
-        // prevent. Evicting/NotLoaded do no cache_dir I/O, so they're
-        // correctly left eligible.
-        let protected_models: std::collections::HashSet<String> = self
-            .read_models("prune_ov_cache_if_over_budget")
-            .iter()
-            .filter(|(_, r)| matches!(r.state, ModelState::Ready | ModelState::Loading))
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let mut candidates: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                std::path::Path::new(&e.file_name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
-            })
-            .filter(|e| {
-                owner_index
-                    .get(&e.file_name)
-                    .is_none_or(|owner| !protected_models.contains(owner))
-            })
-            .collect();
-        candidates.sort_by_key(|e| {
-            let tier = match owner_index.get(&e.file_name) {
-                None => 2, // unattributed — a pre-existing blob from before this feature shipped
-                Some(owner) if !self.known_model(owner) => 0, // no longer configured
-                Some(_) => 1, // configured, just not currently resident
-            };
-            (tier, e.mtime)
-        });
+        let candidates = self.prune_candidates(&entries, &manifest_root);
 
         let mut freed_bytes = 0_u64;
         let mut deleted = 0_usize;
@@ -5626,6 +7824,7 @@ impl ModelManager {
             if remaining_gb <= self.config.ov_cache_max_gb {
                 break;
             }
+            // `file_name` is `<file>` or `kv-<tag>/<file>`, built by the walker itself.
             let path = cache_dir.join(&entry.file_name);
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -5700,7 +7899,7 @@ impl ModelManager {
             return None; // only a polluted measurement goes negative
         }
         #[allow(clippy::cast_precision_loss)]
-        let estimate_gb = estimate as f64 / 1e9;
+        let estimate_gb = estimate as f64 / GIB_F64;
         // Compare with what admission actually charges (NPU footprint factor
         // included), not the configured figure, or an NPU model whose measured
         // memory sits between the two would warn although it IS covered.
@@ -5749,6 +7948,7 @@ impl ModelManager {
                     max_seqs: live.map_or(0, ManagedEngine::max_concurrency),
                     waiting: live.map_or(0, ManagedEngine::waiting),
                     kv_cache_pool_gb: r.kv_cache_gb,
+                    kv_gate_mode: r.kv_gate_mode,
                     pinned: r.pinned,
                     priority: r.priority,
                     // Live occupancy: only a Ready engine reports it; evicted
@@ -5780,6 +7980,7 @@ impl ModelManager {
                 (total, used, v.domain_snapshot())
             });
         MetricsSnapshot {
+            gpu_poisoned: self.is_gpu_poisoned(),
             device: self.config.device.clone(),
             total_vram_gb,
             used_vram_gb,
@@ -5801,6 +8002,20 @@ impl ModelManager {
     /// listing a dead model as healthy.
     pub fn is_gpu_poisoned(&self) -> bool {
         self.gpu_poisoned.load(Ordering::Acquire)
+    }
+
+    /// Test hook: set the poisoned flag without the exit reaction `mark_gpu_poisoned` triggers.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        self.set_gpu_poisoned();
+    }
+
+    /// True when a model placed on `device` cannot serve because the GPU context
+    /// is poisoned (E-12). Only GPU placements are affected: CPU and NPU models
+    /// keep serving, so their state stays truthful.
+    #[must_use]
+    pub fn gpu_unavailable(&self, device: &str) -> bool {
+        self.is_gpu_poisoned() && device_uses_gpu(device)
     }
 
     /// Flag the GPU `OpenCL` context as poisoned after an OOM-class failure and
@@ -5830,14 +8045,116 @@ impl ModelManager {
         err: impl std::fmt::Display,
         from_serving_model: bool,
     ) {
-        let first = self.set_gpu_poisoned();
+        self.set_gpu_poisoned();
         tracing::error!(
             model_id,
             error = %err,
             "GPU OpenCL context poisoned — process restart required before loading any model"
         );
-        if first {
+        self.poison_reaction.get_or_init(|| {
+            // The exit decision first: it only stores a flag (the drain waits for this request), and
+            // the G1 replies read it.
             crate::startup::on_gpu_poisoned(model_id, from_serving_model);
+            // G2 (step 7): the memory state at the moment of failure, once per process.
+            tracing::error!(
+                state = %poison_diag::format_poison_diag(&self.poison_diagnostics(model_id)),
+                "GPU context poisoned — memory state at the moment of failure"
+            );
+        });
+    }
+
+    /// Collect [`poison_diag::PoisonDiag`] for `model_id` (G2). Takes the models and VRAM read locks
+    /// in turn, never nested; every OS reading is best-effort.
+    fn poison_diagnostics(&self, model_id: &str) -> poison_diag::PoisonDiag {
+        let (device, domain, idle_secs, ids) = {
+            let guard = self.read_models("poison_diagnostics");
+            let rec = guard.get(model_id);
+            (
+                rec.map_or_else(|| self.config.device.clone(), |r| r.device.clone()),
+                rec.map_or_else(|| self.inference_domain.clone(), |r| r.domain.clone()),
+                rec.map(|r| r.last_used.elapsed().as_secs()),
+                guard.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let mut booked: Vec<(String, f64)> = self
+            .vram
+            .read()
+            .map(|v| {
+                ids.iter()
+                    .map(|id| (id.clone(), v.allocated_gb(id)))
+                    .filter(|(_, gb)| *gb > 0.0)
+                    .collect()
+            })
+            .unwrap_or_default();
+        booked.sort_by(|a, b| a.0.cmp(&b.0));
+        let drm = crate::gpu_memory::read_process()
+            .map(|m| {
+                m.into_iter()
+                    .map(|((drv, pdev, region), b)| (drv, pdev, region, b))
+                    .collect()
+            })
+            .unwrap_or_default();
+        poison_diag::PoisonDiag {
+            model_id: model_id.to_owned(),
+            device,
+            domain,
+            idle_secs,
+            mem_available_gb: os_memory::available_ram_gb(),
+            swap_used_gb: os_memory::swap_used_gb(),
+            zram_used_gb: os_memory::zram_used_gb(),
+            pressure: os_memory::memory_pressure(),
+            drm,
+            booked,
+        }
+    }
+
+    /// Where `model_id`'s learned KV-capacity ceilings live: `<ratchet root>/<id>-<hash>`, the
+    /// hash (8 hex digits of SHA-256) taken over the model's directory path, so two libraries
+    /// with a model of the same name do not share a ceiling. `None` without a ratchet root.
+    fn ratchet_dir(&self, model_id: &str) -> Option<std::path::PathBuf> {
+        use sha2::Digest as _;
+        let root = self.ratchet_root.as_ref()?;
+        let path = self.config.models_dir.join(model_id);
+        let digest = sha2::Sha256::digest(path.to_string_lossy().as_bytes());
+        let hash = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        let name = model_id.replace(['/', '\\'], "_");
+        Some(root.join(format!("{name}-{hash:08x}")))
+    }
+
+    /// Persist the ceiling a KV-admission wedge taught: under the exact key of the pool that
+    /// wedged when there is one (and an exact gate that over-promised is a defect worth a log
+    /// line), else in the old per-model file.
+    fn learn_wedge_ceiling(
+        &self,
+        model_id: &str,
+        safe_tokens: usize,
+        (observed_prompt_tokens, gate_limit): (usize, usize),
+        kv_cache_gb: f64,
+        exact_pool: bool,
+        key: Option<&kv_ratchet::RatchetKey>,
+    ) {
+        let Some(model_dir) = self.ratchet_dir(model_id) else {
+            tracing::warn!(
+                model_id,
+                safe_tokens,
+                "no cache directory for the learned KV-capacity ceiling - it is not stored and not applied"
+            );
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&model_dir) {
+            tracing::warn!(model_id, dir = %model_dir.display(), error = %e, "could not create the KV-capacity ratchet directory");
+            return;
+        }
+        if let Some(key) = key {
+            tracing::warn!(
+                model_id,
+                observed_prompt_tokens,
+                gate_limit,
+                "exact gate over-promised - file a defect with this log line"
+            );
+            kv_ratchet::write_ratchet_v2(&model_dir, safe_tokens, key);
+        } else {
+            template::write_kv_capacity_ratchet(&model_dir, safe_tokens, kv_cache_gb, exact_pool);
         }
     }
 
@@ -5878,6 +8195,7 @@ impl ModelManager {
     ///   crossing lands near the true ceiling (~30% of the old, too-generous
     ///   formula estimate per the characterization doc), not at a tiny
     ///   fraction of it.
+    #[allow(clippy::too_many_lines)] // one record-inspect -> learn -> evict+reload sequence
     pub(crate) fn spawn_kv_wedge_recovery(
         self: &Arc<Self>,
         model_id: &str,
@@ -5901,10 +8219,17 @@ impl ModelManager {
         let current = self
             .read_models("spawn_kv_wedge_recovery")
             .get(model_id)
-            .map(|r| (r.max_prompt_tokens, r.kv_cache_gb));
+            .map(|r| {
+                (
+                    r.max_prompt_tokens,
+                    r.kv_cache_gb,
+                    r.kv_pool_blocks.is_some(),
+                    r.kv_ratchet_key.clone(),
+                )
+            });
 
         match current {
-            Some((current_max_prompt_tokens, kv_cache_gb)) => {
+            Some((current_max_prompt_tokens, kv_cache_gb, exact_pool, ratchet_key)) => {
                 let floor = current_max_prompt_tokens / 10;
                 if observed_prompt_tokens > 0 && observed_prompt_tokens >= floor {
                     #[allow(
@@ -5913,10 +8238,13 @@ impl ModelManager {
                         clippy::cast_possible_truncation
                     )]
                     let safe_tokens = (observed_prompt_tokens as f64 * 0.95) as usize;
-                    template::write_kv_capacity_ratchet(
-                        &self.config.models_dir.join(model_id),
+                    self.learn_wedge_ceiling(
+                        model_id,
                         safe_tokens,
+                        (observed_prompt_tokens, current_max_prompt_tokens),
                         kv_cache_gb,
+                        exact_pool,
+                        ratchet_key.as_ref(),
                     );
                     tracing::warn!(
                         model_id,
@@ -5995,7 +8323,22 @@ impl ModelManager {
             return Err(ModelError::GpuPoisoned.into());
         }
 
+        // Step 6b: a late result commits (or frees) first, so a retried load sees it.
+        self.reap_stalled_loads();
         let mut guard = self.write_models("begin_load");
+        let device = guard
+            .get(model_id)
+            .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?
+            .device
+            .clone();
+        if let Some((stalled, secs)) = Self::stalled_load_on(&guard, &device) {
+            return Err(ModelError::DeviceStalled {
+                device,
+                model: stalled,
+                secs,
+            }
+            .into());
+        }
         let record = guard
             .get_mut(model_id)
             .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
@@ -6008,21 +8351,29 @@ impl ModelManager {
                     "cannot load model while it is being evicted"
                 ));
             }
+            // D-04 S2: a load started now would hold up the stop for its whole duration. Only the
+            // start of a load is refused — a Ready model still answers as loaded while draining.
+            ModelState::NotLoaded if self.is_shutting_down() => {
+                return Err(ModelError::ShuttingDown.into());
+            }
             ModelState::NotLoaded => record.state = ModelState::Loading,
         }
         Ok(self.budget_weight_gb(record))
     }
 
-    /// What the memory accounting charges for `r`'s weights: its `vram_gb`,
-    /// times [`Config::npu_footprint_factor`] when it runs on the NPU (whose
-    /// real footprint exceeds the weight size — Windows pass 2, D8). The one
-    /// place the factor is applied, shared by the real load, the dry-run and
-    /// the eviction plan so they cannot disagree.
+    /// What the memory accounting charges for `r`'s weights: [`Config::weight_charge_gb`]
+    /// (its `vram_gb`, times the NPU footprint factor — Windows pass 2, D8 — or the CPU
+    /// image-generation factor, D-06), or the footprint learned from a measured load when that
+    /// is larger (not on the NPU). Shared by the real load, the dry-run and the eviction plan
+    /// so they cannot disagree.
     fn budget_weight_gb(&self, r: &ModelRecord) -> f64 {
+        let charged =
+            self.config
+                .weight_charge_gb(r.vram_gb, &r.device, r.configured_kind, r.image_family);
         if r.device.starts_with("NPU") {
-            r.vram_gb * self.config.npu_footprint_factor
+            charged
         } else {
-            r.vram_gb
+            r.learned_weight_gb.map_or(charged, |l| l.max(charged))
         }
     }
 
@@ -6079,22 +8430,25 @@ impl ModelManager {
     /// the project's internal engineering log's Phi-4 case study).
     fn compute_max_prompt_tokens(
         model_id: &str,
-        model_dir: &std::path::Path,
+        files: &GateFiles,
         kv_gb: f64,
         kv_cache_precision: &str,
     ) -> (usize, usize) {
         if kv_gb == 0.0 {
             return (0, 0); // media model: no KV pool — gate disabled, no warn
         }
-        let bytes_f16 = template::read_kv_bytes_per_token_f16(model_dir);
-        let precision_bytes: usize = match kv_cache_precision {
-            "u8" => 1,
-            "f32" => 4,
-            _ => 2, // f16 plugin default
+        let bytes_f16 = files.legacy_bytes_f16;
+        // Quarter-bytes per element: i8 (and the legacy "u8" spelling) = 2, f16 plugin
+        // default = 4. u4 is priced like i8 on purpose: its per-head scales and zero
+        // points make the real cost ~1.27x the naive half of i8 (27B: 20,736 B/token
+        // measured vs 16,384 naive), so half-pricing would over-promise the pool.
+        let precision_quarters: usize = match kv_cache_precision {
+            "u4" | "i8" | "u8" => 2,
+            _ => 4,
         };
         // bytes_f16 already encodes the ×2 f16 factor; adjust to actual precision.
         let bytes_per_token = if bytes_f16 > 0 {
-            bytes_f16 * precision_bytes / 2
+            bytes_f16 * precision_quarters / 4
         } else {
             0
         };
@@ -6126,7 +8480,7 @@ impl ModelManager {
         // when known and tighter — unmargined, since `FORMULA_SAFETY_MARGIN`
         // corrects an *estimate* and `max_position_embeddings` is a hard
         // model property, not one.
-        let native_clamped = match template::read_native_context_limit(model_dir) {
+        let native_clamped = match files.native_context {
             Some(native) if native > 0 && native < formula_result => {
                 tracing::info!(
                     model_id,
@@ -6138,7 +8492,7 @@ impl ModelManager {
             }
             _ => formula_result,
         };
-        let max_prompt_tokens = match template::read_kv_capacity_ratchet(model_dir, kv_gb) {
+        let max_prompt_tokens = match files.ratchet_v1 {
             Some(ratchet) if ratchet > 0 && ratchet < native_clamped => {
                 tracing::info!(
                     model_id,
@@ -6162,19 +8516,20 @@ impl ModelManager {
     /// `None` when no override is set, which leaves template loading exactly as
     /// it was.
     fn resolve_template_override(&self, model_id: &str) -> Option<std::path::PathBuf> {
+        // `effective_entry`, not `config.models`: a `chat_template` given to
+        // `POST /v1/admin/models/add` or PATCH lives in the dynamic entries and was ignored until
+        // a restart (template-read opinion side finding).
         let rel = self
-            .config
-            .models
-            .get(model_id)
-            .and_then(|e| e.policy.chat_template.as_ref())?;
+            .effective_entry(model_id)
+            .and_then(|e| e.policy.chat_template)?;
         if rel.is_absolute() {
-            return Some(rel.clone());
+            return Some(rel);
         }
         Some(
             self.config_path
                 .as_ref()
                 .and_then(|c| c.parent())
-                .map_or_else(|| rel.clone(), |dir| dir.join(rel)),
+                .map_or_else(|| rel.clone(), |dir| dir.join(&rel)),
         )
     }
 
@@ -6189,20 +8544,328 @@ impl ModelManager {
         model_id: &str,
         handle: &EngineHandleKind,
         kv_gb: f64,
-    ) -> (usize, usize) {
+        source: &GateSource,
+        files: &GateFiles,
+    ) -> TokenLimits {
+        let gate = source.exact.as_ref();
         if let EngineHandleKind::NpuTextGen(h) = handle {
             let shape = h.shape();
-            return (shape.max_prompt_len, shape.kv_capacity);
+            return TokenLimits {
+                max_prompt_tokens: shape.max_prompt_len,
+                pool_capacity_tokens: shape.kv_capacity,
+                mode: "",
+                clamped_by: None,
+                ratchet_key: None,
+                detail: None,
+                headroom: None,
+            };
         }
-        Self::compute_max_prompt_tokens(
-            model_id,
-            &self.config.models_dir.join(model_id),
-            kv_gb,
-            &self.config.kv_cache_precision,
+        let wants_exact = self.config.kv_gate_mode == "exact";
+        // A vision model on a GPU keeps the legacy limit unless the device-headroom limit can be
+        // computed for it (a discrete GPU whose free memory the probe can read): a prompt near a
+        // big pool's capacity can exhaust the free device memory and poison the GPU context for
+        // the whole process (measured: 164,960 tokens with 3.04 GiB free). Owner decision P12:
+        // shared-memory devices have no such limit and stay legacy.
+        let vision_without_headroom = gate.is_some_and(|g| {
+            g.spec.engine_path == "vlm"
+                && g.spec.device.starts_with("GPU")
+                && g.spec.headroom.is_none()
+        });
+        if vision_without_headroom && wants_exact {
+            warn_vision_without_headroom_cap_once(model_id);
+        }
+        if let (true, false, Some(gate)) = (wants_exact, vision_without_headroom, gate)
+            && let Some((pool_limit, pool_capacity_tokens, by)) =
+                compute_exact_gate(model_id, files, gate)
+        {
+            let (max_prompt_tokens, by, headroom_record) =
+                self.apply_load_time_headroom(model_id, gate, pool_limit, by);
+            return TokenLimits {
+                max_prompt_tokens,
+                pool_capacity_tokens,
+                mode: "exact",
+                clamped_by: Some(by),
+                ratchet_key: Some(gate.spec.ratchet_key(gate.blocks)),
+                detail: Some(GateDetail {
+                    kv_cache_gb: kv_gb,
+                    precision: gate.spec.passed,
+                    prefix_caching: gate.spec.prefix_caching,
+                    hybrid: gate.spec.profile.linear_state_bytes_per_seq > 0,
+                    clamped_by: Some(by),
+                    device_free_gib: None,
+                }),
+                headroom: headroom_record,
+            };
+        }
+        // Price what the engine really got, not the global key a vision model ignores.
+        let priced = source
+            .inputs
+            .as_ref()
+            .map(|i| i.resolution.passed)
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                normalize_kv_precision(&self.config.kv_cache_precision).unwrap_or_default()
+            });
+        let (max_prompt_tokens, pool_capacity_tokens) =
+            Self::compute_max_prompt_tokens(model_id, files, kv_gb, priced);
+        TokenLimits {
+            max_prompt_tokens,
+            pool_capacity_tokens,
+            mode: if max_prompt_tokens == 0 { "" } else { "legacy" },
+            clamped_by: None,
+            ratchet_key: None,
+            // What the engine really got, from the resolution the factory made for this load;
+            // the global key is only the answer for a model the factory could not describe.
+            detail: Some(GateDetail {
+                kv_cache_gb: kv_gb,
+                precision: source.inputs.as_ref().map_or_else(
+                    || normalize_kv_precision(&self.config.kv_cache_precision).unwrap_or_default(),
+                    |i| i.resolution.passed,
+                ),
+                prefix_caching: source.prefix_caching,
+                hybrid: source
+                    .inputs
+                    .as_ref()
+                    .is_some_and(|i| i.profile.linear_state_bytes_per_seq > 0),
+                clamped_by: None,
+                device_free_gib: None,
+            }),
+            headroom: None,
+        }
+    }
+
+    /// The device-headroom limit for a vision model on a discrete GPU at the moment of the
+    /// commit (this model's weights and pool are already booked): `(limit, what limits it, the
+    /// facts to recompute it with)`. Other models get their pool limit back unchanged.
+    fn apply_load_time_headroom(
+        &self,
+        model_id: &str,
+        gate: &ExactGate,
+        pool_limit: usize,
+        by: GateClamp,
+    ) -> (usize, GateClamp, Option<headroom::HeadroomRecord>) {
+        let Some(spec) = gate.spec.headroom.as_ref() else {
+            return (pool_limit, by, None);
+        };
+        let domain = self.record_domain(model_id);
+        let record = headroom::HeadroomRecord {
+            model_id: model_id.to_owned(),
+            spec: spec.clone(),
+            domain,
+            pool_limit_tokens: pool_limit,
+            pool_clamp: by,
+        };
+        let limit = self.headroom_limit_now(&record);
+        if limit < pool_limit {
+            (limit, GateClamp::DeviceHeadroom, Some(record))
+        } else {
+            (pool_limit, by, Some(record))
+        }
+    }
+
+    /// A transient device-memory lease for a long vision request (longer than
+    /// `kv_headroom_inflight_tokens`), held for the request's life so a load started meanwhile
+    /// sees the memory as taken. `None` for models without a headroom limit and for short requests.
+    #[must_use]
+    pub fn acquire_transient_lease(
+        &self,
+        model_id: &str,
+        prompt_tokens: usize,
+    ) -> Option<headroom::TransientLease> {
+        if prompt_tokens <= self.config.kv_headroom_inflight_tokens {
+            return None;
+        }
+        let rec = self
+            .read_models("acquire_transient_lease")
+            .get(model_id)
+            .and_then(|r| r.headroom.clone())?;
+        Some(
+            self.headroom
+                .acquire(&rec.domain, &rec.model_id, &rec.spec, prompt_tokens),
         )
     }
 
-    async fn execute_load(&self, model_id: &str, kv_gb: f64, max_num_seqs: usize) -> Result<()> {
+    /// The device-headroom state for the admin API and `rv status`: per discrete GPU, the total,
+    /// what others hold, what this process holds, the leases, and what is left for one prompt.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // device sizes are far below 2^52 bytes
+    pub fn headroom_report(&self) -> headroom::HeadroomReport {
+        let margin = gib_to_bytes(self.config.kv_headroom_margin_gib);
+        let probe = if self.headroom.has_probe() {
+            "fdinfo"
+        } else {
+            "none"
+        };
+        if self.config.kv_headroom_mode != "dynamic" {
+            // Off: no limit exists, so nothing is read from /proc for the display either.
+            return headroom::HeadroomReport {
+                mode: self.config.kv_headroom_mode.clone(),
+                probe,
+                margin_gib: margin as f64 / GIB_F64,
+                devices: Vec::new(),
+            };
+        }
+        let devices = self
+            .inventory
+            .devices()
+            .iter()
+            .filter(|d| d.kind == crate::device_inventory::DeviceKind::DiscreteGpu)
+            .filter_map(|d| {
+                let pdev = d.pdev.as_deref()?;
+                let total = gib_to_bytes(d.total_mem_gb?);
+                let outside = self.headroom.outside_bytes(pdev);
+                let booked = gib_to_bytes(
+                    self.vram
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .domain_gb(&d.domain_id)
+                        .1,
+                );
+                let leases = self.headroom.lease_bytes(&d.domain_id, None);
+                let own = booked.max(
+                    self.headroom
+                        .own_bytes(pdev)
+                        .unwrap_or(0)
+                        .saturating_sub(leases),
+                );
+                let free = total
+                    .saturating_sub(outside.unwrap_or(0))
+                    .saturating_sub(own)
+                    .saturating_sub(leases)
+                    .saturating_sub(margin);
+                Some(headroom::HeadroomDevice {
+                    device: d.name.clone(),
+                    total_gib: total as f64 / GIB_F64,
+                    outside_mib: outside.map(|b| b >> 20),
+                    own_gib: own as f64 / GIB_F64,
+                    leases_mib: Some(leases >> 20),
+                    free_gib: free as f64 / GIB_F64,
+                })
+            })
+            .collect();
+        headroom::HeadroomReport {
+            mode: self.config.kv_headroom_mode.clone(),
+            probe,
+            margin_gib: margin as f64 / GIB_F64,
+            devices,
+        }
+    }
+
+    /// What this process holds on `pdev` beyond the tracker's booking of `domain`, bytes: the
+    /// driver's figure with the running requests' transient memory taken out (those are the
+    /// leases, added on their own) minus what the tracker booked. Memory the tracker never booked
+    /// (a model charged 0, scratch buffers) lowers every headroom figure by this much. Read fresh
+    /// from the driver: it feeds load admission, where a figure cached before an unload would
+    /// count the unloaded model as unbooked memory (S281 defect b).
+    fn unbooked_own_bytes(&self, domain: &str, pdev: &str) -> u64 {
+        let booked = gib_to_bytes(
+            self.vram
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .domain_gb(domain)
+                .1,
+        );
+        self.headroom
+            .own_bytes_fresh(pdev)
+            .unwrap_or(0)
+            .saturating_sub(self.headroom.lease_bytes(domain, None))
+            .saturating_sub(booked)
+    }
+
+    /// `(outside, own, leases)` bytes for a vision model's headroom right now.
+    fn headroom_readings_now(&self, rec: &headroom::HeadroomRecord) -> (u64, u64, u64) {
+        let booked = self
+            .vram
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .domain_gb(&rec.domain)
+            .1;
+        let outside = self.headroom.outside_bytes(&rec.spec.pdev).unwrap_or(0);
+        // Own bytes: what the tracker booked, or what the driver says this process holds if more
+        // (the driver's figure includes the running requests' transient memory, which the leases
+        // account for separately: taken out here so it is not counted twice, and so a model's own
+        // running request, excluded from its leases, is not charged against its next one).
+        let own = gib_to_bytes(booked).max(
+            self.headroom
+                .own_bytes(&rec.spec.pdev)
+                .unwrap_or(0)
+                .saturating_sub(self.headroom.lease_bytes(&rec.domain, None)),
+        );
+        let leases = self.headroom.lease_bytes(&rec.domain, Some(&rec.model_id));
+        (outside, own, leases)
+    }
+
+    /// The raw device-headroom cap of a vision model right now, tokens (the pool limit not applied).
+    fn headroom_cap_now(&self, rec: &headroom::HeadroomRecord) -> usize {
+        let (outside, own, leases) = self.headroom_readings_now(rec);
+        rec.spec.limit_tokens(outside, own, leases)
+    }
+
+    /// Free device memory behind the model's headroom limit right now, bytes.
+    fn headroom_free_bytes_now(&self, rec: &headroom::HeadroomRecord) -> u64 {
+        let (outside, own, leases) = self.headroom_readings_now(rec);
+        rec.spec.inputs(outside, own, leases).free_bytes()
+    }
+
+    /// The live context limit of a vision model on a discrete GPU: the headroom cap or the pool
+    /// limit, whichever is lower.
+    fn headroom_limit_now(&self, rec: &headroom::HeadroomRecord) -> usize {
+        self.headroom_cap_now(rec).min(rec.pool_limit_tokens)
+    }
+
+    /// D-07: book what a load really took. `recharge` is `(domain, learned weight GB,
+    /// measured GB)` when the load took clearly more than it was charged on the shared-memory
+    /// domain; the tracker is re-booked at that footprint. Then warns when the admission
+    /// promise (the OS reservation stays free) did not hold. Takes no `models` lock.
+    fn book_measured_load(&self, model_id: &str, kv_gb: f64, recharge: Option<(String, f64, f64)>) {
+        if let Some((domain, weight_gb, measured_gb)) = recharge {
+            if let Ok(mut v) = self.vram.write() {
+                v.allocate(&domain, model_id, weight_gb + kv_gb.max(0.0));
+            }
+            tracing::warn!(
+                model_id,
+                measured_gb,
+                learned_weight_gb = weight_gb,
+                "loaded model took more memory than it was charged: re-booked at the \
+                 measured footprint and charged so from now on (set vram_gb at least \
+                 this high to book it correctly from the first load)"
+            );
+        }
+        // The admission promise is that `floor` GB stay free; say so when it did not hold.
+        let floor = self
+            .config
+            .system_ram_reservation_gb
+            .unwrap_or_else(os_memory::default_reservation_gb);
+        if let Some(avail) = self.live_system_avail_gb(&self.record_domain(model_id))
+            && avail < floor
+        {
+            tracing::warn!(
+                model_id,
+                avail_gb = avail,
+                floor_gb = floor,
+                "free system memory is below the OS reservation after this load"
+            );
+        }
+    }
+
+    /// The load deadline for `model_id`: per-model `load_timeout_secs`, else the global one;
+    /// `None` when it is `0` (no deadline).
+    fn load_timeout(&self, model_id: &str) -> Option<Duration> {
+        let secs = self
+            .effective_entry(model_id)
+            .and_then(|e| e.policy.load_timeout_secs)
+            .unwrap_or(self.config.load_timeout_secs);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
+    async fn execute_load(
+        &self,
+        model_id: &str,
+        kv_gb: f64,
+        max_num_seqs: usize,
+        gate: GateSource,
+        kv_plan: Option<KvPoolPlan>,
+    ) -> Result<()> {
         let model_path = self.config.models_dir.join(model_id);
         // Phase C1: load on the model's resolved device (per-model `device`
         // override → else `config.device`), set once at registration. Pre-C1
@@ -6213,56 +8876,233 @@ impl ModelManager {
 
         // Measures exactly the engine-construction/JIT-compile window — not
         // admission-check or HTTP overhead — for `rustedvino_model_load_duration_seconds`.
-        let load_started = Instant::now();
         crate::gpu_memory::note_load_event();
         let gpu_window = crate::gpu_memory::MeasureWindow::open();
-        let gpu_before = crate::gpu_memory::process_total_bytes();
-        let result = tokio::task::spawn_blocking(move || {
-            factory.load(&model_path, &device, kv_gb, max_num_seqs)
+        // A discrete GPU is measured on its own card's dedicated memory; a long vision request
+        // running on that domain would pollute the window (its transient write is in this
+        // process), so such a load is not measured at all.
+        let domain = self.record_domain(model_id);
+        let measure_pdev: Option<String> = (domain != DOMAIN_SYSTEM)
+            .then(|| {
+                self.inventory
+                    .devices()
+                    .iter()
+                    .find(|d| d.name == device)
+                    .and_then(|d| d.pdev.clone())
+            })
+            .flatten();
+        let leases_at_start = self.headroom.lease_bytes(&domain, None);
+        // A running generation of any size (not only a long one with a lease) allocates and frees
+        // device memory inside the window and would pollute the learned weight upward, for good.
+        let quiet = leases_at_start == 0 && self.oldest_generation_age().is_none();
+        let gpu_before = match measure_pdev.as_deref() {
+            Some(p) => crate::gpu_memory::process_vram_bytes(p),
+            None => crate::gpu_memory::process_total_bytes(),
+        }
+        .filter(|_| quiet);
+        // CPU over-admission: the model's own change in anonymous memory, same quiet rule.
+        let rss_before = (device == "CPU")
+            .then(os_memory::process_rss_anon_bytes)
+            .flatten()
+            .filter(|_| quiet);
+        let measure = LoadMeasure {
+            gpu_before,
+            rss_before,
+            gpu_window,
+            measure_pdev,
+            leases_at_start,
+            domain,
+        };
+
+        // Step 6b: the blocking load reports into a slot the record also holds, so this future
+        // may stop waiting (deadline, or dropped because the client went away) while the load
+        // runs on; the reaper then commits or discards its result. The record holds the slot
+        // before anything can cancel this future (no await in between).
+        let timeout = self.load_timeout(model_id);
+        let slot = Arc::new(LoadSlot::new(LoadCommit {
+            kv_gb,
+            max_num_seqs,
+            gate,
+            kv_plan,
+        }));
+        if let Some(r) = self.write_models("execute_load:pending").get_mut(model_id) {
+            r.pending_load = Some(Arc::clone(&slot));
+            r.load_stalled = false;
+        }
+        let worker = Arc::clone(&slot);
+        let token_model = model_id.to_owned();
+        let on_gpu = device.starts_with("GPU");
+        if on_gpu {
+            let secs = timeout.map_or(0, |d| d.as_secs());
+            crate::startup::note_gpu_load(crate::startup::GpuLoadMilestone::Started(secs));
+        }
+        // No deadline (`0`) also means the watchdog never counts this load: an
+        // unbounded allowance keeps it at zero overdue; it still counts for the exit decision.
+        let allowance = timeout.unwrap_or(Duration::MAX);
+        // Detached on purpose: the slot, not the `JoinHandle`, carries the result.
+        drop(tokio::task::spawn_blocking(move || {
+            let token = crate::ffi_watch::global().arm(
+                crate::ffi_watch::FfiKind::Load,
+                &token_model,
+                Some(&device),
+                allowance,
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                factory.load(&model_path, &device, kv_gb, max_num_seqs)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("engine load panicked")));
+            drop(token);
+            worker.finish(result);
+        }));
+
+        let finished = if let Some(limit) = timeout {
+            tokio::time::timeout(limit, slot.wait()).await.is_ok()
+        } else {
+            slot.wait().await;
+            true
+        };
+        if !finished {
+            self.mark_load_stalled(model_id, "deadline");
+            return Err(ModelError::LoadTimeout {
+                model: model_id.to_owned(),
+                secs: timeout.map_or(0, |t| t.as_secs()),
+            }
+            .into());
+        }
+        let (result, commit) = self
+            .take_finished_load(model_id, &slot)
+            .ok_or_else(|| anyhow::anyhow!("load result of '{model_id}' was already taken"))?;
+        // F2-S-7 + template-read opinion: the commit's file inputs are read on the blocking pool,
+        // not in the commit below (which runs on this async task).
+        let kind = result.as_ref().ok().map(|(h, _)| h.kind());
+        let files = self.read_load_files(model_id, kind, &commit).await;
+        let committed = self.finish_load(
+            model_id,
+            result,
+            commit,
+            files,
+            Some(&measure),
+            slot.started,
+        );
+        // A load that returned at all, committed or failed fast, shows the device schedules work:
+        // the first-load deadline is for a load that never returns (0.9.0 review E, shutdown-4).
+        if on_gpu {
+            crate::startup::note_gpu_load(crate::startup::GpuLoadMilestone::Done);
+        }
+        committed
+    }
+
+    /// [`GateFiles`] and [`ModelFiles`] for a finished load, read on the blocking pool (F2-S-7,
+    /// template-read opinion); `kind` is the loaded engine's, `None` for a failed load, which
+    /// commits nothing (empty limits, the fallback template).
+    async fn read_load_files(
+        &self,
+        model_id: &str,
+        kind: Option<ModelKind>,
+        commit: &LoadCommit,
+    ) -> (GateFiles, ModelFiles) {
+        let Some(kind) = kind else {
+            return (GateFiles::default(), ModelFiles::fallback());
+        };
+        let (model_dir, ratchet_dir, gate, kv_gb) = self.gate_files_args(model_id, commit);
+        let template_override = self.resolve_template_override(model_id);
+        let id = model_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            (
+                GateFiles::read(&model_dir, ratchet_dir.as_deref(), gate.as_ref(), kv_gb),
+                ModelFiles::read(&id, &model_dir, kind, template_override.as_deref()),
+            )
         })
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
-        let load_duration_secs = load_started.elapsed().as_secs_f64();
+        .unwrap_or_else(|_| (GateFiles::default(), ModelFiles::fallback()))
+    }
 
+    /// The same reads inline, for the synchronous stalled-load reaper (rare).
+    fn read_load_files_now(
+        &self,
+        model_id: &str,
+        kind: Option<ModelKind>,
+        commit: &LoadCommit,
+    ) -> (GateFiles, ModelFiles) {
+        let Some(kind) = kind else {
+            return (GateFiles::default(), ModelFiles::fallback());
+        };
+        let (model_dir, ratchet_dir, gate, kv_gb) = self.gate_files_args(model_id, commit);
+        let template_override = self.resolve_template_override(model_id);
+        (
+            GateFiles::read(&model_dir, ratchet_dir.as_deref(), gate.as_ref(), kv_gb),
+            ModelFiles::read(model_id, &model_dir, kind, template_override.as_deref()),
+        )
+    }
+
+    /// What [`GateFiles::read`] needs for `model_id`'s finished load, owned so it can move to a
+    /// blocking task: the model directory, its ratchet directory, the exact gate and the pool.
+    fn gate_files_args(
+        &self,
+        model_id: &str,
+        commit: &LoadCommit,
+    ) -> (
+        std::path::PathBuf,
+        Option<std::path::PathBuf>,
+        Option<ExactGate>,
+        f64,
+    ) {
+        (
+            self.config.models_dir.join(model_id),
+            self.ratchet_dir(model_id),
+            commit.gate.exact.clone(),
+            commit.kv_gb,
+        )
+    }
+
+    /// Commit a finished load (Ready) or clean up after a failed one. `measure` is `None` for a
+    /// late result from a stalled load: its measurement window is long gone, so nothing is
+    /// learned from it and the reservation stays as booked.
+    #[allow(clippy::too_many_lines)] // one linear commit sequence
+    fn finish_load(
+        &self,
+        model_id: &str,
+        result: Result<LoadOutput>,
+        commit: LoadCommit,
+        (files, model_files): (GateFiles, ModelFiles),
+        measure: Option<&LoadMeasure>,
+        started: Instant,
+    ) -> Result<()> {
+        let LoadCommit {
+            kv_gb,
+            max_num_seqs,
+            gate,
+            kv_plan,
+        } = commit;
+        let load_duration_secs = started.elapsed().as_secs_f64();
         match result {
             Ok((handle, thread)) => {
                 // Get kind first — gates template loading and L0 warn suppression.
                 let kind = handle.kind();
+                let limits = self.load_token_limits(model_id, &handle, kv_gb, &gate, &files);
                 let (max_prompt_tokens, pool_capacity_tokens) =
-                    self.load_token_limits(model_id, &handle, kv_gb);
+                    (limits.max_prompt_tokens, limits.pool_capacity_tokens);
 
-                // Chat template: only meaningful for text/vision generation.
-                // Media models (embedding, STT, TTS, image) don't ship
-                // tokenizer_config.json — suppress the load and the warn.
-                let template_override = self.resolve_template_override(model_id);
-                let template = if matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
-                    template::load_chat_template_with_override(
-                        &self.config.models_dir.join(model_id),
-                        template_override.as_deref(),
-                    )
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                model_id,
-                                error = %e,
-                                "no chat template found — using generic fallback (tool calling will be degraded)"
-                            );
-                            template::FALLBACK_TEMPLATE.to_owned()
-                        })
-                } else {
-                    template::FALLBACK_TEMPLATE.to_owned()
-                };
+                // Template, special tokens and sampling defaults were read on the blocking pool
+                // before this commit (`ModelFiles`).
+                let ModelFiles {
+                    template,
+                    special_tokens: (eos_token, bos_token),
+                    generation_defaults,
+                } = model_files;
                 let family = ModelFamily::detect(&template);
-                let (eos_token, bos_token) =
-                    template::load_special_tokens(&self.config.models_dir.join(model_id));
-                // Model-shipped sampling defaults: same TextGen/Vision-only gate
-                // as the chat template above — media/embedding models don't ship
-                // a meaningful generation_config.json for this purpose.
-                let generation_defaults = if matches!(kind, ModelKind::TextGen | ModelKind::Vision)
-                {
-                    template::load_generation_defaults(&self.config.models_dir.join(model_id))
-                } else {
-                    template::GenerationDefaults::default()
-                };
+                // The post-load device-memory reading (a /proc fdinfo scan) is taken before the
+                // models lock, not under it.
+                let gpu_after = measure.map(|m| {
+                    m.measure_pdev.as_deref().map_or_else(
+                        crate::gpu_memory::process_total_bytes,
+                        crate::gpu_memory::process_vram_bytes,
+                    )
+                });
+                let rss_load_delta = measure
+                    .and_then(|m| m.rss_before.filter(|_| m.gpu_window.is_clean()))
+                    .zip(os_memory::process_rss_anon_bytes())
+                    .map(|(before, after)| after.saturating_sub(before));
 
                 let mut guard = self.write_models("execute_load:commit");
                 let record = guard
@@ -6270,7 +9110,16 @@ impl ModelManager {
                     .ok_or_else(|| anyhow::anyhow!("model record disappeared during load"))?;
                 record.last_kind = Some(kind);
                 record.last_load_duration_secs = Some(load_duration_secs);
-                record.note_gpu_load(gpu_before, gpu_window);
+                record.cpu_resident = (rss_load_delta, 0);
+                if let Some(m) = measure {
+                    let window_quiet =
+                        m.leases_at_start == 0 && self.headroom.lease_bytes(&m.domain, None) == 0;
+                    record.note_gpu_load(
+                        m.gpu_before.filter(|_| window_quiet),
+                        gpu_after.flatten(),
+                        m.gpu_window,
+                    );
+                }
                 crate::gpu_memory::note_load_event();
                 record.handle = Some(handle);
                 record.thread = Some(thread);
@@ -6288,6 +9137,18 @@ impl ModelManager {
                 record.kv_cache_gb = kv_gb;
                 record.max_prompt_tokens = max_prompt_tokens;
                 record.pool_capacity_tokens = pool_capacity_tokens;
+                record.kv_gate_mode = limits.mode;
+                record.kv_gate_clamped_by = limits.clamped_by;
+                record.kv_ratchet_key = limits.ratchet_key;
+                record.kv_gate_detail = limits.detail;
+                if let Some(h) = limits.headroom.as_ref() {
+                    record.last_headroom_spec = Some(h.spec.clone());
+                }
+                record.headroom = limits.headroom;
+                record
+                    .uncounted_image_admissions
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                record.kv_resolution = gate.inputs.as_ref().map(KvResolutionInfo::from_inputs);
                 record.max_concurrent_streams = max_num_seqs;
                 record.state = ModelState::Ready;
                 record.last_used = Instant::now();
@@ -6301,6 +9162,22 @@ impl ModelManager {
                     load_duration_secs,
                     "model loaded"
                 );
+                // D-07: on the shared-memory domain a load that took clearly more than it was
+                // charged would let the next admission believe in room that is not there. Learn
+                // the real weight footprint (charged from the next admission on) and re-book the
+                // tracker now. Not from a late (stalled) result: nothing was measured.
+                let recharge = measure.is_some().then(|| {
+                    record.learn_from_load(
+                        kv_gb,
+                        self.budget_weight_gb(record),
+                        gate.exact.is_some(),
+                    )
+                });
+                drop(guard);
+                self.book_measured_load(model_id, kv_gb, recharge.flatten());
+                if let Some(plan) = kv_plan {
+                    self.note_kv_plan(model_id, plan);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -6308,7 +9185,9 @@ impl ModelManager {
                 crate::gpu_memory::note_release_event();
                 // L3: detect GPU context poisoning. Once set, gpu_poisoned blocks
                 // all future load attempts with a 503 until a process restart.
-                if is_gpu_poison_error(&e.to_string()) {
+                // `{e:#}` walks the whole context chain: a poison wrapped in a context message (the
+                // warm-up's) must still be recognised, `to_string` shows only the outer one.
+                if is_gpu_poison_error(&format!("{e:#}")) {
                     self.mark_gpu_poisoned_during_load(model_id, &e);
                 }
 
@@ -6318,14 +9197,200 @@ impl ModelManager {
                 if let Ok(mut v) = self.vram.write() {
                     v.free(model_id);
                 }
+                // MR-2: GenAI's own free-memory check is a capacity refusal (503), not a raw 500
+                // with a C++ path. Bare (no context) so the F1 wrapper can name evicted models.
+                let raw = format!("{e:#}");
+                if is_genai_memory_budget_error(&raw) {
+                    tracing::warn!(model_id, error = %raw, "GenAI refused the KV cache: device memory");
+                    return Err(genai_memory_budget_refusal(model_id).into());
+                }
                 Err(e)
             }
         }
     }
 
-    /// Error path for `load_model`: reset state to `NotLoaded` and release any
-    /// VRAM reservation that was made by `ensure_vram_for`. Idempotent — also
-    /// run by [`LoadCancelGuard`] when the load future is dropped mid-await.
+    /// Take a finished load's result and commit parameters out of `slot`, and detach the slot
+    /// from the record (no longer pending, no longer stalled). `None` when the result is not
+    /// there yet or another caller already took it.
+    fn take_finished_load(
+        &self,
+        model_id: &str,
+        slot: &Arc<LoadSlot>,
+    ) -> Option<(Result<LoadOutput>, LoadCommit)> {
+        let mut guard = self.write_models("take_finished_load");
+        let result = slot.take_result()?;
+        let commit = slot.take_commit()?;
+        if let Some(r) = guard.get_mut(model_id).filter(|r| {
+            r.pending_load
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, slot))
+        }) {
+            r.pending_load = None;
+            r.load_stalled = false;
+        }
+        Some((result, commit))
+    }
+
+    /// Book a pending load as stalled: its caller stopped waiting (`why`: "deadline" or "client
+    /// gone") while the engine construction runs on. Memory stays reserved (orphan memory is
+    /// real), and the device takes no new loads until the result arrives. `false` when no load
+    /// is pending for `model_id`.
+    fn mark_load_stalled(&self, model_id: &str, why: &str) -> bool {
+        let mut guard = self.write_models("mark_load_stalled");
+        let Some(r) = guard.get_mut(model_id) else {
+            return false;
+        };
+        let Some(slot) = r.pending_load.as_ref() else {
+            return false;
+        };
+        // A result that arrived between the caller's last poll and its drop is still booked as
+        // stalled: the reaper commits it on the next touch.
+        if r.load_stalled {
+            return true;
+        }
+        r.load_stalled = true;
+        let (device, running) = (r.device.clone(), slot.started.elapsed());
+        drop(guard);
+        // A load stalled only because its client went away is usually healthy: no recovery step
+        // until it passes its deadline (`rv status` shows it then).
+        let recovery = self
+            .load_overdue(model_id, running)
+            .then(|| self.stall_recovery(&device));
+        tracing::warn!(
+            model_id,
+            device = %device,
+            why,
+            running_secs = running.as_secs(),
+            recovery = recovery.as_deref().unwrap_or("none yet: the load is inside its deadline"),
+            "load has not returned — booked as stalled: memory stays reserved, no new loads \
+             on this device until it returns"
+        );
+        true
+    }
+
+    /// Whether a load of `model_id` running for `running` is past its deadline: its
+    /// `load_timeout_secs`, or the stop's [`crate::startup::LOAD_SETTLE_CAP`] when it has none.
+    fn load_overdue(&self, model_id: &str, running: Duration) -> bool {
+        running
+            >= self
+                .load_timeout(model_id)
+                .unwrap_or(crate::startup::LOAD_SETTLE_CAP)
+    }
+
+    /// The operator's way out of a load on `device` that may never return (D-04 S9): the GT
+    /// reset command on a discrete xe GPU whose PCI address is known; otherwise advice for that
+    /// kind of device. Reads sysfs, so never call it holding a lock.
+    #[must_use]
+    pub fn stall_recovery(&self, device: &str) -> String {
+        let info = self.inventory.get(device);
+        let pci = info.and_then(|d| d.pdev.clone());
+        let driver = pci.as_deref().and_then(crate::gpu_driver::kernel_driver);
+        crate::gpu_driver::stalled_load_recovery(
+            info.map(|d| d.kind),
+            pci.as_deref(),
+            driver.as_deref(),
+        )
+    }
+
+    /// Commit or discard every stalled load whose result has arrived (step 6b). Run at
+    /// `begin_load` and `shutdown`, and by the model-listing handlers (`/v1/models`,
+    /// `/v1/admin/models`): a late result shows up on the next touch. Cheap when nothing is
+    /// stalled (one read-lock scan). Takes the models and VRAM locks: never call it while
+    /// holding either (kept out of `list_models` for that reason).
+    pub fn reap_stalled_loads(&self) {
+        let ready: Vec<(String, Arc<LoadSlot>)> = self
+            .read_models("reap_stalled_loads")
+            .iter()
+            .filter(|(_, r)| r.load_stalled)
+            .filter_map(|(id, r)| r.pending_load.as_ref().map(|s| (id.clone(), Arc::clone(s))))
+            .filter(|(_, s)| s.is_finished())
+            .collect();
+        for (model_id, slot) in ready {
+            let Some((result, commit)) = self.take_finished_load(&model_id, &slot) else {
+                continue;
+            };
+            // How long the load really ran, not how long until this reap noticed it.
+            let secs = slot
+                .finished_at
+                .lock()
+                .ok()
+                .and_then(|at| *at)
+                .map_or_else(
+                    || slot.started.elapsed(),
+                    |at| at.duration_since(slot.started),
+                )
+                .as_secs();
+            // A late (stalled) result: rare, and this sweep is synchronous, so the context
+            // limit's few small file reads happen here rather than on the blocking pool.
+            let kind = result.as_ref().ok().map(|(h, _)| h.kind());
+            let files = self.read_load_files_now(&model_id, kind, &commit);
+            match self.finish_load(&model_id, result, commit, files, None, slot.started) {
+                Ok(()) => {
+                    if self.record_device(&model_id).starts_with("GPU") {
+                        crate::startup::note_gpu_load(crate::startup::GpuLoadMilestone::Done);
+                    }
+                    tracing::info!(
+                        model_id,
+                        secs,
+                        "stalled load returned after {secs} s — committed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model_id,
+                        secs,
+                        error = %e,
+                        "stalled load returned after {secs} s with an error — discarded, \
+                         reservation freed"
+                    );
+                    self.abort_load(&model_id);
+                }
+            }
+        }
+    }
+
+    /// Every stalled load still running, sorted by device then model (step 6e). A stalled load
+    /// whose result has arrived but is not reaped yet is not listed: its device is free again
+    /// on the next load. Read-only — never reaps (cheap enough for `/health`).
+    #[must_use]
+    pub fn stalled_loads(&self) -> Vec<StalledLoad> {
+        let mut out: Vec<StalledLoad> = self
+            .read_models("stalled_loads")
+            .iter()
+            .filter(|(_, r)| r.load_stalled)
+            .filter_map(|(id, r)| {
+                let slot = r.pending_load.as_ref().filter(|s| !s.is_finished())?;
+                Some(StalledLoad {
+                    device: r.device.clone(),
+                    model: id.clone(),
+                    secs: slot.started.elapsed().as_secs(),
+                    overdue: false,
+                })
+            })
+            .collect();
+        // Outside the models lock: the deadline lookup reads the config entries.
+        for s in &mut out {
+            s.overdue = self.load_overdue(&s.model, Duration::from_secs(s.secs));
+        }
+        out.sort_by(|a, b| (&a.device, &a.model).cmp(&(&b.device, &b.model)));
+        out
+    }
+
+    /// The stalled load blocking `device`, if any: (model id, seconds it has been running).
+    fn stalled_load_on(
+        models: &HashMap<String, ModelRecord>,
+        device: &str,
+    ) -> Option<(String, u64)> {
+        models
+            .iter()
+            .filter(|(_, r)| r.load_stalled && r.device == device)
+            .find_map(|(id, r)| {
+                r.pending_load
+                    .as_ref()
+                    .map(|s| (id.clone(), s.started.elapsed().as_secs()))
+            })
+    }
+
     /// Live system-RAM availability for the M1 admission gate, in GiB.
     ///
     /// `None` for any domain other than [`DOMAIN_SYSTEM`] (a discrete GPU's
@@ -6340,11 +9405,15 @@ impl ModelManager {
     /// (see [`os_memory::reclaimable_gpu_cache_gb`]) and then capped at the
     /// declared budget, so the server never plans against more system RAM than
     /// it was granted even if the machine happens to have more free.
+    ///
+    /// Either way the reading first loses what Ready `CPU` models are charged but do not hold
+    /// yet ([`cpu_outstanding_gb`](Self::cpu_outstanding_gb)): `MemAvailable` counts their
+    /// mapped weights as available until the first request copies them into anonymous memory.
     fn live_system_avail_gb(&self, domain: &str) -> Option<f64> {
         if domain != DOMAIN_SYSTEM {
             return None;
         }
-        let avail = os_memory::available_ram_gb()?;
+        let avail = os_memory::available_ram_gb()? - self.cpu_outstanding_gb();
         let Some(budget) = self.config.system_ram_budget_gb else {
             return Some(avail);
         };
@@ -6363,7 +9432,148 @@ impl ModelManager {
         Some((avail + credit).min(budget))
     }
 
+    /// CPU over-admission: GiB the Ready `CPU` models are charged for but were not measured to
+    /// hold, `Σ max(0, allocation − resident)`. A model that has not served a request yet holds
+    /// little more than its load delta (the CPU plugin copies the weights into anonymous memory
+    /// at the first request), so `MemAvailable` alone over-states the room by nearly its whole
+    /// charge (measured on qwen3-14b: 8.3 GiB). Ready only, so the model being loaded is never
+    /// counted. `0` where anonymous memory cannot be read.
+    ///
+    /// Known conservatism: KV growth after the measured request is in `MemAvailable` already
+    /// and is still subtracted here, up to each model's pool.
+    ///
+    /// Takes the models lock, then the vram lock, never nested; callers hold neither.
+    fn cpu_outstanding_gb(&self) -> f64 {
+        if !cpu_rss_measurable() {
+            return 0.0;
+        }
+        self.close_solo_window();
+        let residents = self.cpu_residents();
+        if residents.is_empty() {
+            return 0.0;
+        }
+        let Ok(vram) = self.vram.read() else {
+            return 0.0;
+        };
+        residents
+            .iter()
+            .map(|(id, resident)| (vram.allocated_gb(id) - resident).max(0.0))
+            .sum()
+    }
+
+    /// The Ready `CPU` models and the GiB each was measured to hold
+    /// ([`ModelRecord::cpu_resident_gb`]). Empty where that cannot be measured.
+    fn cpu_residents(&self) -> HashMap<String, f64> {
+        self.read_models("cpu_residents")
+            .iter()
+            .filter(|(_, r)| r.state == ModelState::Ready)
+            .filter_map(|(id, r)| r.cpu_resident_gb().map(|g| (id.clone(), g)))
+            .collect()
+    }
+
+    /// Whether any Ready model has a request running.
+    fn any_in_flight(&self) -> bool {
+        self.read_models("any_in_flight")
+            .values()
+            .any(|r| r.state == ModelState::Ready && r.has_in_flight())
+    }
+
+    /// CPU over-admission: count a handed-out request and, when it is for a `CPU` model and
+    /// nothing else is in flight, open a [`SoloWindow`] on it. Closes the previous window first.
+    /// The window lock is held across count and open so two handouts cannot share one window.
+    fn note_request_start(&self, model_id: &str) {
+        if !cpu_rss_measurable() {
+            return;
+        }
+        self.close_solo_window();
+        let Ok(mut slot) = self.solo_window.lock() else {
+            return;
+        };
+        let starts = self.request_starts.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.record_device(model_id) != "CPU" || self.any_in_flight() {
+            *slot = None;
+            return;
+        }
+        *slot = os_memory::process_rss_anon_bytes().map(|rss_before| SoloWindow {
+            model_id: model_id.to_owned(),
+            starts,
+            rss_before,
+            window: crate::gpu_memory::MeasureWindow::open(),
+        });
+    }
+
+    /// CPU over-admission: close the open [`SoloWindow`] once nothing is in flight. Its request's
+    /// change in anonymous memory raises the model's measured resident when the window stayed
+    /// solo and clean; a resident above what the model is charged teaches the charge (D-07
+    /// dead band, upward only, logged by [`book_measured_load`](Self::book_measured_load)).
+    ///
+    /// Locks: the window, then (released) models, then vram, never nested.
+    fn close_solo_window(&self) {
+        let Ok(mut slot) = self.solo_window.lock() else {
+            return;
+        };
+        if slot.is_none() || self.any_in_flight() {
+            return;
+        }
+        let Some(w) = slot.take() else {
+            return;
+        };
+        let Some(delta) = solo_request_delta(
+            &w,
+            self.request_starts.load(Ordering::Relaxed),
+            w.window.is_clean(),
+            os_memory::process_rss_anon_bytes(),
+        ) else {
+            return;
+        };
+        drop(slot);
+        self.record_solo_request(&w.model_id, delta);
+    }
+
+    /// CPU over-admission: a solo request on `model_id` changed anonymous memory by `delta`
+    /// bytes. Raises the model's measured resident when larger, and teaches its weight charge
+    /// when the resident is clearly above it ([`cpu_learned_weight_gb`]).
+    fn record_solo_request(&self, model_id: &str, delta: u64) {
+        let recharge = {
+            let mut guard = self.write_models("close_solo_window");
+            let Some(r) = guard
+                .get_mut(model_id)
+                .filter(|r| r.state == ModelState::Ready && r.device == "CPU")
+            else {
+                return;
+            };
+            if delta <= r.cpu_resident.1 {
+                return;
+            }
+            r.cpu_resident.1 = delta;
+            let kv_gb = r.kv_cache_gb.max(0.0);
+            let charged = self.budget_weight_gb(r);
+            let resident = r.cpu_resident_gb().unwrap_or(0.0);
+            tracing::debug!(
+                model_id,
+                resident_gb = resident,
+                charged_gb = charged + kv_gb,
+                "CPU model resident memory measured across a solo request"
+            );
+            cpu_learned_weight_gb(resident, charged).map(|weight| {
+                r.learned_weight_gb = Some(weight);
+                (kv_gb, (r.domain.clone(), weight, resident))
+            })
+        };
+        if let Some((kv_gb, recharge)) = recharge {
+            self.book_measured_load(model_id, kv_gb, Some(recharge));
+        }
+    }
+
+    /// Error path for `load_model`: reset state to `NotLoaded` and release any
+    /// VRAM reservation that was made by `ensure_vram_for`. Idempotent — also
+    /// run by [`LoadCancelGuard`] when the load future is dropped mid-await.
     fn abort_load(&self, model_id: &str) {
+        // A load still in its engine construction is not aborted: its memory is real until it
+        // returns. Book it as stalled instead (the (c) bug: freeing the reservation mid-call).
+        if self.mark_load_stalled(model_id, "client gone") {
+            return;
+        }
         if let Ok(mut guard) = self.models.write()
             && let Some(r) = guard
                 .get_mut(model_id)
@@ -6406,8 +9616,84 @@ impl ModelManager {
     ///
     /// # Errors
     /// [`ModelError::NotFound`] if `model_id` is not a registered model.
-    #[allow(clippy::too_many_lines)] // one linear dry-run mirroring `ensure_vram_for`
     pub fn check_admission_with(&self, model_id: &str, force: bool) -> Result<AdmissionCheck> {
+        // F1/A2: preview the device-headroom gate as the load will apply it. The loading model's
+        // own part needs its headroom facts, known from its last load here; the exact pool sizing
+        // facts are not, so the others' floors are checked with the whole-GiB pool estimate.
+        let (domain, weight_gb, needs_kv_pool, last_spec, is_vision, device) = {
+            let guard = self.read_models("check_admission:headroom");
+            let record = guard
+                .get(model_id)
+                .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
+            (
+                record.domain.clone(),
+                self.budget_weight_gb(record),
+                record.needs_kv_pool(),
+                record.last_headroom_spec.clone(),
+                record.configured_kind == ModelKind::Vision,
+                record.device.clone(),
+            )
+        };
+        // Probe readings after the models lock is released: the first one scans /proc.
+        let gate_expected = is_vision && self.headroom_gate_expected(&device);
+        let round_whole_gib = !device.starts_with("NPU");
+        let others = self.vision_headrooms_on(&domain, model_id);
+        let spec = last_spec.filter(|_| needs_kv_pool && gate_expected);
+        let outsides = self.headroom_outsides(&domain, spec.as_ref(), &others);
+        // Facts whose device can no longer be read are not applied (the load would not either).
+        let spec = spec.filter(|h| outsides.contains_key(&h.pdev));
+        let preview = HeadroomPreview {
+            spec: spec.as_ref(),
+            others: &others,
+            outsides: &outsides,
+            weight_gb,
+            kv_target_gb: self.resolved_kv_target_gb(model_id),
+            needs_kv_pool,
+            round_whole_gib,
+            exact: None,
+        };
+        let mut check = self.check_admission_inner(model_id, force, Some(&preview))?;
+        if gate_expected && spec.is_none() && !check.already_loaded {
+            check.headroom_not_previewed = Some(
+                "this model has not been loaded on this server yet, so its own device-headroom \
+                 need is unknown and the load may need more room than shown"
+                    .to_owned(),
+            );
+        }
+        Ok(check)
+    }
+
+    /// F1/A2: would a vision load on `device` be subject to its own device-headroom gate — a
+    /// discrete GPU whose memory the probe reads, with `kv_headroom_mode` "dynamic"? The same
+    /// conditions as `headroom_spec_for`, without the model's sizing facts. Reads the probe: call
+    /// it with no lock held.
+    fn headroom_gate_expected(&self, device: &str) -> bool {
+        self.config.kv_headroom_mode == "dynamic"
+            && device.starts_with("GPU")
+            && self
+                .inventory
+                .devices()
+                .iter()
+                .find(|d| d.name == device)
+                .is_some_and(|d| {
+                    d.kind == crate::device_inventory::DeviceKind::DiscreteGpu
+                        && d.pdev
+                            .as_deref()
+                            .is_some_and(|p| self.headroom.outside_bytes(p).is_some())
+                })
+    }
+
+    /// [`Self::check_admission_with`] with a real load's device-headroom gate folded in (F1):
+    /// `headroom` makes the plan include the victims that gate needs, so a load never evicts its
+    /// planned victims and then fails on headroom. When that gate is what keeps the model from
+    /// fitting even after every eviction, its text is in `headroom_refusal`.
+    #[allow(clippy::too_many_lines)] // one linear dry-run mirroring `ensure_vram_for`
+    fn check_admission_inner(
+        &self,
+        model_id: &str,
+        force: bool,
+        headroom: Option<&HeadroomPreview<'_>>,
+    ) -> Result<AdmissionCheck> {
         // Model weight + already-resident check + its domain, under the models
         // lock only. Phase C1: the dry-run mirrors `ensure_vram_for` — it must
         // answer against the *target model's* domain, not the primary one.
@@ -6448,21 +9734,18 @@ impl ModelManager {
                     .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
                 (vram.free_gb(&domain), !vram.fits(&domain, f64::INFINITY))
             };
-            return Ok(AdmissionCheck {
-                fits: true,
+            return Ok(AdmissionCheck::fits_now(
                 needed_gb,
                 free_gb,
                 vram_gated,
-                would_evict: Vec::new(),
-                busy_victims: Vec::new(),
-                blocked_by_busy: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
-                already_loaded: true,
-            });
+                true,
+            ));
         }
 
         let candidates = self.eviction_candidates(model_id, &domain, force);
+        let cpu_residents = self.cpu_residents();
 
         let vram = self
             .vram
@@ -6474,39 +9757,59 @@ impl ModelManager {
         // VRAM leg at all, only the live RAM gate.
         let vram_gated = !vram.fits(&domain, f64::INFINITY);
         let plan_free_gb = if vram_gated { free_gb } else { f64::INFINITY };
+        // F1: the device-headroom gate on what `victims` (freeing `vram_back` GiB) would leave. The
+        // pool is sized against `plan_free_gb` (unbounded on an ungated domain), as the load does.
+        let booked_now_gb = vram.domain_gb(&domain).1;
+        let headroom_gate = |victims: &[String], vram_back: f64| {
+            headroom.filter(|p| p.applies()).map_or(Ok(()), |p| {
+                self.headroom_preview_admits(
+                    p,
+                    &domain,
+                    booked_now_gb,
+                    plan_free_gb,
+                    victims,
+                    vram_back,
+                )
+            })
+        };
 
         // Fits as-is (covers gating-disabled / unknown domains, where fits() is
         // always true) → no eviction needed.
-        if vram.fits(&domain, needed_gb) && ram_admits(0.0) {
-            return Ok(AdmissionCheck {
-                fits: true,
+        if vram.fits(&domain, needed_gb) && ram_admits(0.0) && headroom_gate(&[], 0.0).is_ok() {
+            return Ok(AdmissionCheck::fits_now(
                 needed_gb,
                 free_gb,
                 vram_gated,
-                would_evict: Vec::new(),
-                busy_victims: Vec::new(),
-                blocked_by_busy: Vec::new(),
                 ram_needed_gb,
                 ram_avail_gb,
-                already_loaded: false,
-            });
+                false,
+            ));
         }
 
         // Greedily evict candidates in order until BOTH gates are satisfied (or
         // we run out) — see [`plan_evictions`] for what each eviction is credited.
-        let alloc: HashMap<&str, f64> = candidates
-            .iter()
-            .map(|(id, _, _)| (id.as_str(), vram.allocated_gb(id)))
-            .collect();
-        let plan: Vec<EvictionCandidate> = candidates
-            .iter()
-            .map(|(id, weight_gb, _)| EvictionCandidate {
-                id: id.clone(),
-                allocated_gb: alloc.get(id.as_str()).copied().unwrap_or(0.0),
-                weight_gb: *weight_gb,
-            })
-            .collect();
-        let (would_evict, fits) = plan_evictions(&plan, plan_free_gb, needed_gb, ram_admits);
+        let plan = eviction_plan_candidates(&vram, &candidates, &cpu_residents);
+        // Release the tracker before anything below takes it again (`busy_excluded` reads it):
+        // a second read while this one is held deadlocks against a queued writer (0.9.0 review
+        // A). Everything still needed from it is copied out above.
+        drop(vram);
+        let (would_evict, fits) =
+            plan_evictions_gated(&plan, plan_free_gb, needed_gb, ram_admits, |v, back| {
+                headroom_gate(v, back).is_ok()
+            });
+        // Not fitting even after every eviction: is the headroom gate the one that refuses?
+        let headroom_refusal = if fits {
+            None
+        } else {
+            sweep_headroom_refusal(
+                &plan,
+                &would_evict,
+                plan_free_gb,
+                needed_gb,
+                ram_admits,
+                headroom_gate,
+            )
+        };
         let busy_victims: Vec<String> = candidates
             .iter()
             .filter(|(id, _, busy)| *busy && would_evict.contains(id))
@@ -6536,6 +9839,8 @@ impl ModelManager {
             ram_needed_gb,
             ram_avail_gb,
             already_loaded: false,
+            headroom_refusal,
+            headroom_not_previewed: None,
         })
     }
 
@@ -6575,7 +9880,10 @@ impl ModelManager {
     /// the full allocation (weights + KV pool) so the VRAM tracker accurately
     /// reflects true GPU usage and prevents concurrent loads from both believing
     /// they fit.
-    #[allow(clippy::too_many_lines)] // cohesive check/reserve/evict loop + M1 RAM gate
+    ///
+    /// A refusal returned after this load already evicted models names them (F1): they stay
+    /// unloaded, and an operator must not read the error as "nothing happened". On success the
+    /// evicted ids come back too, for a refusal from the engine construction that follows (MR-2).
     async fn ensure_vram_for(
         &self,
         model_id: &str,
@@ -6583,7 +9891,40 @@ impl ModelManager {
         kv_target_gb: f64,
         needs_kv_pool: bool,
         force: bool,
-    ) -> Result<f64> {
+        exact: Option<&ExactPoolSpec>,
+    ) -> Result<(KvPoolPlan, Vec<String>)> {
+        let mut evicted = Vec::new();
+        match self
+            .ensure_vram_loop(
+                model_id,
+                weight_gb,
+                kv_target_gb,
+                needs_kv_pool,
+                force,
+                exact,
+                &mut evicted,
+            )
+            .await
+        {
+            Ok(plan) => Ok((plan, evicted)),
+            Err(e) => Err(annotate_refusal_after_eviction(model_id, &evicted, e)),
+        }
+    }
+
+    /// The check/reserve/evict loop of [`Self::ensure_vram_for`]; `evicted` collects every model
+    /// this load evicted, for the caller's error.
+    #[allow(clippy::too_many_lines)] // cohesive check/reserve/evict loop + M1 RAM gate
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_vram_loop(
+        &self,
+        model_id: &str,
+        weight_gb: f64,
+        kv_target_gb: f64,
+        needs_kv_pool: bool,
+        force: bool,
+        exact: Option<&ExactPoolSpec>,
+        evicted: &mut Vec<String>,
+    ) -> Result<KvPoolPlan> {
         // STT / embedding / image / TTS models have no KV cache; charge them
         // weight only. LLM/VLM (or unknown kind) get the min_kv floor so the
         // error message is honest about what they require.
@@ -6599,6 +9940,11 @@ impl ModelManager {
         // not always the primary inference domain. Pre-C1 every model resolved to
         // `inference_domain`, so a single-device box is unchanged.
         let domain = self.record_domain(model_id);
+        // The CB and VLM engines allocate whole GiB; the NPU VLM path has no scheduler pool.
+        let round_whole_gib = !self
+            .read_models("ensure_vram_for:device")
+            .get(model_id)
+            .is_some_and(|r| r.device.starts_with("NPU"));
 
         // M1: live system-RAM admission floor (shared UMA "system" domain only).
         // The logical VRAM tracker cannot see real RSS, `OpenVINO` runtime/compile
@@ -6625,6 +9971,28 @@ impl ModelManager {
             0.0
         };
         let live_need = weight_gb + kv_need + margin;
+
+        // A pool that can never hold the linear-attention reservation plus one block is refused
+        // before anything is evicted: no amount of freed memory raises a configured budget.
+        if let (true, Some(spec)) = (needs_kv_pool, exact)
+            && (kv_target_gb > 0.0 || self.config.cache_size_gb > 0.0)
+        {
+            let ceiling =
+                Self::compute_kv_pool_gb(f64::INFINITY, kv_target_gb, &self.config, false).gb;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if ceiling.is_finite()
+                && ceiling > 0.0
+                && let Err(e) = spec.profile.plan_pool(
+                    (ceiling * GIB_F64) as u64,
+                    spec.precision,
+                    spec.prefix_caching,
+                    spec.la_rule,
+                    None,
+                )
+            {
+                return Err(capacity_refusal(model_id, &e).into());
+            }
+        }
 
         // Upfront feasibility check — before evicting anything, verify this
         // load could ever fit even after freeing every evictable resident in
@@ -6654,6 +10022,7 @@ impl ModelManager {
             let max_capacity = free_gb + reclaimable_gb;
 
             let live_avail = self.live_system_avail_gb(&domain);
+            let ram_ceiling = self.ram_ceiling_gb(&domain);
 
             // Models excluded from eviction only because they have requests running (D3): if
             // evicting them too would make this load feasible, the refusal is "busy, retry or
@@ -6665,7 +10034,11 @@ impl ModelManager {
                 (gating_disabled || free_gb + reclaimable_gb + busy_alloc >= total_minimum)
                     && live_avail.is_none_or(|a| {
                         os_memory::ram_floor_admits(
-                            a + reclaimable_weights_gb + busy_weights,
+                            os_memory::credited_avail_gb(
+                                a,
+                                reclaimable_weights_gb + busy_weights,
+                                ram_ceiling,
+                            ),
                             live_need,
                             ram_floor,
                         )
@@ -6673,7 +10046,11 @@ impl ModelManager {
             };
             let infeasible_now = !gating_disabled && max_capacity < total_minimum
                 || live_avail.is_some_and(|a| {
-                    !os_memory::ram_floor_admits(a + reclaimable_weights_gb, live_need, ram_floor)
+                    !os_memory::ram_floor_admits(
+                        os_memory::credited_avail_gb(a, reclaimable_weights_gb, ram_ceiling),
+                        live_need,
+                        ram_floor,
+                    )
                 });
             if infeasible_now && busy_rescues {
                 return Err(Self::refuse_load_busy(
@@ -6683,7 +10060,8 @@ impl ModelManager {
             }
 
             if let Some(avail) = live_avail {
-                let max_avail = avail + reclaimable_weights_gb;
+                let max_avail =
+                    os_memory::credited_avail_gb(avail, reclaimable_weights_gb, ram_ceiling);
                 if !os_memory::ram_floor_admits(max_avail, live_need, ram_floor) {
                     return Err(ModelError::InsufficientMemory(format!(
                         "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
@@ -6697,6 +10075,16 @@ impl ModelManager {
             }
 
             if !gating_disabled && max_capacity < total_minimum {
+                let grace = self.grace_only_protected(model_id, &domain, force);
+                if !grace.0.is_empty() && max_capacity + grace.1 >= total_minimum {
+                    return Err(Self::grace_window_refusal(
+                        model_id,
+                        total_minimum,
+                        max_capacity,
+                        &grace,
+                    )
+                    .into());
+                }
                 let tail = if reclaimable_gb <= 0.0 {
                     self.eviction_blocked_tail(model_id, &domain, force)
                 } else {
@@ -6716,7 +10104,16 @@ impl ModelManager {
         // D3 bookkeeping: what the dry-run said it would evict (computed lazily,
         // just before the first eviction) vs what this load actually evicts.
         let mut predicted: Option<Vec<String>> = None;
-        let mut evicted: Vec<String> = Vec::new();
+        // Why the last attempt failed on the device-headroom rule, if it did: not a capacity miss
+        // that evicting could fix by itself, but evicting other models frees booked memory too, so
+        // the loop treats it like one and reports it if nothing more can be evicted.
+        let mut headroom_refusal: Option<String> = None;
+        // F1 step B / D-02: the driver releases an unloaded engine's last memory seconds late,
+        // which the headroom gate reads as this process's unbooked memory. At most two bounded
+        // waits for it: before the eviction plan is made (so stale figures do not plan extra
+        // victims), and before giving up on a headroom refusal.
+        let mut settled_before_plan = false;
+        let mut resettled = false;
 
         loop {
             // Live system-RAM check: `None` unless this is the gated system domain
@@ -6728,6 +10125,10 @@ impl ModelManager {
 
             // One write-lock acquisition per iteration: check, compute, and
             // allocate atomically — no TOCTOU window for a concurrent load.
+            let others = self.vision_headrooms_on(&domain, model_id);
+            // Probe readings are taken before the tracker lock: the first one scans /proc.
+            let outsides =
+                self.headroom_outsides(&domain, exact.and_then(|e| e.headroom.as_ref()), &others);
             let kv_result = {
                 let mut vram = self
                     .vram
@@ -6735,46 +10136,134 @@ impl ModelManager {
                     .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
 
                 if ram_ok && vram.fits(&domain, total_minimum) {
-                    if needs_kv_pool {
-                        // Temporarily allocate just the weight to measure remaining VRAM.
-                        vram.allocate(&domain, model_id, weight_gb);
-                        // T5.4 seam: the KV-size policy lives in `compute_kv_pool_gb`
-                        // — the single place a future bounded/co-residency policy
-                        // changes, without touching this reserve/evict loop.
-                        // A domain with its gate off reports 0.0 free, which would pin every
-                        // KV pool at the floor: use what the OS has live instead (what is left
-                        // after these weights, minus the OS reservation).
-                        let free_after_weights = if vram.fits(&domain, f64::INFINITY) {
-                            live_avail
-                                .map_or(f64::INFINITY, |a| (a - weight_gb - ram_floor).max(0.0))
+                    'sizing: {
+                        if needs_kv_pool {
+                            // Temporarily allocate just the weight to measure remaining VRAM.
+                            vram.allocate(&domain, model_id, weight_gb);
+                            // T5.4 seam: the KV-size policy lives in `compute_kv_pool_gb`
+                            // — the single place a future bounded/co-residency policy
+                            // changes, without touching this reserve/evict loop.
+                            // A domain with its gate off reports 0.0 free, which would pin every
+                            // KV pool at the floor: use what the OS has live instead (what is left
+                            // after these weights, minus the OS reservation).
+                            let free_after_weights = if vram.fits(&domain, f64::INFINITY) {
+                                live_avail
+                                    .map_or(f64::INFINITY, |a| (a - weight_gb - ram_floor).max(0.0))
+                            } else {
+                                vram.free_gb(&domain)
+                            };
+                            // Device headroom (vision model on a discrete GPU): the pool may not be so
+                            // big that this model's own limit falls below the floor, and (checked
+                            // below) neither may any other resident vision model's.
+                            let weights_booked = vram.domain_gb(&domain).1;
+                            let max_pool_gb = match self.headroom_pool_ceiling(
+                                exact.and_then(|e| e.headroom.as_ref()),
+                                &domain,
+                                weights_booked,
+                                &outsides,
+                            ) {
+                                Ok(m) => m,
+                                Err(msg) => {
+                                    vram.free(model_id);
+                                    headroom_refusal = Some(msg);
+                                    break 'sizing None;
+                                }
+                            };
+                            let plan = match Self::compute_kv_pool(
+                                free_after_weights,
+                                kv_target_gb,
+                                &self.config,
+                                round_whole_gib,
+                                exact,
+                                max_pool_gb,
+                            ) {
+                                Ok(plan) => plan,
+                                Err(e) => {
+                                    // Give the weight reservation back: this load is refused.
+                                    vram.free(model_id);
+                                    return Err(capacity_refusal(model_id, &e).into());
+                                }
+                            };
+                            if let Err(msg) = self.headroom_check_others(
+                                &domain,
+                                weights_booked + plan.gb,
+                                &others,
+                                &outsides,
+                            ) {
+                                vram.free(model_id);
+                                headroom_refusal = Some(msg);
+                                break 'sizing None;
+                            }
+                            // Expand the reservation to cover the full allocation.
+                            vram.allocate(&domain, model_id, weight_gb + plan.gb);
+                            Some(plan)
                         } else {
-                            vram.free_gb(&domain)
-                        };
-                        let kv_final = Self::compute_kv_pool_gb(
-                            free_after_weights,
-                            kv_target_gb,
-                            &self.config,
-                        );
-                        // Expand the reservation to cover the full allocation.
-                        vram.allocate(&domain, model_id, weight_gb + kv_final);
-                        Some(kv_final)
-                    } else {
-                        // No KV pool — STT / embedding / image / TTS reserve weight only.
-                        vram.allocate(&domain, model_id, weight_gb);
-                        Some(0.0)
+                            // No KV pool — STT / embedding / image / TTS reserve weight only. They
+                            // still take device memory a resident vision model's limit counts.
+                            vram.allocate(&domain, model_id, weight_gb);
+                            if let Err(msg) = self.headroom_check_others(
+                                &domain,
+                                vram.domain_gb(&domain).1,
+                                &others,
+                                &outsides,
+                            ) {
+                                vram.free(model_id);
+                                headroom_refusal = Some(msg);
+                                break 'sizing None;
+                            }
+                            Some(KvPoolPlan {
+                                gb: 0.0,
+                                requested_gb: None,
+                                clamped_by: None,
+                                rounded_from_gb: None,
+                                blocks: None,
+                                bytes_allocated: None,
+                            })
+                        }
                     }
                 } else {
                     None
                 }
             };
 
-            if let Some(kv_gb) = kv_result {
+            if let Some(plan) = kv_result {
+                let kv_gb = plan.gb;
                 tracing::debug!(
                     model_id,
                     weight_gb,
                     kv_gb,
                     "VRAM reservation: weight + KV pool"
                 );
+                if let Some(from) = plan.rounded_from_gb {
+                    let added_pct = (kv_gb - from) / from * 100.0;
+                    if kv_gb < from {
+                        tracing::warn!(
+                            model_id,
+                            from_gib = from,
+                            to_gib = kv_gb,
+                            "KV pool rounded down to whole GiB: the rounded-up pool would not fit the free memory"
+                        );
+                    } else if added_pct > 10.0 {
+                        tracing::warn!(
+                            model_id,
+                            from_gib = from,
+                            to_gib = kv_gb,
+                            added_pct,
+                            "KV pool rounded up to whole GiB (the engine allocates whole GiB)"
+                        );
+                    }
+                }
+                if let (Some(asked), Some(by)) = (plan.requested_gb, plan.clamped_by)
+                    && by != KvClamp::WholeGibFallback
+                {
+                    tracing::warn!(
+                        model_id,
+                        requested_gib = asked,
+                        pool_gib = kv_gb,
+                        clamped_by = by.label(),
+                        "KV pool differs from the requested size"
+                    );
+                }
                 if let Some(predicted) = predicted.as_ref()
                     && evicted.iter().any(|e| !predicted.contains(e))
                 {
@@ -6785,7 +10274,7 @@ impl ModelManager {
                         "load evicted a model the dry-run had not predicted"
                     );
                 }
-                return Ok(kv_gb);
+                return Ok(plan);
             }
 
             // Not enough VRAM — pick a victim (T5.4 seam: `select_eviction_victim`)
@@ -6795,6 +10284,22 @@ impl ModelManager {
 
             match lru_id {
                 None => {
+                    if headroom_refusal.is_some()
+                        && !resettled
+                        && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
+                    {
+                        resettled = true;
+                        self.await_vram_release(&domain, &outsides).await;
+                        continue;
+                    }
+                    // The device-headroom rule is what refused this load and nothing is left to
+                    // evict: say so, with the numbers.
+                    if let Some(msg) = headroom_refusal.take() {
+                        return Err(ModelError::InsufficientMemory(format!(
+                            "cannot load {model_id}: {msg}"
+                        ))
+                        .into());
+                    }
                     // Busy models (D3) are not victims: if evicting them would have made this
                     // load fit, say so — a retryable "busy", not a capacity verdict. Only
                     // reachable with the busy rule on.
@@ -6856,12 +10361,43 @@ impl ModelManager {
                         constraint = if ram_ok { "vram" } else { "system_ram" },
                         "LRU eviction to make room"
                     );
+                    if predicted.is_none()
+                        && !settled_before_plan
+                        && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
+                    {
+                        // D-02: an engine unloaded moments ago is still partly held by the driver;
+                        // plan on settled figures, not on memory about to come back.
+                        settled_before_plan = true;
+                        self.await_vram_release(&domain, &outsides).await;
+                        continue;
+                    }
                     if predicted.is_none() {
                         // Preview once, before the first eviction, and then execute exactly
                         // that plan. A preview that says even full eviction cannot make room
                         // refuses now, with nothing evicted, instead of destroying idle
                         // models and failing anyway (D3, over-eviction).
-                        let check = self.check_admission_with(model_id, force).ok();
+                        // F1: the preview applies this load's device-headroom gate as well, so
+                        // its plan names every victim that gate needs (or refuses up front).
+                        let preview = HeadroomPreview {
+                            spec: exact.and_then(|e| e.headroom.as_ref()),
+                            others: &others,
+                            outsides: &outsides,
+                            weight_gb,
+                            kv_target_gb,
+                            needs_kv_pool,
+                            round_whole_gib,
+                            exact,
+                        };
+                        let check = self
+                            .check_admission_inner(model_id, force, Some(&preview))
+                            .ok();
+                        if let Some(msg) = check.as_ref().and_then(|c| c.headroom_refusal.clone()) {
+                            return Err(ModelError::InsufficientMemory(format!(
+                                "cannot load {model_id}: {msg}; evicting every evictable model \
+                                 would not make room — nothing was evicted"
+                            ))
+                            .into());
+                        }
                         if let Some(c) = check.as_ref().filter(|c| !c.fits) {
                             // The live system-RAM gate can be the binding one while the
                             // logical tracker has room (a CPU-only box has a zero tracker
@@ -6901,19 +10437,40 @@ impl ModelManager {
                         predicted = Some(check.map(|c| c.would_evict).unwrap_or_default());
                     }
                     if let Some(plan) = predicted.as_ref()
-                        && !plan_permits(plan, &evicted, &id)
+                        && !plan_permits(plan, evicted, &id)
                     {
+                        if headroom_refusal.is_some()
+                            && !resettled
+                            && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
+                        {
+                            resettled = true;
+                            self.await_vram_release(&domain, &outsides).await;
+                            continue;
+                        }
+                        let reason = headroom_refusal.take().unwrap_or_else(|| {
+                            let free = self.vram.read().map_or(0.0, |v| v.free_gb(&domain));
+                            format!("tracked VRAM: need {total_minimum:.1} GB, {free:.1} GB free")
+                        });
                         return Err(ModelError::InsufficientMemory(format!(
-                            "loading {model_id} would have to evict {id}, which the preview did \
-                             not plan to ({}) — refusing to evict outside the plan; retry",
+                            "loading {model_id} would have to evict {id}, which is not in its \
+                             eviction plan ({}), so it is not evicted; still refused by: {reason}",
                             plan.join(", ")
                         ))
                         .into());
                     }
-                    let victim_gb = self
+                    // What the release wait expects back: the victim's RAM credit, read before
+                    // the eviction frees its tracker allocation ([`ram_credit_gb`]).
+                    let (victim_weight, victim_resident) = self
                         .read_models("ensure_vram:victim_weight")
                         .get(&id)
-                        .map_or(0.0, |r| self.budget_weight_gb(r));
+                        .map_or((0.0, None), |r| {
+                            (self.budget_weight_gb(r), r.cpu_resident_gb())
+                        });
+                    let victim_gb = ram_credit_gb(
+                        victim_weight,
+                        self.vram.read().map_or(0.0, |v| v.allocated_gb(&id)),
+                        victim_resident,
+                    );
                     // The victim was idle when picked; if it turned busy since, the load is
                     // refused (retryable) rather than aborting that request (D3).
                     match self.evict_model_for_load(&id, force).await {
@@ -6933,6 +10490,30 @@ impl ModelManager {
                             &domain, live_avail, victim_gb, live_need, ram_floor,
                         )
                         .await;
+                        // Stop rule (S281 defect f): re-run the capped "can it ever fit" check
+                        // on what the system really holds now plus the models still evictable.
+                        // When evictions return less than their weights were credited, this
+                        // refuses before the next victim instead of evicting every resident.
+                        if let Some(avail) = self.live_system_avail_gb(&domain) {
+                            let (_, rest_weights_gb) =
+                                self.max_reclaimable(model_id, &domain, force);
+                            let best = os_memory::credited_avail_gb(
+                                avail,
+                                rest_weights_gb,
+                                self.ram_ceiling_gb(&domain),
+                            );
+                            if !os_memory::ram_floor_admits(best, live_need, ram_floor) {
+                                return Err(ModelError::InsufficientMemory(format!(
+                                    "insufficient system memory: loading {model_id} needs \
+                                     ~{live_need:.1} GB; after evicting {} the system has \
+                                     ~{avail:.1} GB available and evicting the rest could reach \
+                                     at most ~{best:.1} GB, with {ram_floor:.1} GB kept free for \
+                                     the OS — stopping, no further models evicted",
+                                    evicted.join(", "),
+                                ))
+                                .into());
+                            }
+                        }
                     }
                 }
             }
@@ -6973,6 +10554,51 @@ impl ModelManager {
                 waited_ms = RAM_RELEASE_WAIT.as_millis(),
                 "evicted model's memory was not returned in time - continuing"
             );
+        }
+    }
+
+    /// F1 step B / D-02: this process's unbooked device memory above
+    /// [`VRAM_RELEASE_SLACK_BYTES`] (GiB, the worst of the `watched` devices) — memory the driver
+    /// still reports for engines the tracker already released. `None` when nothing is watched or
+    /// the driver does not report this process's memory.
+    #[allow(clippy::cast_precision_loss)] // device byte counts are far below 2^52
+    fn unbooked_excess_gib(&self, domain: &str, watched: &HashMap<String, u64>) -> Option<f64> {
+        let mut worst: Option<f64> = None;
+        for pdev in watched.keys() {
+            self.headroom.own_bytes_fresh(pdev)?;
+            let over = self
+                .unbooked_own_bytes(domain, pdev)
+                .saturating_sub(VRAM_RELEASE_SLACK_BYTES);
+            worst = Some(worst.unwrap_or(0.0).max(over as f64 / GIB_F64));
+        }
+        worst
+    }
+
+    /// F1 step B / D-02: wait (bounded) until the driver has released what unloaded engines still
+    /// hold — [`Self::unbooked_excess_gib`] down to 0 on the `watched` devices. The tracker drops a
+    /// booking at once, but the driver's per-process figure keeps part of an unloaded engine for
+    /// seconds (see [`VRAM_RELEASE_WAIT`]); read as unbooked memory, that makes the headroom gate
+    /// refuse a load that fits, or plan evictions it does not need. Returns at once when nothing
+    /// is pending or readable; gives up after [`VRAM_RELEASE_WAIT`] and carries on.
+    async fn await_vram_release(&self, domain: &str, watched: &HashMap<String, u64>) {
+        let outcome = poll_until_released(
+            || self.unbooked_excess_gib(domain, watched),
+            |over| over <= 0.0,
+            VRAM_RELEASE_WAIT,
+            RAM_RELEASE_POLL,
+        )
+        .await;
+        match outcome {
+            ReleaseOutcome::TimedOut(over) => tracing::warn!(
+                domain,
+                excess_gib = over,
+                waited_ms = VRAM_RELEASE_WAIT.as_millis(),
+                "unloaded models' device memory was not released in time - continuing"
+            ),
+            ReleaseOutcome::Released => {
+                tracing::debug!(domain, "unloaded models' device memory released");
+            }
+            ReleaseOutcome::Unavailable => {}
         }
     }
 
@@ -7024,7 +10650,7 @@ impl ModelManager {
     /// to bring it back, which is exactly what "a growing resize leaves the model unloaded" was.
     /// Read-only: nothing is evicted, no cooldown claimed, no flag set.
     fn resize_preflight(&self, model_id: &str, kv_cache_gb: f64, force: bool) -> Result<()> {
-        let (weight_gb, domain, needs_kv_pool, active) = {
+        let (weight_gb, domain, needs_kv_pool, active, resident) = {
             let guard = self.read_models("resize_preflight");
             let record = guard
                 .get(model_id)
@@ -7038,6 +10664,7 @@ impl ModelManager {
                 record.domain.clone(),
                 record.needs_kv_pool(),
                 active,
+                record.cpu_resident_gb(),
             )
         };
         if active > 0 && self.busy_protects(force) {
@@ -7057,14 +10684,16 @@ impl ModelManager {
             0.0
         };
         let (reclaim_alloc, reclaim_weights) = self.max_reclaimable(model_id, &domain, force);
-        let (capacity, gating_disabled) = {
+        let (capacity, gating_disabled, own_credit) = {
             let vram = self
                 .vram
                 .read()
                 .map_err(|_| anyhow::anyhow!("vram lock poisoned"))?;
+            let own_alloc = vram.allocated_gb(model_id);
             (
-                vram.free_gb(&domain) + vram.allocated_gb(model_id) + reclaim_alloc,
+                vram.free_gb(&domain) + own_alloc + reclaim_alloc,
                 vram.fits(&domain, f64::INFINITY),
+                ram_credit_gb(weight_gb, own_alloc, resident),
             )
         };
         let floor = self
@@ -7074,7 +10703,7 @@ impl ModelManager {
         let live_need = weight_gb + kv_need + margin;
         let live_ram = self
             .live_system_avail_gb(&domain)
-            .map(|avail| (avail + weight_gb + reclaim_weights, live_need, floor));
+            .map(|avail| (avail + own_credit + reclaim_weights, live_need, floor));
         if resize_reload_admits(
             capacity,
             weight_gb + min_kv + margin,
@@ -7171,7 +10800,7 @@ impl ModelManager {
         if !self.busy_protects(force) {
             return Vec::new();
         }
-        let found: Vec<(String, f64)> = {
+        let found: Vec<(String, f64, Option<f64>)> = {
             let guard = self.read_models("ensure_vram:busy_excluded");
             guard
                 .iter()
@@ -7182,7 +10811,7 @@ impl ModelManager {
                         && r.has_in_flight()
                         && !self.eviction_protected_ex(id, r, force, false)
                 })
-                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r)))
+                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r), r.cpu_resident_gb()))
                 .collect()
         };
         let Ok(vram) = self.vram.read() else {
@@ -7190,10 +10819,13 @@ impl ModelManager {
         };
         found
             .into_iter()
-            .map(|(id, weight_gb)| BusyExcluded {
-                allocated_gb: vram.allocated_gb(&id),
-                id,
-                weight_gb,
+            .map(|(id, weight_gb, resident)| {
+                let allocated_gb = vram.allocated_gb(&id);
+                BusyExcluded {
+                    weight_gb: ram_credit_gb(weight_gb, allocated_gb, resident),
+                    allocated_gb,
+                    id,
+                }
             })
             .collect()
     }
@@ -7285,7 +10917,7 @@ impl ModelManager {
     /// RAM, because a KV pool is reserved in the tracker but allocated lazily, so
     /// an idle model gives back far less real RAM than it holds in the tracker.
     fn max_reclaimable(&self, loading_id: &str, domain: &str, force: bool) -> (f64, f64) {
-        let candidates: Vec<(String, f64)> = {
+        let candidates: Vec<(String, f64, Option<f64>)> = {
             let guard = self.read_models("ensure_vram:max_reclaimable");
             guard
                 .iter()
@@ -7295,15 +10927,81 @@ impl ModelManager {
                         && r.domain == domain
                         && !self.eviction_protected(id, r, force)
                 })
-                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r)))
+                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r), r.cpu_resident_gb()))
                 .collect()
         };
         let Ok(vram) = self.vram.read() else {
             return (0.0, 0.0);
         };
-        let allocated = candidates.iter().map(|(id, _)| vram.allocated_gb(id)).sum();
-        let weights = candidates.iter().map(|(_, w)| w).sum();
+        let allocated = candidates
+            .iter()
+            .map(|(id, _, _)| vram.allocated_gb(id))
+            .sum();
+        let weights = candidates
+            .iter()
+            .map(|(id, w, res)| ram_credit_gb(*w, vram.allocated_gb(id), *res))
+            .sum();
         (allocated, weights)
+    }
+
+    /// MR-5a: the Ready models in `domain` (other than `loading_id`) that are protected from
+    /// eviction ONLY by their eviction-grace window (loaded or used less than
+    /// `eviction_grace_secs` ago): `(their ids, GiB they hold, seconds until the last one becomes
+    /// evictable)`. Empty with `force` (a forced load ignores the window).
+    fn grace_only_protected(
+        &self,
+        loading_id: &str,
+        domain: &str,
+        force: bool,
+    ) -> (Vec<String>, f64, f64) {
+        if force {
+            return (Vec::new(), 0.0, 0.0);
+        }
+        let guard = self.read_models("grace_only_protected");
+        let busy = self.busy_protects(false);
+        let mut ids = Vec::new();
+        let mut wait = 0.0_f64;
+        for (id, r) in guard.iter() {
+            if id.as_str() == loading_id || r.state != ModelState::Ready || r.domain != domain {
+                continue;
+            }
+            // Protected now, but not once the window is ignored: the window is the only reason.
+            if self.eviction_protected_ex(id, r, false, busy)
+                && !self.eviction_protected_ex(id, r, true, busy)
+            {
+                let left = self
+                    .eviction_grace_for(id)
+                    .saturating_sub(r.last_used.elapsed())
+                    .as_secs_f64();
+                wait = wait.max(left);
+                ids.push(id.clone());
+            }
+        }
+        drop(guard);
+        let gib = self
+            .vram
+            .read()
+            .map_or(0.0, |v| ids.iter().map(|id| v.allocated_gb(id)).sum());
+        ids.sort();
+        (ids, gib, wait)
+    }
+
+    /// MR-5a: the refusal for a load that does not fit now but would once models protected only
+    /// by their eviction-grace window age out — transient, so not "can never fit".
+    fn grace_window_refusal(
+        model_id: &str,
+        need_gb: f64,
+        can_free_gb: f64,
+        (ids, _, wait): &(Vec<String>, f64, f64),
+    ) -> ModelError {
+        ModelError::InsufficientMemory(format!(
+            "insufficient VRAM right now: loading {model_id} needs {need_gb:.1} GB and at most \
+             {can_free_gb:.1} GB can be freed now; {} were loaded or used less than \
+             eviction_grace_secs ago (their eviction grace window) and become evictable in {:.0} s \
+             — retry then (nothing was evicted)",
+            ids.join(", "),
+            wait.ceil().max(1.0)
+        ))
     }
 
     /// Diagnostic tail for an insufficient-VRAM error: distinguishes "nothing
@@ -7326,6 +11024,9 @@ impl ModelManager {
                 && r.domain == domain
                 && !self.eviction_protected(id, r, force)
         });
+        // `busy_excluded` takes the models lock again: a second read while this one is held
+        // deadlocks against a queued writer (0.9.0 review A, same shape as the admission dry-run).
+        drop(guard);
         let blocked_by_busy = !self.busy_excluded(model_id, domain, force).is_empty();
         if blocked_by_busy {
             "the models that could be evicted have requests running — retry when \
@@ -7367,7 +11068,23 @@ impl ModelManager {
                 .config
                 .system_ram_reservation_gb
                 .unwrap_or_else(os_memory::default_reservation_gb),
+            ceiling: self.ram_ceiling_gb(domain),
         }
+    }
+
+    /// The most system RAM evictions can ever make available on `domain`, GB: `MemTotal`,
+    /// capped by `system_ram_budget_gb` when set. `None` off the `system` domain or when
+    /// `MemTotal` is unreadable (the credit then stays uncapped, the old behaviour).
+    fn ram_ceiling_gb(&self, domain: &str) -> Option<f64> {
+        if domain != DOMAIN_SYSTEM {
+            return None;
+        }
+        let total = os_memory::total_ram_gb()?;
+        Some(
+            self.config
+                .system_ram_budget_gb
+                .map_or(total, |budget| total.min(budget)),
+        )
     }
 
     /// The KV pool a load will *conservatively* be charged for by the live
@@ -7397,7 +11114,9 @@ impl ModelManager {
         };
         let bound = target.min(cap);
         if bound.is_finite() {
-            bound.max(config.min_kv_cache_gb)
+            // The engine allocates whole GiB, so that is what the live RAM floor and the
+            // dry-run must be checked against.
+            bound.max(config.min_kv_cache_gb).ceil()
         } else {
             config.min_kv_cache_gb // fully uncapped grab-all -> can't predict
         }
@@ -7428,24 +11147,175 @@ impl ModelManager {
     /// it so models co-reside. The global `cache_size_gb` cap and the
     /// `min_kv_cache_gb` floor still apply, so an absent target + unset
     /// `cache_size_gb` reproduces the pre-feature result byte-for-byte.
-    fn compute_kv_pool_gb(free_after_weight_gb: f64, kv_target_gb: f64, config: &Config) -> f64 {
+    ///
+    /// **Whole-GiB fallback (T5, E-13).** The CB/VLM engines allocate
+    /// `ceil(cache_size_gb)` GiB (`ov_bridge.cpp`), so the booked pool is rounded
+    /// the same way: what the tracker books is what the engine takes. A round-up
+    /// that adds more than 10 % warns; a round-up that would not fit the free
+    /// memory after the weights is floored instead (never below 1 GiB, the
+    /// engine's own minimum). The exact pool model sizes in whole blocks instead.
+    ///
+    /// Also names the setting that made the pool differ from an explicit target
+    /// (`clamped_by`, E-09).
+    fn compute_kv_pool_gb(
+        free_after_weight_gb: f64,
+        kv_target_gb: f64,
+        config: &Config,
+        round_whole_gib: bool,
+    ) -> KvPoolPlan {
+        let requested = (kv_target_gb > 0.0).then_some(kv_target_gb);
+        let mut clamp = None;
         // Grab-all baseline: everything left after the safety margin.
         let mut kv = free_after_weight_gb - config.vram_safety_margin_gb;
         // Bounded reservation: clamp to the resolved per-model target (0.0 = off).
-        if kv_target_gb > 0.0 {
-            kv = kv.min(kv_target_gb);
+        if let Some(target) = requested {
+            if target < kv {
+                kv = target;
+            } else if kv < target {
+                clamp = Some(KvClamp::FreeVram);
+            }
         }
         // Global hard cap still applies on top of the target (0.0 = uncapped).
-        if config.cache_size_gb > 0.0 {
-            kv = kv.min(config.cache_size_gb);
+        if config.cache_size_gb > 0.0 && config.cache_size_gb < kv {
+            kv = config.cache_size_gb;
+            clamp = requested.map(|_| KvClamp::CacheSizeGb);
         }
         // An unbounded yardstick with no target and no cap (an ungated domain whose RAM is
         // unreadable) cannot be allocated: take the floor rather than infinity.
         if !kv.is_finite() {
-            return config.min_kv_cache_gb;
+            return KvPoolPlan {
+                gb: config.min_kv_cache_gb,
+                requested_gb: requested,
+                clamped_by: None,
+                rounded_from_gb: None,
+                blocks: None,
+                bytes_allocated: None,
+            };
         }
         // Never go below the floor — ensure_vram_for guarantees this much is free.
-        kv.max(config.min_kv_cache_gb)
+        if kv < config.min_kv_cache_gb {
+            kv = config.min_kv_cache_gb;
+            clamp = requested.map(|_| KvClamp::MinKvCacheGb);
+        }
+        // Whole-GiB fallback: book what the engine will really allocate. Float noise just
+        // above a whole number (a tracker sum such as 6.000000000000004) is snapped first,
+        // or it would take a whole extra GiB.
+        let mut rounded_from = None;
+        if round_whole_gib {
+            if (kv - kv.round()).abs() < 1e-9 {
+                kv = kv.round();
+            }
+            let rounded = kv.ceil();
+            if rounded > kv {
+                let fits = !free_after_weight_gb.is_finite() || rounded <= free_after_weight_gb;
+                let floored = kv.floor();
+                let final_gb = if fits || floored < 1.0 {
+                    rounded
+                } else {
+                    floored
+                };
+                rounded_from = Some(kv);
+                kv = final_gb;
+                // Name the setting that limited the pool when there is one; rounding is
+                // reported only for an explicit request that nothing else limited.
+                if clamp.is_none() && requested.is_some() {
+                    clamp = Some(KvClamp::WholeGibFallback);
+                }
+            }
+        }
+        KvPoolPlan {
+            gb: kv,
+            requested_gb: requested,
+            clamped_by: clamp,
+            rounded_from_gb: rounded_from,
+            blocks: None,
+            bytes_allocated: None,
+        }
+    }
+
+    /// Size the pool for one load: the GiB budget of [`compute_kv_pool_gb`](Self::compute_kv_pool_gb)
+    /// (all its clamps apply), then, when `exact` is given, the exact block count `GenAI` builds
+    /// for that budget. The booked size is what the engine allocates, fractional GiB included
+    /// (4.2 GiB asked, 4.1999 GiB booked), with no whole-GiB rounding.
+    ///
+    /// # Errors
+    /// The budget cannot hold the linear-attention reservation plus one block.
+    fn compute_kv_pool(
+        free_after_weight_gb: f64,
+        kv_target_gb: f64,
+        config: &Config,
+        round_whole_gib: bool,
+        exact: Option<&ExactPoolSpec>,
+        max_pool_gb: Option<f64>,
+    ) -> Result<KvPoolPlan, kv_capacity::CapacityError> {
+        let mut plan = Self::compute_kv_pool_gb(
+            free_after_weight_gb,
+            kv_target_gb,
+            config,
+            round_whole_gib && exact.is_none(),
+        );
+        // The device-headroom ceiling on the pool (vision model on a discrete GPU).
+        if let Some(max) = max_pool_gb
+            && max < plan.gb
+        {
+            plan.gb = max;
+            plan.clamped_by = Some(KvClamp::DeviceHeadroom);
+        }
+        let Some(spec) = exact else {
+            return Ok(plan);
+        };
+        if !(plan.gb.is_finite() && plan.gb > 0.0) {
+            // No budget to turn into blocks (an untracked domain with a zero floor): leave it to
+            // the engine as before.
+            return Ok(plan);
+        }
+        // A truncating float -> u64 cast of a finite, non-negative budget.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let budget = (plan.gb.max(0.0) * GIB_F64) as u64;
+        let pool = spec.profile.plan_pool(
+            budget,
+            spec.precision,
+            spec.prefix_caching,
+            spec.la_rule,
+            None,
+        )?;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            plan.gb = pool.bytes_allocated as f64 / GIB_F64;
+        }
+        plan.blocks = Some(pool.kv_blocks);
+        plan.bytes_allocated = Some(pool.bytes_allocated);
+        plan.rounded_from_gb = None;
+        Ok(plan)
+    }
+
+    /// KV pool for a model with no known weight footprint (`vram_gb = 0`, so no VRAM gating): an
+    /// explicit target if one resolved, else the configured cap.
+    fn ungated_kv_gb(&self, kv_target_gb: f64) -> f64 {
+        let gb = if kv_target_gb > 0.0 {
+            kv_target_gb
+        } else {
+            self.config.cache_size_gb
+        };
+        // The engine allocates whole GiB whatever the booking says (not capped by
+        // `cache_size_gb` here: this model has no known footprint, so nothing is gated).
+        gb.ceil()
+    }
+
+    /// Remember what a finished load asked for and why the pool differs (E-09), for the
+    /// admin API and the `rv add` / `rv resize` sentence.
+    fn note_kv_plan(&self, model_id: &str, plan: KvPoolPlan) {
+        // Only while the model is still resident: an eviction that slipped in after the
+        // load committed already cleared these fields and must not get them back.
+        if let Some(record) = self
+            .write_models("note_kv_plan")
+            .get_mut(model_id)
+            .filter(|r| r.state == ModelState::Ready)
+        {
+            record.kv_requested_gb = plan.requested_gb;
+            record.kv_clamped_by = plan.clamped_by;
+            record.kv_pool_blocks = plan.blocks;
+        }
     }
 
     /// Phase 1 of `evict_model`: validate state, transition to `Evicting`,
@@ -7558,6 +11428,15 @@ impl ModelManager {
         {
             r.state = ModelState::NotLoaded;
             r.kv_cache_gb = 0.0;
+            r.kv_requested_gb = None;
+            r.kv_clamped_by = None;
+            r.kv_pool_blocks = None;
+            r.kv_gate_mode = "";
+            r.kv_gate_clamped_by = None;
+            r.kv_ratchet_key = None;
+            r.kv_gate_detail = None;
+            r.headroom = None;
+            r.kv_resolution = None;
             r.max_prompt_tokens = 0;
         }
         // Always safe — no-op if the model was never allocated (e.g. vram_gb=0.0).
@@ -7644,6 +11523,86 @@ impl ModelManager {
     }
 }
 
+/// What the factory hands back: the engine handle and its OS thread.
+type LoadOutput = (EngineHandleKind, std::thread::JoinHandle<()>);
+
+/// What a load's commit needs besides the factory result.
+#[derive(Debug)]
+struct LoadCommit {
+    kv_gb: f64,
+    max_num_seqs: usize,
+    gate: GateSource,
+    kv_plan: Option<KvPoolPlan>,
+}
+
+/// The measurement window of a load that `execute_load` itself commits.
+#[derive(Debug)]
+struct LoadMeasure {
+    gpu_before: Option<u64>,
+    /// `RssAnon` before a `CPU` load (CPU over-admission); `None` off `CPU` or when not quiet.
+    rss_before: Option<u64>,
+    gpu_window: crate::gpu_memory::MeasureWindow,
+    measure_pdev: Option<String>,
+    leases_at_start: u64,
+    domain: String,
+}
+
+/// Where a blocking load leaves its result (step 6b). Shared by the load thread, `execute_load`
+/// and the model's record, so the result survives `execute_load` giving up (deadline, client
+/// gone): the record keeps the slot and [`ModelManager::reap_stalled_loads`] commits it.
+#[derive(Debug)]
+struct LoadSlot {
+    result: std::sync::Mutex<Option<Result<LoadOutput>>>,
+    commit: std::sync::Mutex<Option<LoadCommit>>,
+    done: tokio::sync::Notify,
+    started: Instant,
+    /// When the load thread delivered its result (for the late-commit log).
+    finished_at: std::sync::Mutex<Option<Instant>>,
+}
+
+impl LoadSlot {
+    fn new(commit: LoadCommit) -> Self {
+        Self {
+            result: std::sync::Mutex::new(None),
+            commit: std::sync::Mutex::new(Some(commit)),
+            done: tokio::sync::Notify::new(),
+            started: Instant::now(),
+            finished_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Called once by the load thread.
+    fn finish(&self, result: Result<LoadOutput>) {
+        if let Ok(mut at) = self.finished_at.lock() {
+            *at = Some(Instant::now());
+        }
+        if let Ok(mut slot) = self.result.lock() {
+            *slot = Some(result);
+        }
+        // `notify_one` keeps a permit when nobody waits yet, so the waiter cannot miss it.
+        self.done.notify_one();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.result.lock().is_ok_and(|r| r.is_some())
+    }
+
+    /// Resolves once [`Self::finish`] ran. Cancel-safe: dropping it loses nothing.
+    async fn wait(&self) {
+        while !self.is_finished() {
+            self.done.notified().await;
+        }
+    }
+
+    fn take_result(&self) -> Option<Result<LoadOutput>> {
+        self.result.lock().ok()?.take()
+    }
+
+    fn take_commit(&self) -> Option<LoadCommit> {
+        self.commit.lock().ok()?.take()
+    }
+}
+
 /// RAII cancellation guard for [`ModelManager::load_model`] (T5.1, committee
 /// finding 5 — mirrors the shared [`crate::in_flight::InFlightGuard`] pattern).
 ///
@@ -7651,12 +11610,10 @@ impl ModelManager {
 /// the HTTP client disconnects, axum drops the handler task and every future
 /// in it — mid-await. Without this guard a dropped `load_model` left the
 /// record in `Loading` forever: chat 503s, reload 409s, evict 409s, until a
-/// process restart. `Drop` while armed runs `abort_load` (reset to
-/// `NotLoaded` + release any VRAM reservation); the normal exits `disarm()`.
-///
-/// The engine-load itself runs detached on the blocking pool, so a cancelled
-/// load may still briefly hold real GPU memory until the orphaned engine
-/// drops — the *tracker* is reset immediately, which is what gates new loads.
+/// process restart. `Drop` while armed runs `abort_load`: reset to `NotLoaded`
+/// and release any VRAM reservation — or, once the engine construction is
+/// running, book the load as stalled (step 6b: its memory is real until it
+/// returns; the reaper commits or frees it then). The normal exits `disarm()`.
 struct LoadCancelGuard<'a> {
     mm: &'a ModelManager,
     model_id: &'a str,
@@ -7675,7 +11632,8 @@ impl Drop for LoadCancelGuard<'_> {
         if self.armed {
             tracing::warn!(
                 model_id = self.model_id,
-                "load_model future dropped mid-load — resetting state (cancellation guard)"
+                "load_model future dropped mid-load (cancellation guard) — resetting the record, or \
+                 booking it as stalled when the engine construction is already running"
             );
             self.mm.abort_load(self.model_id);
         }
@@ -7691,18 +11649,33 @@ mod load_cancel_tests {
 
     use std::path::Path;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Waker};
 
     use super::*;
     use crate::model_manager::lifecycle::{EngineFactory, MockEngineFactory};
 
-    /// A mock factory whose `load` blocks long enough that the first poll of
-    /// `load_model` reliably parks at the `spawn_blocking` await.
-    struct SlowFactory(MockEngineFactory);
+    /// A factory whose `load` blocks until the test releases it, then succeeds (`true`) or
+    /// fails (`false`).
+    struct GatedFactory {
+        inner: MockEngineFactory,
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<bool>>,
+    }
 
-    impl EngineFactory for SlowFactory {
+    impl GatedFactory {
+        fn new() -> (Self, std::sync::mpsc::Sender<bool>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Self {
+                    inner: MockEngineFactory::default(),
+                    gate: std::sync::Mutex::new(rx),
+                },
+                tx,
+            )
+        }
+    }
+
+    impl EngineFactory for GatedFactory {
         fn detect_kind(&self, model_dir: &Path) -> engine::ModelKind {
-            self.0.detect_kind(model_dir)
+            self.inner.detect_kind(model_dir)
         }
         fn load(
             &self,
@@ -7711,65 +11684,228 @@ mod load_cancel_tests {
             cache_size_gb: f64,
             max_num_seqs: usize,
         ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            self.0.load(model_path, device, cache_size_gb, max_num_seqs)
+            let ok = self.gate.lock().unwrap().recv().unwrap_or(false);
+            anyhow::ensure!(ok, "simulated late load failure");
+            self.inner
+                .load(model_path, device, cache_size_gb, max_num_seqs)
         }
     }
 
-    /// T5.1 accept test: dropping the `load_model` future mid-flight (the
-    /// HTTP client disconnected) must NOT wedge the record in `Loading` —
-    /// the cancellation guard resets it to `NotLoaded`, the VRAM reservation
-    /// is released, and a subsequent load succeeds.
+    /// Two models on the same device, `timeout_secs` load deadline (0 = none).
+    async fn gated_mm(timeout_secs: u64) -> (ModelManager, std::sync::mpsc::Sender<bool>) {
+        let mut config = tests::make_config(&[("m", 1.0), ("n", 1.0), ("gate-m", 1.0)], 10.0);
+        config.vram_safety_margin_gb = 0.0;
+        config.load_timeout_secs = timeout_secs;
+        let (factory, release) = GatedFactory::new();
+        let mm = ModelManager::new(config, Arc::new(factory)).await.unwrap();
+        (mm, release)
+    }
+
+    fn info(mm: &ModelManager, id: &str) -> ModelInfo {
+        mm.reap_stalled_loads();
+        mm.list_models().into_iter().find(|m| m.id == id).unwrap()
+    }
+
+    /// Reap and poll until `id` is no longer stalled.
+    async fn wait_unstalled(mm: &ModelManager, id: &str) -> ModelInfo {
+        for _ in 0..300 {
+            let i = info(mm, id);
+            if i.stalled_secs.is_none() {
+                return i;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} stayed stalled");
+    }
+
+    /// 0.9.0 review D: an added model whose load passes its deadline stays registered (stalled,
+    /// its booking kept) instead of being rolled back, and becomes Ready when the load returns.
     #[tokio::test]
-    async fn dropped_load_future_resets_state_and_allows_reload() {
-        let config = {
-            let mut c = tests::make_config(&[("m", 1.0)], 10.0);
-            c.vram_safety_margin_gb = 0.0;
-            c
-        };
-        let mm = ModelManager::new(config, Arc::new(SlowFactory(MockEngineFactory::default())))
+    async fn add_model_past_its_deadline_stays_registered_until_the_load_returns() {
+        let (mm, release) = gated_mm(1).await;
+        let dir = std::path::Path::new("/tmp/test-models/add-stall-review-d");
+        std::fs::create_dir_all(dir).unwrap();
+        let err = mm
+            .add_model(
+                "add-stall-review-d".to_owned(),
+                1.0,
+                None,
+                config::ModelPolicy::default(),
+            )
             .await
-            .unwrap();
-
-        // Poll the load future exactly once: it parks at the engine-load
-        // await (the factory sleeps), leaving the record in `Loading`.
-        let mut fut = Box::pin(mm.load_model("m"));
-        let mut cx = Context::from_waker(Waker::noop());
+            .unwrap_err();
         assert!(
-            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
-            "load must park at the engine-load await"
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::LoadTimeout { .. })
+            ),
+            "{err}"
+        );
+        let i = info(&mm, "add-stall-review-d");
+        assert!(i.stalled_secs.is_some(), "still registered and stalled");
+        assert!(
+            mm.metrics_snapshot().used_vram_gb > 0.0,
+            "its booking is kept"
+        );
+        release.send(true).unwrap();
+        let i = wait_unstalled(&mm, "add-stall-review-d").await;
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(i.state, ModelState::Ready);
+    }
+
+    /// 6b: a load past its deadline returns `LoadTimeout`, stays booked as stalled with its
+    /// `ffi_watch` token in flight, blocks new loads on its device, and commits when it returns.
+    #[tokio::test]
+    async fn load_past_deadline_is_stalled_then_committed_late() {
+        let (mm, release) = gated_mm(1).await;
+        let device = mm.record_device("gate-m");
+        let err = mm.load_model("gate-m").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::LoadTimeout { secs: 1, .. })
+            ),
+            "{err}"
+        );
+        let i = info(&mm, "gate-m");
+        assert_eq!(i.state, ModelState::Loading);
+        assert!(i.stalled_secs.is_some());
+        assert!(
+            mm.metrics_snapshot().used_vram_gb > 0.0,
+            "a stalled load keeps its reservation"
+        );
+        let token = format!("load gate-m on {device}");
+        assert!(
+            crate::ffi_watch::global()
+                .in_flight_models()
+                .contains(&token),
+            "the load's token is in flight"
         );
 
-        // Simulate the client disconnect: axum drops the handler future.
-        drop(fut);
-
-        // The guard must have reset the state — no permanent Loading wedge —
-        // and released the tracker reservation.
-        let state = mm
-            .list_models()
-            .into_iter()
-            .find(|m| m.id == "m")
-            .unwrap()
-            .state;
+        let err = mm.load_model("n").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::DeviceStalled { model, .. }) if model == "gate-m"
+            ),
+            "{err}"
+        );
+        let stalled = mm.stalled_loads();
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
         assert_eq!(
-            state,
-            ModelState::NotLoaded,
-            "cancelled load must reset Loading → NotLoaded"
+            (stalled[0].model.as_str(), stalled[0].device.as_str()),
+            ("gate-m", device.as_str())
         );
+        assert!(
+            stalled[0].overdue,
+            "past its 1 s deadline: recovery is shown"
+        );
+
+        release.send(true).unwrap();
+        assert_eq!(wait_unstalled(&mm, "gate-m").await.state, ModelState::Ready);
+        assert!(mm.stalled_loads().is_empty());
+        assert!(
+            !crate::ffi_watch::global()
+                .in_flight_models()
+                .contains(&token),
+            "the token is gone once the load returned"
+        );
+        release.send(true).unwrap();
+        mm.load_model("n").await.unwrap();
+    }
+
+    /// 6b: a stalled load that finally fails frees its reservation and its device.
+    #[tokio::test]
+    async fn stalled_load_that_fails_late_is_discarded_and_freed() {
+        let (mm, release) = gated_mm(1).await;
+        assert!(mm.load_model("m").await.is_err());
+        release.send(false).unwrap();
+        assert_eq!(wait_unstalled(&mm, "m").await.state, ModelState::NotLoaded);
         assert!(
             mm.metrics_snapshot().used_vram_gb.abs() < f64::EPSILON,
-            "cancelled load must release its VRAM reservation"
+            "a discarded late load frees its reservation"
+        );
+        release.send(true).unwrap();
+        mm.load_model("m").await.unwrap();
+    }
+
+    /// 6b (the (c) bug): dropping the `load_model` future mid-load (client gone) does NOT free
+    /// the reservation of a load that is still running; it is booked as stalled and committed
+    /// when it returns. Replaces T5.1's "reset to `NotLoaded`" for a running load.
+    #[tokio::test]
+    async fn dropped_load_future_is_stalled_not_freed() {
+        let (mm, release) = gated_mm(0).await;
+        let mm = Arc::new(mm);
+        let task = {
+            let mm = Arc::clone(&mm);
+            tokio::spawn(async move { mm.load_model("m").await })
+        };
+        // Wait until the engine construction runs (the factory blocks on the gate) …
+        for _ in 0..300 {
+            let pending = mm
+                .read_models("test")
+                .get("m")
+                .is_some_and(|r| r.pending_load.is_some());
+            if pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // … then the client goes away: the handler future is dropped.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let i = info(&mm, "m");
+        assert_eq!(i.state, ModelState::Loading);
+        assert!(
+            i.stalled_secs.is_some(),
+            "a dropped running load is stalled"
+        );
+        // D-04 S9 review #1: stalled only because the client left, inside its deadline (none
+        // set -> the 600 s cap), so no recovery step is offered for it.
+        let stalled = mm.stalled_loads();
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        assert!(!stalled[0].overdue, "a client-gone stall is not overdue");
+        assert!(
+            mm.metrics_snapshot().used_vram_gb > 0.0,
+            "and keeps its reservation"
         );
 
-        // And the model is loadable again.
+        release.send(true).unwrap();
+        assert_eq!(wait_unstalled(&mm, "m").await.state, ModelState::Ready);
+    }
+
+    /// With `load_timeout_secs: 0` a load waits for its result, however long it takes.
+    #[tokio::test]
+    async fn no_load_without_deadline_waits_for_the_result() {
+        let (mm, release) = gated_mm(0).await;
+        release.send(true).unwrap();
         mm.load_model("m").await.unwrap();
-        let state = mm
-            .list_models()
-            .into_iter()
-            .find(|m| m.id == "m")
-            .unwrap()
-            .state;
-        assert_eq!(state, ModelState::Ready, "reload after cancellation works");
+        assert_eq!(info(&mm, "m").state, ModelState::Ready);
+    }
+
+    /// 6b: shutdown commits a stalled load that has returned, then evicts it normally.
+    #[tokio::test]
+    async fn shutdown_reaps_a_returned_stalled_load() {
+        let (mm, release) = gated_mm(1).await;
+        assert!(mm.load_model("m").await.is_err());
+        release.send(true).unwrap();
+        // Wait for the load thread to finish, without reaping.
+        for _ in 0..300 {
+            let done = mm
+                .read_models("test")
+                .get("m")
+                .and_then(|r| r.pending_load.as_ref().map(|s| s.is_finished()))
+                .unwrap_or(false);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let report = mm.shutdown().await;
+        assert!(report.unclean.is_empty(), "{report:?}");
+        assert_eq!(info(&mm, "m").state, ModelState::NotLoaded);
+        assert!(mm.metrics_snapshot().used_vram_gb.abs() < f64::EPSILON);
     }
 
     // ---- T5.2: load serialization + panic-safe VRAM tracker ------------
@@ -8092,6 +12228,40 @@ mod load_cancel_tests {
             "panic must not wedge the record in Evicting"
         );
     }
+
+    /// Step 6a: an engine whose thread does not exit cleanly during shutdown is reported, so
+    /// process exit skips the C++ destructors (Test 5, 2026-10-27: a timed-out join inside the
+    /// shutdown deadline used to look like a clean teardown).
+    #[tokio::test]
+    async fn shutdown_reports_an_engine_that_did_not_exit_cleanly() {
+        let mm = ModelManager::new(
+            tests::make_config(&[("m", 4.0)], 10.0),
+            Arc::new(PanicOnEvictFactory),
+        )
+        .await
+        .unwrap();
+        mm.load_model("m").await.unwrap();
+        let report = mm.shutdown().await;
+        assert_eq!(report.unclean, vec!["m".to_string()]);
+    }
+
+    /// Only an engine that may still be running counts — not a benign eviction failure.
+    #[test]
+    fn only_unclean_or_incomplete_evictions_mean_the_engine_may_still_run() {
+        assert!(engine_may_still_run(&UncleanEngineExit.into()));
+        assert!(engine_may_still_run(
+            &ModelError::EvictionIncomplete("m".to_owned()).into()
+        ));
+        assert!(!engine_may_still_run(&anyhow::anyhow!(
+            "model m is not loaded"
+        )));
+        assert!(
+            UncleanEngineExit
+                .to_string()
+                .contains("did not exit cleanly"),
+            "the wording other checks rely on"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8219,6 +12389,7 @@ mod tests {
             tier: DeviceTier::Fallback,
             domain_id,
             total_mem_gb: None,
+            pdev: None,
         }
     }
 
@@ -8346,10 +12517,66 @@ mod tests {
         );
     }
 
-    /// A config larger than what the iGPU reports is capped at the reported
-    /// figure, converted from GiB to the tracker's decimal GB (16.51 GiB =
-    /// 17.73 GB); a smaller one, a disabled one (0.0) and a device with no
-    /// reported memory are left alone. The Windows trip's case: config 27.
+    /// T17U BIG-01 (B50, 2026-10-31): a discrete inference GPU with `total_vram_gb: 0.0` is
+    /// budgeted at the VRAM it reports — not left ungated — exactly like a secondary dGPU.
+    #[test]
+    fn assemble_inference_dgpu_with_zero_total_uses_reported_vram() {
+        let mut cfg = make_config(&[], 0.0);
+        cfg.device = "GPU.1".to_owned();
+        let inv = DeviceInventory::from_devices(vec![
+            dev_mem("GPU.1", DeviceKind::DiscreteGpu, 15.13),
+            dev("GPU.0", DeviceKind::IntegratedGpu),
+            dev("CPU", DeviceKind::Cpu),
+        ]);
+        let b = assemble_domain_budgets(&cfg, &inv, "GPU.1", 11.0);
+        assert_eq!(budget_of(&b, "GPU.1"), Some(15.13));
+    }
+
+    /// The opt-out stays: an explicit `domain_budgets {"GPU.1": 0.0}` keeps the discrete
+    /// inference GPU ungated.
+    #[test]
+    fn assemble_inference_dgpu_explicit_zero_override_stays_ungated() {
+        let mut cfg = make_config(&[], 0.0);
+        cfg.device = "GPU.1".to_owned();
+        cfg.domain_budgets.insert("GPU.1".to_owned(), 0.0);
+        let inv =
+            DeviceInventory::from_devices(vec![dev_mem("GPU.1", DeviceKind::DiscreteGpu, 15.13)]);
+        let b = assemble_domain_budgets(&cfg, &inv, "GPU.1", 11.0);
+        assert_eq!(budget_of(&b, "GPU.1"), Some(0.0));
+    }
+
+    /// Only a discrete GPU changes: an integrated inference GPU (UMA, its memory is shared
+    /// RAM) and a dGPU that reports no figure keep `0.0` = ungated.
+    #[test]
+    fn assemble_inference_zero_total_unchanged_for_igpu_and_unreported_dgpu() {
+        let mut cfg = make_config(&[], 0.0);
+        cfg.device = "GPU".to_owned();
+        let inv =
+            DeviceInventory::from_devices(vec![dev_mem("GPU", DeviceKind::IntegratedGpu, 16.51)]);
+        // An integrated GPU shares the `system` domain (production resolves it there).
+        let b = assemble_domain_budgets(&cfg, &inv, DOMAIN_SYSTEM, 11.0);
+        assert_eq!(
+            budget_of(&b, DOMAIN_SYSTEM),
+            Some(0.0),
+            "iGPU stays ungated"
+        );
+        cfg.device = "GPU.1".to_owned();
+        let inv = DeviceInventory::from_devices(vec![dev("GPU.1", DeviceKind::DiscreteGpu)]);
+        let b = assemble_domain_budgets(&cfg, &inv, "GPU.1", 11.0);
+        assert_eq!(budget_of(&b, "GPU.1"), Some(0.0), "no reported figure");
+    }
+
+    /// A configured `total_vram_gb` still wins over the reported figure (below it).
+    #[test]
+    fn assemble_inference_dgpu_configured_total_still_wins() {
+        let mut cfg = make_config(&[], 12.0);
+        cfg.device = "GPU.1".to_owned();
+        let inv =
+            DeviceInventory::from_devices(vec![dev_mem("GPU.1", DeviceKind::DiscreteGpu, 15.13)]);
+        let b = assemble_domain_budgets(&cfg, &inv, "GPU.1", 11.0);
+        assert_eq!(budget_of(&b, "GPU.1"), Some(12.0));
+    }
+
     fn cand(id: &str, allocated: f64, weight: f64) -> EvictionCandidate {
         EvictionCandidate {
             id: id.to_owned(),
@@ -8434,7 +12661,101 @@ mod tests {
         assert!(!fits);
     }
 
+    /// F1: the refusal after evictions names every evicted model and the reason, and no longer
+    /// invites a bare retry.
     #[test]
+    fn refused_after_eviction_names_the_victims() {
+        let evicted = ["embed-e1".to_owned(), "embed-e2".to_owned()];
+        let msg = refused_after_eviction("vlm-big", &evicted, "the device headroom says no");
+        for want in [
+            "vlm-big",
+            "embed-e1, embed-e2",
+            "stay unloaded",
+            "the device headroom says no",
+        ] {
+            assert!(msg.contains(want), "{want}: {msg}");
+        }
+        assert!(!msg.contains("; retry"), "{msg}");
+    }
+
+    /// F1: the annotation keeps the error's kind, and leaves errors alone when nothing was
+    /// evicted, when context is attached, or when the kind's payload is not a message.
+    #[test]
+    fn annotate_refusal_after_eviction_keeps_the_kind() {
+        let evicted = ["embed-e1".to_owned()];
+        let e = annotate_refusal_after_eviction(
+            "vlm-big",
+            &evicted,
+            ModelError::InsufficientMemory("no room".to_owned()).into(),
+        );
+        match e.downcast_ref::<ModelError>() {
+            Some(ModelError::InsufficientMemory(m)) => {
+                assert!(m.contains("embed-e1") && m.contains("no room"), "{m}");
+            }
+            other => panic!("kind lost: {other:?}"),
+        }
+        let untouched = annotate_refusal_after_eviction(
+            "vlm-big",
+            &[],
+            ModelError::InsufficientMemory("no room".to_owned()).into(),
+        );
+        assert_eq!(
+            untouched.to_string(),
+            ModelError::InsufficientMemory("no room".to_owned()).to_string()
+        );
+        let busy = annotate_refusal_after_eviction(
+            "vlm-big",
+            &evicted,
+            ModelError::BlockedByBusy(vec!["m".to_owned()]).into(),
+        );
+        assert!(matches!(
+            busy.downcast_ref::<ModelError>(),
+            Some(ModelError::BlockedByBusy(_))
+        ));
+        let with_ctx = annotate_refusal_after_eviction(
+            "vlm-big",
+            &evicted,
+            anyhow::Error::from(ModelError::InsufficientMemory("no room".to_owned()))
+                .context("outer"),
+        );
+        assert!(!format!("{with_ctx:#}").contains("embed-e1"));
+    }
+
+    /// F1: an extra gate (the device headroom) extends the plan past what the tracker needs, and
+    /// is asked with the victims so far and the VRAM they free.
+    #[test]
+    fn plan_evictions_extra_gate_extends_the_plan() {
+        let residents = [
+            cand("a", 8.0, 2.0),
+            cand("b", 8.0, 2.0),
+            cand("c", 8.0, 2.0),
+        ];
+        // The tracker is happy after "a"; the extra gate wants 16 GiB back.
+        let (two, fits) =
+            plan_evictions_gated(&residents, 0.0, 6.0, |_| true, |_, back| back >= 16.0);
+        assert_eq!(two, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(fits);
+        // The gate sees the victims: it admits only once "b" is gone.
+        let (named, fits) = plan_evictions_gated(
+            &residents,
+            10.0,
+            6.0,
+            |_| true,
+            |v, _| v.iter().any(|id| id == "b"),
+        );
+        assert_eq!(named, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(fits);
+        // Never satisfied: every candidate is listed and fits is false.
+        let (all, fits) = plan_evictions_gated(&residents, 0.0, 6.0, |_| true, |_, _| false);
+        assert_eq!(all.len(), 3);
+        assert!(!fits);
+    }
+
+    #[test]
+    /// A config larger than what the iGPU reports is capped at the reported figure, in GiB
+    /// like every tracker figure; a smaller one and a disabled one (0.0) are left alone. The
+    /// Windows trip's case: config 27 on a 16.51 GiB device.
+    #[allow(clippy::float_cmp)] // the cap is the reported figure itself, not a computed value
     fn assemble_inference_budget_is_capped_at_the_devices_reported_memory() {
         let inv = DeviceInventory::from_devices(vec![
             dev("CPU", DeviceKind::Cpu),
@@ -8444,8 +12765,7 @@ mod tests {
         cfg.device = "GPU".to_owned();
         let b = assemble_domain_budgets(&cfg, &inv, DOMAIN_SYSTEM, 99.0);
         let got = budget_of(&b, DOMAIN_SYSTEM).expect("system domain");
-        assert!((got - 16.51 * GIB_TO_GB).abs() < 1e-9, "{got}");
-        assert!(got > 17.7 && got < 17.8, "{got}");
+        assert_eq!(got, 16.51, "capped at the reported GiB");
 
         // Config already below the device figure: unchanged.
         cfg.total_vram_gb = 12.0;
@@ -8540,6 +12860,7 @@ mod tests {
             default_kv_cache_gb: 0.0, // unbounded — pre-Slice-2 grab-all
             vram_safety_margin_gb: 0.0, // no margin — keeps existing LRU test math simple
             npu_footprint_factor: 1.0,
+            cpu_image_gen_max_pixels: 1024 * 1024,
             min_kv_cache_gb: 0.0, // no minimum — allows any KV size including 0
             light_model_max_gb: 2.0, // C2 default; placement engine unused with empty inventory
             light_stt_max_gb: 1.0, // STT light/heavy threshold; engine unused with empty inventory
@@ -8574,6 +12895,16 @@ mod tests {
             unknown_fields: HashMap::new(),
             embedding_device: None,
             ov_cache_dir: None,
+            ov_cache_layout: "keyed".to_owned(),
+            kv_precision_pass: "explicit".to_owned(),
+            kv_gate_mode: "exact".to_owned(),
+            kv_gate_exact_on_unknown_engine: false,
+            kv_headroom_mode: "dynamic".to_owned(),
+            kv_transient_factor: 2.0,
+            kv_headroom_margin_gib: 0.5,
+            kv_headroom_min_tokens: 4096,
+            kv_headroom_inflight_tokens: 32_768,
+            kv_warmup: true,
             ov_cache_max_gb: 0.0,
             ov_cache_sweep_interval_secs: 21_600,
             kv_pressure_monitor_enabled: false,
@@ -8581,6 +12912,7 @@ mod tests {
             kv_pressure_sustained_secs: 0,
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
+            load_timeout_secs: 600,
         }
     }
 
@@ -9166,7 +13498,7 @@ mod tests {
         let rb = rb.unwrap();
 
         let loser = match (ra, rb) {
-            (Ok(()), Err(e)) | (Err(e), Ok(())) => e,
+            (Ok(_), Err(e)) | (Err(e), Ok(_)) => e,
             other => panic!("exactly one racer must win, got: {other:?}"),
         };
         assert!(
@@ -9915,8 +14247,10 @@ mod tests {
     /// zero-capacity stub.
     #[tokio::test]
     async fn image_kind_flows_through_the_registry_with_no_manager_edits() {
-        // The "imagegen" segment makes MockEngineFactory classify this as ImageGen.
-        let mm = make_mm(&[("sdxl-imagegen-ov", 6.5)], 22.5).await;
+        // The "imagegen" segment makes MockEngineFactory classify this as ImageGen. On the
+        // CPU it is charged its weights plus the D-06 working set (~24.5 GiB for an unreadable
+        // family at 1024x1024), so the budget is sized for that.
+        let mm = make_mm(&[("sdxl-imagegen-ov", 6.5)], 40.0).await;
         mm.load_model("sdxl-imagegen-ov").await.unwrap();
 
         let snap = mm.metrics_snapshot();
@@ -10180,7 +14514,8 @@ mod tests {
         mm.load_model("vlm-a").await.unwrap();
         mm.load_model("model-b").await.unwrap();
 
-        mm.shutdown().await;
+        let report = mm.shutdown().await;
+        assert!(report.unclean.is_empty(), "clean engines: {report:?}");
 
         let guard = mm.read_models("test");
         for id in ["vlm-a", "model-b", "model-c"] {
@@ -10425,7 +14760,10 @@ mod tests {
     /// plan-file finding).
     #[tokio::test]
     async fn prune_never_deletes_cl_cache_files() {
-        let cache_dir = tempfile::tempdir().expect("cache dir tempdir");
+        // The manifest lives in the PARENT of the cache dir, so give each test its own parent;
+        // bare tempdirs under /tmp all shared /tmp/cache_manifest and raced.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let cache_dir = tempfile::tempdir_in(sandbox.path()).expect("cache dir tempdir");
         // One 2MB orphan .blob (over budget alone) plus a .cl_cache file of
         // the same size — if cl_cache were eligible, deleting it would also
         // clear the budget, masking the bug this test guards against.
@@ -10439,6 +14777,7 @@ mod tests {
             vec![0_u8; 2 * 1024 * 1024],
         )
         .expect("write cl_cache file");
+        backdate(&cache_dir.path().join("orphan.blob"));
 
         let mut config = make_config(&[], 17.0);
         config.ov_cache_dir = Some(cache_dir.path().to_string_lossy().into_owned());
@@ -10464,7 +14803,10 @@ mod tests {
     /// live model's next load to recompile.
     #[tokio::test]
     async fn prune_never_deletes_a_ready_models_blob() {
-        let cache_dir = tempfile::tempdir().expect("cache dir tempdir");
+        // The manifest lives in the PARENT of the cache dir, so give each test its own parent;
+        // bare tempdirs under /tmp all shared /tmp/cache_manifest and raced.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let cache_dir = tempfile::tempdir_in(sandbox.path()).expect("cache dir tempdir");
         std::fs::write(
             cache_dir.path().join("resident.blob"),
             vec![0_u8; 2 * 1024 * 1024],
@@ -10474,6 +14816,7 @@ mod tests {
         let mut config = make_config(&[("model-a", 5.0)], 17.0);
         config.ov_cache_dir = Some(cache_dir.path().to_string_lossy().into_owned());
         config.ov_cache_max_gb = 0.001; // over budget on its own
+        config.ov_cache_layout = "flat".to_owned(); // the root is the active location
         let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
             .await
             .unwrap();
@@ -10484,7 +14827,7 @@ mod tests {
         crate::cache_manifest::write_device_blobs_entry(
             &manifest_root,
             "model-a",
-            "GPU",
+            "CPU",
             &["resident.blob".to_owned()],
         );
 
@@ -10508,7 +14851,10 @@ mod tests {
     /// before the fix in `prune_ov_cache_if_over_budget`.
     #[tokio::test]
     async fn prune_never_deletes_a_loading_models_blob() {
-        let cache_dir = tempfile::tempdir().expect("cache dir tempdir");
+        // The manifest lives in the PARENT of the cache dir, so give each test its own parent;
+        // bare tempdirs under /tmp all shared /tmp/cache_manifest and raced.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let cache_dir = tempfile::tempdir_in(sandbox.path()).expect("cache dir tempdir");
         std::fs::write(
             cache_dir.path().join("loading.blob"),
             vec![0_u8; 2 * 1024 * 1024],
@@ -10518,6 +14864,7 @@ mod tests {
         let mut config = make_config(&[("model-a", 5.0)], 17.0);
         config.ov_cache_dir = Some(cache_dir.path().to_string_lossy().into_owned());
         config.ov_cache_max_gb = 0.001; // over budget on its own
+        config.ov_cache_layout = "flat".to_owned(); // the root is the active location
         let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
             .await
             .unwrap();
@@ -10527,7 +14874,7 @@ mod tests {
         crate::cache_manifest::write_device_blobs_entry(
             &manifest_root,
             "model-a",
-            "GPU",
+            "CPU",
             &["loading.blob".to_owned()],
         );
 
@@ -10544,13 +14891,284 @@ mod tests {
         );
     }
 
+    /// Builds a manager with one Ready model `model-a` (device CPU) over a sandboxed keyed cache
+    /// and returns it with its active `kv-<tag>` directory name and the cache dir.
+    async fn keyed_cache_fixture(
+        sandbox: &tempfile::TempDir,
+    ) -> (ModelManager, &'static str, std::path::PathBuf) {
+        let cache_dir = sandbox.path().join("ov_cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        let mut config = make_config(&[("model-a", 5.0)], 17.0);
+        config.ov_cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        config.ov_cache_max_gb = 0.001; // over budget with any two blobs
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        let active = mm
+            .active_cache_subdir("model-a", ModelKind::TextGen, "CPU")
+            .expect("keyed layout gives a KV engine a directory");
+        (mm, active, cache_dir)
+    }
+
+    fn put_blob(cache_dir: &std::path::Path, rel: &str) {
+        let path = cache_dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, vec![0_u8; 2 * 1024 * 1024]).expect("write blob");
+        backdate(&path);
+    }
+
+    /// Protection follows (model, device, active directory) (U-17, U-C30): a Ready model keeps
+    /// the blobs in the directory it compiles into; its 0.8.x root blobs and another
+    /// precision's directory are ordinary candidates.
+    #[tokio::test]
+    async fn prune_protects_only_the_active_directory_of_a_ready_model() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let (mm, active, cache_dir) = keyed_cache_fixture(&sandbox).await;
+        let other = if active == "kv-f16" {
+            "kv-u4"
+        } else {
+            "kv-f16"
+        };
+        let (live, root_old, other_dir) = (
+            format!("{active}/live.blob"),
+            "old-flat.blob".to_owned(),
+            format!("{other}/x.blob"),
+        );
+        for rel in [&live, &root_old, &other_dir] {
+            put_blob(&cache_dir, rel);
+        }
+        let root = crate::cache_manifest::manifest_root(config_ov_cache_dir(&mm)).expect("root");
+        crate::cache_manifest::write_device_blobs_entry(
+            &root,
+            "model-a",
+            "CPU",
+            &[live.clone(), root_old.clone(), other_dir.clone()],
+        );
+
+        mm.run_cache_sweep_once_blocking();
+
+        assert!(
+            cache_dir.join(&live).exists(),
+            "active directory is protected"
+        );
+        assert!(
+            !cache_dir.join(&root_old).exists(),
+            "legacy root blob is tier 1"
+        );
+        assert!(
+            !cache_dir.join(&other_dir).exists(),
+            "other precision is tier 1"
+        );
+    }
+
+    /// The directory a model's live blobs are in follows what its factory passed it, not the
+    /// global string (S1-B): with a per-model `u4` the `kv-u4` blob is protected and the blobs
+    /// of the global-string directory are ordinary candidates, in either direction.
+    #[tokio::test]
+    async fn prune_follows_the_per_model_passed_precision() {
+        for (passed, global_dir) in [("u4", "kv-i8"), ("i8", "kv-u4")] {
+            let sandbox = tempfile::tempdir().expect("sandbox");
+            let cache_dir = sandbox.path().join("ov_cache");
+            std::fs::create_dir_all(&cache_dir).expect("cache dir");
+            let mut config = make_config(&[("model-a", 5.0)], 17.0);
+            config.ov_cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+            config.ov_cache_max_gb = 0.001;
+            config.kv_cache_precision = if passed == "u4" { "i8" } else { "u4" }.to_owned();
+            let factory = MockEngineFactory {
+                kv_passed: Some(passed.to_owned()),
+                ..MockEngineFactory::default()
+            };
+            let mm = ModelManager::new(config, Arc::new(factory)).await.unwrap();
+            mm.load_model("model-a").await.unwrap();
+            let live_dir = format!("kv-{passed}");
+            assert_eq!(
+                mm.active_cache_subdir("model-a", ModelKind::TextGen, "CPU"),
+                Some(live_dir.as_str())
+            );
+            let (live, wrong) = (
+                format!("{live_dir}/live.blob"),
+                format!("{global_dir}/global.blob"),
+            );
+            for rel in [&live, &wrong] {
+                put_blob(&cache_dir, rel);
+            }
+            let root =
+                crate::cache_manifest::manifest_root(config_ov_cache_dir(&mm)).expect("root");
+            crate::cache_manifest::write_device_blobs_entry(
+                &root,
+                "model-a",
+                "CPU",
+                &[live.clone(), wrong.clone()],
+            );
+            mm.run_cache_sweep_once_blocking();
+            assert!(
+                cache_dir.join(&live).exists(),
+                "{passed}: live dir protected"
+            );
+            assert!(
+                !cache_dir.join(&wrong).exists(),
+                "{passed}: the global-string directory is not this model's"
+            );
+        }
+    }
+
+    /// The device is part of the key (U-C31): the same model's blobs for a device it is not
+    /// resident on stay prunable even in the active directory name.
+    #[tokio::test]
+    async fn prune_protection_is_per_device() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let (mm, active, cache_dir) = keyed_cache_fixture(&sandbox).await;
+        let (here, elsewhere) = (format!("{active}/c.blob"), format!("{active}/g.blob"));
+        put_blob(&cache_dir, &here);
+        put_blob(&cache_dir, &elsewhere);
+        let root = crate::cache_manifest::manifest_root(config_ov_cache_dir(&mm)).expect("root");
+        crate::cache_manifest::write_device_blobs_entry(
+            &root,
+            "model-a",
+            "CPU",
+            std::slice::from_ref(&here),
+        );
+        crate::cache_manifest::write_device_blobs_entry(
+            &root,
+            "model-a",
+            "GPU.1",
+            std::slice::from_ref(&elsewhere),
+        );
+
+        mm.run_cache_sweep_once_blocking();
+
+        assert!(cache_dir.join(&here).exists());
+        assert!(!cache_dir.join(&elsewhere).exists());
+    }
+
+    /// An unattributed file younger than the grace period may be a compile still running, so it
+    /// is never pruned; an old one goes (U-C33).
+    #[tokio::test]
+    async fn prune_leaves_young_unattributed_blobs_alone() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let (mm, active, cache_dir) = keyed_cache_fixture(&sandbox).await;
+        let (young, old) = (format!("{active}/young.blob"), format!("{active}/old.blob"));
+        put_blob(&cache_dir, &young);
+        put_blob(&cache_dir, &old);
+        // `put_blob` backdates both; make one fresh again.
+        std::fs::File::options()
+            .write(true)
+            .open(cache_dir.join(&young))
+            .expect("open")
+            .set_modified(std::time::SystemTime::now())
+            .expect("touch");
+
+        mm.run_cache_sweep_once_blocking();
+
+        assert!(
+            cache_dir.join(&young).exists(),
+            "young unattributed blob survives"
+        );
+        assert!(
+            !cache_dir.join(&old).exists(),
+            "old unattributed blob is pruned"
+        );
+    }
+
+    /// The "left behind" report counts blobs of a model that moved device and 0.8.x root blobs
+    /// of a keyed model, and leaves the model's live directory out.
+    #[tokio::test]
+    async fn outside_active_dirs_counts_moved_device_and_old_layout() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let (mm, active, cache_dir) = keyed_cache_fixture(&sandbox).await;
+        let (live, old_root, moved) = (
+            format!("{active}/live.blob"),
+            "old-flat.blob".to_owned(),
+            format!("{active}/moved.blob"),
+        );
+        for rel in [&live, &old_root, &moved] {
+            put_blob(&cache_dir, rel);
+        }
+        let root = crate::cache_manifest::manifest_root(config_ov_cache_dir(&mm)).expect("root");
+        crate::cache_manifest::write_device_blobs_entry(&root, "model-a", "CPU", &[live, old_root]);
+        // Compiled when the model sat on another device: right directory, wrong device.
+        crate::cache_manifest::write_device_blobs_entry(&root, "model-a", "GPU.0", &[moved]);
+
+        let entries = crate::cache_manifest::list_cache_dir_entries(&cache_dir);
+        let (count, bytes) = mm.blobs_outside_active_dirs(&entries, &root);
+        assert_eq!((count, bytes), (2, 2 * 2 * 1024 * 1024));
+    }
+
+    /// End to end through `reload_config` (U-C35): a file edit of `ov_cache_layout` is reported
+    /// as not applied and the running layout is unchanged; a bogus value is refused.
+    #[tokio::test]
+    async fn reload_reports_ov_cache_layout_as_not_applied() {
+        let (mm, dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"models_dir":"/tmp/test-models","device":"CPU","total_vram_gb":0.0,
+                "ov_cache_layout":"flat","models":{"existing":{"vram_gb":1.0}}}"#,
+        )
+        .expect("rewrite temp config");
+        let report = mm.reload_config().expect("reload_config");
+        assert_eq!(
+            report.globals_not_applied,
+            vec!["ov_cache_layout".to_owned()]
+        );
+        assert_eq!(
+            mm.config.ov_cache_layout, "keyed",
+            "reload never swaps globals"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"models_dir":"/tmp/test-models","device":"CPU","total_vram_gb":0.0,
+                "ov_cache_layout":"bogus","models":{"existing":{"vram_gb":1.0}}}"#,
+        )
+        .expect("rewrite temp config");
+        let err = mm
+            .reload_config()
+            .expect_err("bogus layout is refused")
+            .to_string();
+        assert!(err.contains("ov_cache_layout"), "{err}");
+        assert!(
+            err.starts_with(CONFIG_INVALID_PREFIX),
+            "an invalid file must be recognisable for the 422 mapping: {err}"
+        );
+    }
+
+    /// The E-17 advice is recognised from the plugin's message, names the model's active
+    /// directory, and is logged once per model (B4 of the family smoke).
+    #[tokio::test]
+    async fn blob_mismatch_is_recognised_and_noted_once() {
+        assert!(is_kv_blob_mismatch_error(
+            "[GPU] Incorrect block size for Paged Attention operation for key cache quant mode BY_CHANNEL. Expected 20, but got 12"
+        ));
+        assert!(!is_kv_blob_mismatch_error("CL_OUT_OF_RESOURCES"));
+        let hint = kv_blob_mismatch_hint("m", Some("/c/ov_cache/kv-i8"));
+        assert!(
+            hint.contains("/c/ov_cache/kv-i8") && hint.contains("stop the server"),
+            "{hint}"
+        );
+        assert!(kv_blob_mismatch_hint("m", None).contains("no ov_cache_dir"));
+
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let (mm, _active, _dir) = keyed_cache_fixture(&sandbox).await;
+        assert!(
+            mm.note_kv_blob_mismatch("model-a"),
+            "first failure is noted"
+        );
+        assert!(!mm.note_kv_blob_mismatch("model-a"), "then quiet");
+    }
+
     /// Priority ordering: a blob owned by a model no longer in config is
     /// deleted before a blob owned by a configured-but-not-`Ready` model,
     /// which is deleted before an unattributed blob — each only as needed to
     /// get back under budget, not all at once.
     #[tokio::test]
     async fn prune_prioritizes_not_in_config_over_not_ready_over_unattributed() {
-        let cache_dir = tempfile::tempdir().expect("cache dir tempdir");
+        // The manifest lives in the PARENT of the cache dir, so give each test its own parent;
+        // bare tempdirs under /tmp all shared /tmp/cache_manifest and raced.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let cache_dir = tempfile::tempdir_in(sandbox.path()).expect("cache dir tempdir");
         let blob_size = 2 * 1024 * 1024; // 2MB each
         std::fs::write(cache_dir.path().join("gone.blob"), vec![0_u8; blob_size])
             .expect("write gone.blob");
@@ -10561,6 +15179,7 @@ mod tests {
         .expect("write not-ready.blob");
         std::fs::write(cache_dir.path().join("orphan.blob"), vec![0_u8; blob_size])
             .expect("write orphan.blob");
+        backdate(&cache_dir.path().join("orphan.blob"));
 
         // "model-a" is configured (NotLoaded, never loaded) — "gone-model" is
         // attributed but absent from config entirely.
@@ -10602,6 +15221,17 @@ mod tests {
             cache_dir.path().join("orphan.blob").exists(),
             "unattributed blob must survive once the cap is met"
         );
+    }
+
+    /// Makes `path` look two hours old, past the prune pass's grace for unattributed blobs.
+    fn backdate(path: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_hours(2);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for backdate")
+            .set_modified(old)
+            .expect("set mtime");
     }
 
     /// Test-only accessor: `ModelManager` doesn't expose its `Config` outside
@@ -10678,9 +15308,11 @@ mod tests {
         );
     }
 
-    /// D3-S1.C1: the upfront feasibility check credits live RAM with weights only, like
-    /// `plan_evictions`: `max_reclaimable` reports the reserved KV pool in the allocated total
-    /// (the VRAM credit) but not in the weights total (the RAM credit).
+    /// D3-S1.C1 + CPU over-admission: `max_reclaimable` reports the reserved KV pool in the
+    /// allocated total (the VRAM credit). The RAM credit goes through `ram_credit_gb`: these mock
+    /// models run on `CPU`, so an unmeasured one is credited its whole allocation (its resident
+    /// memory plus the outstanding rest the live gate subtracts), a measured one above it with what
+    /// it holds.
     #[tokio::test]
     async fn max_reclaimable_credits_ram_with_weights_and_vram_with_the_reservation() {
         let config = make_config(&[("model-a", 5.0), ("incoming", 5.0)], 17.0);
@@ -10691,18 +15323,165 @@ mod tests {
         );
         mm.load_model("model-a").await.unwrap();
         let domain = mm.record_domain("model-a");
+        mm.write_models("test")
+            .get_mut("model-a")
+            .unwrap()
+            .cpu_resident = (Some(0), 0);
 
-        let (allocated, weights) = mm.max_reclaimable("incoming", &domain, true);
+        let (allocated, credit) = mm.max_reclaimable("incoming", &domain, true);
         assert!(
-            (weights - 5.0).abs() < 1e-9,
-            "weights credit is the model's weights, got {weights}"
+            allocated > 5.0 + 0.5,
+            "the VRAM credit includes the reserved KV pool: allocated {allocated}"
         );
         assert!(
-            allocated > weights + 0.5,
-            "the VRAM credit includes the reserved KV pool: allocated {allocated} vs weights {weights}"
+            (credit - allocated).abs() < 1e-9,
+            "an unmeasured CPU model is credited its allocation, got {credit} vs {allocated}"
         );
+        assert!((mm.cpu_outstanding_gb() - allocated).abs() < 1e-9);
+
+        // Measured above its charge: credited what it holds, nothing outstanding.
+        let held = allocated + 3.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let held_bytes = (held * GIB_F64) as u64;
+        mm.write_models("test")
+            .get_mut("model-a")
+            .unwrap()
+            .cpu_resident = (Some(0), held_bytes);
+        let (_, credit) = mm.max_reclaimable("incoming", &domain, true);
+        assert!(
+            (credit - held).abs() < 1e-6,
+            "credit {credit} vs held {held}"
+        );
+        assert!(mm.cpu_outstanding_gb().abs() < 1e-9);
+
         // The loading model itself is never a candidate.
         assert_eq!(mm.max_reclaimable("model-a", &domain, true), (0.0, 0.0));
+    }
+
+    /// CPU over-admission: only Ready `CPU` models count as outstanding. A load in progress
+    /// (its reservation already in the tracker) is the model being admitted, never subtracted.
+    #[tokio::test]
+    async fn cpu_outstanding_counts_ready_cpu_models_only() {
+        let mut config = make_config(&[("model-a", 5.0), ("model-b", 4.0)], 30.0);
+        config.cache_size_gb = 1.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        mm.load_model("model-b").await.unwrap();
+        let alloc = |id: &str| mm.vram.read().unwrap().allocated_gb(id);
+        let (a, b) = (alloc("model-a"), alloc("model-b"));
+        // model-a measured 2 GiB resident, model-b nothing yet.
+        {
+            let mut guard = mm.write_models("test");
+            guard.get_mut("model-a").unwrap().cpu_resident = (Some(1 << 30), 1 << 30);
+            guard.get_mut("model-b").unwrap().cpu_resident = (None, 0);
+        }
+        let got = mm.cpu_outstanding_gb();
+        assert!(
+            (got - (a - 2.0 + b)).abs() < 1e-9,
+            "got {got}, a {a}, b {b}"
+        );
+
+        mm.write_models("test").get_mut("model-b").unwrap().state = ModelState::Loading;
+        assert!(
+            (mm.cpu_outstanding_gb() - (a - 2.0)).abs() < 1e-9,
+            "a model still loading is not outstanding"
+        );
+        mm.write_models("test").get_mut("model-b").unwrap().state = ModelState::Ready;
+    }
+
+    /// CPU over-admission: a second request handed out inside a solo window voids it, as does a
+    /// load or eviction in it; a clean solo window measures the change in anonymous memory.
+    #[test]
+    fn solo_request_delta_counts_only_a_clean_solo_window() {
+        let w = SoloWindow {
+            model_id: "m".to_owned(),
+            starts: 7,
+            rss_before: 1_000,
+            window: crate::gpu_memory::MeasureWindow::open(),
+        };
+        assert_eq!(solo_request_delta(&w, 7, true, Some(9_000)), Some(8_000));
+        assert_eq!(solo_request_delta(&w, 7, true, Some(500)), Some(0));
+        assert_eq!(solo_request_delta(&w, 8, true, Some(9_000)), None);
+        assert_eq!(solo_request_delta(&w, 7, false, Some(9_000)), None);
+        assert_eq!(solo_request_delta(&w, 7, true, None), None);
+    }
+
+    /// CPU over-admission: a CPU model measured above its weight charge learns what it holds as
+    /// its weights, the lazily allocated pool still charged on top and outstanding.
+    #[test]
+    fn cpu_learning_keeps_the_lazy_pool_charged() {
+        assert_eq!(cpu_learned_weight_gb(8.0, 5.0), Some(8.0));
+        // Within the dead band (5 % or 0.75 GB) of the weight charge: no correction.
+        assert_eq!(cpu_learned_weight_gb(5.5, 5.0), None);
+        // weights 5 + pool 2 charged, 8 resident: the weights become 8, allocation 10, 2 outstanding.
+        let weight = cpu_learned_weight_gb(8.0, 5.0).unwrap();
+        let allocation = weight + 2.0;
+        assert!(((allocation - 8.0_f64).max(0.0) - 2.0).abs() < 1e-12);
+    }
+
+    /// CPU over-admission: a solo request that shows a CPU model holding more than its weight
+    /// charge re-books it at what it holds, with its lazily allocated pool still charged on top.
+    #[tokio::test]
+    async fn solo_request_above_the_charge_learns_the_weights_and_keeps_the_pool() {
+        let mut config = make_config(&[("model-a", 5.0)], 30.0);
+        config.cache_size_gb = 2.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        let kv = mm.read_models("test")["model-a"].kv_cache_gb;
+        mm.write_models("test")
+            .get_mut("model-a")
+            .unwrap()
+            .cpu_resident = (Some(0), 0);
+        mm.record_solo_request("model-a", 8 << 30);
+        let learned = mm.read_models("test")["model-a"].learned_weight_gb;
+        assert_eq!(learned, Some(8.0));
+        let alloc = mm.vram.read().unwrap().allocated_gb("model-a");
+        assert!((alloc - (8.0 + kv)).abs() < 1e-9, "alloc {alloc}, kv {kv}");
+        assert!((mm.cpu_outstanding_gb() - kv).abs() < 1e-9);
+        // A smaller later request changes nothing.
+        mm.record_solo_request("model-a", 1 << 30);
+        assert_eq!(mm.read_models("test")["model-a"].cpu_resident.1, 8 << 30);
+    }
+
+    /// CPU over-admission: a window whose request count moved (another request was handed out)
+    /// is discarded at close, leaving the measured resident as it was.
+    #[tokio::test]
+    async fn close_solo_window_discards_a_window_another_request_shared() {
+        let config = make_config(&[("model-a", 5.0)], 17.0);
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        mm.write_models("test")
+            .get_mut("model-a")
+            .unwrap()
+            .cpu_resident = (Some(0), 0);
+        let starts = mm.request_starts.fetch_add(2, Ordering::Relaxed) + 1;
+        *mm.solo_window.lock().unwrap() = Some(SoloWindow {
+            model_id: "model-a".to_owned(),
+            starts,
+            rss_before: 0,
+            window: crate::gpu_memory::MeasureWindow::open(),
+        });
+        mm.close_solo_window();
+        assert!(
+            mm.solo_window.lock().unwrap().is_none(),
+            "the window is closed"
+        );
+        assert_eq!(mm.read_models("test")["model-a"].cpu_resident, (Some(0), 0));
+    }
+
+    /// CPU over-admission: every live-RAM credit site agrees: a non-`CPU` victim is credited its
+    /// weights, a `CPU` one the larger of its allocation and what it holds.
+    #[test]
+    fn ram_credit_is_weights_off_cpu_and_allocation_or_resident_on_cpu() {
+        assert!((ram_credit_gb(5.0, 7.0, None) - 5.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, Some(0.8)) - 7.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, Some(9.0)) - 9.0).abs() < 1e-12);
     }
 
     /// D3-S1.B3: the automatic-recovery eviction behaves like `evict_model` today — it drains a
@@ -11311,6 +16090,7 @@ mod tests {
             avail: None,
             needed: None,
             floor: 4.0,
+            ceiling: None,
         };
         assert!(discrete.admits(0.0), "a discrete domain has no RAM gate");
         assert!(discrete.admits(-999.0), "and nothing can make it refuse");
@@ -11325,6 +16105,7 @@ mod tests {
             avail: Some(10.0),
             needed: Some(24.0),
             floor: 4.0,
+            ceiling: None,
         };
         assert!(
             !gate.admits(0.0),
@@ -11334,6 +16115,55 @@ mod tests {
         assert!(
             gate.admits(20.0),
             "eviction credit must be counted, as ensure_vram_for's retry does"
+        );
+    }
+
+    /// S281 defect (f), QA cell MEM-01 figures: ~40.7 GB available, three CPU residents credited
+    /// ~37 GB, a 43 GB load and a 20 GB floor on a 47 GB box. Uncapped, the preview promised a
+    /// fit after evicting all three; capped at `MemTotal` it refuses with nothing evicted.
+    #[test]
+    fn test_ram_gate_caps_the_eviction_credit_at_the_machines_ram() {
+        let uncapped = RamGate {
+            avail: Some(40.7),
+            needed: Some(43.0),
+            floor: 20.0,
+            ceiling: None,
+        };
+        assert!(uncapped.admits(37.0), "the old, unsound verdict");
+        let capped = RamGate {
+            ceiling: Some(47.0),
+            ..uncapped
+        };
+        assert!(!capped.admits(37.0), "47 - 43 < 20: can never fit");
+        let candidates: Vec<EvictionCandidate> = ["a", "b", "c"]
+            .iter()
+            .map(|id| EvictionCandidate {
+                id: (*id).to_owned(),
+                allocated_gb: 0.0,
+                weight_gb: 12.3,
+            })
+            .collect();
+        let (_, fits) = plan_evictions(&candidates, 0.0, 0.0, |f| capped.admits(f));
+        assert!(!fits, "the preview refuses, so the load evicts nothing");
+    }
+
+    /// The cap never lowers a reading below what is live, and is inert when unset (discrete
+    /// domains, unreadable `MemTotal`); the UMA case where eviction really returns memory still
+    /// admits under the ceiling.
+    #[test]
+    fn test_credited_avail_is_capped_but_never_below_live() {
+        assert!((os_memory::credited_avail_gb(10.0, 5.0, None) - 15.0).abs() < 1e-9);
+        assert!((os_memory::credited_avail_gb(10.0, 50.0, Some(30.0)) - 30.0).abs() < 1e-9);
+        assert!((os_memory::credited_avail_gb(31.0, 5.0, Some(30.0)) - 31.0).abs() < 1e-9);
+        let uma = RamGate {
+            avail: Some(8.0),
+            needed: Some(12.0),
+            floor: 4.0,
+            ceiling: Some(30.0),
+        };
+        assert!(
+            uma.admits(12.0),
+            "8 + 12 = 20, under the 30 GB ceiling: admits"
         );
     }
 
@@ -11348,14 +16178,14 @@ mod tests {
 
         // Uncapped (cache_size_gb == 0): grab all remaining minus the margin.
         cfg.cache_size_gb = 0.0;
-        assert!((ModelManager::compute_kv_pool_gb(10.0, 0.0, &cfg) - 9.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(10.0, 0.0, &cfg, true).gb - 9.0).abs() < 1e-9);
         // Floored at min_kv when remaining-after-margin is tiny.
-        assert!((ModelManager::compute_kv_pool_gb(2.0, 0.0, &cfg) - 2.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(2.0, 0.0, &cfg, true).gb - 2.0).abs() < 1e-9);
         // Capped by cache_size_gb when set and smaller than the optimal grab.
         cfg.cache_size_gb = 4.0;
-        assert!((ModelManager::compute_kv_pool_gb(10.0, 0.0, &cfg) - 4.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(10.0, 0.0, &cfg, true).gb - 4.0).abs() < 1e-9);
         // Cap above the optimal grab does not inflate it.
-        assert!((ModelManager::compute_kv_pool_gb(3.0, 0.0, &cfg) - 2.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(3.0, 0.0, &cfg, true).gb - 2.0).abs() < 1e-9);
     }
 
     /// Co-residency Slice 2: a non-zero `kv_target_gb` clamps the pool so a
@@ -11370,16 +16200,1619 @@ mod tests {
 
         // Target below the grab-all baseline → clamped to the target.
         // free-margin = 19; target 6 → 6.
-        assert!((ModelManager::compute_kv_pool_gb(20.0, 6.0, &cfg) - 6.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(20.0, 6.0, &cfg, true).gb - 6.0).abs() < 1e-9);
         // Target above the available baseline → cannot exceed what's free.
         // free-margin = 4; target 6 → 4.
-        assert!((ModelManager::compute_kv_pool_gb(5.0, 6.0, &cfg) - 4.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(5.0, 6.0, &cfg, true).gb - 4.0).abs() < 1e-9);
         // Target below the floor is lifted to min_kv (never start below the floor).
         // free-margin = 19; target 1; floor 2 → 2.
-        assert!((ModelManager::compute_kv_pool_gb(20.0, 1.0, &cfg) - 2.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(20.0, 1.0, &cfg, true).gb - 2.0).abs() < 1e-9);
         // Global cache_size_gb cap still binds on top of a larger target.
         cfg.cache_size_gb = 5.0;
-        assert!((ModelManager::compute_kv_pool_gb(20.0, 8.0, &cfg) - 5.0).abs() < 1e-9);
+        assert!((ModelManager::compute_kv_pool_gb(20.0, 8.0, &cfg, true).gb - 5.0).abs() < 1e-9);
+    }
+
+    fn kv_profile_fixture(
+        layers: usize,
+        heads: usize,
+        dim: usize,
+        la: u64,
+    ) -> kv_profile::KvProfile {
+        kv_profile::KvProfile {
+            pa_layers: vec![
+                kv_profile::PaLayer {
+                    kv_heads: heads,
+                    k_head_dim: dim,
+                    v_head_dim: dim,
+                };
+                layers
+            ],
+            block_tokens: kv_profile::GPU_BLOCK_TOKENS,
+            weights_4bit: Some(true),
+            ir_kv_hint: None,
+            linear_state_bytes_per_seq: la,
+            hidden_size: 4096,
+            confidence: kv_profile::Confidence::High,
+        }
+    }
+
+    fn exact_spec(
+        profile: &kv_profile::KvProfile,
+        precision: kv_profile::KvPrecision,
+        la_rule: kv_capacity::LaBlocksRule,
+    ) -> ExactPoolSpec {
+        ExactPoolSpec {
+            profile: Arc::new(profile.clone()),
+            precision,
+            prefix_caching: false,
+            la_rule,
+            passed: "u4",
+            engine_path: "cb",
+            max_num_seqs: 4,
+            device: "GPU.1".to_owned(),
+            versions: ("2026.4.1".to_owned(), "2026.4.1".to_owned()),
+            headroom: None,
+        }
+    }
+
+    /// Blocks-first (T5, U-09): the budget keeps every existing clamp, the pool is exactly what
+    /// the engine builds (fractional GiB, no rounding up), and `blocks` is what the engine gets.
+    #[test]
+    fn exact_pool_is_the_budget_in_whole_blocks() {
+        let mut cfg = make_config(&[], 24.0);
+        cfg.vram_safety_margin_gb = 1.0;
+        cfg.min_kv_cache_gb = 0.0;
+        cfg.cache_size_gb = 0.0;
+        let q8b = kv_profile_fixture(36, 8, 128, 0);
+        let spec8 = exact_spec(
+            &q8b,
+            kv_profile::KvPrecision::I8,
+            kv_capacity::LaBlocksRule::One,
+        );
+        let plan = |free: f64, target: f64, spec: &ExactPoolSpec| {
+            ModelManager::compute_kv_pool(free, target, &cfg, true, Some(spec), None).unwrap()
+        };
+
+        // Asked 4 GiB with room to spare: 3,192 blocks, nothing clamped, no rounding.
+        let p = plan(7.3, 4.0, &spec8);
+        assert_eq!(
+            (p.blocks, p.clamped_by, p.rounded_from_gb),
+            (Some(3_192), None, None)
+        );
+        assert_eq!(p.bytes_allocated, Some(3_192 * 1_345_536));
+        assert!((p.gb - 3_192.0 * 1_345_536.0 / 1_073_741_824.0).abs() < 1e-12);
+        // "All that fits" 2.7 - 1.0 = 1.7 GiB is planned as 1.7 GiB (not 2, not 1).
+        let p = plan(2.7, 0.0, &spec8);
+        assert_eq!(p.blocks, Some(1_356));
+        assert!(p.gb < 1.7 && p.gb > 1.69, "{}", p.gb);
+        assert_eq!(p.clamped_by, None);
+        // A fractional request is booked as asked, not rounded up to 2.
+        let p = plan(20.0, 1.21, &spec8);
+        assert_eq!(p.clamped_by, None);
+        assert!((p.gb - 1.21).abs() < 0.002, "{}", p.gb);
+        // The other clamps still apply and are still named.
+        let mut capped = cfg.clone();
+        capped.cache_size_gb = 2.0;
+        let p =
+            ModelManager::compute_kv_pool(20.0, 4.0, &capped, true, Some(&spec8), None).unwrap();
+        assert_eq!(p.clamped_by, Some(KvClamp::CacheSizeGb));
+        assert!(p.gb <= 2.0 && p.gb > 1.99);
+        // Hybrid VLM path: 27B at 4.2 GiB u4 -> 13,353 blocks, 4.1999 GiB.
+        let q27 = kv_profile_fixture(16, 4, 256, 79_429_632);
+        let spec27 = exact_spec(
+            &q27,
+            kv_profile::KvPrecision::U4,
+            kv_capacity::LaBlocksRule::One,
+        );
+        let p = plan(20.0, 4.2, &spec27);
+        assert_eq!(
+            (p.blocks, p.bytes_allocated),
+            (Some(13_353), Some(4_509_634_560))
+        );
+        // Without a spec nothing changes: whole GiB, no blocks.
+        let p = ModelManager::compute_kv_pool(20.0, 1.21, &cfg, true, None, None).unwrap();
+        assert_eq!((p.gb, p.blocks), (2.0, None));
+    }
+
+    /// A pool that cannot hold the linear-attention reservation plus one block is refused with the
+    /// reason, never handed to the engine as `num_kv_blocks = 0` ("size it yourself").
+    #[test]
+    fn exact_pool_refuses_a_budget_that_holds_no_block() {
+        let mut cfg = make_config(&[], 24.0);
+        cfg.vram_safety_margin_gb = 0.0;
+        cfg.min_kv_cache_gb = 0.0;
+        cfg.cache_size_gb = 0.0;
+        let q27 = kv_profile_fixture(16, 4, 256, 79_429_632);
+        let many = exact_spec(
+            &q27,
+            kv_profile::KvPrecision::U4,
+            kv_capacity::LaBlocksRule::MaxNumSeqs(256),
+        );
+        let err =
+            ModelManager::compute_kv_pool(20.0, 4.0, &cfg, true, Some(&many), None).unwrap_err();
+        assert!(
+            matches!(err, kv_capacity::CapacityError::LaExceedsBudget { .. }),
+            "{err}"
+        );
+        let q8b = kv_profile_fixture(36, 8, 128, 0);
+        let one = exact_spec(
+            &q8b,
+            kv_profile::KvPrecision::I8,
+            kv_capacity::LaBlocksRule::One,
+        );
+        let err =
+            ModelManager::compute_kv_pool(0.0001, 0.0, &cfg, true, Some(&one), None).unwrap_err();
+        assert!(
+            matches!(err, kv_capacity::CapacityError::BudgetTooSmall { .. }),
+            "{err}"
+        );
+    }
+
+    fn pool_inputs(
+        profile: kv_profile::KvProfile,
+        resolution: kv_precision::KvResolution,
+        path: kv_precision::EnginePath,
+    ) -> lifecycle::KvPoolInputs {
+        lifecycle::KvPoolInputs {
+            profile: Arc::new(profile),
+            resolution,
+            path,
+        }
+    }
+
+    fn explicit_u4() -> kv_precision::KvResolution {
+        kv_precision::KvResolution {
+            precision: Some(kv_profile::KvPrecision::U4),
+            rule_guess: None,
+            source: kv_precision::PrecisionSource::AutoRule,
+            passed: "u4",
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // mirrors the Option the sizing function takes
+    fn known_versions() -> Option<(String, String)> {
+        Some((
+            "2026.4.1-22982-e213a147257".to_owned(),
+            "2026.4.1.0-3408-ab01d1771e4".to_owned(),
+        ))
+    }
+
+    /// End to end through `load_model`: a trusted dense model gets its exact block count handed to
+    /// the factory and recorded, the booking is the allocated bytes (not a rounded GiB figure),
+    /// and a model the factory knows nothing about keeps the whole-GiB path and clears the hint.
+    #[tokio::test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    async fn load_hands_the_exact_block_count_to_the_engine() {
+        let mut config = make_config(&[("model-a", 5.0), ("model-b", 5.0)], 40.0);
+        config.cache_size_gb = 4.2;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        let inputs = pool_inputs(
+            kv_profile_fixture(36, 8, 128, 0),
+            explicit_u4(),
+            kv_precision::EnginePath::Cb,
+        );
+        let factory = Arc::new(MockEngineFactory {
+            pool_inputs: Some(inputs),
+            ..MockEngineFactory::default()
+        });
+        let mm = ModelManager::new(config, Arc::clone(&factory) as Arc<dyn EngineFactory>)
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        // 4.2 GiB at u4 (755,712 B per block): floor(4.2 * 2^30 / 755,712) blocks.
+        let want = 5_967_u64; // floor(4.2 GiB / 755,712 B per u4 block of the 8B shape)
+        let hints = factory.blocks_hints.lock().unwrap().clone();
+        assert_eq!(hints, vec![Some(want)]);
+        let (blocks, kv_gb) = {
+            let models = mm.read_models("test");
+            let r = models.get("model-a").unwrap();
+            (r.kv_pool_blocks, r.kv_cache_gb)
+        };
+        assert_eq!(blocks, Some(want));
+        let booked = want as f64 * 755_712.0 / 1_073_741_824.0;
+        assert!((kv_gb - booked).abs() < 1e-9, "{kv_gb} vs {booked}");
+        assert!(kv_gb < 4.2 && kv_gb > 4.19, "not rounded up to 5: {kv_gb}");
+    }
+
+    /// A pool that can never hold the linear-attention reservation is refused up front, as a typed
+    /// insufficient-memory error naming the knob, and nothing is evicted to make room for it.
+    #[tokio::test]
+    async fn impossible_exact_pool_is_refused_before_anything_is_evicted() {
+        let mut config = make_config(&[("model-a", 5.0), ("model-b", 5.0)], 12.0);
+        config.cache_size_gb = 4.0;
+        config.vram_safety_margin_gb = 1.0;
+        config.min_kv_cache_gb = 1.0;
+        config.enable_prefix_caching = false; // a hybrid model with it on keeps whole-GiB sizing
+        let hybrid = kv_profile_fixture(16, 4, 256, 79_429_632);
+        let factory = Arc::new(MockEngineFactory {
+            pool_inputs: Some(pool_inputs(
+                hybrid,
+                explicit_u4(),
+                kv_precision::EnginePath::Cb,
+            )),
+            ..MockEngineFactory::default()
+        });
+        let mm = ModelManager::new(config, Arc::clone(&factory) as Arc<dyn EngineFactory>)
+            .await
+            .unwrap();
+        // b fits with a single stream (one LA block); a asks for the config's 1000 streams.
+        mm.load_model_with_overrides(
+            "model-b",
+            LoadOverrides {
+                max_concurrent_streams: Some(1),
+                ..LoadOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+        let free_before = mm.vram.read().unwrap().free_gb("system");
+        let err = mm.load_model("model-a").await.unwrap_err();
+        let model_err = err.downcast_ref::<ModelError>().expect("typed refusal");
+        assert!(
+            matches!(model_err, ModelError::InsufficientMemory(m)
+                if m.contains("max_concurrent_streams") && m.contains("MiB")),
+            "{err}"
+        );
+        // b is still resident, nothing was reserved for a, and the hint was not set for a.
+        assert_eq!(
+            mm.read_models("t").get("model-b").unwrap().state,
+            ModelState::Ready
+        );
+        assert!((mm.vram.read().unwrap().free_gb("system") - free_before).abs() < 1e-9);
+        assert_eq!(factory.blocks_hints.lock().unwrap().len(), 1);
+    }
+
+    /// End to end: an exactly-sized load gets the exact gate (95 % of the pool's capacity, named);
+    /// `kv_gate_mode: legacy` keeps the old estimate for the same pool; a load the factory cannot
+    /// describe is legacy as well.
+    #[tokio::test]
+    async fn load_records_the_gate_mode_and_its_limit() {
+        // The mock model directory has no config.json, so the legacy estimate disables the gate
+        // (mode ""), which is itself the point: "legacy" is never claimed without a limit.
+        for (mode, want_mode) in [("exact", "exact"), ("legacy", "")] {
+            let mut config = make_config(&[("model-a", 5.0)], 40.0);
+            config.cache_size_gb = 4.0;
+            config.vram_safety_margin_gb = 0.0;
+            config.min_kv_cache_gb = 0.0;
+            config.kv_gate_mode = mode.to_owned();
+            let inputs = pool_inputs(
+                kv_profile_fixture(36, 8, 128, 0),
+                explicit_u4(),
+                kv_precision::EnginePath::Cb,
+            );
+            let factory = Arc::new(MockEngineFactory {
+                pool_inputs: Some(inputs),
+                ..MockEngineFactory::default()
+            });
+            let mm = ModelManager::new(config, factory as Arc<dyn EngineFactory>)
+                .await
+                .unwrap();
+            mm.load_model("model-a").await.unwrap();
+            let models = mm.read_models("t");
+            let r = models.get("model-a").unwrap();
+            assert_eq!(r.kv_gate_mode, want_mode);
+            if mode == "exact" {
+                // The mock model dir has no config.json, so only the pool limits it.
+                // 4 GiB / 755,712 B per u4 block = 5,683 blocks = 90,928 tokens; 95 % = 86,381.
+                assert_eq!(r.kv_pool_blocks, Some(5_683));
+                assert_eq!(r.pool_capacity_tokens, 90_928);
+                assert_eq!(r.max_prompt_tokens, 86_381);
+                assert_eq!(r.kv_gate_clamped_by, Some(GateClamp::Pool));
+                assert!(r.kv_ratchet_key.is_some());
+            } else {
+                assert_eq!(r.kv_gate_clamped_by, None);
+                assert!(r.kv_ratchet_key.is_none());
+            }
+        }
+    }
+
+    /// End to end: a wedge on an exactly-sized pool teaches a ceiling that the recovery reload
+    /// applies (named `ratchet`), a later wedge at a larger prompt never raises it, and the old
+    /// per-model file is not touched.
+    #[tokio::test]
+    async fn wedge_ceiling_is_learned_and_applied_by_the_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("model-a")).unwrap();
+        let mut config = make_config(&[("model-a", 5.0)], 40.0);
+        config.models_dir = dir.path().to_path_buf();
+        config.cache_size_gb = 4.0;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        let inputs = pool_inputs(
+            kv_profile_fixture(36, 8, 128, 0),
+            explicit_u4(),
+            kv_precision::EnginePath::Cb,
+        );
+        let factory = Arc::new(MockEngineFactory {
+            pool_inputs: Some(inputs),
+            ..MockEngineFactory::default()
+        });
+        let mm = Arc::new(
+            ModelManager::new(config, factory as Arc<dyn EngineFactory>)
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
+        let limit = |mm: &ModelManager| {
+            let models = mm.read_models("t");
+            let r = models.get("model-a").unwrap();
+            (r.max_prompt_tokens, r.kv_gate_clamped_by, r.kv_pool_blocks)
+        };
+        assert_eq!(limit(&mm), (86_381, Some(GateClamp::Pool), Some(5_683)));
+
+        // Wedge at 50,000 prompt tokens: the reload applies 95 % of it, for this very pool.
+        mm.spawn_kv_wedge_recovery("model-a", 50_000);
+        wait_for_wedge_recovery_to_finish(&mm, "model-a").await;
+        assert_eq!(limit(&mm), (47_500, Some(GateClamp::Ratchet), Some(5_683)));
+        // Learned into the ratchet directory, never into the model library.
+        let ratchet_dir = mm.ratchet_dir("model-a").unwrap();
+        assert!(ratchet_dir.join(".rustedvino_kv_ratchet.v2.json").is_file());
+        assert!(
+            !ratchet_dir.starts_with(dir.path()),
+            "{}",
+            ratchet_dir.display()
+        );
+        for f in [
+            ".rustedvino_kv_ratchet.v2.json",
+            ".rustedvino_kv_ratchet.json",
+        ] {
+            assert!(
+                !dir.path().join("model-a").join(f).exists(),
+                "{f} in the library"
+            );
+        }
+
+        // A later wedge at a larger prompt (60,000 > the 8,638 floor of the current limit) must not
+        // raise what the stricter observation learned.
+        mm.spawn_kv_wedge_recovery("model-a", 60_000);
+        wait_for_wedge_recovery_to_finish(&mm, "model-a").await;
+        assert_eq!(limit(&mm).0, 47_500);
+    }
+
+    /// A fake probe: other processes hold `outside` bytes of the device.
+    #[derive(Debug)]
+    struct FakeProbe(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64);
+
+    impl crate::gpu_memory::VramProbe for FakeProbe {
+        fn outside_used_bytes(&self, _pdev: &str) -> Option<u64> {
+            Some(self.0.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        /// Own device memory the driver reports (0 = unknown).
+        fn own_used_bytes(&self, _pdev: &str) -> Option<u64> {
+            Some(self.1.load(std::sync::atomic::Ordering::Relaxed)).filter(|b| *b > 0)
+        }
+    }
+
+    /// A manager over a 24 GiB discrete GPU `GPU.1` with the given vision models (weights in GiB),
+    /// a 27B-shaped hybrid vision profile (hidden 5120) and a probe reporting 0.5 GiB held by
+    /// other processes.
+    async fn headroom_manager(
+        models: &[(&str, f64)],
+        cache_size_gb: f64,
+        outside_bytes: u64,
+    ) -> (ModelManager, Arc<FakeProbe>) {
+        headroom_manager_with(models, cache_size_gb, outside_bytes, |_| {}).await
+    }
+
+    /// [`headroom_manager`] with a last edit to the config before the manager is built.
+    async fn headroom_manager_with(
+        models: &[(&str, f64)],
+        cache_size_gb: f64,
+        outside_bytes: u64,
+        edit: impl FnOnce(&mut Config),
+    ) -> (ModelManager, Arc<FakeProbe>) {
+        let mut config = make_config(models, 24.0);
+        config.device = "GPU.1".to_owned();
+        config.cache_size_gb = cache_size_gb;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        config.enable_prefix_caching = false;
+        config.embedding_device = Some("GPU.1".to_owned());
+        edit(&mut config);
+        let mut hybrid = kv_profile_fixture(16, 4, 256, 79_429_632);
+        hybrid.hidden_size = 5120;
+        let factory = Arc::new(MockEngineFactory {
+            pool_inputs: Some(pool_inputs(
+                hybrid,
+                explicit_u4(),
+                kv_precision::EnginePath::Vlm,
+            )),
+            ..MockEngineFactory::default()
+        });
+        let inventory = Arc::new(DeviceInventory::from_devices(vec![DeviceInfo {
+            name: "GPU.1".to_owned(),
+            full_name: "test dGPU".to_owned(),
+            architecture: None,
+            kind: DeviceKind::DiscreteGpu,
+            tier: DeviceTier::Heavy,
+            domain_id: "GPU.1".to_owned(),
+            total_mem_gb: Some(24.0),
+            pdev: Some("0000:03:00.0".to_owned()),
+        }]));
+        let probe = Arc::new(FakeProbe(
+            std::sync::atomic::AtomicU64::new(outside_bytes),
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let mm =
+            ModelManager::new_with_inventory(config, factory as Arc<dyn EngineFactory>, inventory)
+                .await
+                .unwrap()
+                .with_vram_probe(Some(
+                    Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
+                ));
+        (mm, probe)
+    }
+
+    /// T7: a vision model on a discrete GPU is limited by the free device memory as well as by its
+    /// pool: 15 GiB of weights + a 4 GiB pool on a 24 GiB card with 0.5 GiB held elsewhere and a
+    /// 0.5 GiB margin leave 4 GiB for one prompt's transient write (5120 x 4 x 2 B per token).
+    #[tokio::test]
+    async fn vision_on_a_discrete_gpu_is_limited_by_the_device_headroom() {
+        let (mm, probe) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let (limit, by, mode) = {
+            let m = mm.read_models("t");
+            let r = m.get("vlm-a").unwrap();
+            (r.max_prompt_tokens, r.kv_gate_clamped_by, r.kv_gate_mode)
+        };
+        assert_eq!(mode, "exact");
+        assert_eq!(by, Some(GateClamp::DeviceHeadroom));
+        assert!((104_000..106_000).contains(&limit), "{limit}");
+        // The pool alone would allow 193,116. The request path follows the device right now:
+        // another process grabs 3 GiB more (free 4.0 -> 1.0 GiB = about 26,000 tokens).
+        let mut mm = mm;
+        mm.headroom.set_ttl(std::time::Duration::ZERO);
+        probe
+            .0
+            .store(3_584 << 20, std::sync::atomic::Ordering::Relaxed);
+        let ctx = mm.get_chat_context("vlm-a").unwrap();
+        assert!(
+            (25_000..27_500).contains(&ctx.max_prompt_tokens),
+            "{}",
+            ctx.max_prompt_tokens
+        );
+        assert_eq!(
+            ctx.gate_detail.and_then(|d| d.clamped_by),
+            Some(GateClamp::DeviceHeadroom)
+        );
+        // ...and recovers when it lets go.
+        probe
+            .0
+            .store(512 << 20, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
+            limit
+        );
+    }
+
+    /// Fable S-1: memory this process holds that the tracker never booked (a model charged 0,
+    /// scratch buffers) still lowers the headroom limit.
+    #[tokio::test]
+    async fn headroom_sees_own_vram_the_tracker_never_booked() {
+        let (mm, probe) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let mut mm = mm;
+        mm.headroom.set_ttl(std::time::Duration::ZERO);
+        let before = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        // The driver says the process holds 3 GiB more than the 19 GiB booked.
+        probe
+            .1
+            .store(22 << 30, std::sync::atomic::Ordering::Relaxed);
+        let after = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        assert!(after < before - 50_000, "{before} -> {after}");
+        // Less than booked changes nothing (the tracker's figure still counts).
+        probe.1.store(1 << 30, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
+            before
+        );
+    }
+
+    /// Block B1 (A3): `kv_headroom_cap_tokens` is the raw headroom cap, not the live limit, so it
+    /// stays above `max_prompt_tokens` while the pool binds; the report shows the numbers behind it.
+    #[tokio::test]
+    async fn the_raw_cap_and_the_headroom_report_are_exposed() {
+        let (mm, _probe) = headroom_manager(&[("vlm-a", 15.0)], 2.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let info = mm.list_models().into_iter().next().unwrap();
+        let cap = info.kv_headroom_cap_tokens.expect("cap shown");
+        assert_eq!(info.kv_gate_clamped_by, Some(GateClamp::Pool));
+        assert!(
+            cap > info.max_prompt_tokens + 10_000,
+            "pool binds: cap {cap} vs limit {}",
+            info.max_prompt_tokens
+        );
+        let report = mm.headroom_report();
+        assert_eq!((report.mode.as_str(), report.probe), ("dynamic", "fdinfo"));
+        let d = &report.devices[0];
+        assert_eq!((d.device.as_str(), d.outside_mib), ("GPU.1", Some(512)));
+        // 24 GiB - 0.5 outside - (15 weights + 2 pool) - 0.5 margin
+        assert!((d.free_gib - 6.0).abs() < 0.1, "{d:?}");
+        assert!((d.own_gib - 17.0).abs() < 0.1, "{d:?}");
+        // No device-memory measurement in the mock: nothing to show.
+        assert_eq!(info.vram_measured_mib, None);
+    }
+
+    /// Review S2 + S1: the request limit follows the device both ways (it rises again when memory is
+    /// freed) and a headroom refusal carries the free GiB whenever the headroom is what binds.
+    #[tokio::test]
+    async fn the_request_limit_rises_again_and_names_the_free_memory() {
+        // 4 GiB pool: headroom binds at load (cap about 54k against a pool limit near 98k).
+        let (mm, probe) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 3_584 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let mut mm = mm;
+        mm.headroom.set_ttl(std::time::Duration::ZERO);
+        let tight = mm.get_chat_context("vlm-a").unwrap();
+        let d = tight.gate_detail.as_ref().unwrap();
+        assert_eq!(d.clamped_by, Some(GateClamp::DeviceHeadroom));
+        assert!(d.device_free_gib.is_some_and(|g| g > 0.0), "{d:?}");
+        // The other process lets go: the limit rises above the load-time figure.
+        probe
+            .0
+            .store(512 << 20, std::sync::atomic::Ordering::Relaxed);
+        let loose = mm.get_chat_context("vlm-a").unwrap();
+        assert!(
+            loose.max_prompt_tokens > tight.max_prompt_tokens + 10_000,
+            "{} -> {}",
+            tight.max_prompt_tokens,
+            loose.max_prompt_tokens
+        );
+        assert_eq!(
+            loose.max_prompt_tokens,
+            mm.list_models()
+                .into_iter()
+                .next()
+                .unwrap()
+                .max_prompt_tokens,
+            "request path and admin agree"
+        );
+    }
+
+    /// Fable review 3, S-1/S-2: the driver's figure includes a running request's transient memory,
+    /// which the lease already accounts for, so it is counted once; a model's own running request
+    /// does not lower its next limit; and the unbooked part is what exceeds the tracker.
+    #[tokio::test]
+    async fn the_drivers_own_figure_does_not_double_count_a_running_request() {
+        let (mm, probe) = headroom_manager(&[("vlm-a", 15.0)], 2.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let mut mm = mm;
+        mm.headroom.set_ttl(std::time::Duration::ZERO);
+        let gib = 1_u64 << 30;
+        // The tracker books 15 weights + 2 pool = 17 GiB; the driver agrees.
+        probe
+            .1
+            .store(17 * gib, std::sync::atomic::Ordering::Relaxed);
+        let idle = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        // (The pool is whole blocks, a few KiB under 2 GiB: "equal" means within a MiB.)
+        let near = |bytes: u64, want: u64| bytes.abs_diff(want) < (1 << 20);
+        assert!(near(mm.unbooked_own_bytes("GPU.1", "0000:03:00.0"), 0));
+        // A 90k-token request runs: its transient memory is in the driver's figure and in a lease.
+        let lease = mm.acquire_transient_lease("vlm-a", 90_000).unwrap();
+        let transient = 90_000_u64 * 5120 * 4 * 2;
+        probe
+            .1
+            .store(17 * gib + transient, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            near(mm.unbooked_own_bytes("GPU.1", "0000:03:00.0"), 0),
+            "the transient part is the lease's, not unbooked"
+        );
+        assert_eq!(
+            mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
+            idle,
+            "the model's own running request neither lowers its next limit nor is counted twice"
+        );
+        drop(lease);
+        // Memory nobody booked and nobody leased is counted.
+        probe
+            .1
+            .store(20 * gib, std::sync::atomic::Ordering::Relaxed);
+        assert!(near(
+            mm.unbooked_own_bytes("GPU.1", "0000:03:00.0"),
+            3 * gib
+        ));
+        assert!(mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens < idle);
+    }
+
+    /// S281 defect (b): an own-memory reading cached while a model was resident (the admin list
+    /// stamps it) must not count that model against a load right after its unload. Default TTL.
+    #[tokio::test]
+    async fn a_load_right_after_an_unload_does_not_see_the_unloaded_model_as_own_memory() {
+        let (mm, probe) =
+            headroom_manager(&[("vlm-a", 15.0), ("vlm-b", 15.0)], 2.0, 512 << 20).await;
+        let gib = 1_u64 << 30;
+        mm.load_model("vlm-a").await.unwrap();
+        probe
+            .1
+            .store(17 * gib, std::sync::atomic::Ordering::Relaxed);
+        // A status read inside the TTL window caches the 17 GiB.
+        assert_eq!(mm.headroom.own_bytes("0000:03:00.0"), Some(17 * gib));
+        mm.evict_model("vlm-a").await.unwrap();
+        probe.1.store(gib / 8, std::sync::atomic::Ordering::Relaxed);
+        mm.load_model("vlm-b")
+            .await
+            .expect("the unloaded model's memory is gone; the load must fit");
+    }
+
+    /// Fable review 2: a resize re-evaluates everything derived from the pool: the block count, the
+    /// gate, the ratchet key the wedge recovery will write under, and what `/v1/models` shows.
+    #[tokio::test]
+    async fn a_resize_re_evaluates_the_gate_the_ratchet_key_and_the_models_list() {
+        let (mm, _probe) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let snapshot = |mm: &ModelManager| {
+            let m = mm.read_models("t");
+            let r = m.get("vlm-a").unwrap();
+            (
+                r.kv_pool_blocks.unwrap(),
+                r.max_prompt_tokens,
+                r.kv_ratchet_key
+                    .clone()
+                    .expect("exact pool has a ratchet key"),
+            )
+        };
+        let (blocks4, gate4, key4) = snapshot(&mm);
+        assert_eq!(key4.kv_pool_blocks, blocks4);
+        mm.resize_model_kv_cache("vlm-a", 1.0).await.unwrap();
+        let (blocks1, gate1, key1) = snapshot(&mm);
+        assert!(blocks1 < blocks4 / 3, "{blocks4} -> {blocks1}");
+        assert_eq!(
+            key1.kv_pool_blocks, blocks1,
+            "the ratchet key follows the pool"
+        );
+        assert_ne!(key1, key4);
+        let info = mm.list_models().into_iter().next().unwrap();
+        // The pool limit at 1 GiB is below what the headroom allows, and it is what is shown.
+        assert!(
+            info.max_prompt_tokens <= gate1 && gate1 < gate4,
+            "{gate4} -> {gate1}"
+        );
+        assert_eq!(info.kv_pool_blocks, Some(blocks1));
+        assert_eq!(info.kv_gate_clamped_by, Some(GateClamp::Pool));
+    }
+
+    /// F3-S-6: the realtime vision path's protections (`realtime::vlm_clamp_and_lease`): a long
+    /// prompt takes a transient lease and a small one does not; an answer larger than the pool's
+    /// room is clamped; a prompt that leaves no room is an error, not a request sent to the engine.
+    #[tokio::test]
+    async fn realtime_vision_path_clamps_the_answer_and_takes_the_lease() {
+        let (mm, _probe) = headroom_manager(&[("vlm-a", 15.0)], 2.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let ctx = mm.get_chat_context("vlm-a").unwrap();
+        assert_eq!(
+            ctx.kv_gate_mode, "exact",
+            "the clamp applies on the exact gate"
+        );
+        let cap = ctx.pool_capacity_tokens;
+        assert!(cap > 0, "an exact pool reports its capacity");
+        let pool = (true, cap);
+        let f = crate::handlers::realtime::vlm_clamp_and_lease;
+
+        // A short prompt: no lease (below the in-flight threshold), the answer unchanged.
+        let (n, lease) = f(&mm, "vlm-a", pool, 100, 256).unwrap();
+        assert_eq!(n, 256);
+        assert!(lease.is_none(), "a 100-token prompt takes no lease");
+
+        // A long prompt: it takes the lease, and an answer bigger than the room is clamped.
+        let long = cap / 2;
+        let (n, lease) = f(&mm, "vlm-a", pool, long, cap).unwrap();
+        assert!(
+            n < cap - long,
+            "clamped below the room: {n} (cap {cap}, prompt {long})"
+        );
+        assert!(lease.is_some(), "a {long}-token prompt takes the lease");
+        drop(lease);
+
+        // A prompt that fills the pool leaves no room: an error before anything is submitted.
+        let Err(err) = f(&mm, "vlm-a", pool, cap, 256) else {
+            panic!("a full pool must leave no room")
+        };
+        assert!(err.to_string().contains("no room left to answer"), "{err}");
+    }
+
+    /// Template-read opinion: `ModelFiles::read` gives a text model its own template and
+    /// tokens, a media model the fallback template (tokens still read), an unreadable override
+    /// the fallback; `fallback()` is never an empty template.
+    #[test]
+    fn model_files_read_text_media_and_unreadable_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "TPL {{ messages }}").unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token": "</s>", "bos_token": "<s>"}"#,
+        )
+        .unwrap();
+        let text = ModelFiles::read("m", dir.path(), ModelKind::TextGen, None);
+        assert_eq!(text.template, "TPL {{ messages }}");
+        assert_eq!(text.special_tokens, ("</s>".to_owned(), "<s>".to_owned()));
+        let media = ModelFiles::read("m", dir.path(), ModelKind::Embedding, None);
+        assert_eq!(media.template, template::FALLBACK_TEMPLATE);
+        assert_eq!(media.special_tokens.0, "</s>");
+        let missing = std::path::Path::new("/nonexistent/override.jinja");
+        let bad = ModelFiles::read("m", dir.path(), ModelKind::TextGen, Some(missing));
+        assert_eq!(bad.template, template::FALLBACK_TEMPLATE);
+        assert!(!ModelFiles::fallback().template.is_empty());
+    }
+
+    /// Template-read opinion side finding: a `chat_template` given to `add_model` (admin add /
+    /// `rv add`) is used at that model's load, not only after a restart.
+    #[tokio::test]
+    async fn an_admin_added_chat_template_override_is_used() {
+        let mm = make_mm(&[], 22.5).await;
+        let dir = std::path::Path::new("/tmp/test-models/tpl-override-model");
+        std::fs::create_dir_all(dir).unwrap();
+        let tpl = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tpl.path(), "OVERRIDE {{ messages }}").unwrap();
+        mm.add_model(
+            "tpl-override-model".to_owned(),
+            2.0,
+            None,
+            config::ModelPolicy {
+                chat_template: Some(tpl.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        if mm.get_chat_context("tpl-override-model").is_err() {
+            mm.load_model("tpl-override-model").await.unwrap();
+        }
+        let ctx = mm.get_chat_context("tpl-override-model").unwrap();
+        assert_eq!(&*ctx.template, "OVERRIDE {{ messages }}");
+    }
+
+    /// F2-S-5 (E-16): uncounted image admissions are counted per model, shown in `list_models`,
+    /// and reset by the next load; an unknown id is a no-op.
+    #[tokio::test]
+    async fn uncounted_image_admissions_are_counted_until_the_next_load() {
+        let mm = make_mm(&[("qwen-vlm-a", 2.0)], 22.5).await;
+        mm.load_model("qwen-vlm-a").await.unwrap();
+        let count = |mm: &ModelManager| {
+            mm.list_models()
+                .into_iter()
+                .find(|i| i.id == "qwen-vlm-a")
+                .unwrap()
+                .uncounted_image_admissions
+        };
+        assert_eq!(count(&mm), 0);
+        mm.note_uncounted_image_admission("qwen-vlm-a");
+        mm.note_uncounted_image_admission("qwen-vlm-a");
+        mm.note_uncounted_image_admission("nope");
+        assert_eq!(count(&mm), 2);
+        mm.evict_model("qwen-vlm-a").await.unwrap();
+        mm.load_model("qwen-vlm-a").await.unwrap();
+        assert_eq!(count(&mm), 0, "a new load starts with full confidence");
+    }
+
+    /// Fable review 2: `kv_gate_mode: "legacy"` also turns the device-headroom limit, the transient
+    /// lease and the vision `max_tokens` clamp off (documented in CONFIG.md): it is a rollback of
+    /// the whole admission model, not only of the limit's formula.
+    #[tokio::test]
+    async fn legacy_mode_disables_headroom_the_lease_and_the_clamp() {
+        let (mm, _probe) = headroom_manager_with(&[("vlm-a", 15.0)], 4.0, 512 << 20, |c| {
+            c.kv_gate_mode = "legacy".to_owned();
+        })
+        .await;
+        mm.load_model("vlm-a").await.unwrap();
+        let info = mm.list_models().into_iter().next().unwrap();
+        assert_ne!(info.kv_gate_mode, "exact");
+        assert_eq!(info.kv_headroom_cap_tokens, None, "no headroom limit");
+        assert!(
+            mm.acquire_transient_lease("vlm-a", 100_000).is_none(),
+            "no lease for a long prompt"
+        );
+        let ctx = mm.get_chat_context("vlm-a").unwrap();
+        assert_ne!(
+            ctx.kv_gate_mode, "exact",
+            "the chat path sees the legacy gate"
+        );
+        // The clamp applies under the exact gate only (`clamp_vlm_max_tokens` takes the flag).
+        assert!(!ctx.kv_gate_mode.eq("exact"));
+    }
+
+    /// The measured weights are the load's device-memory delta minus the pool it allocated.
+    #[test]
+    fn measured_weights_are_delta_minus_pool() {
+        let gib = 1_i64 << 30;
+        assert_eq!(
+            measured_weights_mib(Some(19 * gib), 4.0),
+            Some(15 * 1024),
+            "19 GiB over the load, 4 GiB of it pool"
+        );
+        assert_eq!(measured_weights_mib(None, 4.0), None);
+        assert_eq!(measured_weights_mib(Some(2 * gib), 4.0), None, "polluted");
+        assert_eq!(measured_weights_mib(Some(-1), 0.0), None);
+    }
+
+    /// Never-0: a pool that would push the limit under the floor is shrunk until it keeps it, and a
+    /// device with no room even for the floor refuses the load with a reason.
+    #[tokio::test]
+    async fn headroom_shrinks_the_pool_or_refuses_the_load() {
+        // 15 GiB weights; 24 - 0.5 outside - 0.5 margin - 15 = 8 GiB free. The floor (4,096 x
+        // 40,960 B = 160 MiB) leaves a pool of 7.84 GiB at most; the config asks 12.
+        let (mm, _p) = headroom_manager(&[("vlm-a", 15.0)], 12.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let (gb, by, limit) = {
+            let m = mm.read_models("t");
+            let r = m.get("vlm-a").unwrap();
+            (r.kv_cache_gb, r.kv_clamped_by, r.max_prompt_tokens)
+        };
+        assert!(
+            gb < 7.9 && gb > 7.7,
+            "pool shrunk to what keeps the floor: {gb}"
+        );
+        assert_eq!(by, Some(KvClamp::DeviceHeadroom));
+        assert!(limit >= 4096, "{limit}");
+
+        // Weights alone leave less than the floor (another process holds 7.5 GiB): refused with the
+        // reason, nothing booked.
+        let (mm, _p) = headroom_manager(&[("vlm-big", 17.0)], 4.0, 7_680 << 20).await;
+        let err = mm.load_model("vlm-big").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("kv_headroom_min_tokens"), "{msg}");
+        assert!((mm.vram.read().unwrap().domain_gb("GPU.1").1).abs() < 1e-9);
+    }
+
+    /// A later load shrinks its own pool to keep its floor (identical vision models therefore keep
+    /// theirs too); a resident model whose tokens cost more (a larger hidden size) is checked
+    /// separately and the load is refused when the new booking would push it under its floor.
+    #[tokio::test]
+    async fn a_later_load_keeps_resident_vision_models_above_their_floor() {
+        let (mm, _p) = headroom_manager(&[("vlm-a", 8.0), ("vlm-b", 8.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        mm.load_model("vlm-b").await.unwrap();
+        let pools: Vec<f64> = ["vlm-a", "vlm-b"]
+            .iter()
+            .map(|id| mm.read_models("t").get(*id).unwrap().kv_cache_gb)
+            .collect();
+        assert!(pools[0] > 3.9, "first model keeps its pool: {pools:?}");
+        assert!(
+            pools[1] < pools[0],
+            "second pool shrunk by the headroom: {pools:?}"
+        );
+        for id in ["vlm-a", "vlm-b"] {
+            let limit = mm.get_chat_context(id).unwrap().max_prompt_tokens;
+            assert!(limit >= 4096, "{id}: {limit}");
+        }
+        // The check itself: with 22.8 GiB booked a resident model of hidden size 8192 would fall
+        // under its floor, with 20 GiB booked it would not.
+        let wide = headroom::HeadroomSpec {
+            hidden_size: 8192,
+            pdev: "0000:03:00.0".to_owned(),
+            total_bytes: 24 << 30,
+            factor: 2.0,
+            margin_bytes: 1 << 29,
+            floor_tokens: 4096,
+        };
+        let others = vec![("vlm-wide".to_owned(), wide)];
+        let outsides = HashMap::from([("0000:03:00.0".to_owned(), 512_u64 << 20)]);
+        assert!(
+            mm.headroom_check_others("GPU.1", 20.0, &others, &outsides)
+                .is_ok()
+        );
+        let msg = mm
+            .headroom_check_others("GPU.1", 22.9, &others, &outsides)
+            .unwrap_err();
+        assert!(
+            msg.contains("vlm-wide") && msg.contains("kv_headroom_min_tokens"),
+            "{msg}"
+        );
+    }
+
+    /// The admin view of a load: the resolution (precision, source, bytes per token, confidence),
+    /// the exact pool and, for a vision model on a discrete GPU, the live headroom limit.
+    #[tokio::test]
+    async fn list_models_carries_the_kv_decision() {
+        let (mm, _p) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        assert!(
+            mm.list_models()[0].kv_resolution.is_none(),
+            "before the first load"
+        );
+        mm.load_model("vlm-a").await.unwrap();
+        let info = mm.list_models().into_iter().next().unwrap();
+        let r = info.kv_resolution.expect("resolution after a load");
+        assert_eq!(
+            (r.precision, r.source, r.passed, r.profile_confidence),
+            (Some("u4"), "auto_rule", "u4", Some("high"))
+        );
+        assert_eq!(
+            r.bytes_per_token,
+            Some(20_736),
+            "16 attention layers of (4, 256)"
+        );
+        assert_eq!(info.kv_pool_blocks, Some(12_705));
+        assert_eq!(info.kv_gate_mode, "exact");
+        let cap = info.kv_headroom_cap_tokens.expect("headroom limit shown");
+        assert_eq!(
+            cap, info.max_prompt_tokens,
+            "the shown limit is the live one"
+        );
+        mm.evict_model("vlm-a").await.unwrap();
+        let gone = mm.list_models().into_iter().next().unwrap();
+        assert!(gone.kv_resolution.is_none() && gone.kv_headroom_cap_tokens.is_none());
+    }
+
+    /// A long request holds a transient lease: it lowers the limit other models (and other
+    /// loads) see, but not its own model's, since a vision engine runs one generation at a time.
+    #[tokio::test]
+    async fn long_requests_take_a_lease_the_limit_counts() {
+        let (mm, _p) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        assert!(
+            mm.acquire_transient_lease("vlm-a", 1_000).is_none(),
+            "short request"
+        );
+        let before = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        let lease = mm
+            .acquire_transient_lease("vlm-a", 100_000)
+            .expect("long request");
+        assert_eq!(
+            mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
+            before,
+            "its own running request does not lower its own next request's limit"
+        );
+        // Another model's long request (about 3.9 GiB at 100k tokens) does.
+        let rec = mm
+            .read_models("t")
+            .get("vlm-a")
+            .unwrap()
+            .headroom
+            .clone()
+            .unwrap();
+        let other = mm
+            .headroom
+            .acquire(&rec.domain, "vlm-other", &rec.spec, 100_000);
+        let during = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        assert!(during < before, "{during} < {before}");
+        drop(other);
+        drop(lease);
+        assert_eq!(
+            mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
+            before
+        );
+    }
+
+    /// A poison hidden in a context chain (the warm-up wraps its error) is still recognised;
+    /// `to_string` of the outer error alone would miss it.
+    #[test]
+    fn a_wrapped_out_of_resources_error_is_recognised_as_a_poison() {
+        let e = anyhow::anyhow!("clEnqueueWriteBuffer failed: CL_OUT_OF_RESOURCES")
+            .context("KV warm-up generation hit an out-of-resources failure");
+        assert!(
+            !is_gpu_poison_error(&e.to_string()),
+            "the outer message hides it"
+        );
+        assert!(is_gpu_poison_error(&format!("{e:#}")));
+    }
+
+    /// A load that needs no KV pool (STT, embedding, image, TTS) is held to the same rule: it may
+    /// not take the room a resident vision model's floor needs.
+    #[tokio::test]
+    async fn a_load_without_a_kv_pool_may_not_break_a_vision_models_floor() {
+        // vlm-a: 15 GiB weights + 4 GiB pool. 24 - 0.5 - 0.5 - 19 = 4 GiB free; an embedding model
+        // of 3.9 GiB leaves 0.1 GiB = about 2,600 tokens, under the 4,096 floor.
+        let (mm, _p) = headroom_manager(&[("vlm-a", 15.0), ("embed-x", 3.9)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        // Pinned: it cannot be evicted to make room, so the refusal must stand.
+        mm.write_models("t").get_mut("vlm-a").unwrap().pinned = true;
+        let err = mm.load_model("embed-x").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vlm-a") && msg.contains("kv_headroom_min_tokens"),
+            "{msg}"
+        );
+        assert_eq!(
+            mm.read_models("t").get("vlm-a").unwrap().state,
+            ModelState::Ready,
+            "the pinned resident model is untouched"
+        );
+    }
+
+    /// A headroom refusal is a capacity miss like any other: the loop evicts the least-recently
+    /// used model and tries again, and only reports the refusal when nothing is left to evict.
+    #[tokio::test]
+    async fn headroom_refusal_evicts_before_it_gives_up() {
+        // vlm-a (8 + 4) is resident. vlm-b needs 12 GiB of weights: with vlm-a still booked the
+        // device has no room for its floor; once vlm-a is evicted it loads.
+        let (mm, _p) = headroom_manager(&[("vlm-a", 8.0), ("vlm-b", 12.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        mm.load_model("vlm-b").await.unwrap();
+        let m = mm.read_models("t");
+        assert_eq!(m.get("vlm-b").unwrap().state, ModelState::Ready);
+        assert_eq!(m.get("vlm-a").unwrap().state, ModelState::NotLoaded);
+    }
+
+    /// A model's ratchet directory is under the ratchet root, named after the id
+    /// plus a hash of the model's path — the same id in another library gets another directory,
+    /// and a `/` in an id cannot escape the root.
+    #[tokio::test]
+    async fn ratchet_dir_is_per_library_and_outside_it() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let mut ca = make_config(&[("m", 1.0)], 8.0);
+        ca.models_dir = a.path().to_path_buf();
+        let mut cb = make_config(&[("m", 1.0)], 8.0);
+        cb.models_dir = b.path().to_path_buf();
+        let factory = || Arc::new(MockEngineFactory::default()) as Arc<dyn EngineFactory>;
+        let ma = ModelManager::new(ca, factory()).await.unwrap();
+        let mb = ModelManager::new(cb, factory()).await.unwrap();
+        let (da, db) = (ma.ratchet_dir("m").unwrap(), mb.ratchet_dir("m").unwrap());
+        assert_ne!(da, db);
+        assert!(!da.starts_with(a.path()) && !db.starts_with(b.path()));
+        let root = ma.ratchet_root.clone().unwrap();
+        assert_eq!(da.parent(), Some(root.as_path()));
+        assert_eq!(
+            ma.ratchet_dir("x/../y").unwrap().parent(),
+            Some(root.as_path())
+        );
+    }
+
+    /// F1 fixture (B60 QA 2026-10-28, BIG-08 rung 9): two embedding residents, `embed-e1` the least
+    /// recently used, and a vision load whose tracker need is met by evicting `embed-e1` alone
+    /// (slack 0.05 GiB) while the device headroom then still refuses it (24 - 0.5 outside -
+    /// (2 + 19.95) - 0.5 margin = 1.05 GiB, minus the 0.156 GiB floor = 0.89 < `min_kv_cache_gb`).
+    async fn f1_manager(pin_e2: bool) -> ModelManager {
+        f1_manager_with_probe(pin_e2).await.0
+    }
+
+    /// [`f1_manager`] with its probe, so a test can play the driver's per-process figure.
+    async fn f1_manager_with_probe(pin_e2: bool) -> (ModelManager, Arc<FakeProbe>) {
+        let (mm, probe) = headroom_manager_with(
+            &[("embed-e1", 3.0), ("embed-e2", 2.0), ("vlm-big", 19.95)],
+            1.0,
+            512 << 20,
+            |c| {
+                c.vram_safety_margin_gb = 1.0;
+                c.min_kv_cache_gb = 1.0;
+                c.kv_headroom_margin_gib = 0.5;
+                c.kv_transient_factor = 2.0;
+                c.kv_headroom_min_tokens = 4096;
+                c.dgpu_size_ceiling_fraction = 1.0;
+            },
+        )
+        .await;
+        mm.load_model("embed-e1").await.unwrap();
+        mm.load_model("embed-e2").await.unwrap();
+        if pin_e2 {
+            mm.write_models("t").get_mut("embed-e2").unwrap().pinned = true;
+        }
+        (mm, probe)
+    }
+
+    /// F1 step B: the driver still reports the evicted engines' memory for a moment after the
+    /// tracker dropped their bookings. Before giving up on headroom, the load waits for the
+    /// release instead of reading it as unbooked memory and refusing.
+    #[tokio::test]
+    async fn f1_settle_rides_out_stale_own_device_memory() {
+        let (mm, probe) = f1_manager_with_probe(false).await;
+        // The driver says this process holds exactly what is booked (e1 + e2 = 5 GiB) ...
+        probe.1.store(5 << 30, std::sync::atomic::Ordering::Relaxed);
+        // ... and keeps saying so for 300 ms after the evictions start, then lets go.
+        let late = Arc::clone(&probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            late.1.store(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let res = mm.load_model("vlm-big").await;
+        assert!(res.is_ok(), "{:#}", res.unwrap_err());
+        assert_eq!(state_of(&mm, "vlm-big"), ModelState::Ready);
+    }
+
+    fn state_of(mm: &ModelManager, id: &str) -> ModelState {
+        mm.read_models("t").get(id).unwrap().state
+    }
+
+    /// F1: the eviction preview models the device-headroom gate, so it plans both victims and the
+    /// load succeeds, instead of evicting the tracker's one victim and then refusing.
+    #[tokio::test]
+    async fn f1_preview_plans_the_headroom_victim() {
+        let mm = f1_manager(false).await;
+        let res = mm.load_model("vlm-big").await;
+        assert!(res.is_ok(), "{:#}", res.unwrap_err());
+        assert_eq!(state_of(&mm, "vlm-big"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "embed-e1"), ModelState::NotLoaded);
+        assert_eq!(state_of(&mm, "embed-e2"), ModelState::NotLoaded);
+    }
+
+    /// D-02: reloading a vision model right after unloading it — the driver still reports the
+    /// unloaded engine for a moment and nothing is left to evict. The load waits for the release
+    /// instead of refusing with "0.00 GiB free".
+    #[tokio::test]
+    async fn d02_reload_right_after_an_unload_waits_for_the_release() {
+        let (mm, probe) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        // The driver reports the 19 GiB booked, and keeps reporting it after the unload.
+        probe
+            .1
+            .store(19 << 30, std::sync::atomic::Ordering::Relaxed);
+        mm.evict_model("vlm-a").await.unwrap();
+        let late = Arc::clone(&probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            late.1.store(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let res = mm.load_model("vlm-a").await;
+        assert!(res.is_ok(), "{:#}", res.unwrap_err());
+    }
+
+    /// D-02: memory the driver has not yet released after an unload must not make the eviction
+    /// plan take a victim the load does not need.
+    #[tokio::test]
+    async fn d02_stale_release_does_not_plan_an_extra_victim() {
+        let (mm, probe) =
+            headroom_manager(&[("vlm-a", 15.0), ("embed-x", 2.0)], 4.0, 512 << 20).await;
+        mm.load_model("embed-x").await.unwrap();
+        mm.load_model("vlm-a").await.unwrap();
+        probe
+            .1
+            .store(21 << 30, std::sync::atomic::Ordering::Relaxed);
+        mm.evict_model("vlm-a").await.unwrap();
+        let late = Arc::clone(&probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            late.1.store(2 << 30, std::sync::atomic::Ordering::Relaxed);
+        });
+        let res = mm.load_model("vlm-a").await;
+        assert!(res.is_ok(), "{:#}", res.unwrap_err());
+        assert_eq!(
+            state_of(&mm, "embed-x"),
+            ModelState::Ready,
+            "not evicted for memory that was about to come back"
+        );
+    }
+
+    /// F1/A2: the public preview (`rv check`) applies the headroom gate once the model's headroom
+    /// facts are known from a first load, and says so when they are not.
+    #[tokio::test]
+    async fn f1_check_previews_the_headroom_gate_after_a_first_load() {
+        let mm = f1_manager(false).await;
+        let first = mm.check_admission_with("vlm-big", false).unwrap();
+        assert!(
+            first.headroom_not_previewed.is_some(),
+            "never loaded: facts unknown"
+        );
+        assert_eq!(
+            first.would_evict,
+            vec!["embed-e1".to_owned()],
+            "tracker-only plan"
+        );
+
+        mm.load_model("vlm-big").await.unwrap();
+        mm.evict_model("vlm-big").await.unwrap();
+        mm.load_model("embed-e1").await.unwrap();
+        mm.load_model("embed-e2").await.unwrap();
+        let known = mm.check_admission_with("vlm-big", false).unwrap();
+        assert!(known.headroom_not_previewed.is_none());
+        assert!(known.fits);
+        assert_eq!(
+            known.would_evict,
+            vec!["embed-e1".to_owned(), "embed-e2".to_owned()],
+            "the headroom victim is in the plan"
+        );
+
+        mm.write_models("t").get_mut("embed-e2").unwrap().pinned = true;
+        let pinned = mm.check_admission_with("vlm-big", false).unwrap();
+        assert!(!pinned.fits);
+        let why = pinned.headroom_refusal.unwrap_or_default();
+        assert!(why.contains("min_kv_cache_gb"), "{why}");
+    }
+
+    /// F1: when even evicting every evictable model cannot satisfy the headroom gate, the load is
+    /// refused with the headroom reason before anything is evicted.
+    #[tokio::test]
+    async fn f1_headroom_infeasible_refuses_before_evicting() {
+        let mm = f1_manager(true).await;
+        let msg = format!("{:#}", mm.load_model("vlm-big").await.unwrap_err());
+        assert!(msg.contains("min_kv_cache_gb"), "{msg}");
+        assert!(msg.contains("nothing was evicted"), "{msg}");
+        assert_eq!(state_of(&mm, "embed-e1"), ModelState::Ready, "{msg}");
+        assert_eq!(state_of(&mm, "embed-e2"), ModelState::Ready);
+    }
+
+    /// The headroom ceiling may not push the pool below `min_kv_cache_gb`: the refusal says so.
+    #[tokio::test]
+    async fn headroom_ceiling_below_min_kv_cache_is_refused_with_that_reason() {
+        let (mut mm, _p) = headroom_manager(&[("vlm-a", 15.0)], 4.0, 8_192 << 20).await;
+        mm.config.min_kv_cache_gb = 1.0;
+        let err = mm.load_model("vlm-a").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("min_kv_cache_gb"), "{msg}");
+        assert!(
+            mm.vram.read().unwrap().domain_gb("GPU.1").1.abs() < 1e-9,
+            "nothing booked"
+        );
+    }
+
+    /// A vision model on a discrete GPU keeps the legacy limit (no device-headroom cap yet), with
+    /// the refusal detail taken from the factory's resolution: hybrid, prefix caching and the
+    /// precision the engine really got (E-10 / review S2); the same model sized exactly on a
+    /// shared-memory device gets the exact gate.
+    #[tokio::test]
+    async fn vision_models_on_any_gpu_keep_the_legacy_limit() {
+        // GPU.1 = discrete, GPU = also GPU-class (shared-memory iGPU boxes name it so); CPU is not
+        // a GPU device, so its (mock) exact sizing stands.
+        for (device, want_mode) in [("GPU.1", "legacy"), ("GPU", "legacy"), ("CPU", "exact")] {
+            let mut config = make_config(&[("vlm-a", 5.0)], 40.0);
+            config.device = device.to_owned();
+            config.cache_size_gb = 4.0;
+            config.vram_safety_margin_gb = 0.0;
+            config.min_kv_cache_gb = 0.0;
+            config.enable_prefix_caching = false;
+            let hybrid = kv_profile_fixture(16, 4, 256, 79_429_632);
+            let factory = Arc::new(MockEngineFactory {
+                pool_inputs: Some(pool_inputs(
+                    hybrid,
+                    explicit_u4(),
+                    kv_precision::EnginePath::Vlm,
+                )),
+                ..MockEngineFactory::default()
+            });
+            let mm = ModelManager::new(config, factory as Arc<dyn EngineFactory>)
+                .await
+                .unwrap();
+            mm.load_model("vlm-a").await.unwrap();
+            let models = mm.read_models("t");
+            let r = models.get("vlm-a").unwrap();
+            // The mock model directory has no config.json, so the legacy estimate disables the
+            // gate (""): the point is that the exact gate was not used on the discrete GPU.
+            let want = if want_mode == "legacy" { "" } else { "exact" };
+            assert_eq!(r.kv_gate_mode, want, "{device}");
+            if want_mode == "legacy" {
+                let d = r.kv_gate_detail.as_ref().unwrap();
+                assert_eq!(
+                    (d.precision, d.hybrid, d.prefix_caching),
+                    ("u4", true, false)
+                );
+            }
+        }
+    }
+
+    /// The same manager state with a factory that cannot say anything about the model: whole GiB,
+    /// no blocks, and the hint is cleared (`None`) so a stale one cannot leak into the next load.
+    #[tokio::test]
+    async fn load_without_pool_inputs_keeps_whole_gib_sizing() {
+        let mut config = make_config(&[("model-a", 5.0)], 40.0);
+        config.cache_size_gb = 4.2;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        let factory = Arc::new(MockEngineFactory::default());
+        let mm = ModelManager::new(config, Arc::clone(&factory) as Arc<dyn EngineFactory>)
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        assert_eq!(*factory.blocks_hints.lock().unwrap(), vec![None]);
+        let models = mm.read_models("test");
+        let r = models.get("model-a").unwrap();
+        assert_eq!(r.kv_pool_blocks, None);
+        assert!(
+            (r.kv_cache_gb - 5.0).abs() < 1e-9,
+            "4.2 rounds up to 5 GiB: {}",
+            r.kv_cache_gb
+        );
+    }
+
+    fn gate_fixture(profile: &kv_profile::KvProfile, blocks: u64) -> ExactGate {
+        ExactGate {
+            spec: exact_spec(
+                profile,
+                kv_profile::KvPrecision::U4,
+                kv_capacity::LaBlocksRule::One,
+            ),
+            blocks,
+        }
+    }
+
+    /// The exact gate (T4, U-10): 95 % of the pool's capacity, then the model's native context,
+    /// then a ratchet for exactly this pool; each limit is named.
+    #[test]
+    fn exact_gate_is_the_pool_then_native_then_ratchet() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = kv_profile_fixture(36, 8, 128, 0);
+        // 5,683 blocks x 16 tokens = 90,928 (the 8B at 4 GiB u4): 95 % = 86,381.
+        let gate = gate_fixture(&profile, 5_683);
+        let (limit, capacity, by) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&gate), 0.0),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!((limit, capacity, by), (86_381, 90_928, GateClamp::Pool));
+        // A native context below the pool limit wins.
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings": 40960}"#,
+        )
+        .unwrap();
+        let (limit, capacity, by) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&gate), 0.0),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!((limit, capacity, by), (40_960, 90_928, GateClamp::Native));
+        // A ratchet for exactly this pool is tighter still; for another pool it is ignored.
+        kv_ratchet::write_ratchet_v2(dir.path(), 30_000, &gate.spec.ratchet_key(5_683));
+        let (limit, _, by) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&gate), 0.0),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!((limit, by), (30_000, GateClamp::Ratchet));
+        // A smaller pool of the same configuration gets the ceiling scaled down (5,000 / 5,683);
+        // a larger one gets nothing from it.
+        let smaller = gate_fixture(&profile, 5_000);
+        let (limit, _, by) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&smaller), 0.0),
+            &smaller,
+        )
+        .unwrap();
+        assert_eq!((limit, by), (26_394, GateClamp::Ratchet));
+        let larger = gate_fixture(&profile, 6_000);
+        let (limit, _, by) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&larger), 0.0),
+            &larger,
+        )
+        .unwrap();
+        assert_eq!(
+            (limit, by),
+            (40_960, GateClamp::Native),
+            "6,000 blocks would allow 91,200"
+        );
+    }
+
+    /// A hybrid model's capacity counts only its attention layers: the 27B at 4 GiB u4 is 203,280
+    /// tokens (limit 193,116), against the legacy estimate that counted every layer.
+    #[test]
+    fn exact_gate_prices_a_hybrid_by_its_attention_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let q27 = kv_profile_fixture(16, 4, 256, 79_429_632);
+        let gate = gate_fixture(&q27, 12_705);
+        let (limit, capacity, _) = compute_exact_gate(
+            "m",
+            &GateFiles::read(dir.path(), Some(dir.path()), Some(&gate), 0.0),
+            &gate,
+        )
+        .unwrap();
+        assert_eq!((limit, capacity), (193_116, 203_280));
+    }
+
+    /// Which loads may use exact sizing and which keep whole GiB (each reason is a separate guard).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of guard cases
+    fn exact_sizing_is_used_only_where_the_model_is_trusted() {
+        use kv_precision::EnginePath::{Cb, Vlm};
+        let dense = kv_profile_fixture(36, 8, 128, 0);
+        let hybrid = kv_profile_fixture(16, 4, 256, 79_429_632);
+        let ok = |i: &lifecycle::KvPoolInputs, prefix, seqs, sd, v| {
+            exact_pool_spec(i, prefix, seqs, sd, v, "GPU.1", false)
+        };
+        // Dense text model: eligible, one LA-free pool for any max_num_seqs.
+        let i = pool_inputs(dense.clone(), explicit_u4(), Cb);
+        let spec = ok(&i, true, 4, false, known_versions()).unwrap();
+        assert_eq!(spec.precision, kv_profile::KvPrecision::U4);
+        // Hybrid text model: one LA block per sequence; 0 means GenAI's 256.
+        let i = pool_inputs(hybrid.clone(), explicit_u4(), Cb);
+        assert_eq!(
+            ok(&i, false, 8, false, known_versions()).unwrap().la_rule,
+            kv_capacity::LaBlocksRule::MaxNumSeqs(8)
+        );
+        assert_eq!(
+            ok(&i, false, 0, false, known_versions()).unwrap().la_rule,
+            kv_capacity::LaBlocksRule::MaxNumSeqs(256)
+        );
+        // Hybrid vision model: a single LA block.
+        let i = pool_inputs(hybrid.clone(), explicit_u4(), Vlm);
+        assert_eq!(
+            ok(&i, false, 1, false, known_versions()).unwrap().la_rule,
+            kv_capacity::LaBlocksRule::One
+        );
+        // Prefix caching on a hybrid is eligible (G-12 verified the adaptive interval).
+        assert!(ok(&i, true, 1, false, known_versions()).is_ok());
+        // Not eligible: speculative decoding, unknown engine versions, no versions at all.
+        let i = pool_inputs(dense.clone(), explicit_u4(), Cb);
+        assert!(ok(&i, false, 4, true, known_versions()).is_err());
+        assert!(
+            ok(
+                &i,
+                false,
+                4,
+                false,
+                Some(("2026.5.0".into(), "2026.5.0".into()))
+            )
+            .is_err()
+        );
+        assert!(ok(&i, false, 4, false, None).is_err());
+        // Not eligible: a hybrid whose linear-attention state was derived from config.json
+        // (Medium), not read from the IR: the engine would no longer guard the budget.
+        let medium_hybrid = kv_profile::KvProfile {
+            confidence: kv_profile::Confidence::Medium,
+            ..hybrid.clone()
+        };
+        assert!(
+            ok(
+                &pool_inputs(medium_hybrid, explicit_u4(), Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+        // Not eligible: a device the layouts do not model (HETERO/AUTO/CPU pass the string through).
+        let passthrough = kv_precision::KvResolution {
+            source: kv_precision::PrecisionSource::LegacyPassthrough,
+            passed: "i8",
+            precision: Some(kv_profile::KvPrecision::I8),
+            rule_guess: None,
+        };
+        assert!(
+            ok(
+                &pool_inputs(dense.clone(), passthrough, Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+        // Not eligible: the engine is not given an explicit precision (plugin decides)...
+        let plugin = kv_precision::KvResolution {
+            passed: "",
+            ..explicit_u4()
+        };
+        assert!(
+            ok(
+                &pool_inputs(dense.clone(), plugin, Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+        // ...or the precision is unknown, the profile low-confidence, or the blocks are not GPU's.
+        let unknown = kv_precision::KvResolution {
+            precision: None,
+            ..explicit_u4()
+        };
+        assert!(
+            ok(
+                &pool_inputs(dense.clone(), unknown, Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+        let low = kv_profile::KvProfile {
+            confidence: kv_profile::Confidence::Low,
+            ..dense.clone()
+        };
+        assert!(
+            ok(
+                &pool_inputs(low, explicit_u4(), Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+        let cpu_blocks = kv_profile::KvProfile {
+            block_tokens: 32,
+            ..dense
+        };
+        assert!(
+            ok(
+                &pool_inputs(cpu_blocks, explicit_u4(), Cb),
+                false,
+                4,
+                false,
+                known_versions()
+            )
+            .is_err()
+        );
+    }
+
+    /// T5 / E-13: the booked pool is the whole-GiB pool the engine really allocates; T8 / E-09:
+    /// `clamped_by` names the setting that made it differ from an explicit request.
+    #[test]
+    #[allow(clippy::float_cmp)] // sizes here are exact small integers or literals
+    fn kv_pool_plan_rounds_to_whole_gib_and_names_the_clamp() {
+        let mut cfg = make_config(&[], 24.0);
+        cfg.vram_safety_margin_gb = 1.0;
+        cfg.min_kv_cache_gb = 0.0;
+        cfg.cache_size_gb = 0.0;
+        let plan = |free: f64, target: f64, cfg: &Config| {
+            ModelManager::compute_kv_pool_gb(free, target, cfg, true)
+        };
+
+        // An exact request: nothing to report.
+        let p = plan(7.3, 4.0, &cfg);
+        assert_eq!((p.gb, p.requested_gb, p.clamped_by), (4.0, Some(4.0), None));
+        // "All that fits" 2.7 - 1.0 = 1.7 GiB is booked as the 2 GiB the engine allocates;
+        // nothing was requested, so nothing is called a clamp.
+        let p = plan(2.7, 0.0, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (2.0, None));
+        assert!((p.rounded_from_gb.unwrap_or(0.0) - 1.7).abs() < 1e-9);
+        // A fractional request is rounded up (booking equals allocation, E-13).
+        let p = plan(20.0, 1.21, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (2.0, Some(KvClamp::WholeGibFallback)));
+        // Float noise just above a whole number does not take a whole extra GiB.
+        let p = plan(7.000_000_000_000_004, 0.0, &cfg);
+        assert_eq!(p.gb, 6.0);
+        // A rounded-up pool that would not fit the free memory is floored instead.
+        let mut tight = cfg.clone();
+        tight.vram_safety_margin_gb = 0.0;
+        let p = plan(1.9, 0.0, &tight);
+        assert_eq!((p.gb, p.rounded_from_gb), (1.0, Some(1.9)));
+        // Below 1 GiB the engine allocates 1 GiB regardless, so that is what is booked.
+        assert_eq!(plan(0.9, 0.0, &tight).gb, 1.0);
+        // An engine that takes no scheduler pool (NPU VLM) is not rounded.
+        let p = ModelManager::compute_kv_pool_gb(20.0, 1.21, &cfg, false);
+        assert_eq!((p.gb, p.clamped_by, p.rounded_from_gb), (1.21, None, None));
+
+        // E-09: the global cap beats a larger request, and is named.
+        cfg.cache_size_gb = 2.0;
+        let p = plan(20.0, 4.0, &cfg);
+        assert_eq!(
+            (p.gb, p.requested_gb, p.clamped_by),
+            (2.0, Some(4.0), Some(KvClamp::CacheSizeGb))
+        );
+        // ... also when the capped pool is then rounded: the cap stays the reason.
+        cfg.cache_size_gb = 2.5;
+        let p = plan(20.0, 4.0, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (3.0, Some(KvClamp::CacheSizeGb)));
+        // No explicit request: the cap is configuration, not a clamp.
+        cfg.cache_size_gb = 2.0;
+        let p = plan(20.0, 0.0, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (2.0, None));
+        // Free memory beats the request, and stays the reason after rounding (5.5 -> 6).
+        cfg.cache_size_gb = 0.0;
+        let p = plan(6.5, 6.0, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (6.0, Some(KvClamp::FreeVram)));
+        // The floor lifts a small request.
+        cfg.min_kv_cache_gb = 2.0;
+        let p = plan(20.0, 1.0, &cfg);
+        assert_eq!((p.gb, p.clamped_by), (2.0, Some(KvClamp::MinKvCacheGb)));
+    }
+
+    /// A ratchet file written before the whole-GiB booking holds the unrounded pool (1.21);
+    /// the engine had 2 GiB, so the same real pool must not scale the learned ceiling up.
+    #[test]
+    fn ratchet_from_an_unrounded_booking_is_not_scaled_up_on_the_same_pool() {
+        let dir = std::env::temp_dir().join(format!("rv-ratchet-ceil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        template::write_kv_capacity_ratchet(&dir, 10_000, 1.21, false);
+        assert_eq!(template::read_kv_capacity_ratchet(&dir, 2.0), Some(10_000));
+        assert_eq!(template::read_kv_capacity_ratchet(&dir, 4.0), Some(20_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ratchet learned on an exactly-sized (fractional) pool is not shrunk by a ceil on the same pool.
+    #[test]
+    fn ratchet_from_an_exact_pool_scales_by_the_pool_itself() {
+        let dir = std::env::temp_dir().join(format!("rv-ratchet-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        template::write_kv_capacity_ratchet(&dir, 10_000, 4.199_95, true);
+        assert_eq!(
+            template::read_kv_capacity_ratchet(&dir, 4.199_95),
+            Some(10_000)
+        );
+        assert_eq!(
+            template::read_kv_capacity_ratchet(&dir, 8.3999),
+            Some(20_000)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- Non-KV VRAM estimation (fix-1: STT / embed / image charge weight only) --
@@ -11558,6 +17991,96 @@ mod tests {
         );
     }
 
+    /// SF-5 D-06: an image-generation model on the CPU is charged `vram_gb` plus its family's
+    /// working set at `cpu_image_gen_max_pixels` by the dry-run, the real load and the tracker
+    /// (no readable `model_index.json` here: charged as the largest family); the shown figure
+    /// stays `vram_gb`; a text model on the same CPU is charged as configured; the pixel limit
+    /// applies to the image model only.
+    #[tokio::test]
+    async fn cpu_image_gen_model_is_charged_its_working_set() {
+        let mut config = make_config(&[("flux-imagegen", 4.0), ("cpu-llm", 4.0)], 64.0);
+        config.cpu_image_gen_max_pixels = 512 * 512;
+        let margin = config.vram_safety_margin_gb;
+        let min_kv = config.min_kv_cache_gb;
+        let ws = image_footprint::ImageFamily::Unknown.cpu_working_set_gb(512 * 512);
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+
+        let img = mm.check_admission("flux-imagegen").unwrap();
+        assert!(
+            (img.needed_gb - (4.0 + ws + margin)).abs() < 1e-9,
+            "CPU image model needs 4.0 + {ws} + margin: {}",
+            img.needed_gb
+        );
+        let llm = mm.check_admission("cpu-llm").unwrap();
+        assert!(
+            (llm.needed_gb - (4.0 + min_kv + margin)).abs() < 1e-9,
+            "a CPU text model is charged as configured: {}",
+            llm.needed_gb
+        );
+
+        mm.load_model("flux-imagegen").await.unwrap();
+        let domain = mm.record_domain("flux-imagegen");
+        let used = mm.vram.read().unwrap().domain_gb(&domain).1;
+        assert!(
+            (used - (4.0 + ws)).abs() < 0.1,
+            "tracker holds 4.0 + {ws}, got {used}"
+        );
+        let shown = mm
+            .list_models()
+            .into_iter()
+            .find(|i| i.id == "flux-imagegen")
+            .unwrap();
+        assert!(
+            (shown.vram_gb - 4.0).abs() < 1e-9,
+            "configured figure is unchanged"
+        );
+
+        assert_eq!(mm.cpu_image_pixel_limit("flux-imagegen"), Some(512 * 512));
+        assert_eq!(mm.cpu_image_pixel_limit("cpu-llm"), None);
+        assert_eq!(mm.cpu_image_pixel_limit("nope"), None);
+    }
+
+    /// D-06: an image model placed on a GPU is charged `vram_gb` unchanged and has no CPU
+    /// pixel limit.
+    #[tokio::test]
+    async fn gpu_image_gen_model_is_charged_as_configured() {
+        let mut config = make_config(&[("flux-imagegen", 4.0)], 64.0);
+        config
+            .models
+            .entry("flux-imagegen".to_owned())
+            .or_default()
+            .policy = config::ModelPolicy {
+            device: Some("GPU.1".to_owned()),
+            ..Default::default()
+        };
+        let charged = config.weight_charge_gb(
+            4.0,
+            "GPU.1",
+            ModelKind::ImageGen,
+            Some(image_footprint::ImageFamily::Sd3),
+        );
+        assert!((charged - 4.0).abs() < 1e-9, "{charged}");
+        let cpu = config.weight_charge_gb(
+            4.0,
+            "CPU",
+            ModelKind::ImageGen,
+            Some(image_footprint::ImageFamily::Sd15),
+        );
+        assert!(cpu > 4.0 + 10.0, "SD1.5 at 1024x1024 adds ~10 GiB: {cpu}");
+    }
+
+    /// `cpu_image_gen_max_pixels` below 256x256 is a config error.
+    #[test]
+    fn cpu_image_gen_max_pixels_below_256_squared_is_rejected() {
+        let mut cfg = make_config(&[("m", 1.0)], 8.0);
+        cfg.cpu_image_gen_max_pixels = 256 * 255;
+        assert!(cfg.validate().is_err());
+        cfg.cpu_image_gen_max_pixels = 256 * 256;
+        assert!(cfg.validate().is_ok());
+    }
+
     /// `npu_footprint_factor` below 1.0 (or non-finite) is a config error.
     #[test]
     fn npu_footprint_factor_below_one_is_rejected() {
@@ -11605,10 +18128,10 @@ mod tests {
             let mut guard = mm.write_models("t");
             let r = guard.get_mut("m").unwrap();
             r.kv_cache_gb = 1.0; // pin the pool: the charge is weights + pool
-            r.gpu_load_delta_bytes = Some(9_900_000_000);
+            r.gpu_load_delta_bytes = Some(10_630_000_000); // 9.9 GiB
         }
-        assert!((estimate(&mm).unwrap() - 9.9).abs() < 1e-9);
-        assert!(warned(&mm), "9.9 GB measured > vram_gb 2.5 + its KV pool");
+        assert!((estimate(&mm).unwrap() - 9.9).abs() < 0.01);
+        assert!(warned(&mm), "9.9 GiB measured > vram_gb 2.5 + its KV pool");
 
         mm.evict_model("m").await.unwrap();
         assert_eq!(estimate(&mm), None, "evicted");
@@ -12351,6 +18874,27 @@ mod tests {
         );
     }
 
+    /// MR-5a: a load blocked only by another model's grace window is refused as transient —
+    /// it names the model and when to retry, and does not claim "can never fit".
+    #[tokio::test]
+    async fn a_load_blocked_only_by_the_grace_window_says_retry_not_never() {
+        let mut config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 10.0);
+        config.eviction_grace_secs = 300.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+        let err = mm.load_model("model-b").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(
+            err.downcast_ref::<ModelError>(),
+            Some(ModelError::InsufficientMemory(_))
+        ));
+        assert!(msg.contains("model-a") && msg.contains("retry"), "{msg}");
+        assert!(!msg.contains("can never fit"), "{msg}");
+        assert!(msg.contains("300 s"), "the remaining window: {msg}");
+    }
+
     /// D3: `eviction_grace_secs: 0.0` (global or per-model override) opts a
     /// model out of grace protection entirely — pure LRU, unchanged from
     /// pre-D3 behavior. Regression guard for the "every existing test uses
@@ -12456,6 +19000,23 @@ mod tests {
 
         let none = poll_until_released(|| None, |_| false, ms(500), ms(5)).await;
         assert_eq!(none, ReleaseOutcome::Unavailable);
+    }
+
+    /// E-12 review: composite device specs that include a GPU count as GPU placements.
+    #[test]
+    fn device_uses_gpu_sees_composites() {
+        for yes in [
+            "GPU",
+            "GPU.1",
+            "HETERO:GPU.1,CPU",
+            "MULTI:GPU.0, GPU.1",
+            "AUTO:CPU,GPU",
+        ] {
+            assert!(device_uses_gpu(yes), "{yes}");
+        }
+        for no in ["CPU", "NPU", "HETERO:CPU,NPU", ""] {
+            assert!(!device_uses_gpu(no), "{no:?}");
+        }
     }
 
     /// Only the FIRST poisoning reports `first`, so the exit reaction cannot
@@ -12887,6 +19448,24 @@ mod tests {
         );
     }
 
+    /// D-04 S2: once stopping, an `on_demand` model is answered `ShuttingDown` (no retry hint) and
+    /// no load is started.
+    #[tokio::test]
+    async fn test_on_demand_load_while_shutting_down_starts_nothing() {
+        let mm = make_on_demand_mm(config::LoadPolicy::OnDemand).await;
+        mm.begin_shutdown();
+        assert_eq!(
+            mm.request_on_demand_load("model-a"),
+            OnDemandLoad::ShuttingDown
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mm.read_models("test").get("model-a").unwrap().state,
+            ModelState::NotLoaded,
+            "no load may start while stopping"
+        );
+    }
+
     /// An `on_demand` `NotLoaded` model is loaded lazily: the call returns
     /// `Loading` and the detached task drives the model to `Ready`.
     #[tokio::test]
@@ -13146,6 +19725,149 @@ mod tests {
         assert_eq!(*model_err, ModelError::GpuPoisoned);
     }
 
+    /// D-04 S6: `join_tracked` reports a clean exit, a panicked thread, and an empty slot (the
+    /// fallback path when the join helper could not be started relies on the slot).
+    #[test]
+    fn join_tracked_reports_clean_panicked_and_empty() {
+        let slot = std::sync::Mutex::new(Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(10));
+        })));
+        assert!(join_tracked(&slot, "jt-clean", Some("GPU.1")));
+        assert!(!join_tracked(&slot, "jt-clean", None), "slot already taken");
+        let slot = std::sync::Mutex::new(Some(std::thread::spawn(|| {
+            panic!("engine thread panics during teardown");
+        })));
+        assert!(!join_tracked(&slot, "jt-panic", None));
+        assert!(
+            !crate::ffi_watch::global()
+                .in_flight_models()
+                .iter()
+                .any(|m| m.starts_with("teardown jt-")),
+            "the teardown entries are gone once the joins returned"
+        );
+    }
+
+    /// D-04 S4: the stop-path wait sees `Loading`/`Evicting` records (not `Ready` ones), gives up
+    /// on an overdue call or at the cap, and ends as soon as the record settles. The overdue probe
+    /// is injected: the global `ffi_watch` carries other tests' calls.
+    #[tokio::test]
+    async fn wait_for_loads_to_settle_follows_the_records() {
+        use crate::startup::Settle;
+        let config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 22.5);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("model-a").await.unwrap();
+        let cap = Duration::from_secs(5);
+        assert!(mm.unsettled_loads().is_empty(), "Ready is settled");
+        assert_eq!(
+            mm.wait_for_loads_to_settle(Instant::now(), cap, || None)
+                .await,
+            Settle::Done
+        );
+
+        mm.write_models("test").get_mut("model-b").unwrap().state = ModelState::Loading;
+        assert_eq!(mm.unsettled_loads().len(), 1);
+        assert!(mm.unsettled_loads()[0].starts_with("load model-b on "));
+        assert_eq!(
+            mm.wait_for_loads_to_settle(Instant::now(), Duration::ZERO, || None)
+                .await,
+            Settle::Cap
+        );
+        assert_eq!(
+            mm.wait_for_loads_to_settle(Instant::now(), cap, || Some(Duration::from_secs(1)))
+                .await,
+            Settle::Overdue
+        );
+
+        let settler = Arc::clone(&mm);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            settler
+                .write_models("test")
+                .get_mut("model-b")
+                .unwrap()
+                .state = ModelState::NotLoaded;
+        });
+        assert_eq!(
+            mm.wait_for_loads_to_settle(Instant::now(), cap, || Some(Duration::ZERO))
+                .await,
+            Settle::Done,
+            "an in-allowance load is waited for until it settles"
+        );
+        release.await.unwrap();
+    }
+
+    /// D-04 S2 (review): a load that passed `begin_load` before the stop and queued on `load_lock`
+    /// is refused once it gets the lock — no engine build starts — and its record goes back to
+    /// `NotLoaded`.
+    #[tokio::test]
+    async fn a_load_queued_on_the_load_lock_is_refused_after_the_stop() {
+        let config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 22.5);
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        let held = mm.load_lock.lock().await;
+        let queued = {
+            let mm = Arc::clone(&mm);
+            tokio::spawn(async move { mm.load_model("model-b").await })
+        };
+        // Let the load pass `begin_load` and park on the lock.
+        for _ in 0..50 {
+            if mm.read_models("test").get("model-b").unwrap().state == ModelState::Loading {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            mm.read_models("test").get("model-b").unwrap().state,
+            ModelState::Loading
+        );
+        mm.begin_shutdown();
+        drop(held);
+        let err = queued.await.unwrap().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ModelError>(),
+            Some(&ModelError::ShuttingDown)
+        );
+        assert!(
+            matches!(mm.get_handle("model-b"), Err(ModelError::NotLoaded)),
+            "the cancel guard resets the record"
+        );
+    }
+
+    /// D-04 S2: after `begin_shutdown` a new load is refused with `ShuttingDown` (and nothing is
+    /// charged), while an already-Ready model still answers as loaded. The process-wide flag is
+    /// not raised here — it would leak into every other test in this binary.
+    #[tokio::test]
+    async fn begin_shutdown_refuses_new_loads_but_not_ready_models() {
+        let config = make_config(&[("model-a", 6.0), ("model-b", 6.0)], 22.5);
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("model-a").await.unwrap();
+
+        mm.begin_shutdown();
+        assert!(mm.is_shutting_down());
+        let err = mm.load_model("model-b").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ModelError>(),
+            Some(&ModelError::ShuttingDown)
+        );
+        assert!(
+            matches!(mm.get_handle("model-b"), Err(ModelError::NotLoaded)),
+            "the refused load leaves the record NotLoaded"
+        );
+        mm.load_model("model-a")
+            .await
+            .expect("a Ready model is not refused while stopping");
+        assert!(mm.get_handle("model-a").is_ok());
+    }
+
     /// A plain (non-OOM) factory failure must NOT set the poison flag — the
     /// GPU context is still healthy; the failure was a bad model path or config.
     #[tokio::test]
@@ -13222,6 +19944,40 @@ mod tests {
         );
     }
 
+    /// Stage 0: the legacy gate prices the normalised spellings — `i8` and the
+    /// legacy `u8` the same (1 B/element), `u4` like `i8` (scales and zero points
+    /// make a naive half-of-i8 price an over-promise), f16/auto double.
+    #[test]
+    fn compute_max_prompt_tokens_scales_with_normalised_precision() {
+        let dir = std::env::temp_dir().join(format!(
+            "rv-max-prompt-prec-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,"hidden_size":2560}"#,
+        )
+        .unwrap();
+        let tokens = |prec: &str| {
+            ModelManager::compute_max_prompt_tokens(
+                "qwen3-4b-int4-ov",
+                &GateFiles::read(&dir, None, None, 3.0),
+                3.0,
+                prec,
+            )
+            .1
+        };
+        let (f16, i8_, u8_, u4) = (tokens(""), tokens("i8"), tokens("u8"), tokens("u4"));
+        assert_eq!(i8_, u8_, "u8 is the legacy spelling of i8");
+        assert_eq!(tokens("f16"), f16, "explicit f16 = plugin default");
+        assert_eq!(u4, i8_, "u4 is priced like i8, not at the naive half");
+        // Integer division in the formula: f16 and 2 x f16 may differ by a rounding unit.
+        assert!(i8_.abs_diff(f16 * 2) <= 2, "i8 {i8_} vs 2 x f16 {f16}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `compute_max_prompt_tokens` applies `FORMULA_SAFETY_MARGIN` to the raw
     /// K+V byte-math result before ever comparing it against a ratchet — no
     /// ratchet sidecar exists here, so the returned value must be exactly
@@ -13249,8 +20005,12 @@ mod tests {
         let expected = (kv_gb * 1_073_741_824.0 / bytes_per_token
             * ModelManager::FORMULA_SAFETY_MARGIN) as usize;
 
-        let (result, pool_capacity) =
-            ModelManager::compute_max_prompt_tokens("qwen3-4b-int4-ov", &dir, kv_gb, "u8");
+        let (result, pool_capacity) = ModelManager::compute_max_prompt_tokens(
+            "qwen3-4b-int4-ov",
+            &GateFiles::read(&dir, None, None, kv_gb),
+            kv_gb,
+            "u8",
+        );
         assert_eq!(result, expected);
         assert!(
             result < 69_905,
@@ -13296,8 +20056,12 @@ mod tests {
         let raw_formula_result = (kv_gb * 1_073_741_824.0 / bytes_per_token
             * ModelManager::FORMULA_SAFETY_MARGIN) as usize;
 
-        let (result, pool_capacity) =
-            ModelManager::compute_max_prompt_tokens("qwen3-4b-int4-ov", &dir, kv_gb, "u8");
+        let (result, pool_capacity) = ModelManager::compute_max_prompt_tokens(
+            "qwen3-4b-int4-ov",
+            &GateFiles::read(&dir, None, None, kv_gb),
+            kv_gb,
+            "u8",
+        );
         assert_eq!(
             result, 40_960,
             "native ceiling is tighter than the formula estimate — must win, unmargined"
@@ -13342,8 +20106,12 @@ mod tests {
         let expected = (kv_gb * 1_073_741_824.0 / bytes_per_token
             * ModelManager::FORMULA_SAFETY_MARGIN) as usize;
 
-        let (result, pool_capacity) =
-            ModelManager::compute_max_prompt_tokens("qwen3-4b-int4-ov", &dir, kv_gb, "u8");
+        let (result, pool_capacity) = ModelManager::compute_max_prompt_tokens(
+            "qwen3-4b-int4-ov",
+            &GateFiles::read(&dir, None, None, kv_gb),
+            kv_gb,
+            "u8",
+        );
         assert_eq!(result, expected);
         assert_eq!(
             pool_capacity, expected,
@@ -13580,18 +20348,20 @@ mod tests {
             let mut guard = mm.write_models("test setup");
             let record = guard.get_mut("vlm-1").unwrap();
             record.max_prompt_tokens = 100_000;
-            record.kv_cache_gb = 7.5;
+            record.kv_cache_gb = 8.0; // pools are whole GiB since the E-13 booking fix
         }
 
         mm.spawn_kv_wedge_recovery("vlm-1", 37_847); // well above the 10,000 floor
         wait_for_wedge_recovery_to_finish(&mm, "vlm-1").await;
 
-        let ratchet = template::read_kv_capacity_ratchet(&dir.join("vlm-1"), 7.5);
+        // Legacy (v1) ceiling, in the ratchet directory — never in the model library.
+        assert!(!dir.join("vlm-1/.rustedvino_kv_ratchet.json").exists());
+        let ratchet = template::read_kv_capacity_ratchet(&mm.ratchet_dir("vlm-1").unwrap(), 8.0);
         assert_eq!(
             ratchet,
             Some(35_954), // 37_847 * 0.95, truncated
             "a plausible observation is written with the 0.95 safety margin, \
-             at the pool size (7.5GB) active when it was learned"
+             at the pool size (8GB) active when it was learned"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13612,6 +20382,61 @@ mod tests {
         ] {
             assert!(!is_plain_model_id(bad), "{bad:?}");
         }
+    }
+
+    /// D-07: a measured load that took clearly more than it was charged teaches the weight
+    /// footprint (measured minus the pool that load reserved); noise-level overshoots and
+    /// under-shoots teach nothing, so the figure only ever corrects upward.
+    #[test]
+    fn learned_weight_is_measured_minus_pool_and_only_corrects_upward() {
+        // 27B booked 12.5 GB + 2 GB pool, measured 17.5: weights really took 15.5.
+        let w = learned_weight_gb(17.5, 2.0, 12.5).unwrap();
+        assert!((w - 15.5).abs() < 1e-9);
+        // Within the tolerance of weights + pool (14.5 + 0.75): nothing learned.
+        assert_eq!(learned_weight_gb(15.2, 2.0, 12.5), None);
+        // Measured below the charge never lowers it.
+        assert_eq!(learned_weight_gb(9.0, 2.0, 12.5), None);
+        // No pool (a negative figure is treated as none) and an unknown charge.
+        assert!((learned_weight_gb(14.0, -1.0, 12.5).unwrap() - 14.0).abs() < 1e-9);
+        assert_eq!(learned_weight_gb(14.0, 0.0, 0.0), None);
+    }
+
+    /// D-07: after the correction, admission charges the learned weights; it survives eviction
+    /// (the record stays) and never lowers a larger configured `vram_gb`. Only the shared-memory
+    /// `system` domain learns.
+    #[tokio::test]
+    async fn learned_weight_is_charged_by_later_admissions_on_the_system_domain() {
+        let mm = make_mm(&[("m", 12.5)], 40.0).await;
+        let mut guard = mm.write_models("t");
+        let r = guard.get_mut("m").unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            r.gpu_load_delta_bytes = Some((17.5 * GIB_F64) as i64);
+        }
+
+        // A discrete GPU with a pool the server cannot vouch for to the byte (whole-GiB sizing):
+        // nothing learned, charge unchanged.
+        r.domain = "GPU.1".to_owned();
+        assert!(r.learn_from_load(2.0, 12.5, false).is_none());
+        assert!(r.learned_weight_gb.is_none());
+        // An exactly-sized pool (blocks known, materialised by the warm-up): learned there too.
+        assert!(r.learn_from_load(2.0, 12.5, true).is_some());
+        r.learned_weight_gb = None;
+
+        r.domain = DOMAIN_SYSTEM.to_owned();
+        let (domain, w, measured) = r.learn_from_load(2.0, 12.5, false).unwrap();
+        assert_eq!(domain, DOMAIN_SYSTEM);
+        assert!((w - 15.5).abs() < 1e-9 && (measured - 17.5).abs() < 1e-9);
+        assert!((mm.budget_weight_gb(r) - 15.5).abs() < 1e-9);
+
+        // An unknown measurement (polluted window) teaches nothing and keeps what was learned.
+        r.gpu_load_delta_bytes = None;
+        assert!(r.learn_from_load(2.0, 15.5, false).is_none());
+        assert!((mm.budget_weight_gb(r) - 15.5).abs() < 1e-9);
+
+        // A configured figure above the learned one still wins.
+        r.vram_gb = 16.0;
+        assert!((mm.budget_weight_gb(r) - 16.0).abs() < 1e-9);
     }
 
     /// D-03/D-01: the "measured memory exceeds `vram_gb`" warning ignores overshoots that are within
@@ -13837,6 +20662,82 @@ mod tests {
         }
     }
 
+    /// The real `GenAI` text of a KV-cache free-memory refusal (0.8.4 D-01, B60).
+    const GENAI_BUDGET_ERR: &str = "ov_cb_create failed: Check 'budget_in_bytes <= \
+        total_available_memory' failed at /home/jenkins/agent/workspace/private-ci/ie/build-linux/\
+        openvino.genai/src/cpp/src/continuous_batching/cache/cache_orchestrator.hpp:759";
+
+    /// MR2-6: a refused resize reload says the model itself is now unloaded; other kinds and
+    /// context-wrapped errors pass through.
+    #[test]
+    fn a_refused_resize_reload_says_the_model_stays_unloaded() {
+        let e = resize_reload_refused("m", ModelError::InsufficientMemory("no room".into()).into());
+        let Some(ModelError::InsufficientMemory(msg)) = e.downcast_ref::<ModelError>() else {
+            panic!("kind kept: {e:#}");
+        };
+        assert!(
+            msg.starts_with("no room") && msg.contains("m was unloaded"),
+            "{msg}"
+        );
+        let busy = resize_reload_refused("m", ModelError::Loading.into());
+        assert_eq!(
+            busy.downcast_ref::<ModelError>(),
+            Some(&ModelError::Loading)
+        );
+    }
+
+    /// MR-2: both `<= total_available_memory` forms match; the pool-sizing form and poison do not.
+    #[test]
+    fn genai_memory_budget_errors_are_recognised() {
+        assert!(is_genai_memory_budget_error(GENAI_BUDGET_ERR));
+        assert!(is_genai_memory_budget_error(
+            "Check 'total_requested_bytes <= total_available_memory' failed"
+        ));
+        assert!(!is_genai_memory_budget_error(
+            "Check 'reserved_la_bytes <= budget_in_bytes' failed"
+        ));
+        assert!(!is_genai_memory_budget_error("CL_OUT_OF_RESOURCES (-5)"));
+        assert!(!is_gpu_poison_error(GENAI_BUDGET_ERR), "not a poison");
+    }
+
+    /// MR-2: a load `GenAI` refuses for device memory after it evicted a model for room is a clean
+    /// `InsufficientMemory` (503) naming the evicted model, with no C++ text or CI path, and the
+    /// GPU is not marked poisoned.
+    #[tokio::test]
+    async fn a_genai_memory_budget_refusal_is_a_clean_insufficient_memory_naming_the_evicted() {
+        let config = make_config(&[("llm-a", 6.0), ("llm-b", 6.0)], 10.0);
+        let factory = Arc::new(MockEngineFactory {
+            fail_message_for: Some(("llm-b".to_owned(), GENAI_BUDGET_ERR.to_owned())),
+            ..Default::default()
+        });
+        let mm = ModelManager::new(config, factory).await.unwrap();
+        mm.load_model("llm-a").await.unwrap();
+
+        let err = mm.load_model("llm-b").await.unwrap_err();
+        let Some(ModelError::InsufficientMemory(msg)) = err.downcast_ref::<ModelError>() else {
+            panic!("expected InsufficientMemory, got {err:#}");
+        };
+        assert!(msg.contains("llm-b") && msg.contains("llm-a"), "{msg}");
+        for leak in [
+            "budget_in_bytes",
+            "jenkins",
+            "cache_orchestrator",
+            "Check '",
+        ] {
+            assert!(!msg.contains(leak), "leaks {leak}: {msg}");
+        }
+        assert!(!mm.gpu_poisoned.load(Ordering::Acquire));
+        assert_eq!(
+            mm.read_models("t").get("llm-b").unwrap().state,
+            ModelState::NotLoaded
+        );
+        let free = mm.vram.read().unwrap().free_gb(&mm.inference_domain);
+        assert!(
+            (free - 10.0).abs() < 0.01,
+            "the reservation is released: {free}"
+        );
+    }
+
     // ---- T5.3: poison-tolerant `models` lock -----------------------------
 
     /// T5.3 (committee findings 39, 40): a poisoned `models` lock must NOT turn
@@ -13894,56 +20795,6 @@ mod tests {
             dev("GPU.0", DeviceKind::IntegratedGpu),
             dev("CPU", DeviceKind::Cpu),
         ])
-    }
-
-    /// D-01: a hybrid linear-attention model is never auto-placed on a GPU (it cannot
-    /// load there with the prefix-cache guard in force); an explicit
-    /// `enable_prefix_caching: true` lifts the ban; a plain model still goes to the dGPU.
-    #[test]
-    fn hybrid_model_auto_places_on_cpu_not_gpu() {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, cfg) in [
-            (
-                "hybrid",
-                r#"{"text_config":{"layer_types":["linear_attention","full_attention"]}}"#,
-            ),
-            ("plain", r#"{"layer_types":["full_attention"]}"#),
-        ] {
-            std::fs::create_dir(dir.path().join(name)).unwrap();
-            std::fs::write(dir.path().join(name).join("config.json"), cfg).unwrap();
-        }
-        let mut config = make_config(&[], 0.0);
-        config.models_dir = dir.path().to_path_buf();
-        config.default_placement = config::DefaultPlacement::Auto;
-        let tiered = |name: &str, kind, tier| DeviceInfo {
-            tier,
-            ..dev(name, kind)
-        };
-        let inv = DeviceInventory::from_devices(vec![
-            tiered("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy),
-            tiered("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
-        ]);
-        let none = HashMap::new();
-        let place = |id: &str, policy: Option<&config::ModelPolicy>| {
-            resolve_model_device(
-                id,
-                3.0,
-                Some(ModelKind::Vision),
-                policy,
-                &config,
-                &inv,
-                &none,
-                &none,
-            )
-            .unwrap()
-        };
-        assert_eq!(place("hybrid", None), "CPU");
-        assert_eq!(place("plain", None), "GPU.1");
-        let allow = config::ModelPolicy {
-            enable_prefix_caching: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(place("hybrid", Some(&allow)), "GPU.1");
     }
 
     /// `resolve_device_domain` maps any device to its domain: a discrete GPU to
@@ -14159,6 +21010,85 @@ mod tests {
         cfg
     }
 
+    /// T17U BIG-01 (B50, 2026-10-31): the dGPU is the global `device` and `total_vram_gb` is the
+    /// shipped `0.0`. A model declared bigger than the card must be refused — by the admission
+    /// preview (`rv check`), `load_model` (`rv load` / `rv add`), and a preload — while a model
+    /// that fits still loads. Before the fix all of these admitted a 40 GB model on 15.13 GiB.
+    #[tokio::test]
+    async fn dgpu_inference_device_with_zero_total_refuses_oversized_loads() {
+        let b50 = || {
+            let mut dgpu = tiered_dev("GPU.1", DeviceKind::DiscreteGpu, DeviceTier::Heavy);
+            dgpu.total_mem_gb = Some(15.13);
+            Arc::new(DeviceInventory::from_devices(vec![
+                dgpu,
+                tiered_dev("GPU.0", DeviceKind::IntegratedGpu, DeviceTier::WeakIgpu),
+                tiered_dev("CPU", DeviceKind::Cpu, DeviceTier::Fallback),
+            ]))
+        };
+        let loaded = |mm: &ModelManager, id: &str| {
+            mm.read_models("test")
+                .get(id)
+                .is_some_and(|r| r.state == ModelState::Ready)
+        };
+        let gpu_config = |preload: &[&str]| {
+            let mut c = make_config(&[("huge", 40.0), ("small", 1.2)], 0.0);
+            c.device = "GPU.1".to_owned();
+            c.default_placement = config::DefaultPlacement::Device;
+            // Pinned to the dGPU, as rvbench's throwaway servers and `rv add --device` do.
+            for e in c.models.values_mut() {
+                e.policy.device = Some("GPU.1".to_owned());
+            }
+            c.preload = preload.iter().map(|m| (*m).to_owned()).collect();
+            c
+        };
+        let mm = ModelManager::new_with_inventory(
+            gpu_config(&[]),
+            Arc::new(MockEngineFactory::default()),
+            b50(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mm.record_device("huge"),
+            "GPU.1",
+            "the test must exercise the dGPU"
+        );
+        let check = mm.check_admission("huge").unwrap();
+        assert!(!check.fits, "40 GB on a 15.13 GiB card must not fit");
+        let err = mm.load_model("huge").await.unwrap_err().to_string();
+        assert!(
+            err.contains("insufficient VRAM"),
+            "refused by the VRAM gate: {err}"
+        );
+        assert!(!loaded(&mm, "huge"));
+        mm.load_model("small").await.unwrap();
+        assert!(loaded(&mm, "small"), "a model that fits still loads");
+
+        // Preload goes through the same gate: the oversized model is not loaded.
+        let pre = ModelManager::new_with_inventory(
+            gpu_config(&["huge"]),
+            Arc::new(MockEngineFactory::default()),
+            b50(),
+        )
+        .await
+        .unwrap();
+        // A failed preload does not fail start-up: the server comes up without the model.
+        assert!(!loaded(&pre, "huge"), "an oversized preload must not load");
+
+        // The deliberate opt-out brings the ungated behaviour back.
+        let mut optout = gpu_config(&[]);
+        optout.domain_budgets.insert("GPU.1".to_owned(), 0.0);
+        let mm =
+            ModelManager::new_with_inventory(optout, Arc::new(MockEngineFactory::default()), b50())
+                .await
+                .unwrap();
+        mm.load_model("huge").await.unwrap();
+        assert!(
+            loaded(&mm, "huge"),
+            "domain_budgets 0.0 opts out of the gate"
+        );
+    }
+
     /// Shipped config + a discrete GPU that reports its memory (as the B70 does): `device`
     /// placement keeps everything on the CPU; `auto` sends chat and the 14B model to the card.
     #[tokio::test]
@@ -14226,9 +21156,15 @@ mod tests {
         let mut cfg = make_config(&[], 0.0);
         cfg.min_kv_cache_gb = 1.0;
         cfg.cache_size_gb = 0.0;
-        assert!((ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg) - 1.0).abs() < 1e-9);
+        assert!(
+            (ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg, true).gb - 1.0).abs()
+                < 1e-9
+        );
         cfg.cache_size_gb = 2.0;
-        assert!((ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg) - 2.0).abs() < 1e-9);
+        assert!(
+            (ModelManager::compute_kv_pool_gb(f64::INFINITY, 0.0, &cfg, true).gb - 2.0).abs()
+                < 1e-9
+        );
     }
 
     /// An ungated domain reports 0.0 free; the eviction plan must treat that as "no VRAM leg", or no
@@ -15025,6 +21961,99 @@ mod tests {
         );
         let ids: Vec<String> = mm.list_models().into_iter().map(|m| m.id).collect();
         assert!(!ids.contains(&"existing".to_owned()));
+    }
+
+    /// S281 defect (a): `config.json` broken by ANOTHER entry (a stanza without `vram_gb`, as the
+    /// QA kit's `setmodel.py` left one) refuses an add before anything loads, names the field,
+    /// and says the request did not cause it.
+    const BROKEN_BY_OTHER_ENTRY: &str = r#"{
+        "models_dir": "/tmp/test-models",
+        "device": "CPU",
+        "total_vram_gb": 0.0,
+        "models": { "existing": { "vram_gb": 1.0 }, "half-written": { "kind": "text_gen" } }
+    }"#;
+
+    #[tokio::test]
+    async fn add_model_refuses_before_loading_when_config_is_already_invalid() {
+        let (mm, dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        std::fs::write(dir.path().join("config.json"), BROKEN_BY_OTHER_ENTRY).unwrap();
+        let model_dir = std::path::Path::new("/tmp/test-models/s281a-add-model");
+        std::fs::create_dir_all(model_dir).unwrap();
+
+        let err = mm
+            .add_model(
+                "s281a-add-model".to_owned(),
+                1.0,
+                None,
+                config::ModelPolicy::default(),
+            )
+            .await
+            .unwrap_err();
+        std::fs::remove_dir_all(model_dir).ok();
+
+        assert!(matches!(
+            err.downcast_ref::<ModelError>(),
+            Some(ModelError::ConfigFileInvalid(_))
+        ));
+        let text = format!("{err:#}");
+        assert!(text.contains("vram_gb"), "names the field: {text}");
+        assert!(text.contains("already invalid"), "{text}");
+        assert!(text.contains("not caused by this request"), "{text}");
+        assert!(
+            !mm.list_models().iter().any(|m| m.id == "s281a-add-model"),
+            "nothing registered"
+        );
+        assert!(
+            mm.metrics_snapshot().used_vram_gb.abs() < f64::EPSILON,
+            "nothing loaded"
+        );
+    }
+
+    /// S281 defect (a): the same broken file refuses a deregister BEFORE the eviction, so the
+    /// model is not left unloaded-but-still-in-the-file (back on the next restart).
+    #[tokio::test]
+    async fn deregister_refuses_before_evicting_when_config_is_already_invalid() {
+        let (mm, dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        mm.load_model("existing").await.expect("load existing");
+        std::fs::write(dir.path().join("config.json"), BROKEN_BY_OTHER_ENTRY).unwrap();
+
+        let err = mm.deregister_model("existing").await.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ModelError>(),
+            Some(ModelError::ConfigFileInvalid(_))
+        ));
+        let still = mm
+            .list_models()
+            .into_iter()
+            .find(|m| m.id == "existing")
+            .expect("still registered");
+        assert_eq!(still.state, ModelState::Ready, "not evicted");
+    }
+
+    /// A change that itself makes the file invalid is still blamed on the change, with the
+    /// cause chain, not reported as "already invalid".
+    #[tokio::test]
+    async fn a_change_that_breaks_config_is_blamed_on_the_change() {
+        let (_mm, dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        let path = dir.path().join("config.json");
+        let err = ModelManager::write_config_json(&path, |value| {
+            value["models"]["existing"]
+                .as_object_mut()
+                .unwrap()
+                .remove("vram_gb");
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.downcast_ref::<ModelError>().is_none());
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("this change would make config.json invalid"),
+            "{text}"
+        );
+        assert!(text.contains("vram_gb"), "{text}");
     }
 
     /// Deregistering an unknown `model_id` is a clean `NotFound`, matching

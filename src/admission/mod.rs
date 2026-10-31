@@ -106,9 +106,27 @@ impl std::error::Error for AdmitError {}
 #[derive(Debug, Default)]
 pub struct WorkLease {
     permits: HashMap<String, Vec<OwnedSemaphorePermit>>,
+    /// Other release-on-drop resources that live exactly as long as the request (a transient
+    /// device-memory reservation of a long vision request).
+    held: Vec<HeldGuard>,
+}
+
+/// A boxed release-on-drop guard; only its `Drop` matters.
+struct HeldGuard(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for HeldGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldGuard")
+    }
 }
 
 impl WorkLease {
+    /// Tie `guard` to this lease: it is dropped (and so released) with the lease, on every exit
+    /// path of the request, streaming or not.
+    pub fn hold(&mut self, guard: impl std::any::Any + Send) {
+        self.held.push(HeldGuard(Box::new(guard)));
+    }
+
     fn push(&mut self, device: String, mut new_permits: Vec<OwnedSemaphorePermit>) {
         self.permits
             .entry(device)

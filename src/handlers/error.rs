@@ -23,9 +23,38 @@ use axum::{
 use serde::Serialize;
 
 use crate::model_manager::{
-    ModelError, ModelManager, is_gpu_poison_error, is_pool_exhausted_error, is_vlm_kv_wedge_error,
-    kv_wedge_observed_prompt_tokens, pool_exhausted_active_requests,
+    ModelError, ModelManager, is_genai_memory_budget_error, is_gpu_poison_error,
+    is_pool_exhausted_error, is_vlm_kv_wedge_error, kv_wedge_observed_prompt_tokens,
+    pool_exhausted_active_requests,
 };
+
+/// Marker of `GenAI`'s chat-template failure (the vision pipeline renders the template itself).
+const TEMPLATE_ERROR_MARKER: &str = "Minja's error: ";
+
+/// The template's own reason from a `GenAI` chat-template failure (SF-5 D-03), e.g.
+/// `Unexpected message role.` from a `raise_exception` — text written by the template's author,
+/// cut before the row/column and template excerpt, one line, at most 200 characters. `None`
+/// when `raw` is not a template failure.
+fn template_rejection_reason(raw: &str) -> Option<String> {
+    let after = &raw[raw.find(TEMPLATE_ERROR_MARKER)? + TEMPLATE_ERROR_MARKER.len()..];
+    let line = after.lines().next().unwrap_or_default();
+    let reason = line.find(" at row ").map_or(line, |i| &line[..i]).trim();
+    let reason: String = reason.chars().take(200).collect();
+    Some(if reason.is_empty() {
+        "(no reason given)".to_owned()
+    } else {
+        reason
+    })
+}
+
+/// The client text for [`InferenceErrorKind::TemplateRejected`] (both response shapes).
+fn template_rejected_message(reason: &str) -> String {
+    format!("the model's chat template rejected the messages: {reason}")
+}
+
+/// The client text for [`InferenceErrorKind::DeviceMemory`] (both response shapes).
+const DEVICE_MEMORY_MESSAGE: &str = "the device has too little free memory for this model's KV \
+     cache; the model is being reloaded. Retry in a few seconds, or unload another model";
 
 // ── JsonBody extractor ────────────────────────────────────────────────────────
 
@@ -269,15 +298,38 @@ pub(crate) fn sse_inference_error_event(
              issue; retry shortly",
             "kv_capacity_wedge",
         ),
-        InferenceErrorKind::GpuPoisoned => sse_error_frame(
-            "model unavailable — the GPU context failed (out of resources) and the server must be restarted; retrying will not help",
-            "model_unavailable",
-        ),
+        // G1: an SSE frame cannot carry `Retry-After`; the text says it.
+        InferenceErrorKind::GpuPoisoned => {
+            sse_error_frame(gpu_poisoned_reply_now().0, "model_unavailable")
+        }
         InferenceErrorKind::ModelUnloading => sse_error_frame(
             "the model was unloaded while this request was running — retry shortly",
             "model_unloading",
         ),
+        InferenceErrorKind::DeviceMemory => {
+            sse_error_frame(DEVICE_MEMORY_MESSAGE, "insufficient_memory")
+        }
+        InferenceErrorKind::TemplateRejected(reason) => {
+            sse_error_frame(&template_rejected_message(&reason), "template_rejected")
+        }
         InferenceErrorKind::Opaque => sse_error_frame("inference failed", "mid_stream_error"),
+    }
+}
+
+/// One SSE `data:` frame carrying `value` as JSON (K-02d). Serialising the server's own frame
+/// structs cannot realistically fail, but if it ever does the stream gets a typed error frame
+/// (`frame_serialize_failed`) and an error log, not an empty `data:` line a client fails to
+/// parse without a word in the log.
+pub(crate) fn sse_json_event<T: Serialize>(value: &T) -> axum::response::sse::Event {
+    match serde_json::to_string(value) {
+        Ok(json) => axum::response::sse::Event::default().data(json),
+        Err(e) => {
+            tracing::error!(error = %e, "an SSE frame could not be serialised; sent an error frame");
+            sse_error_frame(
+                "internal error: a stream frame could not be serialised",
+                "frame_serialize_failed",
+            )
+        }
     }
 }
 
@@ -346,6 +398,73 @@ pub(crate) fn device_admission_error_response(e: &crate::admission::AdmitError) 
 /// `Retry-After` for transient not-ready states (loading / evicting), seconds.
 pub(crate) const RETRY_AFTER_TRANSIENT: HeaderValue = HeaderValue::from_static("5");
 
+/// `Retry-After` while a supervised worker restarts after a GPU poisoning (G1, step 7): the first
+/// respawn's backoff (5 s) + worker start + a typical model reload (a fixed 30 s).
+pub(crate) const RETRY_AFTER_WORKER_RESTART: HeaderValue = HeaderValue::from_static("30");
+
+/// What a client is told about a poisoned GPU context (G1). `restarting` = this worker is
+/// supervised and on its way to exit 75 (`startup::gpu_poison_exit_requested`): the supervisor
+/// brings a fresh one up, so a retry shortly WILL help. Otherwise only a manual restart does.
+fn gpu_poisoned_reply(restarting: bool) -> (&'static str, Option<HeaderValue>) {
+    if restarting {
+        (
+            "model unavailable — the GPU context failed (out of resources); the worker is \
+             restarting — retry shortly",
+            Some(RETRY_AFTER_WORKER_RESTART),
+        )
+    } else {
+        (
+            "model unavailable — the GPU context failed (out of resources) and the server must be \
+             restarted; retrying will not help",
+            None,
+        )
+    }
+}
+
+/// [`gpu_poisoned_reply`] for the current process state.
+pub(crate) fn gpu_poisoned_reply_now() -> (&'static str, Option<HeaderValue>) {
+    gpu_poisoned_reply(crate::startup::gpu_poison_exit_requested())
+}
+
+/// A 503 for a poisoned GPU context (G1): `code` as before, text and `Retry-After` from
+/// [`gpu_poisoned_reply_now`].
+fn gpu_poisoned_response(code: &'static str) -> Response {
+    let (msg, retry) = gpu_poisoned_reply_now();
+    let mut resp = openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        msg,
+        "server_error",
+        Some(code),
+    );
+    if let Some(v) = retry {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+/// A load that did not return (step 6b): `504 load_timeout` for the load that hit its deadline,
+/// `503 device_stalled` + `Retry-After` for a load refused because another load on its device is
+/// stalled. Shared by the inference routes and the admin load routes.
+pub(crate) fn load_stall_response(e: &ModelError) -> Response {
+    if matches!(e, ModelError::LoadTimeout { .. }) {
+        return openai_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("{e}"),
+            "server_error",
+            Some("load_timeout"),
+        );
+    }
+    let mut resp = openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("{e}"),
+        "server_error",
+        Some("device_stalled"),
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
+    resp
+}
+
 /// Map a [`ModelError`] to its OpenAI-shaped HTTP response.
 ///
 /// Shared by every endpoint that resolves a model by id (tokenize, detokenize,
@@ -403,6 +522,10 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             }
             resp
         }
+        // G1: a supervised worker draining toward its restart says so; otherwise as before.
+        ModelError::GpuPoisoned if crate::startup::gpu_poison_exit_requested() => {
+            gpu_poisoned_response("gpu_poisoned")
+        }
         ModelError::GpuPoisoned => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
@@ -410,6 +533,13 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             ),
             "server_error",
             Some("gpu_poisoned"),
+        ),
+        // D-04 S2: no Retry-After — this process will not take the load; its successor might.
+        ModelError::ShuttingDown => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            e.to_string(),
+            "server_error",
+            Some("server_stopping"),
         ),
         ModelError::InsufficientMemory(msg) => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -432,6 +562,9 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
                 .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
             resp
         }
+        ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. } => {
+            load_stall_response(&e)
+        }
         // A forced eviction's engine is still finishing its request: its memory is not free
         // yet, so the load that needed it is refused; retryable.
         ModelError::EvictionIncomplete(_) => {
@@ -451,7 +584,20 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             "invalid_request_error",
             Some("unsupported_operation"),
         ),
+        ModelError::ConfigFileInvalid(_) => config_file_invalid_response(&e),
     }
+}
+
+/// 409 `config_file_invalid`: `config.json` was already invalid, so a change that persists to it
+/// was refused before anything was loaded or evicted. The code is what tells `rv` this is not a
+/// bare 409 ("already registered").
+pub(crate) fn config_file_invalid_response(e: &ModelError) -> Response {
+    openai_error(
+        StatusCode::CONFLICT,
+        e.to_string(),
+        "invalid_request_error",
+        Some("config_file_invalid"),
+    )
 }
 
 /// The answer for a request an engine refused because its model is being evicted (the engine's
@@ -517,12 +663,7 @@ pub(crate) fn inference_error_from_text(
             "server_error",
             Some("kv_capacity_wedge"),
         ),
-        InferenceErrorKind::GpuPoisoned => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "model unavailable — the GPU context failed (out of resources) and the server must be restarted; retrying will not help",
-            "server_error",
-            Some("model_unavailable"),
-        ),
+        InferenceErrorKind::GpuPoisoned => gpu_poisoned_response("model_unavailable"),
         InferenceErrorKind::ModelUnloading => {
             let mut resp = openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -536,6 +677,23 @@ pub(crate) fn inference_error_from_text(
             );
             resp
         }
+        InferenceErrorKind::DeviceMemory => {
+            let mut resp = openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                DEVICE_MEMORY_MESSAGE,
+                "server_error",
+                Some("insufficient_memory"),
+            );
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
+            resp
+        }
+        InferenceErrorKind::TemplateRejected(reason) => openai_error(
+            StatusCode::BAD_REQUEST,
+            template_rejected_message(&reason),
+            "invalid_request_error",
+            Some("template_rejected"),
+        ),
         InferenceErrorKind::Opaque => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "inference failed",
@@ -576,6 +734,16 @@ enum InferenceErrorKind {
     /// The engine was stopped under a live request (eviction drain deadline,
     /// shutdown) — the request is fine, the model went away; retryable 503.
     ModelUnloading,
+    /// `GenAI` refused to build the KV pool at request time for device memory
+    /// ([`is_genai_memory_budget_error`], MR2-1): a vision model's pool is built at its first
+    /// generate, which is a request when the load-time warm-up did not run (`kv_warmup: false`,
+    /// a non-`GPU…` device string). The model is evicted and reloaded (the wedge recovery with
+    /// no observed tokens, so no ceiling is learned); retryable 503 `insufficient_memory`.
+    DeviceMemory,
+    /// The model's chat template refused the messages (`raise_exception`, rendered by `GenAI` on
+    /// the vision path; the text path already answers this with a 400 from its own renderer).
+    /// Carries [`template_rejection_reason`]. A client error: 400 `template_rejected`.
+    TemplateRejected(String),
     /// Anything else — an opaque 500, raw text logged server-side only.
     Opaque,
 }
@@ -643,9 +811,32 @@ fn classify_inference_error(
         }
         return InferenceErrorKind::GpuPoisoned;
     }
+    if is_genai_memory_budget_error(raw) {
+        // Not a poison and not a ceiling miss: the pool never got built. Evict and reload
+        // (first caller wins; `0` observed tokens skips the ratchet write) so the model does
+        // not sit Ready and fail every request.
+        if let Some(mm) = mm {
+            mm.spawn_kv_wedge_recovery(model_id, 0);
+        }
+        tracing::warn!(
+            model_id,
+            error = %raw,
+            "GenAI refused the KV cache at request time (device memory); reloading the model"
+        );
+        return InferenceErrorKind::DeviceMemory;
+    }
+    if let Some(reason) = template_rejection_reason(raw) {
+        tracing::warn!(model_id, error = %raw, "the model's chat template rejected the request");
+        return InferenceErrorKind::TemplateRejected(reason);
+    }
     if raw.contains(ENGINE_SHUTDOWN_MARKER) {
         tracing::warn!(model_id, error = %raw, "request aborted: its engine was stopped (eviction or shutdown)");
         return InferenceErrorKind::ModelUnloading;
+    }
+    if crate::model_manager::is_kv_blob_mismatch_error(raw)
+        && let Some(mm) = mm
+    {
+        mm.note_kv_blob_mismatch(model_id);
     }
     tracing::error!(model_id, error = %raw, "inference failed");
     InferenceErrorKind::Opaque
@@ -661,6 +852,51 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// G1 (step 7): a supervised worker on its way to a restart says "retry shortly" and sends
+    /// `Retry-After: 30`; otherwise the old "retrying will not help" text, no header.
+    #[test]
+    fn gpu_poisoned_reply_is_retryable_only_while_restarting() {
+        let (msg, retry) = gpu_poisoned_reply(true);
+        assert!(msg.contains("retry shortly"), "{msg}");
+        assert!(!msg.contains("will not help"), "{msg}");
+        assert_eq!(retry, Some(HeaderValue::from_static("30")));
+        let (msg, retry) = gpu_poisoned_reply(false);
+        assert!(msg.contains("retrying will not help"), "{msg}");
+        assert_eq!(retry, None);
+    }
+
+    /// Step 6b: a load past its deadline is a 504 `load_timeout`; a load refused because its
+    /// device has a stalled load is a retryable 503 `device_stalled`.
+    #[test]
+    fn load_stall_errors_map_to_504_and_retryable_503() {
+        let r = load_stall_response(&ModelError::LoadTimeout {
+            model: "m".to_owned(),
+            secs: 600,
+        });
+        assert_eq!(r.status(), StatusCode::GATEWAY_TIMEOUT);
+        let r = load_stall_response(&ModelError::DeviceStalled {
+            device: "GPU.1".to_owned(),
+            model: "m".to_owned(),
+            secs: 700,
+        });
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// D-04 S2: a load refused because the server is stopping is a 503 `server_stopping` with no
+    /// `Retry-After` (this process will not take it).
+    #[tokio::test]
+    async fn shutting_down_is_503_server_stopping_without_retry_after() {
+        let resp = model_error_response(ModelError::ShuttingDown);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!resp.headers().contains_key(header::RETRY_AFTER));
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "server_stopping");
+    }
 
     #[test]
     fn field_hint_names_path_but_never_value() {
@@ -764,6 +1000,76 @@ mod tests {
         let msg = json["error"]["message"].as_str().unwrap();
         assert_eq!(msg, "inference failed");
         assert!(!msg.contains("ragged batch"), "raw error leaked: {msg}");
+    }
+
+    /// SF-5 D-03: a chat-template `raise_exception` on the vision path is a 400 naming the
+    /// template's reason, without the template excerpt; other text is not matched.
+    #[tokio::test]
+    async fn a_template_rejection_is_a_400_with_the_templates_reason() {
+        let raw = anyhow::anyhow!(
+            "ov_vlm generate failed: Minja failed to apply chat template. Possible solutions \
+             are\n* Provide a simplified chat template\nMinja's error: Unexpected message role. \
+             at row 144, column 28:\n    {{%- else %}}\n        {{{{- raise_exception('x') }}}}"
+        );
+        let resp = inference_error_response(None, "qwen3.5", &raw);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "template_rejected");
+        assert_eq!(
+            json["error"]["message"],
+            "the model's chat template rejected the messages: Unexpected message role."
+        );
+        assert_eq!(template_rejection_reason("plain failure"), None);
+        assert_eq!(
+            template_rejection_reason("Minja's error:  at row 1").as_deref(),
+            Some("(no reason given)")
+        );
+    }
+
+    /// K-02d: a frame that cannot be serialised becomes a typed error frame, not an empty
+    /// `data:` line; a normal value is sent as its JSON.
+    #[test]
+    fn sse_json_event_sends_an_error_frame_when_serialisation_fails() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+        let frame = |e: axum::response::sse::Event| format!("{e:?}");
+        let bad = frame(sse_json_event(&Fails));
+        assert!(bad.contains("frame_serialize_failed"), "{bad}");
+        let good = frame(sse_json_event(&serde_json::json!({"a": 1})));
+        assert!(
+            good.contains(r#"{\"a\":1}"#) || good.contains(r#"{"a":1}"#),
+            "{good}"
+        );
+    }
+
+    /// MR2-1: `GenAI` refusing the KV pool at request time (a vision model whose warm-up did not
+    /// run) is a retryable 503 `insufficient_memory` with `Retry-After`, the C++ text and CI
+    /// path scrubbed — not an opaque 500 on every request.
+    #[tokio::test]
+    async fn genai_memory_budget_at_request_time_is_retryable_503() {
+        let raw = anyhow::anyhow!(
+            "ov_vlm generate failed: Check 'budget_in_bytes <= total_available_memory' failed \
+             at /home/jenkins/agent/src/cache_orchestrator.hpp:759"
+        );
+        let resp = inference_error_response(None, "qwen3-vl", &raw);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "insufficient_memory");
+        let msg = json["error"]["message"].as_str().unwrap();
+        for leak in ["budget_in_bytes", "jenkins", "cache_orchestrator"] {
+            assert!(!msg.contains(leak), "leaks {leak}: {msg}");
+        }
     }
 
     /// An engine stopped under a live request (eviction drain deadline) is a retryable 503

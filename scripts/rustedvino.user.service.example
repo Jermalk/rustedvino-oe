@@ -1,0 +1,41 @@
+# Example systemd USER unit for a RustedVINO bundle unpacked under ~/rustedvino-live/ (current -> releases/<bundle>).
+# Install: copy to ~/.config/systemd/user/rustedvino.service, then
+#   loginctl enable-linger $USER; systemctl --user daemon-reload; systemctl --user enable --now rustedvino
+#
+# GPU/NPU access: /dev/dri/renderD* and /dev/accel/* are root:render 0660. A desktop login gets
+# access through a per-session ACL, which does NOT exist at boot before anyone logs in, so a lingering
+# user manager starts this service without GPU access. Add the user to the render group instead:
+#   sudo usermod -aG render,video $USER      (then log out and back in)
+[Unit]
+Description=RustedVINO inference server
+# The supervisor gives up after supervisor.max_restarts crashes within restart_window_secs;
+# Restart=on-failure below would then start it again after RestartSec, forever. These limits
+# stop that: 3 starts in 15 min and the unit goes to "failed" and stays there, visible in
+# `systemctl --user status`.
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rustedvino-live/current
+Environment=RUSTEDVINO_CONFIG=%h/rustedvino-live/config.json
+# --supervise: a thin parent restarts the worker (backoff, crash-loop cap) and restarts it on
+# purpose after a poisoned GPU context (worker exit code 75).
+ExecStart=%h/rustedvino-live/current/rustedvino --supervise
+Restart=on-failure
+RestartSec=30
+# SIGTERM first: the server drains in-flight requests (up to 30 s), waits for a model load that is
+# still running (up to 600 s, counted from the stop: a SIGKILL during a GPU load wedges the Arc
+# B60 driver), then tears the engines down (8 s each, at least 10 s) and exits (~6 s). With six
+# engines that is ~660 s; 720 s leaves slack. Lower it only if no model ever loads for long. If a
+# stop hangs past it, systemd SIGKILLs rather than leaving a stuck unit that refuses to restart
+# (SendSIGKILL=no would do that). The worker ignores the second SIGTERM systemd sends it directly.
+KillSignal=SIGTERM
+TimeoutStopSec=720
+# Asks systemd-oomd to prefer other victims under memory pressure. It does not stop swap-based
+# kills, and OOMScoreAdjust cannot be lowered from a user manager, so a real memory shortage can
+# still kill this service: keep the combined model footprint well under the box's RAM.
+ManagedOOMPreference=avoid
+
+[Install]
+WantedBy=default.target

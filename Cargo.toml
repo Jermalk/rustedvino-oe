@@ -22,7 +22,7 @@ expect_used = "deny"
 
 [package]
 name = "rustedvino"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -60,6 +60,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Application error handling — anyhow::Result<T> = Result<T, any error>
 # The ? operator propagates errors up the call stack (like Go's if err != nil)
 anyhow = "1"
+
+# IR `.xml` reader for the KV profile (MIT/Apache-2.0, depends only on memchr). Read-only DOM;
+# the IRs are 0.4-10 MB.
+roxmltree = "0.21"
 
 # Test helpers — only compiled for `cargo test`, not production builds
 # CRASH COURSE — [dev-dependencies]:
@@ -197,6 +201,13 @@ tempfile = "3"
 # Parity test only (tests/rv_keys_path_parity.rs): pins rv's copy of the keys-file
 # path rule to the server's. rv itself never depends on this crate.
 rv = { path = "tools/rv" }
+
+[features]
+# Test-only fault injection (step 7 live test): `RUSTEDVINO_FAULT_POISON_AT_STEP=N` makes the Nth
+# continuous-batching step fail once with the GPU plugin's real CL_OUT_OF_RESOURCES text, so the
+# poison path (G1 retryable reply, G2 diagnostics, exit 75 + respawn) runs end-to-end without a
+# real driver fault. Never enable in release bundles.
+fault-injection = []
 
 [lints]
 workspace = true

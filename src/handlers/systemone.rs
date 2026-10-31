@@ -57,6 +57,10 @@ fn resolve_decision_handle(
         }
         Err(ModelError::NotLoaded) => Err(Box::new(match mm.request_on_demand_load(model) {
             OnDemandLoad::Loading => not_ready_transient(model, &ModelError::Loading),
+            OnDemandLoad::ShuttingDown => ollama_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("model '{model}' is not ready: {}", ModelError::ShuttingDown),
+            ),
             OnDemandLoad::NotApplicable => ollama_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("model '{model}' is not ready: {}", ModelError::NotLoaded),

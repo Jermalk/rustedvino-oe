@@ -30,9 +30,9 @@ path was kept at `/metrics` so existing scrape configs keep working.
 
 | Code | Cause |
 |---|---|
-| `200` | Valid admin-scope key (or a keys file that exists with `admin_api_keys` explicitly empty, which delegates to the inference gate) |
+| `200` | Valid admin-scope key (or a keys file that exists with `admin_api_keys` explicitly empty, which delegates to the inference gate; if that file has no `api_keys` either, `/metrics` is served without any key to clients that send no `Origin` header) |
 | `401` | No `Authorization` header, or an unrecognized Bearer key |
-| `403` | A valid **inference-scope** key presented to a server that also has admin keys — authenticated but not authorized (`insufficient_scope`). Requires both `api_keys` and `admin_api_keys` to be non-empty; with `admin_api_keys` empty the route falls back to the inference gate and an inference key is admitted |
+| `403` | A valid **inference-scope** key presented to a server that also has admin keys — authenticated but not authorized (`insufficient_scope`). Requires both `api_keys` and `admin_api_keys` to be non-empty; with `admin_api_keys` empty the route falls back to the inference gate and an inference key is admitted. Or `browser_origin_refused`: the keys file configures no keys at all and the request carries an `Origin` header (browsers always send one; curl and Prometheus do not) |
 | `503` | Two distinct causes — see below |
 
 Two different conditions produce `503`, and they are not interchangeable:
@@ -54,9 +54,11 @@ Configure `keys_file` before pointing a scraper at this server. See `keys_file` 
 Four traps, in descending order of how often they bite.
 
 **1. An absent series means "never happened since boot", not zero.** The exporter renders a
-series only after its first value. Ten of the metrics below therefore do not appear at all
-on a freshly-booted server: the three rejection counters, both `ov_cache_pruned_*` counters,
-and all five `realtime_*` metrics. For alerting, treat absence with `absent()` — do not
+series only after its first value. Several metrics below therefore do not appear at all
+on a freshly-booted server: the four rejection and clamp counters, the four eviction-policy
+counters, both `ov_cache_pruned_*` counters, both per-key metrics (until the first
+authenticated request), `rustedvino_model_load_duration_seconds` (until a model's first load
+completes) and all five `realtime_*` metrics. For alerting, treat absence with `absent()` — do not
 write a rule that assumes `== 0` will match. `rustedvino_ov_cache_bytes` is a special case:
 it is absent when `ov_cache_dir` is not configured, which means "no cache directory", not
 "empty cache".
@@ -71,7 +73,7 @@ applies to:
 | `rustedvino_kv_cache_pressure_flagged` | The pressure monitor is disabled (the default) |
 | `rustedvino_kv_cache_pool_gb` | The model is unloaded, or this kind has no KV pool at all |
 | `rustedvino_requests_max` | The model is unloaded — not "zero capacity configured" |
-| `rustedvino_tokens_per_second` | This kind never generates tokens (embedding/stt/tts/image_gen/reranking) |
+| `rustedvino_tokens_per_second` | This kind never generates tokens (embedding/stt/tts/image_gen/reranking/decision) |
 
 `rustedvino_model_pinned` and `rustedvino_model_priority` are the honest ones: `0` there
 genuinely means unpinned / lowest priority.
@@ -100,12 +102,15 @@ identically; on a multi-GPU box the `domain=` series are the per-GPU breakdown a
 |---|---|---|
 | `model` | model ID as registered in `config.json` | |
 | `device` | resolved OpenVINO device (`CPU`, `GPU`, `GPU.1`, `NPU`, …) | The model's *actual* silicon, not the global `device` config field |
-| `kind` | `text_gen`, `vision`, `embedding`, `stt`, `tts`, `image_gen`, `reranking` | Property of the loaded model. **`text_gen` covers two different engines** — the continuous-batching pipeline and the NPU static pipeline |
+| `kind` | `text_gen`, `vision`, `embedding`, `stt`, `tts`, `image_gen`, `reranking`, `decision` | Property of the loaded model. **`text_gen` covers two different engines** — the continuous-batching pipeline and the NPU static pipeline. The only label on the forced-eviction counters |
 | `modality` | `text`, `multimodal` | Property of the *request*, not the model. Only a `kind="vision"` engine registers a `multimodal` series |
 | `gate` | `cb`, `vlm`, `npu` | Which prompt-length gate rejected — the only way to tell NPU from CB, which share `kind="text_gen"` |
 | `result` | see the realtime section | |
 | `key_suffix` | last 6 characters of a Bearer key | Never the full key; keys shorter than 12 characters are not counted at all |
 | `domain` | memory-domain id (a GPU name, or `system`) | VRAM gauges only |
+| `mode` | `exact`, `legacy` | `rustedvino_kv_gate_mode` only |
+| `reason` | `busy`, `incomplete` | Load and eviction refusal counters only |
+| `driver`, `pdev`, `region` | DRM driver, PCI device, the driver's memory-region name | `rustedvino_process_gpu_memory_bytes` only |
 
 ---
 
@@ -132,16 +137,18 @@ to `/metrics`. All carry `model`, `device`, `kind`.
 | `rustedvino_tokens_generated_total` | counter | `model`, `device`, `kind` | Output tokens produced. Incremented by the real per-step token count, so a speculative-decoding step that accepts several draft tokens counts all of them. Only the generation engines (`text_gen`, `vision`) ever increment this; other kinds register the series and leave it at `0` |
 | `rustedvino_tokens_per_second` | gauge | `model`, `device`, `kind` | Exponential moving average of aggregate decode throughput across the engine's live batch — a batch-level figure, not per request. **Not reset on eviction**; see trap 3 above |
 
-### Rejection counters
+### Rejection and clamp counters
 
-These three count *clean, expected* rejections, not faults. They are deliberately separate
+Three of these count *clean, expected* rejections and one (`kv_max_tokens_clamped_total`)
+counts a request that was served with a lowered `max_tokens`; none are faults. They are deliberately separate
 metrics because each one calls for different operator action, and a single "rejected"
-counter would tell you nothing about which. None of them appear until the first rejection.
+counter would tell you nothing about which. None of them appear until the first event.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `rustedvino_context_length_exceeded_total` | counter | `model`, `gate` | The prompt itself is longer than the model's ceiling — rejected with `400 context_length_exceeded` before reaching the engine. Action: the client must send a shorter prompt. The `gate` label is the only way to distinguish an NPU rejection from a continuous-batching one, since both are `kind="text_gen"` elsewhere |
 | `rustedvino_pool_capacity_rejected_total` | counter | `model` | The prompt would fit on its own, but admitting it alongside requests already in flight would overcommit the KV pool. Action: **retry shortly** — this is transient contention, and a rising rate means the model needs a larger KV pool or lower concurrency |
+| `rustedvino_kv_max_tokens_clamped_total` | counter | `model` | A vision request's `max_tokens` was lowered so the prompt and the answer fit the KV pool (exact gate only). The reply ends with `finish_reason: length` when the clamp binds. Action: none per request; a rising rate means clients ask for more output than the pool can hold alongside their prompts, so raise `kv_cache_gb` or shorten prompts |
 | `rustedvino_own_budget_rejected_total` | counter | `model` | On a single-slot model, this request's own `prompt_tokens + max_tokens` cannot fit the KV pool, with nothing else in flight. Action: **do not retry unchanged** — an identical retry fails identically; the client needs a smaller `max_tokens`, or the model needs a bigger pool |
 
 ### Eviction policy
@@ -188,8 +195,16 @@ Read trap 4 above before writing a query against these.
 | `rustedvino_vram_total_bytes` | gauge | `device` **or** `domain` | Configured usable VRAM. `device=` is the box-level figure for the primary inference device (from `total_vram_gb`); `domain=` is the per-memory-domain budget, one series per domain |
 | `rustedvino_vram_used_bytes` | gauge | `device` **or** `domain` | VRAM reserved across all loaded models of every kind — weights plus KV pool. This is RustedVINO's own accounting, not a driver query: separate OpenVINO Core instances cannot see each other's allocations, so the server tracks reservations itself |
 
-Both are derived from GB values multiplied by `1e9`, so they are decimal gigabytes, not
-gibibytes.
+Both are derived from the memory accounting's GiB figures (such as `total_vram_gb`, and each model's
+`vram_gb` plus its KV pool) multiplied by 2^30 (1,073,741,824), so they are bytes of a GiB
+budget. **Changed in 0.9.0:** 0.8.x multiplied by 10^9, so the same configuration now reads
+about 7.4 % higher; rescale any dashboard or alert threshold carried over from 0.8.x.
+
+### GPU context
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rustedvino_gpu_poisoned` | gauge | none | `1` once an out-of-resources failure has poisoned the GPU context: loads and unloads are refused and GPU-placed models are reported `unavailable (gpu_poisoned)` until the server restarts; `0` otherwise. `GET /health` carries the same flag as `gpu_poisoned`. |
 
 ### Measured device memory (Linux)
 
@@ -199,7 +214,7 @@ reserves. These two are *measured* from the kernel (`/proc/self/fdinfo`, DRM dri
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `rustedvino_process_gpu_memory_bytes` | gauge | `driver`, `pdev`, `region` | Device memory this server process holds, read at scrape time. `pdev` is the PCI device, so two GPUs on one driver stay separate. `region` is the driver's own name: `gtt` / `system` / `stolen` / `vram0` for the GPU, `memory` for the NPU. Real bytes, not decimal-GB conversions |
+| `rustedvino_process_gpu_memory_bytes` | gauge | `driver`, `pdev`, `region` | Device memory this server process holds, read at scrape time. `pdev` is the PCI device, so two GPUs on one driver stay separate. `region` is the driver's own name, passed through verbatim: on `xe` for example `gtt` / `system` / `stolen` / `vram0`, on `i915` for example `system0` / `local0`, and `memory` for the NPU (`intel_vpu`). Real bytes, not converted from GiB figures |
 | `rustedvino_model_gpu_memory_estimate_bytes` | gauge | `model`, `device`, `kind` | Per loaded model: the measured change across its load, plus runtime growth for embedding engines (the batch cache OpenVINO keeps until eviction). **NaN** while loaded but unknown; 0 once evicted |
 
 The per-model figure is an **estimate** taken from the process-wide counter, so the server
@@ -215,18 +230,38 @@ A reload in a quiet moment measures it again. Use it to check `vram_gb`: when an
 measurement includes), the accounting under-counts that model. The server also logs this once per load, and
 `GET /v1/admin/models` shows it as `gpu_memory_estimate_gb`.
 
+The same measurement gives `vram_measured_mib` in `GET /v1/admin/models`: the weights as measured
+at the last load (the load's device-memory delta minus the KV pool it allocated, MiB), omitted under
+the same conditions and also for every pool sized in whole GiB (`kv_pool_blocks` absent: the legacy
+gate, or a model without an exact KV layout), whose real size is not known to the byte. A vision model that has admitted requests with images since its last
+load carries `kv_admission_low_confidence: true` and `uncounted_image_admissions: <n>`: image tokens
+are not counted by the context limit yet (the limit saw only the text, so an image-heavy prompt can
+still overflow the pool); `rv ps` / `rv status` mark its CTX cell with a trailing `!`. Both fields
+are absent until the first such request, and a new load clears them. A model unloaded and loaded again within 20 s therefore shows neither field;
+wait and reload to get one. `server.headroom` of the same response (every caller of the route, keyless servers included) lists
+each discrete GPU's total, what other processes hold, what this process holds, the running
+leases and what is left for one prompt, with `probe` `fdinfo` or `none`; `rv status` prints it
+under the VRAM bars.
+
 ## KV cache
 
-The three KV metrics only make sense read together. Reading
+`rustedvino_kv_cache_usage_percent`, `_usage_supported` and `_pressure_flagged` only make sense read together. Reading
 `rustedvino_kv_cache_usage_percent` alone is the single easiest way to draw a wrong
 conclusion from this endpoint.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `rustedvino_kv_cache_pool_gb` | gauge | `model`, `device`, `kind` | KV-cache pool reserved for this model at load time, in GB. Follows the live reservation: `0` once the model is evicted, and `0` for kinds that have no pool |
+| `rustedvino_kv_cache_pool_gb` | gauge | `model`, `device`, `kind` | KV-cache pool reserved for this model at load time, in GiB (the metric name keeps its historical `_gb` suffix). Follows the live reservation: `0` once the model is evicted, and `0` for kinds that have no pool |
 | `rustedvino_kv_cache_usage_percent` | gauge | `model`, `device`, `kind` | Live pool occupancy, 0–100, as of the engine's last step. **Only meaningful when `rustedvino_kv_cache_usage_supported == 1`** |
 | `rustedvino_kv_cache_usage_supported` | gauge | `model`, `device`, `kind` | `1` if the percent gauge above is a trustworthy live reading for this model; `0` if it is structurally unqueryable and therefore indistinguishable from a genuinely empty pool |
 | `rustedvino_kv_cache_pressure_flagged` | gauge | `model`, `device`, `kind` | `1` while this model's occupancy has stayed continuously at or above `kv_pressure_threshold_pct` for at least `kv_pressure_sustained_secs`. Detect-and-flag only — nothing is evicted or resized as a result |
+
+### Admission
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rustedvino_kv_gate_mode` | gauge | `model`, `mode` | `1` for the prompt-length gate mode a loaded GPU/CPU text or vision model uses (NPU models have no KV gate and no series), `0` once it is unloaded. `mode="exact"` = the limit comes from the model's real KV layout and exact pool, `mode="legacy"` = the older estimate (a model reads 1 on exactly one of the two). Labels are `model` and `mode` only (no `device`/`kind`), so join with `on(model)`. |
+| `rustedvino_kv_scheduler_drop_total` | counter | `model` | Requests the continuous-batching scheduler ignored because the KV pool had no room for them (the client gets a retryable 503). Text (continuous-batching) and vision models on any device, including a vision model on the NPU (a vision model's KV capacity wedge, `kv_capacity_wedge`, counts too); NPU text models and other kinds have no series. A rising count means the prompt-length gate admits more than the pool holds; see `kv_cache_precision` in `CONFIG.md`. |
 
 ### `supported = 0` is not "the pool is empty"
 
@@ -285,7 +320,7 @@ is static between sweeps and up to `ov_cache_sweep_interval_secs` old.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `rustedvino_ov_cache_bytes` | gauge | — | Total on-disk size of `ov_cache_dir` as of the last sweep. Reported whenever `ov_cache_dir` is configured, whether or not `ov_cache_max_gb` bounds it. **Absent entirely when `ov_cache_dir` is unset** |
+| `rustedvino_ov_cache_bytes` | gauge | — | Total on-disk size of `ov_cache_dir` as of the last sweep, root plus its `kv-*` directories. Reported whenever `ov_cache_dir` is configured, whether or not `ov_cache_max_gb` bounds it. **Absent entirely when `ov_cache_dir` is unset** |
 | `rustedvino_ov_cache_pruned_bytes_total` | counter | — | Cumulative bytes reclaimed by pruning since process start. Only moves when `ov_cache_max_gb` is set *and* a sweep found the cache over budget — permanently absent on an unbounded cache |
 | `rustedvino_ov_cache_pruned_files_total` | counter | — | Cumulative cache files deleted by pruning. Same gating |
 

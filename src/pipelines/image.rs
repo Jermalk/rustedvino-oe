@@ -466,7 +466,7 @@ impl ImageModelMetadata {
 /// Returns `None` if the file is missing, unreadable, or has no `_class_name`
 /// key — `generation_metadata.model_family` is simply omitted in that case,
 /// never fabricated.
-fn read_pipeline_class(model_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn read_pipeline_class(model_dir: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(model_dir.join("model_index.json")).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     parsed

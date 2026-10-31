@@ -19,7 +19,22 @@ use anyhow::Context;
 
 use crate::image_util::DecodedImage;
 use crate::ov_cb::GenParams;
-use crate::ov_pipeline::last_error;
+use crate::ov_pipeline::{last_error, last_props};
+
+/// How the KV-cache precision reaches the VLM pipeline: `0` = the plain top-level
+/// `KV_CACHE_PRECISION` hint, `1` = per role under `MODEL_PROPERTIES` for the language model
+/// only (the default). Which one `GenAI` honours on the VLM path is not settled yet, so the
+/// choice can be flipped without a rebuild: set `RUSTEDVINO_VLM_KV_FORM=plain` (or `role`) in the
+/// server's environment. The form actually used is in the logged `VLM engine properties` line.
+fn vlm_kv_form() -> std::ffi::c_int {
+    static FORM: std::sync::OnceLock<std::ffi::c_int> = std::sync::OnceLock::new();
+    *FORM.get_or_init(
+        || match std::env::var("RUSTEDVINO_VLM_KV_FORM").as_deref() {
+            Ok("plain") => 0,
+            _ => 1,
+        },
+    )
+}
 
 // ── OvGenParamsC (private FFI mirror — must match OvGenParams in ov_bridge.cpp) ──
 //
@@ -65,8 +80,11 @@ unsafe extern "C" {
         device: *const std::ffi::c_char,
         ov_cache_dir: *const std::ffi::c_char,
         cache_size_gb: f64,
+        num_kv_blocks: u64,
         enable_prefix_caching: bool,
         max_num_seqs: usize,
+        kv_cache_precision: *const std::ffi::c_char,
+        kv_form: std::ffi::c_int,
     ) -> *mut c_void;
 
     fn ov_vlm_free(handle: *mut c_void);
@@ -192,15 +210,20 @@ impl OvVlmEngine {
     /// # Performance
     /// Loading takes 30–120 s (GPU JIT for all sub-models). Call from
     /// `spawn_blocking` or the dedicated engine thread — never the async runtime.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model_path: &str,
         device: &str,
         ov_cache_dir: &str,
         cache_size_gb: f64,
+        num_kv_blocks: u64,
         enable_prefix_caching: bool,
         max_num_seqs: usize,
+        kv_cache_precision: &str,
     ) -> anyhow::Result<Self> {
         let c_path = CString::new(model_path).context("model_path contains interior NUL")?;
+        let c_kv_prec =
+            CString::new(kv_cache_precision).context("kv_cache_precision contains interior NUL")?;
         let c_device = CString::new(device).context("device contains interior NUL")?;
         let c_cache_dir =
             CString::new(ov_cache_dir).context("ov_cache_dir contains interior NUL")?;
@@ -213,10 +236,14 @@ impl OvVlmEngine {
                 c_device.as_ptr(),
                 c_cache_dir.as_ptr(),
                 cache_size_gb,
+                num_kv_blocks,
                 enable_prefix_caching,
                 max_num_seqs,
+                c_kv_prec.as_ptr(),
+                vlm_kv_form(),
             )
         };
+        tracing::info!(props = %last_props(), "VLM engine properties");
 
         if handle.is_null() {
             anyhow::bail!("ov_vlm_create failed: {}", last_error());

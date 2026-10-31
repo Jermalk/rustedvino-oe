@@ -9,6 +9,26 @@
 //! wrong, then `= note:` / `= help:` lines saying why and what to do.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+// D-04 S8: what `rv start`/`rv stop` follow in the server's log, and how long. rv cannot depend
+// on the server crate (it would link OpenVINO), so these are copies, pinned to the server's
+// values by `tests/rv_stop_contract.rs`.
+
+/// How long `stop` waits for the process to exit after SIGTERM when no model load holds the stop
+/// up: the server's drain (30 s), the teardown of six engines (8 s each + 2 s) and its exit wait.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long `stop` waits once the server logs that it is waiting for a model load: its stop
+/// wait (`startup::LOAD_SETTLE_CAP`, 600 s) plus drain, teardown and exit; also the systemd
+/// example's `TimeoutStopSec`.
+pub const STOP_LOAD_TIMEOUT: Duration = Duration::from_mins(12);
+/// How long `start` gives a preload with no load deadline of its own (the server's stop wait
+/// gives it as long: `startup::LOAD_SETTLE_CAP`).
+pub const UNCAPPED_PRELOAD: Duration = Duration::from_mins(10);
+/// Part of the server's stop-wait line (`startup::STOP_WAIT_LOG`).
+pub const STOP_WAIT_LINE: &str = "stop requested while a model load is running";
+/// The server's preload line (`startup::PRELOAD_LOG`), with a `load_timeout_s=` field.
+pub const PRELOAD_LINE: &str = "preloading model - the port opens once the preload is done";
 
 use crate::ctx::Ctx;
 
@@ -168,10 +188,12 @@ mod run {
     use crate::proc;
 
     /// How long `start` waits for the server to answer `/health`. Preloaded
-    /// models load before the port opens, so this has to be generous.
+    /// models load before the port opens, so this has to be generous; each preload the log
+    /// reports extends it (D-04 S8).
     const START_TIMEOUT: Duration = Duration::from_secs(180);
-    /// How long `stop` waits for the process to exit after SIGTERM.
-    const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+    use super::{PRELOAD_LINE, STOP_LOAD_TIMEOUT, STOP_TIMEOUT, STOP_WAIT_LINE, UNCAPPED_PRELOAD};
+    /// Slack after a preload's own load deadline before `start` stops waiting for it.
+    const PRELOAD_SLACK: Duration = Duration::from_mins(1);
     const POLL: Duration = Duration::from_millis(500);
     /// How much of the log's end `start` shows when the server dies.
     const LOG_TAIL_BYTES: u64 = 64 * 1024;
@@ -505,7 +527,10 @@ mod run {
         run_start: u64,
     ) -> i32 {
         let t0 = Instant::now();
-        while t0.elapsed() < START_TIMEOUT {
+        let mut deadline = t0 + START_TIMEOUT;
+        let mut offset = run_start;
+        let mut stopping = false;
+        while Instant::now() < deadline {
             if let Ok(Some(status)) = child.try_wait() {
                 if stopped_before_ready(status) {
                     eprintln!(
@@ -537,16 +562,43 @@ mod run {
                     ctx.res.port,
                     t0.elapsed().as_secs_f64()
                 );
+                // Step 8: a server that booted with configuration problems says so here.
+                if ctx.res.admin_usable()
+                    && let Some(a) = ctx.api.get("/v1/admin/models").json()
+                {
+                    let (warnings, _) = crate::commands::status::startup_report_lines(&a["server"]);
+                    for w in warnings {
+                        println!("{} {}", ctx.style.warn(), ctx.style.yellow(&w));
+                    }
+                }
                 return 0;
+            }
+            // D-04 S8: a preload the log reports, or a stop waiting for one, moves the deadline.
+            let lines = new_log_lines(log_path, &mut offset);
+            for secs in preload_allowances(&lines) {
+                let allowance = if secs == 0 {
+                    UNCAPPED_PRELOAD
+                } else {
+                    Duration::from_secs(secs)
+                };
+                deadline = deadline.max(Instant::now() + allowance + PRELOAD_SLACK);
+            }
+            if !stopping && lines.contains(STOP_WAIT_LINE) {
+                stopping = true;
+                deadline = deadline.max(Instant::now() + STOP_LOAD_TIMEOUT);
+                println!(
+                    "rustedvino was asked to stop and is waiting for a model load to finish so \
+                     the GPU is released cleanly (up to 10 min)"
+                );
             }
             std::thread::sleep(POLL);
         }
         fail(
             ctx,
             &format!(
-                "no answer on port {} after {} s",
+                "no answer on port {} after {:.0} s",
                 ctx.res.port,
-                START_TIMEOUT.as_secs()
+                t0.elapsed().as_secs_f64()
             ),
             &[
                 (
@@ -582,6 +634,41 @@ mod run {
             return rest.to_owned();
         }
         text
+    }
+
+    /// The complete lines appended to `path` since `*offset`; moves `*offset` past them (a last
+    /// line still being written is left for the next call).
+    fn new_log_lines(path: &Path, offset: &mut u64) -> String {
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return String::new();
+        };
+        // Truncated or rotated under us (copytruncate): follow it from its new start.
+        if f.metadata().is_ok_and(|m| m.len() < *offset) {
+            *offset = 0;
+        }
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(*offset)).is_err() || f.read_to_end(&mut buf).is_err() {
+            return String::new();
+        }
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
+            return String::new();
+        };
+        *offset += u64::try_from(end + 1).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..=end]).into_owned()
+    }
+
+    /// The load deadline (`load_timeout_s=`, `0` = none) of each preload `lines` report.
+    fn preload_allowances(lines: &str) -> Vec<u64> {
+        lines
+            .lines()
+            .filter(|l| l.contains(PRELOAD_LINE))
+            .map(|l| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix("load_timeout_s="))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            })
+            .collect()
     }
 
     /// The one-sentence cause of a failed start: the fatal `Error: ...` line the
@@ -693,6 +780,9 @@ mod run {
     /// SIGTERM `pid` (via `kill`, which keeps `unsafe` and libc out of rv) and
     /// wait for it to exit.
     fn signal_and_wait(ctx: &Ctx, pid: u32) -> i32 {
+        // D-04 S8: the server says when its stop waits for a model load; follow its log from here.
+        let log_path = ctx.res.config_file.with_file_name("rustedvino.log");
+        let mut offset = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         let sent = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status();
@@ -708,7 +798,9 @@ mod run {
         }
         println!("stopping rustedvino (pid {pid}) ...");
         let t0 = Instant::now();
-        while t0.elapsed() < STOP_TIMEOUT {
+        let mut deadline = t0 + STOP_TIMEOUT;
+        let mut waiting_for_load = false;
+        while Instant::now() < deadline {
             if !pid_alive(pid) {
                 println!(
                     "{} stopped after {:.0} s",
@@ -717,21 +809,48 @@ mod run {
                 );
                 return 0;
             }
+            if !waiting_for_load && new_log_lines(&log_path, &mut offset).contains(STOP_WAIT_LINE) {
+                waiting_for_load = true;
+                deadline = t0 + STOP_LOAD_TIMEOUT;
+                println!(
+                    "{} {}",
+                    ctx.style.warn(),
+                    ctx.style.yellow(
+                        "the server is waiting for a model load to finish so the GPU is released \
+                         cleanly (up to 10 min) - do not kill it"
+                    )
+                );
+            }
             std::thread::sleep(POLL);
         }
         fail(
             ctx,
             &format!(
-                "pid {pid} is still running {} s after SIGTERM",
-                STOP_TIMEOUT.as_secs()
+                "pid {pid} is still running {:.0} s after SIGTERM",
+                t0.elapsed().as_secs_f64()
             ),
             &[
                 (
                     "note",
-                    "a request may be stuck in a device call (this happened once with an NPU)"
+                    "a stop waits up to 10 min for a model load that is still running (the \
+                     server's log says \"waiting for it to finish\"; rv follows only the log next \
+                     to config.json) - give it that time. Otherwise a request may be stuck in a \
+                     device call (an NPU Whisper hang, or a GPU driver hang after an earlier kill)"
                         .to_owned(),
                 ),
-                ("help", format!("if you must: kill -9 {pid}")),
+                (
+                    "help",
+                    "do NOT kill -9 a server with a GPU model loaded: on 2026-10-23 that left \
+                     the B60 hung for ~55 min. Check `rv status` and the kernel log \
+                     (`journalctl -k | grep xe`), wait for the driver to reset, or reboot"
+                        .to_owned(),
+                ),
+                (
+                    "help",
+                    format!(
+                        "CPU/NPU-only server, no GPU model loaded or loading: kill -9 {pid} is safe"
+                    ),
+                ),
             ],
         )
     }
@@ -754,8 +873,8 @@ mod run {
     #[allow(clippy::unwrap_used)]
     mod tests {
         use super::{
-            cgroup_is_service, create_keys_file_if_missing, read_run_log, startup_reason,
-            stopped_before_ready,
+            cgroup_is_service, create_keys_file_if_missing, new_log_lines, preload_allowances,
+            read_run_log, startup_reason, stopped_before_ready,
         };
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
@@ -770,6 +889,35 @@ mod run {
             let h = super::refusal_help(false, 4242);
             assert!(h.contains("kill 4242"), "{h}");
             assert!(h.contains("cannot identify"), "{h}");
+        }
+
+        /// D-04 S8: `start` reads each preload's own deadline off the server's preload line; a line
+        /// without the field (or `0`) is a preload with no deadline.
+        #[test]
+        fn preload_lines_carry_their_load_deadline() {
+            let log = "2026-10-29T09:30:01Z  INFO rustedvino::model_manager: preloading model - the \
+                       port opens once the preload is done model=coder-30b load_timeout_s=600\n\
+                       2026-10-29T09:30:02Z  INFO rustedvino::startup: unrelated load_timeout_s=5\n\
+                       x INFO preloading model - the port opens once the preload is done model=a\n";
+            assert_eq!(preload_allowances(log), vec![600, 0]);
+        }
+
+        /// D-04 S8: the log follower returns complete lines only and resumes after them.
+        #[test]
+        fn new_log_lines_leaves_a_partial_line_for_later() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rustedvino.log");
+            std::fs::write(&path, "old\n").unwrap();
+            let mut offset = 4;
+            assert_eq!(new_log_lines(&path, &mut offset), "");
+            std::fs::write(&path, "old\nstop requested\npart").unwrap();
+            assert_eq!(new_log_lines(&path, &mut offset), "stop requested\n");
+            assert_eq!(offset, 19);
+            std::fs::write(&path, "old\nstop requested\npartial\n").unwrap();
+            assert_eq!(new_log_lines(&path, &mut offset), "partial\n");
+            // Truncated under us: read from the start again.
+            std::fs::write(&path, "new\n").unwrap();
+            assert_eq!(new_log_lines(&path, &mut offset), "new\n");
         }
 
         /// D-04: a clean exit during start means the server was told to shut down while it was

@@ -151,9 +151,6 @@ pub(crate) fn default_tier_preference(
         // the last resort. (A GPU that runs out of room falls through to the CPU via `place_with_fit`.)
         ModelKind::TextGen => vec![Heavy, Fallback, StrongIgpu, WeakIgpu],
         // Vision keeps the size split: a *thin* VLM is light work and parks on the CPU; a heavy one goes dGPU-first.
-        // The hybrid linear-attention Qwen3.5 models cannot load on a GPU with the prefix-cache guard in
-        // force; `resolve_model_device` strips the GPU tiers for them (D-01, 0.8.3), so this order is
-        // not the whole story for those models.
         ModelKind::Vision => {
             if size_gb <= light_max_gb {
                 vec![Fallback, Heavy, StrongIgpu, WeakIgpu]
@@ -190,6 +187,7 @@ mod tests {
             tier,
             domain_id: name.to_owned(),
             total_mem_gb: None,
+            pdev: None,
         }
     }
 

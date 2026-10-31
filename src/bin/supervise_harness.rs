@@ -66,6 +66,8 @@ async fn main() {
         // expose `/v1/admin/health/watchdog` and shouldn't have to; a test that
         // wants to exercise the generation watchdog sets this explicitly.
         watchdog_hang_ceiling_secs: env_u64("HARNESS_WATCHDOG_HANG_CEILING_SECS", 0),
+        gpu_first_load_deadline_secs: env_u64("HARNESS_GPU_FIRST_LOAD_DEADLINE_SECS", 0),
+        gpu_probe_deadline_secs: env_u64("HARNESS_GPU_PROBE_DEADLINE_SECS", 0),
     };
 
     // `rustedvino::supervisor` is `#[cfg(unix)]` (supervisor mode is

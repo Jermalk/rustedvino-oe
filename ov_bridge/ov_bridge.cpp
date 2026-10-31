@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <sstream>
 #include <vector>
 #include <unordered_map>
 #include <filesystem>
@@ -59,6 +60,11 @@
 // the image-metadata plan. Pulled in transitively by core.hpp above,
 // included explicitly here for clarity.
 #include "openvino/core/version.hpp"
+// GPU readiness probe (ov_gpu_probe): a tiny graph built in-process.
+#include "openvino/op/add.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/op/result.hpp"
 // VLMPipeline (Phase 5.2): ChatHistory, JsonContainer, VLMPipeline.
 // visual_language/pipeline.hpp transitively includes chat_history.hpp.
 #include "openvino/genai/visual_language/pipeline.hpp"
@@ -88,7 +94,66 @@ static void set_error(const char* msg) {
     s_last_error[sizeof(s_last_error) - 1] = '\0';
 }
 
+// What the last engine constructor on this thread was really given (review I-12): before
+// this, nothing showed which properties reached OpenVINO, so "the engine got
+// the intended KV precision" could only be inferred. The Rust loader reads it with
+// ov_last_props() right after the constructor and logs it.
+static thread_local std::string s_last_props;
+
+static std::string describe_any(const ov::Any& v) {
+    if (v.is<ov::AnyMap>()) {
+        std::ostringstream o;
+        o << '{';
+        bool first = true;
+        for (const auto& kv : v.as<ov::AnyMap>()) {
+            if (!first) o << ',';
+            first = false;
+            o << kv.first << '=' << describe_any(kv.second);
+        }
+        o << '}';
+        return o.str();
+    }
+    try {
+        return v.as<std::string>();
+    } catch (...) {
+        return "<opaque>";
+    }
+}
+
+static void record_props(const char* what, const std::string& device, const ov::AnyMap& props,
+                         const std::string& extra) {
+    std::ostringstream o;
+    o << what << " device=" << device << ' ' << extra << ' ' << describe_any(props);
+    s_last_props = o.str();
+}
+
+// Map the normalised KV precision string ("i8", "u4", "f16") to the plugin element type.
+// Rust normalises ("u8" -> "i8") and rejects unknown values before the call; false = nothing
+// to pass (empty or unknown: the plugin default stays). The CPU plugin does not accept i8 for
+// KV_CACHE_PRECISION (f32/f16/bf16/u8/u4 only, same on 2026.4.1), so its 8-bit spelling stays
+// u8 there; on GPU both compile to the same kernels.
+// True when a device spec puts any part of the model on the CPU: "CPU" itself, or a HETERO /
+// MULTI / AUTO list that names it ("HETERO:GPU.1,CPU"). Such a spec gets the CPU's 8-bit spelling
+// (u8), as 0.8.4 passed it; the GPU part compiles u8 and i8 to the same kernels (0.9.0 review B).
+static bool spec_names_cpu(const char* device) {
+    return device && std::string(device).find("CPU") != std::string::npos;
+}
+
+static bool kv_precision_type(const char* kv_cache_precision, bool cpu, ov::element::Type& out) {
+    if (!kv_cache_precision || kv_cache_precision[0] == '\0') return false;
+    const std::string p(kv_cache_precision);
+    if      (p == "i8")  out = cpu ? ov::element::u8 : ov::element::i8;
+    else if (p == "u4")  out = ov::element::u4;
+    else if (p == "f16") out = ov::element::f16;
+    else return false;
+    return true;
+}
+
 extern "C" {
+
+/// The properties given to the last engine constructor on this thread, as one line, for the
+/// loader's log. Valid until the next constructor call on the same thread; never NULL.
+const char* ov_last_props() { return s_last_props.c_str(); }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -627,10 +692,13 @@ typedef void (*OvCbTokenCallback)(void*       user_data,
 ///                   scheduler to preempt sequences instead of stalling.
 ///
 /// `kv_cache_precision` — value for the KV_CACHE_PRECISION compile property.
-///                   NULL or "" keeps the plugin default (f16 on GPU). "u8"
+///                   NULL or "" keeps the plugin default (u4 for int4-weight
+///                   models on GPU, i8 otherwise, f16 only when the IR asks for
+///                   it; measured on GenAI 2026.4.1). "i8"
 ///                   compresses the KV cache to 8-bit (~2× tokens per GB at a
-///                   small quality cost); "f16"/"f32" force that precision.
-///                   Unknown values are ignored (plugin default kept).
+///                   small quality cost), "u4" to 4-bit; "f16" forces that
+///                   precision. Unknown values are ignored (plugin default kept);
+///                   the Rust side rejects them at config load.
 ///
 /// `enable_prefix_caching` — reuse KV blocks across requests that share an
 ///                   identical prompt prefix (e.g. repeated system prompts,
@@ -663,12 +731,14 @@ OvCbHandle ov_cb_create(const char* model_path,
                          const char* device,
                          size_t      max_num_seqs,
                          double      cache_size_gb,
+                         uint64_t    num_kv_blocks,
                          const char* kv_cache_precision,
                          const char* ov_cache_dir,
                          bool        enable_prefix_caching,
                          const char* draft_model_path,   // NULL/"" = no draft
                          const char* draft_device) {      // NULL/"" = same as `device`
     s_last_error[0] = '\0';
+    s_last_props.clear();
     if (!model_path) { set_error("null model_path"); return nullptr; }
     if (!device)     { set_error("null device");     return nullptr; }
     try {
@@ -682,18 +752,24 @@ OvCbHandle ov_cb_create(const char* model_path,
         // docs warn against, with zero error or log line (found in adversarial
         // review, 2026-08-20, of the VLM scheduler_config fix below).
         if (cache_size_gb > 0.0) sched.cache_size = static_cast<size_t>(std::ceil(cache_size_gb));
+        // Blocks-first: an exact block count takes precedence over the GiB
+        // budget (scheduler_config.hpp: "when both are set, num_kv_blocks is used"); clear the
+        // budget anyway so the intent is unambiguous in the recorded properties.
+        if (num_kv_blocks > 0) {
+            sched.num_kv_blocks = static_cast<size_t>(num_kv_blocks);
+            sched.cache_size = 0;
+        }
         sched.enable_prefix_caching = enable_prefix_caching;
 
         // Map the requested KV-cache precision to the compile property. Only set
         // it when explicitly requested so the empty/NULL case is byte-identical to
         // the previous behaviour (plugin default).
         ov::AnyMap props;
-        if (kv_cache_precision && kv_cache_precision[0] != '\0') {
-            const std::string p(kv_cache_precision);
-            if      (p == "u8")  props.emplace(ov::hint::kv_cache_precision(ov::element::u8));
-            else if (p == "f16") props.emplace(ov::hint::kv_cache_precision(ov::element::f16));
-            else if (p == "f32") props.emplace(ov::hint::kv_cache_precision(ov::element::f32));
-            // unknown → leave props empty, keep plugin default
+        {
+            ov::element::Type kv_type;
+            if (kv_precision_type(kv_cache_precision, spec_names_cpu(device), kv_type)) {
+                props.emplace(ov::hint::kv_cache_precision(kv_type));
+            }
         }
         // GPU blob cache: first load compiles + writes; subsequent loads read
         // the blob (~10–30 s) instead of recompiling from IR (~1–3 min).
@@ -707,6 +783,12 @@ OvCbHandle ov_cb_create(const char* model_path,
                 std::filesystem::path(draft_model_path), ddev));
         }
 
+        record_props("ov_cb_create", device, props,
+                     "max_num_seqs=" + std::to_string(sched.max_num_seqs) +
+                     " cache_size_gib=" + std::to_string(sched.cache_size) +
+                     " num_kv_blocks=" + std::to_string(sched.num_kv_blocks) +
+                     " prefix_caching=" + (sched.enable_prefix_caching ? "1" : "0") +
+                     " kv_cache_precision=" + (kv_cache_precision ? kv_cache_precision : ""));
         auto* eng = new OvCbEngine(std::string(model_path), sched, std::string(device), props);
         return static_cast<OvCbHandle>(eng);
     } catch (const std::exception& e) {
@@ -1147,6 +1229,63 @@ int ov_list_devices(char* out, size_t out_size) {
     }
 }
 
+/// GPU readiness probe: build a tiny graph (Parameter + Constant ->
+/// Add -> Result, 4096 f32), compile it on `device` (no compile cache: nothing is written),
+/// run one inference (a host-to-device copy, one kernel, a device-to-host copy) and check the
+/// output. Model-size independent: it takes milliseconds to ~1 s on a healthy GPU and never
+/// returns on one whose first work is never scheduled (the B60 stuck-copy-engine state after a
+/// no-teardown exit), which is what the supervisor's deadline on the probe process detects.
+/// The infer request, the compiled model and the core are released, in that order, before the
+/// function returns, so the probe process exits with no live GPU context.
+///
+/// Returns 0 when the output is right, -1 on any error (message via ov_last_error()).
+int ov_gpu_probe(const char* device) {
+    if (!device) {
+        set_error("ov_gpu_probe: null device");
+        return -1;
+    }
+    try {
+        constexpr size_t kLen = 4096;
+        bool ok = true;
+        {
+            ov::Core core;
+            auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{kLen});
+            auto one = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{kLen},
+                                                     std::vector<float>(kLen, 1.0f));
+            auto add = std::make_shared<ov::op::v1::Add>(param, one);
+            auto result = std::make_shared<ov::op::v0::Result>(add);
+            auto model = std::make_shared<ov::Model>(ov::ResultVector{result},
+                                                     ov::ParameterVector{param}, "rv_gpu_probe");
+            {
+                ov::CompiledModel compiled = core.compile_model(model, device);
+                ov::InferRequest req = compiled.create_infer_request();
+                ov::Tensor in(ov::element::f32, ov::Shape{kLen});
+                float* src = in.data<float>();
+                // Small integers: exact in f16, the GPU plugin's default inference precision.
+                for (size_t i = 0; i < kLen; ++i) src[i] = static_cast<float>(i % 1024);
+                req.set_input_tensor(in);
+                req.infer();
+                const ov::Tensor out = req.get_output_tensor();
+                const float* dst = out.data<const float>();
+                for (size_t i = 0; i < kLen; ++i) {
+                    if (dst[i] != static_cast<float>(i % 1024) + 1.0f) { ok = false; break; }
+                }
+            } // infer request, then compiled model, released here
+        } // core released here
+        if (!ok) {
+            set_error((std::string("ov_gpu_probe: wrong result on ") + device).c_str());
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error((std::string("ov_gpu_probe: ") + e.what()).c_str());
+        return -1;
+    } catch (...) {
+        set_error("ov_gpu_probe: unknown exception");
+        return -1;
+    }
+}
+
 /// Writes a single device property (as a string) into `out` for the Phase-A
 /// device inventory. `key` selects the property:
 ///   "FULL_DEVICE_NAME"          → ov::device::full_name        (string)
@@ -1224,6 +1363,48 @@ int ov_get_openvino_version(char* out, size_t out_size) {
     return static_cast<int>(copy_len);
 }
 
+#ifndef _WIN32
+// GenAI exports its build info as an unmangled C-linkage symbol (the Python binding's
+// get_version() wraps it); the vendored headers do not declare it. The result is the same
+// two-pointer ov::Version as ov::get_openvino_version(). Verified against 2026.4.1 with
+// ctypes (buildNumber "2026.4.1.0-3408-ab01d1771e4"). Not declared on Windows, where the
+// export name is not known to us: the version is then reported as unknown.
+extern "C" ov::Version get_version();
+#endif
+
+/// The linked OpenVINO GenAI build-number string (e.g. "2026.4.1.0-3408-ab01d1771e4"), same
+/// contract as `ov_get_openvino_version`. Writes "" and returns 0 when the version is unknown
+/// (Windows, or a null build number); returns -1 on a null/zero argument.
+int ov_get_genai_version(char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        set_error("ov_get_genai_version: null/zero argument");
+        return -1;
+    }
+    out[0] = '\0';
+#ifndef _WIN32
+    try {
+        const ov::Version version = get_version();
+        // `get_version` is a bare C symbol: make sure it is GenAI's (the exact capacity model
+        // trusts this string), not an interposed function of another library.
+        const std::string desc = version.description ? version.description : "";
+        if (desc.find("GenAI") == std::string::npos) {
+            out[0] = '\0';
+            return 0;
+        }
+        const std::string val = version.buildNumber ? version.buildNumber : "";
+        const size_t copy_len = std::min(val.size(), out_size - 1);
+        std::memcpy(out, val.c_str(), copy_len);
+        out[copy_len] = '\0';
+        return static_cast<int>(copy_len);
+    } catch (...) {
+        out[0] = '\0';
+        return 0;
+    }
+#else
+    return 0;
+#endif
+}
+
 /// `sizeof(OvGenParams)` — lets Rust assert its `#[repr(C)]` mirror(s) stay
 /// layout-identical to this struct. There are TWO independent Rust copies
 /// (`ov_cb.rs` and `ov_vlm.rs`, each private to its module — see their doc
@@ -1265,7 +1446,8 @@ struct OvVlmState {
     size_t                  vocab_size = 0;   // 0 = unknown (see tokenizer_vocab_size)
 
     OvVlmState(const char* model_path, const char* device, const char* ov_cache_dir,
-               double cache_size_gb, bool enable_prefix_caching, size_t max_num_seqs)
+               double cache_size_gb, uint64_t num_kv_blocks, bool enable_prefix_caching,
+               size_t max_num_seqs, const char* kv_cache_precision, int kv_form)
         : tok(std::filesystem::path(model_path))
     {
         vocab_size = tokenizer_vocab_size(tok);
@@ -1307,11 +1489,16 @@ struct OvVlmState {
         // prefix cache are CB concepts; on the NPU they have nothing to apply to,
         // so the property is simply not passed.
         const bool vlm_on_npu = std::string(device).rfind("NPU", 0) == 0;
-        if (cache_size_gb > 0.0 && !vlm_on_npu) {
+        if ((cache_size_gb > 0.0 || num_kv_blocks > 0) && !vlm_on_npu) {
             ov::genai::SchedulerConfig sched;
             // round UP, never truncate — see the matching comment in
             // ov_cb_create above; same landmine, same fix.
-            sched.cache_size = static_cast<size_t>(std::ceil(cache_size_gb));
+            if (cache_size_gb > 0.0) sched.cache_size = static_cast<size_t>(std::ceil(cache_size_gb));
+            // Blocks-first: see ov_cb_create; honoured on the VLM path too.
+            if (num_kv_blocks > 0) {
+                sched.num_kv_blocks = static_cast<size_t>(num_kv_blocks);
+                sched.cache_size = 0;
+            }
             sched.enable_prefix_caching = enable_prefix_caching;
             // Without this GenAI assumes its default of 256 sequences and, for a model with
             // linear-attention layers, reserves their per-sequence state for all 256 (about
@@ -1327,6 +1514,34 @@ struct OvVlmState {
         // doc). Deliberately the safer of the two silent outcomes, but still
         // silent; the Rust caller (lifecycle.rs) logs a warning before this
         // constructor ever runs when it detects this case.
+        // KV-cache precision: RustedVINO resolves it and passes it, so the
+        // accounting prices what the engine builds. Empty = leave the plugin default (the
+        // 0.8.x behaviour). NPU: the static pipeline takes no KV properties.
+        // kv_form 0 = the plain top-level hint; 1 = per role, under MODEL_PROPERTIES for the
+        // language model only (keeps the vision encoders untouched). Which form GenAI
+        // honours on the VLM path is test G-02; Rust picks the form.
+        {
+            ov::element::Type kv_type;
+            if (!vlm_on_npu &&
+                kv_precision_type(kv_cache_precision, spec_names_cpu(device), kv_type)) {
+                if (kv_form == 1) {
+                    ov::AnyMap language_model;
+                    language_model.emplace(ov::hint::kv_cache_precision.name(), kv_type);
+                    ov::AnyMap per_role;
+                    per_role.emplace("language_model", language_model);
+                    props.emplace("MODEL_PROPERTIES", per_role);
+                } else {
+                    props.emplace(ov::hint::kv_cache_precision(kv_type));
+                }
+            }
+        }
+        record_props("ov_vlm_create", device, props,
+                     "max_num_seqs=" + std::to_string(max_num_seqs) +
+                     " cache_size_gb=" + std::to_string(cache_size_gb) +
+                     " num_kv_blocks=" + std::to_string(num_kv_blocks) +
+                     " prefix_caching=" + (enable_prefix_caching ? "1" : "0") +
+                     " kv_cache_precision=" + (kv_cache_precision ? kv_cache_precision : "") +
+                     " kv_form=" + std::to_string(kv_form));
         pipe = new ov::genai::VLMPipeline(
             std::filesystem::path(model_path),
             std::string(device),
@@ -1361,18 +1576,30 @@ typedef void* OvVlmHandle;
 /// `max_num_seqs` — sequences the scheduler must be able to hold at once; 0 = GenAI's default
 ///                   (256). The VLM engine thread runs one generation at a time, so callers pass 1.
 ///
+/// `num_kv_blocks` — exact KV pool size in blocks (blocks-first sizing); 0 = size the pool from
+///                   `cache_size_gb`. When non-zero it wins and `cache_size_gb` is ignored.
+///
+/// `kv_cache_precision` — normalised KV-cache precision ("i8", "u4", "f16"); NULL or "" keeps the
+///                   plugin default. Ignored on NPU.
+///
+/// `kv_form` — 0 = pass it as the plain `KV_CACHE_PRECISION` hint, 1 = per role under
+///                   `MODEL_PROPERTIES` for the `language_model` only.
+///
 /// Returns NULL on failure; call ov_last_error() for the message.
 OvVlmHandle ov_vlm_create(const char* model_path, const char* device,
                            const char* ov_cache_dir, double cache_size_gb,
-                           bool enable_prefix_caching, size_t max_num_seqs) {
+                           uint64_t num_kv_blocks, bool enable_prefix_caching,
+                           size_t max_num_seqs, const char* kv_cache_precision, int kv_form) {
     s_last_error[0] = '\0';
+    s_last_props.clear();
     if (!model_path || !device) {
         set_error("ov_vlm_create: null model_path or device");
         return nullptr;
     }
     try {
         return new OvVlmState(model_path, device, ov_cache_dir, cache_size_gb,
-                               enable_prefix_caching, max_num_seqs);
+                               num_kv_blocks, enable_prefix_caching, max_num_seqs,
+                               kv_cache_precision, kv_form);
     } catch (const std::exception& e) {
         set_error(e.what());
         return nullptr;
@@ -2164,7 +2391,18 @@ struct OvWhisperState {
         pipe = new ov::genai::WhisperPipeline(std::filesystem::path(model_path), device, props);
     }
 
+    // One Whisper window: 30 s at 16 kHz. GenAI switches to its long-form path
+    // above 480 160 samples (feature_extractor.cpp), so this stays short-form.
+    static constexpr size_t kWhisperWindowSamples = 16000 * 30;
+
     // Language token for `raw`, e.g. "<|en|>", or "" when detection yields none.
+    //
+    // Only the first window is passed to the detector. GenAI's long-form loop
+    // never terminates with max_new_tokens=1: the one decoded token is the
+    // opening timestamp, so the segment offset never advances (upstream bug,
+    // 2026.2.1 and 2026.4.1).
+    // Whisper detects the language from the first window anyway, so the
+    // truncation does not change the result.
     std::string detect_language(const ov::genai::RawSpeechInput& raw) {
         if (!detector) {
             // Same cache_dir as the main pipeline: without it every server start
@@ -2174,7 +2412,13 @@ struct OvWhisperState {
         ov::genai::WhisperGenerationConfig cfg = detector->get_generation_config();
         cfg.max_new_tokens = 1;
         cfg.return_timestamps = false;
-        const std::string lang = detector->generate(raw, cfg).language;
+        std::string lang;
+        if (raw.size() <= kWhisperWindowSamples) {
+            lang = detector->generate(raw, cfg).language;
+        } else {
+            const ov::genai::RawSpeechInput head(raw.begin(), raw.begin() + kWhisperWindowSamples);
+            lang = detector->generate(head, cfg).language;
+        }
         if (lang.empty()) { return {}; }
         return lang.rfind("<|", 0) == 0 ? lang : "<|" + lang + "|>";
     }
@@ -2358,7 +2602,9 @@ struct OvImageState {
     ov::genai::InpaintingPipeline*  inpaint = nullptr;  // /edits, with mask (base load)
     bool edits_available = false;
 
-    // FLUX's and SD3's inpaint→t2i derivation is BROKEN in OV GenAI 2026.2:
+    // FLUX's and SD3's inpaint→t2i derivation is BROKEN in OV GenAI 2026.2 and
+    // still in 2026.4.1 (re-verified 2026-10-28 on CPU, K-01b: both segfault on
+    // the derived pipeline's generate()):
     // the InpaintingPipeline loads, but a Text2ImagePipeline derived from it
     // crashes on generate() with "longjmp causes uninitialized stack frame"
     // (FLUX: segfault verified; SD3.5 Medium: same fatal crash verified).

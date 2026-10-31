@@ -53,19 +53,21 @@ pub struct Config {
     /// This map defines the set of **known** model IDs. Any model ID not
     /// listed here is unknown — `load_model` and `get_handle` return
     /// `ModelError::NotFound`. Use `vram_gb: 0.0` inside the stanza to register
-    /// a model without VRAM gating (useful when `total_vram_gb` is also 0.0).
+    /// a model without VRAM gating (useful on an ungated domain: the CPU, an integrated GPU, or a
+    /// discrete GPU opted out with `domain_budgets`).
     ///
     /// Each entry replaces what used to be three separate maps (`vram_gb`,
     /// `model_kinds`, `model_policies`): all per-model properties live here.
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
 
-    /// Total usable VRAM on the inference device, in GB.
+    /// Total usable VRAM on the inference device, in GiB (capped at what the device reports).
     ///
-    /// Set to `0.0` to disable VRAM gating entirely — all loads succeed
-    /// without checking capacity (useful on CPU or when VRAM is not a
-    /// constraint). When non-zero, `load_model` evicts LRU models if a new
-    /// model would not fit.
+    /// `0.0`: a discrete-GPU inference device is budgeted at the memory it reports (like every
+    /// other discrete GPU); any other inference device (CPU, integrated GPU, NPU, a composite
+    /// `HETERO:`/`MULTI:`/`AUTO:` spec, a dGPU reporting no figure) is not VRAM-gated. With a
+    /// budget, `load_model` evicts idle LRU models when a new one would not fit, and refuses a
+    /// model that can never fit. `domain_budgets {"<device>": 0.0}` switches gating off on purpose.
     pub total_vram_gb: f64,
 
     /// Maximum concurrent sequences in the CB scheduler (`SchedulerConfig::max_num_seqs`).
@@ -91,6 +93,17 @@ pub struct Config {
     /// the actual pool passed to `ov_cb_create` is `min(computed, cap)`.
     /// `0.0` = uncapped — the model gets all remaining VRAM after its weights
     /// and the safety margin are accounted for.
+    ///
+    /// The cap also limits an explicit per-model or per-load `kv_cache_gb`: asking
+    /// for 4 with a cap of 2 yields 2, and `rv add` / `rv resize` and
+    /// `GET /v1/admin/models` (`kv_requested_gb`, `clamped_by`) say so. Sizes are
+    /// GiB; decimals are accepted. A pool the exact model can describe (a model on a
+    /// plain GPU, known layout; either `kv_gate_mode`) is sized in whole KV blocks and booked
+    /// as built; any other pool is allocated in whole GiB, so it is rounded up to the next
+    /// whole GiB (rounded down when the rounded pool would not fit the free memory) and that
+    /// is what is booked. A model with no known
+    /// footprint (`vram_gb: 0`) is not gated: its explicit `kv_cache_gb` is used as given
+    /// (rounded up, not capped).
     ///
     /// Existing configs setting `cache_size_gb: 6.0` continue to work
     /// identically to the old fixed-allocation behaviour on a single loaded model.
@@ -134,6 +147,17 @@ pub struct Config {
     /// figure as-is. Must be at least 1.0.
     #[serde(default = "default_npu_footprint_factor")]
     pub npu_footprint_factor: f64,
+
+    /// Largest image request (total pixels: `n x width x height`) an image-generation model
+    /// on the CPU serves, and the size its memory charge is sized for (SF-5 D-06). On the CPU a
+    /// diffusion pipeline keeps a working set that depends on its family and the image size,
+    /// not on the weights (SD 3.5 medium: +21 GiB at 1024x1024 beside 8.3 GB of weights), so
+    /// admission charges `vram_gb` plus that working set at this size
+    /// ([`super::image_footprint`]), and a larger request is a 400 `size_exceeds_cpu_limit`.
+    /// Default 1 048 576 (one 1024x1024 image, the largest measured size; above it the charge
+    /// extrapolates). At least 65 536 (256x256). Restart-only.
+    #[serde(default = "default_cpu_image_gen_max_pixels")]
+    pub cpu_image_gen_max_pixels: u64,
 
     /// Minimum KV cache pool size in GB.
     ///
@@ -285,18 +309,30 @@ pub struct Config {
 
     /// KV-cache element precision for the inference device (`KV_CACHE_PRECISION`).
     ///
-    /// `"u8"` (default, since 2026-09-02 — every fleet config already set this
-    /// explicitly, this just makes an omitted field match established practice) =
-    /// compress the KV cache to 8-bit, roughly **doubling** the number of tokens
-    /// the `cache_size_gb` pool holds (e.g. ~26K → ~52K for qwen3-14b in a 4 GB
-    /// pool) at a small quality cost — the lever for more context WITHOUT more
-    /// VRAM. Empty string / `"f16"`/`"f32"` force the plugin default or an
-    /// explicit precision. Unknown values are ignored (plugin default kept).
+    /// Accepted: `"auto"` / `""` (plugin default), `"i8"`, `"u4"`, `"f16"`;
+    /// `"u8"` (the default, kept so every shipped config stays valid) is a
+    /// deprecated alias stored as `"i8"`. Any other value (including the old
+    /// `"f32"`) fails config validation at startup — see
+    /// [`normalize_kv_precision`].
     ///
-    /// NOTE: u8 KV compression is well-supported on CPU; GPU-plugin support must be
-    /// verified empirically per `OpenVINO` version. Passed as a `compile_model`
-    /// property to the CB pipeline at load time.
-    #[serde(default = "default_kv_cache_precision")]
+    /// Measured on `GenAI` 2026.4.1 (GPU): the plugin default (`auto`) is `u4`
+    /// for models with int4 weights and `i8` otherwise (`f16` only via an IR
+    /// hint), so an explicit `i8` (and the shipped `"u8"`) is about 1.8× larger
+    /// per token than the `u4` default for such models (Qwen3.8-27B: 37,134 vs
+    /// 20,748 B/token measured) and `f16` about 3×. The global key applies to the
+    /// CB (text) engine only; VLM engines resolve their own (see `kv_precision_pass`). The
+    /// capacity gate prices `auto` as f16 and `u4` like `i8`, so it is
+    /// conservative there and for hybrids (it counts every layer); for a dense
+    /// model on `i8` it prices one byte per element and ignores the ~13 % scale
+    /// overhead, so it is about 14 % optimistic (unchanged by this release).
+    ///
+    /// NOTE: Passed as a `compile_model` property to the CB pipeline at load
+    /// time. Read once at startup: a config reload never applies it (it is
+    /// reported in `globals_not_applied`); a restart does.
+    #[serde(
+        default = "default_kv_cache_precision",
+        deserialize_with = "de_kv_cache_precision"
+    )]
     pub kv_cache_precision: String,
 
     /// Reuse KV blocks across CB requests that share an identical prompt
@@ -503,8 +539,9 @@ pub struct Config {
     /// Directory for the `OpenVINO` GPU kernel blob cache.
     ///
     /// When set, `OpenVINO` writes the compiled GPU kernel to this directory on
-    /// the first model load (`openvino_cache/` subdirectory is created inside).
-    /// Subsequent server starts load the blob directly — cutting GPU JIT time from
+    /// the first model load. The KV engines (text LLMs, vision) use a
+    /// `kv-<tag>/` subdirectory per KV precision, the rest the directory itself (see
+    /// `ov_cache_layout`). Subsequent server starts load the blob directly — cutting GPU JIT time from
     /// ~1–3 min per model to ~10–30 s. `null`/absent = no cache (default, current
     /// behaviour). Safe to point at a persistent directory across reboots.
     ///
@@ -539,6 +576,85 @@ pub struct Config {
     /// any running code" long after the sweep shipped.
     #[serde(default = "default_ov_cache_sweep_interval_secs")]
     pub ov_cache_sweep_interval_secs: u64,
+
+    /// Layout of `ov_cache_dir` for the KV-cache engines (E-17). `"keyed"` (default): the
+    /// continuous-batching engines (text LLMs, including a draft model) and the vision
+    /// pipelines on GPU and CPU compile into `<ov_cache_dir>/kv-<tag>/`, one directory per
+    /// `KV_CACHE_PRECISION` string passed to the plugin (`kv-auto` when none is passed,
+    /// `kv-i8`, `kv-u4`, `kv-f16`; a vision pipeline passes its resolved precision, see
+    /// `kv_precision_pass`). `"flat"`:
+    /// everything in the root, as 0.8.x did - and with it the precision mixing described below, so
+    /// use it only as a rollback.
+    ///
+    /// Why: on `OpenVINO` 2026.4.x a compiled blob does not record the KV precision, so a blob
+    /// compiled under one precision is silently reused under another (or fails at the first
+    /// inference with `Incorrect block size`). Whisper, image, TTS, embedding and NPU
+    /// engines keep the root. Restart-only. Switching layout recompiles a model only if no usable blob
+    /// is in the new location. A keyed directory the server cannot write to (a read-only,
+    /// pre-warmed cache) is not used: those models compile without a blob cache.
+    #[serde(
+        default = "default_ov_cache_layout",
+        deserialize_with = "de_ov_cache_layout"
+    )]
+    pub ov_cache_layout: String,
+
+    /// Who decides the KV-cache precision the engines are built with.
+    /// `"explicit"` (default): `RustedVINO` resolves each model's precision (the global
+    /// `kv_cache_precision` for text models > the model's own IR hint > a rule: u4
+    /// when the model has 4-bit weights, otherwise i8; vision models ignore the global key) and
+    /// passes the result to the engine, so the context limit the gate computes is the precision
+    /// the engine really uses. `"plugin"`: the 0.8.x behaviour - vision models pass nothing
+    /// (plugin default), text models pass the global `kv_cache_precision` as configured.
+    /// Restart-only. Changing it changes which `kv-<tag>` blob directory a vision model uses.
+    #[serde(
+        default = "default_kv_precision_pass",
+        deserialize_with = "de_kv_precision_pass"
+    )]
+    pub kv_precision_pass: String,
+
+    /// How the context limit (`max_model_len`, the prompt-length gate) is computed.
+    /// `"exact"` (default): from the model's real KV layout and the exact pool the
+    /// engine was built with, as `min(95 % of the pool capacity, native context, a learned
+    /// ratchet)`. `"legacy"`: the 0.8.x estimate (every layer at the configured precision
+    /// times a 0.85 margin). A model the server cannot describe with confidence, a CPU device,
+    /// speculative decoding or an unverified engine version pair always uses the legacy estimate.
+    /// Restart-only; the rollback switch if the exact limit proves wrong on a model.
+    #[serde(default = "default_kv_gate_mode", deserialize_with = "de_kv_gate_mode")]
+    pub kv_gate_mode: String,
+
+    /// Size and gate with the exact layout model even on an OpenVINO/GenAI version pair the
+    /// layouts were not verified on (`2026.4.1` is the verified pair). Default `false`.
+    #[serde(default)]
+    pub kv_gate_exact_on_unknown_engine: bool,
+
+    /// Device-headroom limit for vision models on a discrete GPU.
+    /// `"dynamic"` (default): the context limit also respects the free device memory left after
+    /// the weights, every pool and whatever other processes hold, divided by what one prompt
+    /// token transiently costs (`hidden_size · 4 · kv_transient_factor` bytes); recomputed after
+    /// every load, unload and resize. `"off"`: no headroom limit (vision models on a discrete GPU
+    /// then keep the legacy limit). Restart-only.
+    #[serde(
+        default = "default_kv_headroom_mode",
+        deserialize_with = "de_kv_headroom_mode"
+    )]
+    pub kv_headroom_mode: String,
+    /// Multiplier on the per-token transient cost of a prompt (default 2.0).
+    #[serde(default = "default_kv_transient_factor")]
+    pub kv_transient_factor: f64,
+    /// Device memory (GiB) kept free beyond everything visible (default 0.5).
+    #[serde(default = "default_kv_headroom_margin_gib")]
+    pub kv_headroom_margin_gib: f64,
+    /// Smallest headroom limit ever reported for a vision model, in tokens (default 4096).
+    #[serde(default = "default_kv_headroom_min_tokens")]
+    pub kv_headroom_min_tokens: usize,
+    /// A vision request longer than this many tokens holds a transient device-memory reservation
+    /// while it runs (default 32768).
+    #[serde(default = "default_kv_headroom_inflight_tokens")]
+    pub kv_headroom_inflight_tokens: usize,
+    /// Run a one-token generation after each load so the pool is materialised and the weights'
+    /// real memory can be measured (default `true`).
+    #[serde(default = "default_true")]
+    pub kv_warmup: bool,
 
     /// Master switch for the KV-cache pressure monitor
     /// (the project's internal engineering log). Default `false` —
@@ -593,6 +709,13 @@ pub struct Config {
     #[serde(default = "default_kv_resize_cooldown_secs")]
     pub kv_resize_cooldown_secs: u64,
 
+    /// How long (seconds) a model load may run before the request gets `504 load_timeout` and the
+    /// load is booked as stalled (step 6b): its memory stays reserved, new loads on its device get
+    /// `503 device_stalled`, and a late result is still committed or discarded. `0` = no deadline.
+    /// Otherwise at least 60. Per-model `load_timeout_secs` overrides it.
+    #[serde(default = "default_load_timeout_secs")]
+    pub load_timeout_secs: u64,
+
     /// Tuning for the `--supervise` crash auto-restart wrapper (Linux only —
     /// inert on Windows, where supervise mode never runs). Absent block =
     /// every field defaults, so no existing config file needs updating.
@@ -611,6 +734,37 @@ pub struct Config {
 
 fn default_kv_cache_precision() -> String {
     "u8".to_owned()
+}
+
+/// Accepted `kv_cache_precision` values, in the order the error message lists them.
+const KV_PRECISION_ACCEPTED: &str =
+    r#""auto", "i8", "u4", "f16" (or "" = auto; "u8" = deprecated alias of "i8")"#;
+
+/// Normalise a configured `kv_cache_precision` to the string handed to the
+/// engine: `""` (plugin default; also what `"auto"` means until Stage 2), `"i8"`,
+/// `"u4"` or `"f16"`. `"u8"` becomes `"i8"` with one INFO per process (the GPU
+/// plugin stores both as 8-bit integers; `i8` is the honest name).
+///
+/// # Errors
+/// Any other value, including the previously tolerated `"f32"` and `"i4"`
+/// (the plugin would rewrite `i4` to `u4` anyway); the message lists the accepted values.
+pub fn normalize_kv_precision(raw: &str) -> anyhow::Result<&'static str> {
+    match raw {
+        "" | "auto" => Ok(""),
+        "i8" => Ok("i8"),
+        "u4" => Ok("u4"),
+        "f16" => Ok("f16"),
+        "u8" => {
+            static ALIAS_INFO: std::sync::Once = std::sync::Once::new();
+            ALIAS_INFO.call_once(|| {
+                tracing::info!("kv_cache_precision u8 is a deprecated alias, stored as i8");
+            });
+            Ok("i8")
+        }
+        other => anyhow::bail!(
+            "kv_cache_precision {other:?} is not supported; accepted values: {KV_PRECISION_ACCEPTED}"
+        ),
+    }
 }
 
 /// Backoff/cap/health-check tuning for the `--supervise` wrapper
@@ -648,7 +802,11 @@ pub struct SupervisorConfig {
     /// Grace period after `SIGTERM`ing a hung worker before escalating to
     /// `SIGKILL` — the one sanctioned `SIGKILL` in this codebase, because a
     /// worker that never became healthy never reached a state worth
-    /// preserving. Default 10s.
+    /// preserving. Default 10s. A generation-watchdog kill of a *healthy* worker waits at
+    /// least the worker's drain + teardown floor + exit wait (48 s) regardless, so its other
+    /// models' streams are not killed with `SIGKILL` mid-drain. A worker still waiting
+    /// for a model load or tearing down declares how long it needs, and the supervisor waits
+    /// that out too (up to ~11 min); the grace is never below 1 s.
     #[serde(default = "default_hang_kill_grace_secs")]
     pub hang_kill_grace_secs: u64,
 
@@ -662,14 +820,39 @@ pub struct SupervisorConfig {
     /// Age past which an in-flight generation is treated as hung rather than
     /// merely slow, triggering the same [`hang_kill_grace_secs`]-graced
     /// `SIGTERM`→`SIGKILL` escalation as a worker that never became healthy.
-    /// Default 600s (10 min) — deliberately generous: the only measured decode
-    /// rate so far is ~60 tok/s (256 tokens in ~4.3s,
-    /// the project's internal engineering log), so this should comfortably outlast
-    /// any legitimate single request, but is **provisional** until a clean
-    /// benchmark across realistic `max_tokens`/prompt sizes exists. Set to `0`
-    /// to disable the generation watchdog entirely.
+    /// Default 600s (10 min). This is slack **on top of each request's own allowance**: a
+    /// generation is counted from the moment it exceeds `prompt_tokens / 200` + `max_tokens / 5`
+    /// seconds (floors well below the measured 375 tok/s prefill and 13-18 tok/s decode of the
+    /// 27B vision model on a B60), so a 92k-token prompt with a 6k-token answer is not killed
+    /// at 600 s (it was, before the allowance existed). Set to `0` to disable the generation
+    /// watchdog entirely.
     #[serde(default = "default_watchdog_hang_ceiling_secs")]
     pub watchdog_hang_ceiling_secs: u64,
+    /// After a worker left WITHOUT teardown (exit 75/76, killed by a signal, hang or watchdog
+    /// kill) the next worker's first GPU model load must finish within this many seconds, or the
+    /// supervisor kills it and respawns. On the B60 such an exit can leave the copy engine stuck
+    /// so the next process's first GPU work never runs; the stuck worker's own exit triggers the
+    /// driver's GT reset. Armed at most once per episode (a worker killed by this deadline does not arm it again). Since the GPU
+    /// readiness probe ([`Self::gpu_probe_deadline_secs`]) this is a backstop, kept until a
+    /// destructive test shows the probe catches the stuck state: default 180, above a 27B's
+    /// 48-78 s load (the old 30 killed it); `0` disables it.
+    #[serde(default = "default_gpu_first_load_deadline_secs")]
+    pub gpu_first_load_deadline_secs: u64,
+    /// The GPU readiness probe after a no-teardown exit: before the
+    /// next worker starts, a child running a tiny compile + inference on every GPU must exit
+    /// within this many seconds; past it it is killed (its exit resets a stuck B60) and run
+    /// again, up to 3 times. Default 15 — **provisional** until the normal probe time (cold and
+    /// warm, desktop busy) is measured on the B60; `0` disables the probe.
+    #[serde(default = "default_gpu_probe_deadline_secs")]
+    pub gpu_probe_deadline_secs: u64,
+}
+
+fn default_gpu_first_load_deadline_secs() -> u64 {
+    180
+}
+
+fn default_gpu_probe_deadline_secs() -> u64 {
+    15
 }
 
 impl Default for SupervisorConfig {
@@ -683,8 +866,86 @@ impl Default for SupervisorConfig {
             hang_kill_grace_secs: default_hang_kill_grace_secs(),
             watchdog_poll_secs: default_watchdog_poll_secs(),
             watchdog_hang_ceiling_secs: default_watchdog_hang_ceiling_secs(),
+            gpu_first_load_deadline_secs: default_gpu_first_load_deadline_secs(),
+            gpu_probe_deadline_secs: default_gpu_probe_deadline_secs(),
         }
     }
+}
+
+/// A string setting that names itself in the error when the JSON type is wrong (serde's own
+/// `invalid type: null, expected a string` does not say which key).
+fn de_named_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    key: &str,
+    accepted: &str,
+) -> Result<String, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::String(s) => Ok(s),
+        other => Err(serde::de::Error::custom(format!(
+            "{key} must be a string ({accepted}), got {other}"
+        ))),
+    }
+}
+
+fn de_kv_cache_precision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    de_named_string(
+        d,
+        "kv_cache_precision",
+        "accepted values: \"auto\", \"i8\", \"u4\", \"f16\" (or \"\" = auto; \"u8\" = deprecated alias of \"i8\")",
+    )
+}
+
+fn de_ov_cache_layout<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    de_named_string(d, "ov_cache_layout", "\"keyed\" or \"flat\"")
+}
+
+fn default_ov_cache_layout() -> String {
+    "keyed".to_owned()
+}
+
+fn de_kv_precision_pass<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    de_named_string(d, "kv_precision_pass", "\"explicit\" or \"plugin\"")
+}
+
+fn default_kv_precision_pass() -> String {
+    "explicit".to_owned()
+}
+
+fn de_kv_headroom_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    de_named_string(d, "kv_headroom_mode", "\"dynamic\" or \"off\"")
+}
+
+fn default_kv_headroom_mode() -> String {
+    "dynamic".to_owned()
+}
+
+fn default_kv_transient_factor() -> f64 {
+    2.0
+}
+
+fn default_kv_headroom_margin_gib() -> f64 {
+    0.5
+}
+
+fn default_kv_headroom_min_tokens() -> usize {
+    4096
+}
+
+fn default_kv_headroom_inflight_tokens() -> usize {
+    32_768
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn de_kv_gate_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    de_named_string(d, "kv_gate_mode", "\"exact\" or \"legacy\"")
+}
+
+fn default_kv_gate_mode() -> String {
+    "exact".to_owned()
 }
 
 fn default_ov_cache_sweep_interval_secs() -> u64 {
@@ -698,6 +959,13 @@ fn default_kv_pressure_sweep_interval_secs() -> u64 {
 fn default_kv_resize_cooldown_secs() -> u64 {
     30
 }
+
+pub(crate) fn default_load_timeout_secs() -> u64 {
+    600
+}
+
+/// Smallest non-zero `load_timeout_secs`: a cold compile of a large model takes minutes.
+pub(crate) const MIN_LOAD_TIMEOUT_SECS: u64 = 60;
 
 /// Default eviction-grace window: 2s. It only has to cover the race between a
 /// load finishing and its first request arriving; a model with a running
@@ -1074,18 +1342,26 @@ pub struct ModelPolicy {
     #[serde(default)]
     pub eviction_grace_secs: Option<f64>,
 
+    /// Per-model override of [`Config::load_timeout_secs`] (same rules: `0` = no deadline,
+    /// otherwise at least 60). `None` (the default) uses the global value.
+    #[serde(default)]
+    pub load_timeout_secs: Option<u64>,
+
     /// Per-model override of [`Config::enable_prefix_caching`] (KV-block reuse
-    /// across requests sharing a prompt prefix). `None` (the default) lets the
-    /// server decide: the global flag, except that a hybrid linear-attention
-    /// model (`layer_types` containing `linear_attention` in its
-    /// `config.json`) loaded on a GPU gets it forced **off**, because
-    /// `OpenVINO` `GenAI` 2026.2.x returns wrong continuations on a prefix-cache
-    /// hit for those models on GPU (fixed upstream in 2026.4.1; CPU is
-    /// unaffected). `Some(true)` forces it on even for such a model (use once
-    /// the runtime is fixed); `Some(false)` forces it off for any model.
-    /// Applies from the model's next load.
+    /// across requests sharing a prompt prefix). `None` (the default) uses the
+    /// global flag; `Some(true)` / `Some(false)` force it on / off for this
+    /// model. Applies from the model's next load.
     #[serde(default)]
     pub enable_prefix_caching: Option<bool>,
+
+    /// Per-model KV-cache precision (`"auto"`, `"i8"`, `"u4"`, `"f16"`; `"u8"` is the deprecated
+    /// alias of `"i8"`), overriding the global `kv_cache_precision` and, for a vision model, the
+    /// rule. `None` (the default) lets the global key (text models) and the rule decide.
+    /// Applies from the model's next load, on a plain GPU device with
+    /// `kv_precision_pass: "explicit"` only; on CPU, NPU or in plugin mode it is ignored with a
+    /// one-time warning. Speculative-decoding models ignore it too.
+    #[serde(default)]
+    pub kv_cache_precision: Option<String>,
 }
 
 impl Default for ModelPolicy {
@@ -1109,7 +1385,9 @@ impl Default for ModelPolicy {
             model_revision: None,
             capabilities: Vec::new(),
             eviction_grace_secs: None,
+            load_timeout_secs: None,
             enable_prefix_caching: None,
+            kv_cache_precision: None,
         }
     }
 }
@@ -1266,6 +1544,8 @@ pub struct ModelEntryPatch {
     pub max_concurrent_streams: Option<Option<usize>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub enable_prefix_caching: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub kv_cache_precision: Option<Option<String>>,
     #[serde(default)]
     pub load: Option<LoadPolicy>,
     #[serde(default)]
@@ -1311,6 +1591,7 @@ impl ModelEntryPatch {
             && self.kv_cache_gb.is_none()
             && self.max_concurrent_streams.is_none()
             && self.enable_prefix_caching.is_none()
+            && self.kv_cache_precision.is_none()
             && self.load.is_none()
             && self.evictable.is_none()
             && self.device.is_none()
@@ -1393,6 +1674,7 @@ impl ModelEntryPatch {
         next_load!(kv_cache_gb, "kv_cache_gb");
         next_load!(max_concurrent_streams, "max_concurrent_streams");
         next_load!(enable_prefix_caching, "enable_prefix_caching");
+        next_load!(kv_cache_precision, "kv_cache_precision");
         hot!(load, "load");
         hot!(evictable, "evictable");
         hot_opt!(device, "device");
@@ -1436,6 +1718,15 @@ impl ModelEntryPatch {
 
         (entry, out)
     }
+}
+
+/// `0` (no deadline) or at least [`MIN_LOAD_TIMEOUT_SECS`].
+fn validate_load_timeout(field: &str, secs: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        secs == 0 || secs >= MIN_LOAD_TIMEOUT_SECS,
+        "{field} must be 0 (no deadline) or at least {MIN_LOAD_TIMEOUT_SECS} (got {secs})"
+    );
+    Ok(())
 }
 
 /// Reads a JSON file as text, dropping a leading UTF-8 byte-order mark.
@@ -1496,6 +1787,18 @@ pub fn minimal_stanza(
 /// ratio on the Windows pass-2 box (8.4 / 5.5 = 1.5).
 pub(crate) fn default_npu_footprint_factor() -> f64 {
     1.5
+}
+
+/// True for an image-generation model on a CPU device: the case
+/// [`Config::cpu_image_gen_max_pixels`] charges and caps (one rule for both).
+#[must_use]
+pub fn is_cpu_image_gen(device: &str, kind: super::engine::ModelKind) -> bool {
+    device.starts_with("CPU") && kind == super::engine::ModelKind::ImageGen
+}
+
+/// Default for [`Config::cpu_image_gen_max_pixels`]: one 1024x1024 image.
+pub(crate) fn default_cpu_image_gen_max_pixels() -> u64 {
+    1024 * 1024
 }
 
 fn default_vram_safety_margin() -> f64 {
@@ -1588,6 +1891,31 @@ impl Config {
     /// error; keys live in the keys file) and the catch-all for unknown keys.
     pub const UNTEMPLATED: [&str; 3] = ["api_keys", "admin_api_keys", "unknown_fields"];
 
+    /// What admission charges for a model's weights before anything was measured: `vram_gb`,
+    /// times [`Self::npu_footprint_factor`] on the NPU; for an image-generation model on the
+    /// CPU, `vram_gb` plus its family's working set at [`Self::cpu_image_gen_max_pixels`]
+    /// (D-06; `family` `None` is charged as the largest family). The one rule shared by
+    /// placement at startup and the manager's `budget_weight_gb`.
+    #[must_use]
+    pub fn weight_charge_gb(
+        &self,
+        vram_gb: f64,
+        device: &str,
+        kind: super::engine::ModelKind,
+        family: Option<super::image_footprint::ImageFamily>,
+    ) -> f64 {
+        if device.starts_with("NPU") {
+            vram_gb * self.npu_footprint_factor
+        } else if is_cpu_image_gen(device, kind) {
+            vram_gb
+                + family
+                    .unwrap_or(super::image_footprint::ImageFamily::Unknown)
+                    .cpu_working_set_gb(self.cpu_image_gen_max_pixels)
+        } else {
+            vram_gb
+        }
+    }
+
     /// Every global setting an operator can write in `config.json`, with the
     /// value the server uses when it is absent, in `Config` field order. `models_dir`, `device` and `total_vram_gb` have no default:
     /// they carry placeholders. This is what `--print-default-config` prints
@@ -1656,6 +1984,42 @@ impl Config {
     ///   `total_vram_gb` when gating is on — no model could ever load.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> anyhow::Result<()> {
+        normalize_kv_precision(&self.kv_cache_precision)?;
+        validate_load_timeout("load_timeout_secs", self.load_timeout_secs)?;
+        anyhow::ensure!(
+            matches!(self.ov_cache_layout.as_str(), "keyed" | "flat"),
+            "ov_cache_layout {:?} is not supported; accepted values: \"keyed\", \"flat\"",
+            self.ov_cache_layout
+        );
+        anyhow::ensure!(
+            matches!(self.kv_headroom_mode.as_str(), "dynamic" | "off"),
+            "kv_headroom_mode {:?} is not supported; accepted values: \"dynamic\", \"off\"",
+            self.kv_headroom_mode
+        );
+        anyhow::ensure!(
+            self.kv_transient_factor.is_finite() && self.kv_transient_factor >= 1.0,
+            "kv_transient_factor must be a finite number of at least 1 (got {})",
+            self.kv_transient_factor
+        );
+        anyhow::ensure!(
+            self.kv_headroom_margin_gib.is_finite() && self.kv_headroom_margin_gib >= 0.0,
+            "kv_headroom_margin_gib must be a finite number of at least 0 (got {})",
+            self.kv_headroom_margin_gib
+        );
+        anyhow::ensure!(
+            self.kv_headroom_min_tokens >= 1,
+            "kv_headroom_min_tokens must be at least 1"
+        );
+        anyhow::ensure!(
+            matches!(self.kv_gate_mode.as_str(), "exact" | "legacy"),
+            "kv_gate_mode {:?} is not supported; accepted values: \"exact\", \"legacy\"",
+            self.kv_gate_mode
+        );
+        anyhow::ensure!(
+            matches!(self.kv_precision_pass.as_str(), "explicit" | "plugin"),
+            "kv_precision_pass {:?} is not supported; accepted values: \"explicit\", \"plugin\"",
+            self.kv_precision_pass
+        );
         anyhow::ensure!(
             self.max_embedding_inputs >= 1,
             "max_embedding_inputs must be at least 1 (0 would reject every /v1/embeddings request)"
@@ -1680,6 +2044,11 @@ impl Config {
             self.npu_footprint_factor.is_finite() && self.npu_footprint_factor >= 1.0,
             "config npu_footprint_factor must be a finite number >= 1.0, got {}",
             self.npu_footprint_factor
+        );
+        anyhow::ensure!(
+            self.cpu_image_gen_max_pixels >= 256 * 256,
+            "config cpu_image_gen_max_pixels must be at least 65536 (256x256), got {}",
+            self.cpu_image_gen_max_pixels
         );
         anyhow::ensure!(
             self.kv_pressure_threshold_pct <= 100.0,
@@ -1947,11 +2316,18 @@ pub(crate) fn validate_model_entry(model_id: &str, entry: &ModelEntry) -> anyhow
              got {kv} (omit it for unbounded grab-all)"
         );
     }
+    if let Some(t) = policy.load_timeout_secs {
+        validate_load_timeout(&format!("models['{model_id}'].load_timeout_secs"), t)?;
+    }
     if let Some(streams) = policy.max_concurrent_streams {
         anyhow::ensure!(
             streams >= 1,
             "models['{model_id}'].max_concurrent_streams must be at least 1, got {streams}"
         );
+    }
+    if let Some(p) = policy.kv_cache_precision.as_deref() {
+        normalize_kv_precision(p)
+            .map_err(|e| anyhow::anyhow!("models['{model_id}'].kv_cache_precision: {e}"))?;
     }
     if let Some(max_prompt_len) = policy.max_prompt_len {
         anyhow::ensure!(
@@ -2066,7 +2442,8 @@ define_globals_not_applied! {
     exempt: [models, api_keys, admin_api_keys, keys_file, unknown_fields],
     diffed: [
         models_dir, device, preload, total_vram_gb, max_num_seqs, cache_size_gb,
-        default_kv_cache_gb, vram_safety_margin_gb, npu_footprint_factor, min_kv_cache_gb,
+        default_kv_cache_gb, vram_safety_margin_gb, npu_footprint_factor,
+        cpu_image_gen_max_pixels, min_kv_cache_gb,
         system_ram_reservation_gb, system_ram_budget_gb, default_placement, light_model_max_gb,
         light_stt_max_gb, dgpu_size_ceiling_fraction, domain_budgets,
         eviction_grace_secs, realtime_defaults, realtime_viable_minimum,
@@ -2076,9 +2453,12 @@ define_globals_not_applied! {
         embedding_pooling, embedding_normalize, max_prompt_array, max_embedding_inputs,
         max_embedding_batch_tokens, max_tokens_cap,
         bind_addr, port, allow_insecure_public_bind, ov_cache_dir,
-        ov_cache_max_gb, ov_cache_sweep_interval_secs, kv_pressure_monitor_enabled,
+        ov_cache_max_gb, ov_cache_sweep_interval_secs, ov_cache_layout, kv_precision_pass,
+        kv_gate_mode, kv_gate_exact_on_unknown_engine, kv_headroom_mode, kv_transient_factor,
+        kv_headroom_margin_gib, kv_headroom_min_tokens, kv_headroom_inflight_tokens, kv_warmup,
+        kv_pressure_monitor_enabled,
         kv_pressure_threshold_pct, kv_pressure_sustained_secs,
-        kv_pressure_sweep_interval_secs, kv_resize_cooldown_secs, supervisor,
+        kv_pressure_sweep_interval_secs, kv_resize_cooldown_secs, load_timeout_secs, supervisor,
     ],
 }
 
@@ -2087,6 +2467,36 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Step 6b: `load_timeout_secs` is 0 (off) or at least 60, globally and per model (the
+    /// per-model check is the one `add_model` shares).
+    #[test]
+    fn load_timeout_is_zero_or_at_least_a_minute() {
+        let base = r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":0.0"#;
+        for (extra, ok) in [
+            ("", true),
+            (r#","load_timeout_secs":0"#, true),
+            (r#","load_timeout_secs":60"#, true),
+            (r#","load_timeout_secs":59"#, false),
+            (
+                r#","models":{"m":{"vram_gb":0.0,"load_timeout_secs":5}}"#,
+                false,
+            ),
+            (
+                r#","models":{"m":{"vram_gb":0.0,"load_timeout_secs":0}}"#,
+                true,
+            ),
+        ] {
+            let cfg: Config = serde_json::from_str(&format!("{base}{extra}}}")).unwrap();
+            assert_eq!(cfg.validate().is_ok(), ok, "{extra}");
+        }
+        assert_eq!(
+            serde_json::from_str::<Config>(&format!("{base}}}"))
+                .unwrap()
+                .load_timeout_secs,
+            600
+        );
+    }
 
     /// Windows pass 2 D12: a config written with a UTF-8 BOM (PowerShell 5.1
     /// `Set-Content -Encoding utf8`, Notepad) loads exactly like one without.
@@ -2105,8 +2515,92 @@ mod tests {
         assert_eq!(read_json_text(&bom).unwrap(), body);
     }
 
+    /// Stage 0 (U-07 subset): the accepted `kv_cache_precision` spellings, the
+    /// `u8` -> `i8` alias, and the values that now fail validation.
+    #[test]
+    fn kv_cache_precision_normalises_and_rejects_unknown_values() {
+        for (raw, want) in [
+            ("", ""),
+            ("auto", ""),
+            ("i8", "i8"),
+            ("u4", "u4"),
+            ("f16", "f16"),
+            ("u8", "i8"),
+        ] {
+            assert_eq!(normalize_kv_precision(raw).unwrap(), want, "raw {raw:?}");
+        }
+        for bad in ["xyz", "f32", "i4", "U8", " i8"] {
+            let msg = normalize_kv_precision(bad).unwrap_err().to_string();
+            assert!(msg.contains(bad), "message names the value: {msg}");
+            assert!(
+                msg.contains("\"auto\"") && msg.contains("\"u4\""),
+                "lists accepted: {msg}"
+            );
+        }
+    }
+
+    /// The default and every spelling of the key go through `Config::load`;
+    /// an unsupported one stops startup instead of silently keeping the plugin default.
+    #[test]
+    fn config_load_validates_kv_cache_precision() {
+        let d = tempfile::tempdir().unwrap();
+        let write = |name: &str, extra: &str| {
+            let p = d.path().join(name);
+            std::fs::write(
+                &p,
+                format!(r#"{{"models_dir":"/m","device":"GPU","total_vram_gb":22.5{extra}}}"#),
+            )
+            .unwrap();
+            p
+        };
+        let default = Config::load(&write("default.json", "")).unwrap();
+        assert_eq!(default.kv_cache_precision, "u8", "shipped default is kept");
+        for ok in ["", "auto", "i8", "u4", "f16", "u8"] {
+            let p = write("ok.json", &format!(r#","kv_cache_precision":"{ok}""#));
+            Config::load(&p).unwrap_or_else(|e| panic!("{ok:?} must load: {e}"));
+        }
+        for bad in ["f32", "i4", "xyz"] {
+            let p = write("bad.json", &format!(r#","kv_cache_precision":"{bad}""#));
+            let err = Config::load(&p).unwrap_err().to_string();
+            assert!(
+                err.contains(bad) && err.contains("accepted values"),
+                "{err}"
+            );
+        }
+    }
+
     /// Windows pass 2 D13: persisting a patched model keeps the operator's
     /// stanza as written — it gains the patched field, not every default.
+    #[test]
+    fn kv_cache_precision_policy_parses_validates_and_patches_on_next_load() {
+        let entry = |json: &str| -> ModelEntry { serde_json::from_str(json).unwrap() };
+        assert_eq!(entry(r#"{"vram_gb":2.5}"#).policy.kv_cache_precision, None);
+        for ok in ["auto", "", "i8", "u4", "f16", "u8"] {
+            let e = entry(&format!(r#"{{"vram_gb":2.5,"kv_cache_precision":"{ok}"}}"#));
+            assert!(validate_model_entry("m", &e).is_ok(), "{ok}");
+        }
+        for bad in ["f32", "i4", "bogus", "U4"] {
+            let e = entry(&format!(
+                r#"{{"vram_gb":2.5,"kv_cache_precision":"{bad}"}}"#
+            ));
+            let err = validate_model_entry("m", &e).unwrap_err().to_string();
+            assert!(
+                err.contains("models['m'].kv_cache_precision") && err.contains("accepted"),
+                "{err}"
+            );
+        }
+        // PATCH: next load; null clears.
+        let base = entry(r#"{"vram_gb":2.5}"#);
+        let set: ModelEntryPatch = serde_json::from_str(r#"{"kv_cache_precision":"u4"}"#).unwrap();
+        let (after, out) = set.apply_to(&base);
+        assert_eq!(after.policy.kv_cache_precision.as_deref(), Some("u4"));
+        assert_eq!(out.effective_on_next_load, ["kv_cache_precision"]);
+        let clear: ModelEntryPatch =
+            serde_json::from_str(r#"{"kv_cache_precision":null}"#).unwrap();
+        let (cleared, _) = clear.apply_to(&after);
+        assert_eq!(cleared.policy.kv_cache_precision, None);
+    }
+
     #[test]
     fn enable_prefix_caching_policy_defaults_to_none_and_round_trips() {
         let unset: ModelEntry = serde_json::from_str(r#"{"vram_gb":2.5}"#).unwrap();
@@ -2545,6 +3039,148 @@ mod tests {
         let cfg = from_json(r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0}"#);
         assert!(cfg.ov_cache_max_gb.abs() < 1e-9);
         assert_eq!(cfg.ov_cache_sweep_interval_secs, 21_600);
+    }
+
+    /// `ov_cache_layout` (U-C35): `keyed` by default, `flat` accepted, anything else refused with
+    /// the accepted values named; a reload that changes it is reported as not applied.
+    #[test]
+    fn ov_cache_layout_accepts_keyed_and_flat_only() {
+        let base = |extra: &str| {
+            format!(r#"{{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0{extra}}}"#)
+        };
+        assert_eq!(from_json(&base("")).ov_cache_layout, "keyed");
+        assert_eq!(
+            from_json(&base(r#","ov_cache_layout":"flat""#)).ov_cache_layout,
+            "flat"
+        );
+        for bad in ["bogus", "Keyed", ""] {
+            let cfg: Config =
+                serde_json::from_str(&base(&format!(r#","ov_cache_layout":"{bad}""#))).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("ov_cache_layout") && err.contains("keyed"),
+                "{err}"
+            );
+        }
+    }
+
+    /// `kv_precision_pass`: `explicit` by default, `plugin` accepted, anything else refused with the
+    /// accepted values named; a wrong JSON type names the key; a reload that changes it is reported
+    /// as not applied.
+    #[test]
+    fn kv_precision_pass_accepts_explicit_and_plugin_only() {
+        let base = |extra: &str| {
+            format!(r#"{{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0{extra}}}"#)
+        };
+        assert_eq!(from_json(&base("")).kv_precision_pass, "explicit");
+        assert_eq!(
+            from_json(&base(r#","kv_precision_pass":"plugin""#)).kv_precision_pass,
+            "plugin"
+        );
+        for bad in ["bogus", "Explicit", ""] {
+            let cfg: Config =
+                serde_json::from_str(&base(&format!(r#","kv_precision_pass":"{bad}""#))).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("kv_precision_pass") && err.contains("explicit"),
+                "{err}"
+            );
+        }
+        let err = serde_json::from_str::<Config>(&base(r#","kv_precision_pass":true"#))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("kv_precision_pass") && err.contains("must be a string"),
+            "{err}"
+        );
+        let boot = from_json(&base(""));
+        let file = from_json(&base(r#","kv_precision_pass":"plugin""#));
+        assert_eq!(
+            globals_not_applied(&boot, &file),
+            vec!["kv_precision_pass".to_owned()]
+        );
+    }
+
+    /// `kv_gate_mode` / `kv_gate_exact_on_unknown_engine`: defaults, accepted values, the refusal naming
+    /// the accepted list, and the reload report.
+    #[test]
+    fn kv_gate_keys_default_validate_and_report_changes() {
+        let base = |extra: &str| {
+            format!(r#"{{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0{extra}}}"#)
+        };
+        let d = from_json(&base(""));
+        assert_eq!(
+            (d.kv_gate_mode.as_str(), d.kv_gate_exact_on_unknown_engine),
+            ("exact", false)
+        );
+        let l = from_json(&base(
+            r#","kv_gate_mode":"legacy","kv_gate_exact_on_unknown_engine":true"#,
+        ));
+        assert_eq!(
+            (l.kv_gate_mode.as_str(), l.kv_gate_exact_on_unknown_engine),
+            ("legacy", true)
+        );
+        for bad in ["bogus", "Exact", ""] {
+            let cfg: Config =
+                serde_json::from_str(&base(&format!(r#","kv_gate_mode":"{bad}""#))).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("kv_gate_mode") && err.contains("legacy"),
+                "{err}"
+            );
+        }
+        let err = serde_json::from_str::<Config>(&base(r#","kv_gate_mode":1"#))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("kv_gate_mode") && err.contains("must be a string"),
+            "{err}"
+        );
+        let mut changed = globals_not_applied(&d, &l);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![
+                "kv_gate_exact_on_unknown_engine".to_owned(),
+                "kv_gate_mode".to_owned()
+            ]
+        );
+    }
+
+    /// A wrong JSON type for these two keys names the key (family-smoke B1/B2: serde's own
+    /// message was only `invalid type: null, expected a string`).
+    #[test]
+    fn wrong_type_for_precision_or_layout_names_the_key() {
+        for (key, json) in [
+            ("kv_cache_precision", r#""kv_cache_precision":null"#),
+            ("kv_cache_precision", r#""kv_cache_precision":8"#),
+            ("kv_cache_precision", r#""kv_cache_precision":["u4"]"#),
+            ("ov_cache_layout", r#""ov_cache_layout":null"#),
+            ("ov_cache_layout", r#""ov_cache_layout":1"#),
+        ] {
+            let text =
+                format!(r#"{{"models_dir":"/m","device":"CPU","total_vram_gb":1.0,{json}}}"#);
+            let err = serde_json::from_str::<Config>(&text)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(key) && err.contains("must be a string"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Unit-level half of U-C35: a changed `ov_cache_layout` is named by `globals_not_applied`.
+    #[test]
+    fn globals_not_applied_names_a_changed_cache_layout() {
+        let boot = from_json(r#"{"models_dir":"/m","device":"GPU","total_vram_gb":22.5}"#);
+        let file = from_json(
+            r#"{"models_dir":"/m","device":"GPU","total_vram_gb":22.5,"ov_cache_layout":"flat"}"#,
+        );
+        assert_eq!(
+            globals_not_applied(&boot, &file),
+            vec!["ov_cache_layout".to_owned()]
+        );
     }
 
     /// `kv_pressure_monitor_enabled` defaults to `false`, and the threshold/

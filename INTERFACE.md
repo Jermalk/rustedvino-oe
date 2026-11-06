@@ -128,7 +128,8 @@ CPU, 0.9.0):
 
 ### `POST /v1/audio/speech`
 
-- **Fields:** `model` and `input` (required; at most 4096 characters), `voice`, `response_format`
+- **Fields:** `model` and `input` (required; at most 4096 characters, a `400` above that, but
+  see the per-engine limits below), `voice`, `response_format`
   (`wav` default, or `pcm`) and `speed` (0.25-4.0), as in OpenAI's API, plus two extensions:
   - `language` (optional, e.g. `en`, `pl`, `vi`; a region suffix such as `pl-PL` is fine): the
     language of `input`. Omit it and the server uses the language the model speaks (SpeechT5 and
@@ -150,6 +151,28 @@ CPU, 0.9.0):
 - **An unsupported `language`** (e.g. `de`) leaves the text untouched rather than reading the
   digits as English.
 - The same normaliser runs in the realtime flow.
+- **Input length per engine.** 4096 characters is the request cap. Some models can't speak
+  that much, and the server doesn't split long input for them:
+  - **SpeechT5: keep each request at 200 characters or less.** Its tokenizer works per
+    character and the model has 600 text positions. Everything past about 600 characters is
+    dropped **without an error: the response is still `200`**, and the audio stops at 30–36 s.
+    Quality breaks down before that, from about 250–450 characters, depending on the text:
+    skipped sentences, repeated phrases, then loops on a syllable. The limit applies to the
+    text after normalisation, which spells digits out as words and makes the text longer. To read
+    long text, split it into sentences, send each piece (≤ 200 characters) as its own request,
+    and join the audio. The server does not do this for SpeechT5 in 0.9.0.
+  - **Polish VITS (`pl-vits-mai-female`) and Piper voices (`vi-vais1000-piper`):** tested
+    complete up to about 3,300 characters (about 170 s of audio), with the duration staying
+    proportional to the text. Piper synthesises sentence by sentence; the Polish voice reads the
+    whole input in one pass.
+  - Kokoro: not measured.
+- **`voice`:** chooses one of Kokoro's built-in voices (default `af_heart`). An unknown name
+  falls back to `af_heart` with a server-side warning, not a `400`. SpeechT5, the Polish VITS
+  voice and Piper voices have one voice per model and ignore `voice`, whatever its value.
+- **`speed`:** applies to Kokoro, the Polish VITS voice and Piper voices. **SpeechT5 ignores it.**
+- **Output sample rate** (mono, 16-bit for `wav`; matters when you join audio from different
+  voices): SpeechT5 16 kHz, Kokoro 24 kHz, the Polish VITS voice 22.05 kHz, a Piper voice the
+  rate in its `.onnx.json` (22.05 kHz for `vi-vais1000-piper`).
 
 ### `POST /v1/audio/transcriptions`
 

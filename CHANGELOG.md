@@ -6,7 +6,7 @@ All notable changes to RustedVINO are recorded here. The format follows
 semver claim). Full release notes, with measurements and download instructions, are on each
 [GitHub release](https://github.com/Jermalk/rustedvino-oe/releases).
 
-## [0.9.0] — 2026-10-29
+## [0.9.0] — 2026-11-06
 
 Linux bundle only. Windows: not published in this release (the Windows changes are in the source).
 
@@ -159,6 +159,7 @@ Linux bundle only. Windows: not published in this release (the Windows changes a
 - **Stop edges.** A stop gives up on a load at 600 s; a load that commits later can still be in teardown at exit. A forced eviction with a stuck generation makes a stop wait the full 600 s.
 - **Stalled-load edges.** A KV resize on a device with a stalled load cannot reload the model until that load returns. `/health` shows `device_stalled: true` for a client-gone load that is still running normally. `GPU` and `GPU.0` on a one-GPU box do not block each other.
 - **`rv` edges.** `rv add` / `load` / `resize` give up after 630 s while a longer load goes on (check `rv ps`). `rv add` exits 0 when the model loaded but was not saved. `rv stop` can report a slow many-model teardown as failed after 90 s when the log level hides the wait line (also stopping `rv restart`); `rv restart` during a preload drops `--supervise`.
+- **SpeechT5 speaks at most about 600 characters and still returns `200`.** The rest of `input` is dropped without an error, and quality breaks down from about 250–450 characters (skipped sentences, repeats, loops). Send at most 200 characters per request and join the audio. SpeechT5 ignores `speed`, and every engine accepts an unknown `voice` without a `400`. The Polish VITS and Piper voices were tested complete up to about 3,300 characters. Per-engine limits are in INTERFACE.md.
 - **Carried over from 0.8.4, not re-tested on 2026.4.1:** `rv deregister` / `rv save-defaults` without a terminal need `-y`; gemma-4-e4b-it-int8-ov does not load as a vision model; unloading the reranker can crash the process on some CPU setups.
 
 ## [0.8.4] — 2026-10-16

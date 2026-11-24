@@ -35,12 +35,12 @@ fn rv_waits_as_long_as_the_server_stop() {
 }
 
 /// Every `TimeoutStopSec=` value (in seconds) set outside a comment in the files under
-/// `scripts/`, by file (the public export ships the example user unit).
+/// `scripts/`, by file (the public export ships the example user unit). An unreadable
+/// `scripts/` is a test failure, not an empty list (R-15).
 fn stop_timeouts_in_scripts() -> Vec<(String, Duration)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
@@ -66,7 +66,15 @@ fn stop_timeouts_in_scripts() -> Vec<(String, Duration)> {
 
 #[test]
 fn shipped_stop_timeouts_cover_the_server_stop() {
-    for (file, t) in stop_timeouts_in_scripts() {
+    let found = stop_timeouts_in_scripts();
+    // R-15: with nothing found the loop below checks nothing and the test would pass vacuously.
+    assert!(
+        found
+            .iter()
+            .any(|(file, _)| file == "rustedvino.user.service.example"),
+        "no TimeoutStopSec= found in scripts/rustedvino.user.service.example (found: {found:?})"
+    );
+    for (file, t) in found {
         assert!(
             t >= startup::serving_stop_bound(ENGINES),
             "scripts/{file}: TimeoutStopSec {t:?} < the server's stop bound"

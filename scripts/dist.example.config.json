@@ -9,6 +9,10 @@
   "vram_safety_margin_gb": 1.0,
   "npu_footprint_factor": 1.5,
   "cpu_image_gen_max_pixels": 1048576,
+  "max_audio_duration_secs": 7200,
+  "max_images_per_request": 4,
+  "max_image_pixels_per_request": 67108864,
+  "max_image_pixels": 4000000,
   "min_kv_cache_gb": 1.0,
   "system_ram_reservation_gb": null,
   "system_ram_budget_gb": null,
@@ -37,6 +41,8 @@
   "max_embedding_inputs": 256,
   "max_embedding_batch_tokens": 32768,
   "max_tokens_cap": 8192,
+  "stream_first_token_timeout_secs": 600,
+  "stream_token_gap_timeout_secs": 120,
   "bind_addr": "127.0.0.1",
   "port": 11437,
   "allow_insecure_public_bind": false,
@@ -59,6 +65,7 @@
   "kv_pressure_sweep_interval_secs": 15,
   "kv_resize_cooldown_secs": 30,
   "load_timeout_secs": 600,
+  "on_demand_wait_secs": 0,
   "supervisor": {
     "backoff_base_secs": 5,
     "backoff_max_secs": 60,
@@ -68,8 +75,8 @@
     "hang_kill_grace_secs": 10,
     "watchdog_poll_secs": 30,
     "watchdog_hang_ceiling_secs": 600,
-    "gpu_probe_deadline_secs": 15,
-    "gpu_first_load_deadline_secs": 180
+    "gpu_first_load_deadline_secs": 180,
+    "gpu_probe_deadline_secs": 15
   },
   "models": {}
 }

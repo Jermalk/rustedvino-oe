@@ -27,6 +27,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Finish a request/response job on its engine thread: release the request's admission slot
+/// (`slot`: a semaphore permit, a shared `Arc` of one, an [`InFlightGuard`], or the decision
+/// engine's `DecideTurn`, which holds a guard and a gate permit) and THEN send `result` on
+/// `reply` (0.9.1 C2). The other order lets a caller woken by the reply still see its own
+/// request in `active()`, so an eviction issued at once was refused as busy. The
+/// request/response engines (STT, TTS: `SpeechT5` / Kokoro / Coqui VITS / Piper, embedding,
+/// reranking, image, decision) finish through this one function in their engine threads and
+/// their `spawn_mock_*` mocks, so the mock tests exercise the real order. A receiver that is
+/// gone (the client disconnected) is ignored.
+pub(crate) fn finish<S, T>(slot: S, reply: tokio::sync::oneshot::Sender<T>, result: T) {
+    drop(slot);
+    let _ = reply.send(result);
+}
+
 /// RAII guard for an in-flight request counter: increments on construction,
 /// decrements on `Drop`. Because the decrement runs in `Drop`, it survives task
 /// cancellation — if the awaiting future is dropped (client disconnect,
@@ -119,6 +133,42 @@ impl Drop for AdmittedTokensGuard {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// 0.9.1 C2: [`finish`] releases the slot before the reply is sent. The slot's `Drop` looks
+    /// at the reply channel: had the reply been sent first, it would find the value there.
+    #[test]
+    fn finish_releases_the_slot_before_it_replies() {
+        struct Slot {
+            rx: Arc<std::sync::Mutex<tokio::sync::oneshot::Receiver<u32>>>,
+            reply_already_sent: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                let sent = self.rx.lock().is_ok_and(|mut rx| rx.try_recv().is_ok());
+                self.reply_already_sent.store(sent, Ordering::SeqCst);
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let reply_already_sent = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        finish(
+            Slot {
+                rx: Arc::clone(&rx),
+                reply_already_sent: Arc::clone(&reply_already_sent),
+            },
+            tx,
+            7,
+        );
+        assert!(
+            !reply_already_sent.load(Ordering::SeqCst),
+            "the slot was released after the reply"
+        );
+        assert_eq!(
+            rx.lock().unwrap().try_recv().ok(),
+            Some(7),
+            "the reply arrives"
+        );
+    }
 
     /// The guard increments on construction and decrements on drop — the
     /// happy-path round trip.

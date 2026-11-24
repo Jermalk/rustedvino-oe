@@ -76,6 +76,13 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
     /// the factory — the manager owns "what kind is this model."
     fn detect_kind(&self, model_dir: &Path) -> ModelKind;
 
+    /// [`detect_kind`](Self::detect_kind) when the answer is certain (an explicit hint or a
+    /// marker file), `None` when it would be the fallback (F1b, review N-1: such a kind does not
+    /// refuse a request before a load). Default: every answer is certain.
+    fn detect_kind_certain(&self, model_dir: &Path) -> Option<ModelKind> {
+        Some(self.detect_kind(model_dir))
+    }
+
     /// The `KV_CACHE_PRECISION` string a load of this model hands the engine (`""` = plugin
     /// default; also the tag of its blob-cache directory), or `None` when the factory does not
     /// resolve one (test factories): callers then use the normalised global string. Must agree
@@ -226,6 +233,44 @@ pub(crate) trait EngineFactory: Send + Sync + 'static {
         cache_size_gb: f64,
         max_num_seqs: usize,
     ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)>;
+
+    /// [`load`](Self::load), reporting two moments to `hooks` (C25): the engine is constructed
+    /// and its KV warm-up has not run yet ([`LoadHooks::engine_built`]: the caller takes a
+    /// device-memory reading, so the weights are measured directly and the pool's residency
+    /// separately), and the warm-up finished ([`LoadHooks::warm_up_finished`]). Only an engine
+    /// whose pool the warm-up builds reports them (a vision engine, a text engine without a draft,
+    /// on a GPU device; `engine_built` whether or not `kv_warmup` is on); every other load, and
+    /// every factory that does not override this, reports nothing and is measured the old way.
+    /// Same blocking contract as `load`.
+    fn load_with_hook(
+        &self,
+        model_path: &Path,
+        device: &str,
+        cache_size_gb: f64,
+        max_num_seqs: usize,
+        hooks: &dyn LoadHooks,
+    ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+        let _ = hooks;
+        self.load(model_path, device, cache_size_gb, max_num_seqs)
+    }
+}
+
+/// C25: the moments of a load the manager measures device memory at (see
+/// [`EngineFactory::load_with_hook`]). Called on the blocking load thread.
+pub(crate) trait LoadHooks {
+    /// The engine is constructed; its KV warm-up has not run yet.
+    fn engine_built(&self);
+    /// The KV warm-up ran: `succeeded` is `false` when it failed and the load went on anyway
+    /// (a fatal warm-up failure fails the load instead). Not called when no warm-up ran.
+    fn warm_up_finished(&self, succeeded: bool);
+}
+
+/// [`LoadHooks`] that ignore both moments (a plain [`EngineFactory::load`]).
+pub(crate) struct NoLoadHooks;
+
+impl LoadHooks for NoLoadHooks {
+    fn engine_built(&self) {}
+    fn warm_up_finished(&self, _succeeded: bool) {}
 }
 
 /// Inputs of exact pool sizing, from [`EngineFactory::kv_pool_inputs`].
@@ -252,6 +297,8 @@ pub(crate) struct OvEngineFactory {
     pub kv_cache_precision: String,
     /// Max wait for an inference slot before returning HTTP 429.
     pub admission_queue_timeout_ms: u64,
+    /// [`super::Config::max_audio_duration_secs`], handed to every STT engine (0.9.1 S4).
+    pub max_audio_duration_secs: u64,
     /// Explicit per-model kind hints (from `Config::model_kinds` at startup,
     /// plus [`register_kind_hint`](EngineFactory::register_kind_hint) for
     /// models added at runtime), keyed by model ID. Consulted by
@@ -469,11 +516,19 @@ fn warn_vlm_ignores_global_once(
 /// inference device → `CPU`. The intent is to offload embeddings to the
 /// integrated GPU so the inference dGPU stays free, while never hard-failing
 /// when the preferred device is absent.
-pub(crate) fn resolve_embedding_device(configured: Option<&str>, inference_device: &str) -> String {
-    use crate::ov_cb::device_available;
-
+///
+/// `is_available` answers "did `OpenVINO` enumerate this device?". The manager
+/// passes its [`DeviceInventory`](crate::device_inventory::DeviceInventory)
+/// (built at boot from the same `get_available_devices()` list that
+/// [`crate::ov_cb::device_available`] reads), so placement is pure given the
+/// inventory and a unit test's fake inventory decides it, not the host (0.9.1 C2).
+pub(crate) fn resolve_embedding_device(
+    configured: Option<&str>,
+    inference_device: &str,
+    is_available: impl Fn(&str) -> bool,
+) -> String {
     if let Some(dev) = configured {
-        if device_available(dev) {
+        if is_available(dev) {
             return dev.to_owned();
         }
         tracing::warn!(
@@ -482,10 +537,10 @@ pub(crate) fn resolve_embedding_device(configured: Option<&str>, inference_devic
         );
     }
     // Prefer a GPU distinct from the inference dGPU (the iGPU on these boxes).
-    if inference_device != "GPU.0" && device_available("GPU.0") {
+    if inference_device != "GPU.0" && is_available("GPU.0") {
         return "GPU.0".to_owned();
     }
-    if device_available(inference_device) {
+    if is_available(inference_device) {
         return inference_device.to_owned();
     }
     "CPU".to_owned()
@@ -665,9 +720,13 @@ impl EngineFactory for OvEngineFactory {
     }
 
     fn detect_kind(&self, model_dir: &Path) -> ModelKind {
+        self.detect_kind_certain(model_dir)
+            .unwrap_or(ModelKind::TextGen)
+    }
+
+    fn detect_kind_certain(&self, model_dir: &Path) -> Option<ModelKind> {
         self.explicit_kind_hint(model_dir)
             .or_else(|| detect_kind_from_markers(model_dir))
-            .unwrap_or(ModelKind::TextGen)
     }
 
     fn register_kv_blocks_hint(&self, model_id: &str, blocks: Option<u64>) {
@@ -761,14 +820,31 @@ impl EngineFactory for OvEngineFactory {
         Some(passed.to_owned())
     }
 
-    // Dispatch on ModelKind — one arm per variant; naturally grows with new kinds.
-    #[allow(clippy::too_many_lines)]
     fn load(
         &self,
         model_path: &Path,
         device: &str,
         cache_size_gb: f64,
         max_num_seqs: usize,
+    ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+        self.load_with_hook(
+            model_path,
+            device,
+            cache_size_gb,
+            max_num_seqs,
+            &NoLoadHooks,
+        )
+    }
+
+    // Dispatch on ModelKind — one arm per variant; naturally grows with new kinds.
+    #[allow(clippy::too_many_lines)]
+    fn load_with_hook(
+        &self,
+        model_path: &Path,
+        device: &str,
+        cache_size_gb: f64,
+        max_num_seqs: usize,
+        hooks: &dyn LoadHooks,
     ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
         let path_str = model_path
             .to_str()
@@ -888,11 +964,18 @@ impl EngineFactory for OvEngineFactory {
                     1,
                     kv.passed,
                 )?;
-                if self.kv_warmup
-                    && warm_up_applies(device)
-                    && let Err(e) = warm_up_vlm(&engine, model_id)
-                {
-                    return Err(leak_if_poisoned(engine, e, model_id));
+                // C25: the vision pool is built at the first generate (the warm-up), so the
+                // reading here holds the weights only. GPU devices only: a CPU engine's memory is
+                // not in the device reading. Taken with `kv_warmup` off too (then nothing is
+                // resident at the end of the load, which is what the split reports).
+                if warm_up_applies(device) {
+                    hooks.engine_built();
+                }
+                if self.kv_warmup && warm_up_applies(device) {
+                    match warm_up_vlm(&engine, model_id) {
+                        Ok(succeeded) => hooks.warm_up_finished(succeeded),
+                        Err(e) => return Err(leak_if_poisoned(engine, e, model_id)),
+                    }
                 }
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
@@ -1044,12 +1127,16 @@ impl EngineFactory for OvEngineFactory {
                 };
                 // A draft-attached engine already ran probe generations (`verify_on_load`) or is
                 // not worth a different warm-up; everything else gets its pool materialised now.
-                if self.kv_warmup
-                    && warm_up_applies(device)
-                    && draft_hint.is_none()
-                    && let Err(e) = warm_up_cb(&mut engine, model_id)
-                {
-                    return Err(leak_if_poisoned(engine, e, model_id));
+                // C25: only a plain engine gets the post-construction reading (a draft-attached
+                // one ran generations already, so its pool may be built): measured the old way.
+                if draft_hint.is_none() && warm_up_applies(device) {
+                    hooks.engine_built();
+                }
+                if self.kv_warmup && warm_up_applies(device) && draft_hint.is_none() {
+                    match warm_up_cb(&mut engine, model_id) {
+                        Ok(succeeded) => hooks.warm_up_finished(succeeded),
+                        Err(e) => return Err(leak_if_poisoned(engine, e, model_id)),
+                    }
                 }
                 let queue_timeout =
                     std::time::Duration::from_millis(self.admission_queue_timeout_ms);
@@ -1124,6 +1211,7 @@ impl EngineFactory for OvEngineFactory {
                     device,
                     queue_timeout,
                     crate::ov_whisper::resolve_can_translate(model_path),
+                    self.max_audio_duration_secs,
                 )?;
                 Ok((EngineHandleKind::Stt(handle), thread))
             }
@@ -1631,7 +1719,7 @@ fn warm_up_outcome(
     model_id: &str,
     started: std::time::Instant,
     r: anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     match r {
         Ok(()) => {
             tracing::info!(
@@ -1639,7 +1727,7 @@ fn warm_up_outcome(
                 warm_up_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "KV warm-up generation complete (pool materialised)"
             );
-            Ok(())
+            Ok(true)
         }
         Err(e) if crate::model_manager::is_gpu_poison_error(&format!("{e:#}")) => {
             Err(e.context("KV warm-up generation hit an out-of-resources failure"))
@@ -1651,7 +1739,7 @@ fn warm_up_outcome(
         }
         Err(e) => {
             tracing::warn!(model_id, error = %format!("{e:#}"), "KV warm-up generation failed; continuing");
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -1678,7 +1766,7 @@ fn leak_if_poisoned<E>(engine: E, e: anyhow::Error, model_id: &str) -> anyhow::E
 
 /// One-token generation on a freshly built text engine: materialises the pool and shows a broken
 /// GPU at load time.
-fn warm_up_cb(engine: &mut crate::ov_cb::OvCbEngine, model_id: &str) -> anyhow::Result<()> {
+fn warm_up_cb(engine: &mut crate::ov_cb::OvCbEngine, model_id: &str) -> anyhow::Result<bool> {
     let started = std::time::Instant::now();
     let r = run_probe(engine, "Hello", 1).map(|_| ());
     warm_up_outcome(model_id, started, r)
@@ -1686,7 +1774,7 @@ fn warm_up_cb(engine: &mut crate::ov_cb::OvCbEngine, model_id: &str) -> anyhow::
 
 /// One-token text-only generation on a freshly built vision engine (the pool of a vision model is
 /// allocated at its first generate, not at construction).
-fn warm_up_vlm(engine: &crate::ov_vlm::OvVlmEngine, model_id: &str) -> anyhow::Result<()> {
+fn warm_up_vlm(engine: &crate::ov_vlm::OvVlmEngine, model_id: &str) -> anyhow::Result<bool> {
     let started = std::time::Instant::now();
     let params = crate::ov_cb::GenParams {
         max_new_tokens: 1,
@@ -1817,6 +1905,40 @@ fn verify_speculative_pairing(
 /// Set `should_fail = true` to simulate a generic load failure (bad path, etc.).
 /// Set `fail_with_oom = true` to simulate a `CL_OUT_OF_RESOURCES` GPU OOM — the
 /// kind that poisons the `OpenCL` context (L3 trigger). Both imply `should_fail`.
+/// A one-shot gate a test releases: [`MockEngineFactory::load`] waits on it, so the model stays
+/// in `Loading` until the test says otherwise (no timing assumptions under a loaded machine).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LoadGate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl LoadGate {
+    /// Lets every waiting and future `load()` through.
+    pub fn release(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            open = self
+                .cv
+                .wait(open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockEngineFactory {
@@ -1835,6 +1957,21 @@ pub(crate) struct MockEngineFactory {
     pub pool_inputs: Option<KvPoolInputs>,
     /// The block counts passed to [`EngineFactory::register_kv_blocks_hint`], in order.
     pub blocks_hints: std::sync::Mutex<Vec<Option<u64>>>,
+    /// When set, `load()` sleeps this long first (on the load's worker thread), so a test can
+    /// observe a model in `Loading` and a load that succeeds only after a while.
+    pub load_delay: Option<std::time::Duration>,
+    /// When set, `load()` blocks (on the load's worker thread) until the test calls
+    /// [`LoadGate::release`], so a test can hold a model in `Loading` deterministically.
+    pub load_gate: Option<std::sync::Arc<LoadGate>>,
+    /// The `GenParams` of every `AddRequest` a `TextGen` engine from this factory received,
+    /// in order (V5: a test checks the sampling a request actually got).
+    pub recorded_params: std::sync::Arc<std::sync::Mutex<Vec<crate::ov_cb::GenParams>>>,
+    /// The metrics zero point (`requested_at`) of every `AddRequest` a `TextGen` engine from
+    /// this factory received, in order (F1b: TTFT and duration start after an on-demand wait).
+    pub recorded_requested_at: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    /// The admission queue timeout of the mock vision engines this factory builds (`None` = the
+    /// mock default, 30 s).
+    pub vlm_queue_timeout: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
@@ -1915,6 +2052,22 @@ impl EngineFactory for MockEngineFactory {
         matched.unwrap_or(ModelKind::TextGen)
     }
 
+    /// The mock's markers are its name segments; a name with none is the `TextGen` fallback.
+    fn detect_kind_certain(&self, model_dir: &Path) -> Option<ModelKind> {
+        let name = model_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let kind = self.detect_kind(model_dir);
+        let plain = name.split(['-', '_']).all(|seg| {
+            !["embed", "rerank", "decide", "stt", "tts", "imagegen", "vlm"]
+                .iter()
+                .any(|k| seg.starts_with(k))
+        });
+        (!plain).then_some(kind)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn load(
         &self,
         model_path: &Path,
@@ -1922,6 +2075,12 @@ impl EngineFactory for MockEngineFactory {
         _cache_size_gb: f64,
         _max_num_seqs: usize,
     ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+        if let Some(delay) = self.load_delay {
+            std::thread::sleep(delay);
+        }
+        if let Some(gate) = &self.load_gate {
+            gate.wait();
+        }
         if self.fail_with_oom {
             return Err(anyhow::anyhow!(
                 "ov_cb_create failed: CL_OUT_OF_RESOURCES (-5) from ProgramBuilder build failed"
@@ -1944,8 +2103,26 @@ impl EngineFactory for MockEngineFactory {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("mock-vlm");
-                let (handle, thread) = crate::vlm_engine::spawn_mock_vlm(leaf);
+                let (handle, thread) = match self.vlm_queue_timeout {
+                    Some(t) => crate::vlm_engine::spawn_mock_vlm_with_timeout(leaf, t),
+                    None => crate::vlm_engine::spawn_mock_vlm(leaf),
+                };
                 Ok((EngineHandleKind::Vision(handle), thread))
+            }
+            // 0.9.1 S1: a text model with an `npu` name segment gets the mock NPU engine (the
+            // production factory picks it by placement; `detect_kind` is TextGen either way).
+            ModelKind::TextGen
+                if model_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.split(['-', '_']).any(|seg| seg.starts_with("npu"))) =>
+            {
+                let leaf = model_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("mock-npu");
+                let (handle, thread) = crate::npu_engine::spawn_mock_npu(leaf);
+                Ok((EngineHandleKind::NpuTextGen(handle), thread))
             }
             ModelKind::TextGen => {
                 // Build a real channel so EngineHandle works correctly.
@@ -1956,6 +2133,10 @@ impl EngineFactory for MockEngineFactory {
                 // Tokenize/Detokenize are answered with empty results so callers
                 // that use them (L0 gate, /tokenize endpoint) get a valid response
                 // rather than a channel-dropped error.
+                let recorded = std::sync::Arc::clone(&self.recorded_params);
+                let recorded_at = std::sync::Arc::clone(&self.recorded_requested_at);
+                let liveness = crate::stall_watch::EngineLiveness::new();
+                let liveness_engine = liveness.clone();
                 let thread = std::thread::spawn(move || {
                     while let Some(cmd) = rx.blocking_recv() {
                         match cmd {
@@ -1965,13 +2146,41 @@ impl EngineFactory for MockEngineFactory {
                             crate::cb_engine::EngineCommand::Detokenize { reply, .. } => {
                                 let _ = reply.send(Ok(String::new()));
                             }
-                            crate::cb_engine::EngineCommand::AddRequest { .. } => {} // drain without processing
+                            // Drain without processing: the request's token channel closes with no final
+                            // event, which a realtime turn treats as a cut-off LLM error (0.9.1 Q4).
+                            crate::cb_engine::EngineCommand::AddRequest {
+                                gen_params,
+                                prompt,
+                                token_tx,
+                                permit,
+                                requested_at,
+                                ..
+                            } => {
+                                recorded
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(gen_params);
+                                recorded_at
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(requested_at);
+                                // 0.9.1 S1: a marked request stalls the whole engine thread
+                                // (like a stuck step: later commands wait), holding its permit.
+                                let _ = crate::stall_watch::mock::run(
+                                    &prompt,
+                                    &token_tx,
+                                    &liveness_engine,
+                                );
+                                drop(permit);
+                            }
                         }
                     }
                 });
 
                 Ok((
-                    EngineHandleKind::TextGen(crate::cb_engine::EngineHandle::from_sender(tx)),
+                    EngineHandleKind::TextGen(crate::cb_engine::EngineHandle::from_sender_live(
+                        tx, liveness,
+                    )),
                     thread,
                 ))
             }
@@ -2015,7 +2224,13 @@ impl EngineFactory for MockEngineFactory {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("mock-tts");
-                let (handle, thread) = crate::pipelines::tts::spawn_mock_tts(leaf);
+                // A `speecht5` name gets the SpeechT5-like mock (segment cap,
+                // text-encoding samples) so the handler's split is testable.
+                let (handle, thread) = if leaf.contains("speecht5") {
+                    crate::pipelines::tts::spawn_mock_speecht5_tts(leaf)
+                } else {
+                    crate::pipelines::tts::spawn_mock_tts(leaf)
+                };
                 Ok((EngineHandleKind::Tts(handle), thread))
             }
             ModelKind::Reranking => {
@@ -2049,6 +2264,29 @@ impl EngineFactory for MockEngineFactory {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// 0.9.1 C2: the embedding device follows the availability it is given (the manager's
+    /// inventory), never the host's real `OpenVINO`: configured → `GPU.0` → inference → `CPU`.
+    #[test]
+    fn embedding_device_follows_the_given_availability() {
+        let has = |names: &'static [&'static str]| move |d: &str| names.contains(&d);
+        assert_eq!(
+            resolve_embedding_device(Some("GPU.1"), "GPU.1", has(&["GPU.1", "GPU.0"])),
+            "GPU.1"
+        );
+        assert_eq!(
+            resolve_embedding_device(Some("GPU.9"), "GPU.1", has(&["GPU.1", "GPU.0"])),
+            "GPU.0"
+        );
+        assert_eq!(
+            resolve_embedding_device(None, "GPU.1", has(&["GPU.1"])),
+            "GPU.1"
+        );
+        assert_eq!(
+            resolve_embedding_device(Some("GPU.1"), "GPU.1", has(&[])),
+            "CPU"
+        );
+    }
 
     /// 0.9.0 review F: a poison-class warm-up failure leaks the engine (no destructor on the
     /// poisoned context); any other failure drops it.
@@ -2148,6 +2386,29 @@ mod tests {
 
     fn kind_of(name: &str) -> ModelKind {
         MockEngineFactory::default().detect_kind(Path::new(name))
+    }
+
+    /// C25: a factory that does not override `load_with_hook` loads normally and never calls the
+    /// post-construction hook, so its loads are measured the old way (fallback path).
+    #[test]
+    fn the_default_load_hook_is_never_called() {
+        struct Recording(std::cell::Cell<u32>);
+        impl LoadHooks for Recording {
+            fn engine_built(&self) {
+                self.0.set(self.0.get() + 1);
+            }
+            fn warm_up_finished(&self, _succeeded: bool) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let hooks = Recording(std::cell::Cell::new(0));
+        let (handle, thread) = MockEngineFactory::default()
+            .load_with_hook(Path::new("vlm-vision-ov"), "GPU.1", 1.0, 1, &hooks)
+            .expect("mock load");
+        assert_eq!(handle.kind(), ModelKind::Vision);
+        assert_eq!(hooks.0.get(), 0);
+        drop(handle);
+        let _ = thread.join();
     }
 
     /// Every kind segment resolves, including the real fleet test names, and a
@@ -2281,8 +2542,11 @@ mod tests {
     #[test]
     fn warm_up_fails_the_load_for_a_poisoned_gpu_not_for_other_errors() {
         let t = std::time::Instant::now();
-        assert!(warm_up_outcome("m", t, Ok(())).is_ok());
-        assert!(warm_up_outcome("m", t, Err(anyhow::anyhow!("template exploded"))).is_ok());
+        assert!(warm_up_outcome("m", t, Ok(())).unwrap(), "succeeded");
+        assert!(
+            !warm_up_outcome("m", t, Err(anyhow::anyhow!("template exploded"))).unwrap(),
+            "failed, load goes on (C25: reported as not succeeded)"
+        );
         let err = warm_up_outcome(
             "m",
             t,
@@ -2447,6 +2711,8 @@ mod tests {
             kv_warmup: false,
             kv_precision_overrides: std::sync::RwLock::new(HashMap::new()),
             admission_queue_timeout_ms: 0,
+            max_audio_duration_secs: crate::model_manager::config::default_max_audio_duration_secs(
+            ),
             model_kinds: std::sync::RwLock::new(HashMap::new()),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
             prefix_caching_overrides: std::sync::RwLock::new(HashMap::new()),

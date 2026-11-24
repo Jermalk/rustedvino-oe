@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 use crate::handlers::error::{
-    JsonBody, inference_error_response, model_error_response, openai_error,
+    JsonBody, inference_error_response, model_error_response, openai_error, openai_error_with_param,
 };
+use crate::handlers::on_demand::{self, Unready};
 use crate::model_manager::{ModelError, ModelManager, OnDemandLoad};
 use crate::rerank_engine::RerankingHandle;
 
@@ -26,6 +27,12 @@ use crate::rerank_engine::RerankingHandle;
 /// rejected. The real precision comes from the tokenizer-backed check below;
 /// this is only the fast, generous first pass.
 const MAX_BYTES_PER_TOKEN: usize = 32;
+
+/// Most `documents` one `/v1/rerank` request may carry (FM-6, an owner ruling: a hard
+/// constant, no config key). Each document is a tokenizer round trip and a scoring call on the
+/// model's single engine thread, so an unbounded list let one request hold that thread for minutes
+/// to hours while every other rerank request queued. Above it: 400 `too_many_documents`.
+pub const MAX_RERANK_DOCUMENTS: usize = 1000;
 
 // ── Request ────────────────────────────────────────────────────────────────────
 
@@ -159,6 +166,19 @@ pub async fn rerank(
             None,
         );
     }
+    if req.documents.len() > MAX_RERANK_DOCUMENTS {
+        return openai_error_with_param(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Field 'documents' has {} entries — this server accepts at most \
+                 {MAX_RERANK_DOCUMENTS} per request; split the list over several requests.",
+                req.documents.len()
+            ),
+            "invalid_request_error",
+            Some("too_many_documents"),
+            Some("documents"),
+        );
+    }
     if let Some(resp) = reject_unusable_text(&req) {
         return resp;
     }
@@ -175,7 +195,7 @@ pub async fn rerank(
         );
     };
 
-    let handle = match resolve_rerank_handle(mm, &req.model) {
+    let handle = match resolve_rerank_handle(mm, &req.model).await {
         Ok(h) => h,
         Err(resp) => return *resp,
     };
@@ -308,36 +328,50 @@ async fn gate_rerank_pair(
 /// box) takes the `NotApplicable` arm, which reproduces byte-for-byte the
 /// message the old fallthrough `Err(e)` arm used to produce for
 /// `NotLoaded` — no behaviour change for the models actually in service.
-fn resolve_rerank_handle(
+///
+/// F1b: through the shared on-demand wait (`on_demand_wait_secs`); a failed load the request
+/// waited for is answered through [`rerank_model_error`], like any lookup error of this route.
+async fn resolve_rerank_handle(
     mm: &Arc<ModelManager>,
     model: &str,
 ) -> Result<RerankingHandle, Box<Response>> {
-    match mm.get_reranking_handle(model) {
-        Ok(h) => Ok(h),
+    let unready =
+        match on_demand::resolve_with_wait(mm, model, || mm.get_reranking_handle(model)).await {
+            Ok(h) => return Ok(h),
+            Err(u) => u,
+        };
+    Err(Box::new(match unready {
+        Unready::OnDemand(OnDemandLoad::Loading) => model_error_response(ModelError::Loading),
+        Unready::OnDemand(OnDemandLoad::ShuttingDown) => {
+            model_error_response(ModelError::ShuttingDown)
+        }
+        Unready::OnDemand(OnDemandLoad::NotApplicable) => {
+            rerank_model_error(model, ModelError::NotLoaded)
+        }
+        Unready::Model(e) | Unready::LoadFailed(Some(e)) => rerank_model_error(model, e),
+        Unready::LoadFailed(None) => on_demand::load_failed_response(model),
+    }))
+}
+
+/// This route's answer to a model lookup error (and to the error of a load it waited for).
+fn rerank_model_error(model: &str, e: ModelError) -> Response {
+    match e {
         // The same body every other route gives an unknown model.
-        Err(e @ ModelError::NotFound(_)) => Err(Box::new(model_error_response(e))),
-        Err(ModelError::WrongKind(msg)) => Err(Box::new(openai_error(
-            StatusCode::BAD_REQUEST,
-            msg,
-            "invalid_request_error",
-            None,
-        ))),
-        Err(ModelError::NotLoaded) => Err(Box::new(match mm.request_on_demand_load(model) {
-            OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-            OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-            OnDemandLoad::NotApplicable => openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Model '{model}' is not ready: {}", ModelError::NotLoaded),
-                "server_error",
-                None,
-            ),
-        })),
-        Err(e) => Err(Box::new(openai_error(
+        e @ ModelError::NotFound(_) => model_error_response(e),
+        // A stalled load (F1b): the `504 load_timeout` / `503 device_stalled`
+        // every other route gives.
+        e @ (ModelError::LoadTimeout { .. } | ModelError::DeviceStalled { .. }) => {
+            model_error_response(e)
+        }
+        ModelError::WrongKind(msg) => {
+            openai_error(StatusCode::BAD_REQUEST, msg, "invalid_request_error", None)
+        }
+        e => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("Model '{model}' is not ready: {e}"),
             "server_error",
             None,
-        ))),
+        ),
     }
 }
 
@@ -383,6 +417,10 @@ mod tests {
             vram_safety_margin_gb: 0.0,
             npu_footprint_factor: 1.0,
             cpu_image_gen_max_pixels: 1024 * 1024,
+            max_audio_duration_secs: 7_200,
+            max_images_per_request: 16,
+            max_image_pixels_per_request: 64 * 1024 * 1024,
+            max_image_pixels: 4_000_000,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -410,6 +448,8 @@ mod tests {
             max_embedding_inputs: 256,
             max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,
+            stream_first_token_timeout_secs: 600,
+            stream_token_gap_timeout_secs: 120,
             bind_addr: "127.0.0.1".to_owned(),
             port: 11_437,
             allow_insecure_public_bind: false,
@@ -435,6 +475,7 @@ mod tests {
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
             load_timeout_secs: 600,
+            on_demand_wait_secs: 0,
         }
     }
 
@@ -485,6 +526,10 @@ mod tests {
                 vram_safety_margin_gb: 0.0,
                 npu_footprint_factor: 1.0,
                 cpu_image_gen_max_pixels: 1024 * 1024,
+                max_audio_duration_secs: 7_200,
+                max_images_per_request: 16,
+                max_image_pixels_per_request: 64 * 1024 * 1024,
+                max_image_pixels: 4_000_000,
                 min_kv_cache_gb: 0.0,
                 light_model_max_gb: 2.0,
                 light_stt_max_gb: 1.0,
@@ -512,6 +557,8 @@ mod tests {
                 max_embedding_inputs: 256,
                 max_embedding_batch_tokens: 32_768,
                 max_tokens_cap: 8192,
+                stream_first_token_timeout_secs: 600,
+                stream_token_gap_timeout_secs: 120,
                 bind_addr: "127.0.0.1".to_owned(),
                 port: 11_437,
                 allow_insecure_public_bind: false,
@@ -537,6 +584,7 @@ mod tests {
                 kv_pressure_sweep_interval_secs: 15,
                 kv_resize_cooldown_secs: 30,
                 load_timeout_secs: 600,
+                on_demand_wait_secs: 0,
             },
             Arc::new(MockEngineFactory::default()),
         )
@@ -609,6 +657,38 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), 400);
+    }
+
+    /// FM-6: more than [`MAX_RERANK_DOCUMENTS`] documents is a 400 naming the limit and the
+    /// count, `param: "documents"`; exactly the limit is accepted.
+    #[tokio::test]
+    async fn rerank_document_cap() {
+        let state = state_with_model("mock-rerank").await;
+        let over: Vec<String> = (0..=super::MAX_RERANK_DOCUMENTS)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let resp = post_rerank(
+            create_router(state.clone()),
+            serde_json::json!({"model": "mock-rerank", "query": "q", "documents": over}),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let j = body_json(resp).await;
+        assert_eq!(j["error"]["type"], "invalid_request_error");
+        assert_eq!(j["error"]["code"], "too_many_documents");
+        assert_eq!(j["error"]["param"], "documents");
+        let msg = j["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("1001") && msg.contains("1000"), "{msg}");
+
+        let at: Vec<String> = (0..super::MAX_RERANK_DOCUMENTS)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let resp = post_rerank(
+            create_router(state),
+            serde_json::json!({"model": "mock-rerank", "query": "q", "documents": at}),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
@@ -785,5 +865,28 @@ mod tests {
         for visible in ["a", "ż", "😀", ".", "\u{200B}x", "%00", "../x"] {
             assert!(super::has_visible_text(visible), "{visible:?}");
         }
+    }
+
+    /// F1b: a stalled load answers as on every other route.
+    #[test]
+    fn a_stalled_load_answers_load_timeout_or_device_stalled() {
+        use crate::model_manager::ModelError;
+        let timeout = super::rerank_model_error(
+            "r",
+            ModelError::LoadTimeout {
+                model: "r".to_owned(),
+                secs: 600,
+            },
+        );
+        assert_eq!(timeout.status(), StatusCode::GATEWAY_TIMEOUT);
+        let stalled = super::rerank_model_error(
+            "r",
+            ModelError::DeviceStalled {
+                device: "GPU.1".to_owned(),
+                model: "x".to_owned(),
+                secs: 700,
+            },
+        );
+        assert_eq!(stalled.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

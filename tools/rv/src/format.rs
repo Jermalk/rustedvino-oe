@@ -4,10 +4,16 @@ use std::fmt::Write;
 
 use crate::ansi::Style;
 
-/// `"12.3 GB"` — decimal gigabytes, one decimal place.
+/// Bytes in one GiB. The server's memory unit is the GiB (0.9.0): `vram_gb`, `total_vram_gb`
+/// and the `rustedvino_vram_*_bytes` metrics (`GiB × 2^30`) all use it (R-12).
+pub const GIB: f64 = 1_073_741_824.0;
+
+/// `"12.3 GB"` — bytes in GiB (`n / 2^30`, R-12), one decimal place: the unit of the server's
+/// budgets (`vram_gb`, `total_vram_gb`). Labelled "GB" here, as `rv status` and the other
+/// memory views show it; `rv add`'s estimate lines say "GiB" (0.9.1 R-12).
 #[must_use]
 pub fn human_bytes(n: f64) -> String {
-    format!("{:.1} GB", n / 1e9)
+    format!("{:.1} GB", n / GIB)
 }
 
 /// Python's `round()` on a float: ties go to the even neighbour, unlike Rust's
@@ -128,10 +134,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn human_bytes_matches_python() {
-        assert_eq!(human_bytes(27e9), "27.0 GB");
+    fn human_bytes_is_gib() {
+        // R-12: a 24 GiB budget exported as 24 × 2^30 bytes reads 24.0, not 25.8.
+        assert_eq!(human_bytes(24.0 * GIB), "24.0 GB");
         assert_eq!(human_bytes(0.0), "0.0 GB");
-        assert_eq!(human_bytes(1.55e9), "1.6 GB");
+        assert_eq!(human_bytes(1.55 * GIB), "1.6 GB");
+        assert_eq!(human_bytes(27e9), "25.1 GB");
     }
 
     #[test]

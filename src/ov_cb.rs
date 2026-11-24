@@ -68,6 +68,17 @@ pub struct GenParams {
     /// `None` or `Some(0)` → disabled (engine keeps its default, effectively
     /// unlimited).
     pub top_k: Option<usize>,
+    /// How this request's output splits into reasoning and answer (0.9.1 V1-usage). Not sent to
+    /// `OpenVINO`: the engine thread uses it to count
+    /// `usage.completion_tokens_details.reasoning_tokens` next to the tokens it generates (see
+    /// `crate::reasoning_tokens`). The default (no parser, not starting in thinking) counts a raw
+    /// `<think>…</think>` block when the model emits one, and is 0 otherwise.
+    pub reasoning: crate::prompt_builder::ReasoningSplit,
+    /// The strict thinking budget in tokens (0.9.1; `None` = none). Not sent to `OpenVINO`: the
+    /// engine thread feeds a `crate::thinking_budget::BudgetTracker` with every delta under
+    /// [`Self::reasoning`] and stops the request through its early-stop path when the budget is
+    /// spent inside the reasoning block, finishing it as [`FinishReason::ThinkingBudget`].
+    pub thinking_budget: Option<u32>,
 }
 
 /// The sampling seed handed to `OpenVINO`: the client's `seed`, or a fresh
@@ -246,10 +257,13 @@ unsafe extern "C" {
 
 /// Returns `true` if `device` is listed in `OpenVINO`'s available-devices set.
 ///
-/// Calls `ov::Core::get_available_devices()` via the C bridge. Returns `false`
-/// on any exception or if the device name contains an interior NUL byte.
-/// Used by the startup assertion in `main.rs` to give a clear early error
-/// before any model load attempt.
+/// Calls `ov::Core::get_available_devices()` via the C bridge (a fresh
+/// `ov::Core` per call). Returns `false` on any exception or if the device name
+/// contains an interior NUL byte. No production caller today: the startup
+/// device check and model placement read the boot
+/// [`DeviceInventory`](crate::device_inventory::DeviceInventory) instead (the
+/// embedding-device route moved off this call in 0.9.1 C2). Kept as a public
+/// helper over the bridge symbol.
 #[must_use]
 pub fn device_available(device: &str) -> bool {
     let Ok(c_device) = CString::new(device) else {
@@ -398,6 +412,12 @@ pub enum FinishReason {
     Stop,
     /// Hit the `max_new_tokens` budget (`GenerationFinishReason::LENGTH`).
     Length,
+    /// The engine stopped the request at its thinking budget, inside its reasoning
+    /// (`crate::thinking_budget`, 0.9.1): reported as `"length"`, and the handler neither
+    /// substitutes the "thinking was cut off" placeholder nor parses tool calls. Never produced
+    /// by `OpenVINO` — only by the engines' own early-stop paths. A finished request for the
+    /// usage counters, not a client stop.
+    ThinkingBudget,
 }
 
 impl FinishReason {
@@ -406,7 +426,20 @@ impl FinishReason {
     pub fn as_openai(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
-            FinishReason::Length => "length",
+            FinishReason::Length | FinishReason::ThinkingBudget => "length",
+        }
+    }
+
+    /// The finish to report for a request whose thinking budget was armed: the budget stop when
+    /// the engine stopped it there (`budget_stopped`), or when the generation ran out of
+    /// `max_new_tokens` while still inside the reasoning block (`inside_reasoning`) — no answer
+    /// came in either case, so the response must not pretend otherwise. Otherwise `self`.
+    #[must_use]
+    pub fn with_budget(self, budget_stopped: bool, inside_reasoning: bool) -> Self {
+        if budget_stopped || (self == FinishReason::Length && inside_reasoning) {
+            FinishReason::ThinkingBudget
+        } else {
+            self
         }
     }
 }

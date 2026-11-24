@@ -15,8 +15,8 @@ use std::path::Path;
 ///
 /// Deliberately uniform across all layers, including hybrid attention
 /// architectures (Qwen3.5/3.6's `GatedDeltaNet`-mixed layers) where the
-/// resulting `max_prompt_tokens` **overestimates real usable capacity** by
-/// ~3.2-3.3x (the project's internal engineering log —
+/// resulting `max_prompt_tokens` **overestimated real usable capacity** by
+/// ~3.2-3.3x on 0.8.x (`OpenVINO GenAI` 2026.2.1) (the project's internal engineering log —
 /// same root cause as `vllm-project/vllm#37121`): real per-token KV cost on
 /// these architectures is *higher* than this formula predicts, not lower.
 /// The overestimate isn't unique to hybrid architectures either — a plain
@@ -346,19 +346,16 @@ pub(crate) fn write_kv_capacity_ratchet(
     };
     let final_path = model_dir.join(KV_RATCHET_FILENAME);
     let tmp_path = model_dir.join(format!("{KV_RATCHET_FILENAME}.tmp"));
-    if let Err(err) = std::fs::write(&tmp_path, &serialized) {
+    // R-10 / E1 F3: synced temp file, rename, best-effort directory sync; the temp file is
+    // removed on failure.
+    if let Err((stage, err)) =
+        super::kv_ratchet::write_durably(model_dir, &tmp_path, &final_path, serialized.as_bytes())
+    {
         tracing::warn!(
             model_dir = %model_dir.display(),
             error = %err,
-            "kv capacity ratchet: could not write temp file, skipping"
-        );
-        return;
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
-        tracing::warn!(
-            model_dir = %model_dir.display(),
-            error = %err,
-            "kv capacity ratchet: could not commit write"
+            stage,
+            "kv capacity ratchet: write failed, skipping"
         );
     }
 }
@@ -433,7 +430,8 @@ pub(crate) const FALLBACK_TEMPLATE: &str = concat!(
 /// object form (`"eos_token": {"content": "</s>", ...}`).
 pub(crate) fn load_special_tokens(model_dir: &Path) -> (String, String) {
     let path = model_dir.join("tokenizer_config.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    // A leading BOM would make the whole file unparseable (P-C).
+    let Ok(raw) = super::config::read_json_text(&path) else {
         return (String::new(), String::new());
     };
     let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -495,14 +493,29 @@ pub struct GenerationDefaults {
 /// present, non-negative, whole-number `top_k` (including a float literal
 /// like `20.0`) is otherwise accepted without a range check, since there is
 /// no invalid `top_k` value shy of `0` or non-whole-number.
+// Production reads the file once for the whole file layer (`sampling::load_file_sampling`,
+// via [`generation_defaults_from`]); this one-shot form is the documented gate the unit tests
+// pin, and the target of the doc links that describe it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_generation_defaults(model_dir: &Path) -> GenerationDefaults {
-    let path = model_dir.join("generation_config.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return GenerationDefaults::default();
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return GenerationDefaults::default();
-    };
+    read_generation_config(model_dir).map_or_else(GenerationDefaults::default, |cfg| {
+        generation_defaults_from(&cfg, model_dir)
+    })
+}
+
+/// `model_dir/generation_config.json` parsed as JSON; `None` when missing or
+/// unparseable (blocking file I/O).
+pub(crate) fn read_generation_config(model_dir: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(model_dir.join("generation_config.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// [`load_generation_defaults`] on an already-parsed file (`model_dir` only
+/// names the model in warnings).
+pub(crate) fn generation_defaults_from(
+    cfg: &serde_json::Value,
+    model_dir: &Path,
+) -> GenerationDefaults {
     if cfg.get("do_sample").and_then(serde_json::Value::as_bool) != Some(true) {
         return GenerationDefaults::default();
     }
@@ -586,6 +599,29 @@ pub(crate) fn load_generation_defaults(model_dir: &Path) -> GenerationDefaults {
     }
 }
 
+/// Reads a Jinja template file as text with a leading UTF-8 byte-order mark dropped and CRLF line
+/// endings turned into LF (FM-2). Notepad and PowerShell's `Set-Content -Encoding utf8` write both;
+/// read raw, the U+FEFF became the first character of every rendered prompt and every line break a
+/// `\r\n` — a prompt the model was not trained on, with nothing failing. A lone `\r` is kept.
+///
+/// # Errors
+///
+/// The I/O error from reading the file, or `InvalidData` if it is not UTF-8.
+pub(crate) fn read_template_text(path: &Path) -> std::io::Result<String> {
+    Ok(normalize_template_text(&std::fs::read_to_string(path)?))
+}
+
+/// The text part of [`read_template_text`]: strip one leading BOM, CRLF to LF.
+fn normalize_template_text(text: &str) -> String {
+    strip_leading_bom(text).replace("\r\n", "\n")
+}
+
+/// `text` without one leading BOM (a template embedded in `tokenizer_config.json`: line
+/// endings are kept, see `load_chat_template_with_override`).
+fn strip_leading_bom(text: &str) -> String {
+    text.strip_prefix('\u{feff}').unwrap_or(text).to_owned()
+}
+
 /// Load a model's Jinja chat template.
 ///
 /// Resolution order:
@@ -612,7 +648,7 @@ pub(crate) fn load_chat_template_with_override(
     override_path: Option<&Path>,
 ) -> anyhow::Result<String> {
     if let Some(path) = override_path {
-        return std::fs::read_to_string(path).map_err(|e| {
+        return read_template_text(path).map_err(|e| {
             anyhow::anyhow!(
                 "reading chat_template override {}: {e} — the model's own template was NOT \
                  used as a fallback, because an explicitly configured override that cannot be \
@@ -623,19 +659,24 @@ pub(crate) fn load_chat_template_with_override(
     }
     let jinja = model_dir.join("chat_template.jinja");
     if jinja.is_file() {
-        return std::fs::read_to_string(&jinja)
+        return read_template_text(&jinja)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", jinja.display()));
     }
 
     let cfg_path = model_dir.join("tokenizer_config.json");
     if cfg_path.is_file() {
-        let raw = std::fs::read_to_string(&cfg_path)
+        // P-C (firmness leftover): a BOM before the JSON is skipped (serde_json refuses it), and
+        // one leading BOM of the embedded template is stripped, so it does not start every
+        // prompt. Its line endings are kept as written (P-C review R-4): inside a JSON string
+        // `\r\n` is an escape the exporter wrote, not an editor artefact, and the reference
+        // renderer keeps it. Template files on disk get the full `normalize_template_text`.
+        let raw = super::config::read_json_text(&cfg_path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", cfg_path.display()))?;
         let cfg: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", cfg_path.display()))?;
 
         if let Some(t) = cfg.get("chat_template").and_then(serde_json::Value::as_str) {
-            return Ok(t.to_owned());
+            return Ok(strip_leading_bom(t));
         }
         if let Some(t) = cfg
             .get("chat_template")
@@ -645,7 +686,7 @@ pub(crate) fn load_chat_template_with_override(
                     .find_map(|o| o.get("template").and_then(serde_json::Value::as_str))
             })
         {
-            return Ok(t.to_owned());
+            return Ok(strip_leading_bom(t));
         }
     }
 
@@ -653,6 +694,25 @@ pub(crate) fn load_chat_template_with_override(
         "no chat template found in {}",
         model_dir.display()
     ))
+}
+
+/// Read `model_id`'s configured `chat_template` override at `path` (already resolved to an
+/// absolute path), for the load's pre-flight (C8). Blocking file I/O: call from `spawn_blocking`.
+///
+/// # Errors
+/// The file cannot be read (missing, unreadable, not UTF-8): [`super::ModelError::TemplateUnreadable`],
+/// whose message is self-contained (model, path, cause, what to do), because the preload and
+/// on-demand logs print only the outer message. An unreadable override refuses the load rather
+/// than serving a different template (owner decision, 2026-11-09).
+pub(crate) fn read_chat_template_override(
+    model_id: &str,
+    path: &Path,
+) -> Result<String, super::ModelError> {
+    read_template_text(path).map_err(|e| super::ModelError::TemplateUnreadable {
+        model: model_id.to_owned(),
+        path: path.to_path_buf(),
+        cause: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -733,6 +793,29 @@ mod tests {
         assert_eq!(t, "FROM OVERRIDE");
     }
 
+    /// FM-2: a template saved with a UTF-8 BOM and CRLF line endings (Notepad, PowerShell) reads
+    /// exactly like the LF file, at all three read sites: the override, `chat_template.jinja` and
+    /// the load pre-flight. A `\r` that is not part of a CRLF is left alone.
+    #[test]
+    fn template_files_drop_the_bom_and_crlf() {
+        let lf = "{% for m in messages %}\n{{ m.content }}\n{% endfor %}\n";
+        let windows = format!("\u{feff}{}", lf.replace('\n', "\r\n"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::write(dir.join("chat_template.jinja"), &windows).expect("write");
+        let over = dir.join("override.jinja");
+        std::fs::write(&over, &windows).expect("write");
+
+        assert_eq!(
+            load_chat_template_with_override(dir, Some(&over)).unwrap(),
+            lf
+        );
+        assert_eq!(load_chat_template_with_override(dir, None).unwrap(), lf);
+        assert_eq!(read_chat_template_override("m", &over).unwrap(), lf);
+        assert_eq!(normalize_template_text("a\rb\r\nc"), "a\rb\nc");
+        assert_eq!(normalize_template_text("no bom"), "no bom");
+    }
+
     /// An override that is configured but unreadable is a hard error, NOT a
     /// silent fall-back to the model's own template: the operator asked for a
     /// specific template, and quietly serving a different one would reproduce
@@ -781,6 +864,47 @@ mod tests {
         let t = load_chat_template_with_override(&dir, None).unwrap();
         assert_eq!(t, "FROM CONFIG {{ x }}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P-C (firmness leftover, review R-4): a `tokenizer_config.json` with a BOM before the
+    /// JSON still parses, and its embedded template (string form and list form) loses one
+    /// leading BOM only: its `\r\n` escapes are kept as the exporter wrote them (a template file
+    /// on disk also gets CRLF to LF). The special tokens are read too.
+    #[test]
+    fn tokenizer_config_template_is_bom_stripped_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer_config.json");
+        let string_form = serde_json::json!({
+            "chat_template": "\u{feff}A {{ x }}\r\nB\rC",
+            "eos_token": "</s>", "bos_token": "<s>"
+        });
+        std::fs::write(&path, format!("\u{feff}{string_form}")).unwrap();
+        let t = load_chat_template_with_override(dir.path(), None).unwrap();
+        assert_eq!(t, "A {{ x }}\r\nB\rC", "BOM gone, line endings kept");
+        assert_eq!(
+            load_special_tokens(dir.path()),
+            ("</s>".to_owned(), "<s>".to_owned())
+        );
+
+        let list_form = serde_json::json!({
+            "chat_template": [{"name": "default", "template": "\u{feff}L\r\n{{ y }}"}]
+        });
+        std::fs::write(&path, format!("\u{feff}{list_form}")).unwrap();
+        assert_eq!(
+            load_chat_template_with_override(dir.path(), None).unwrap(),
+            "L\r\n{{ y }}"
+        );
+
+        // A template file next to it still gets both (BOM and CRLF), as before.
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "\u{feff}F\r\n{{ z }}",
+        )
+        .unwrap();
+        assert_eq!(
+            load_chat_template_with_override(dir.path(), None).unwrap(),
+            "F\n{{ z }}"
+        );
     }
 
     // ---- load_generation_defaults ----------------------------------------

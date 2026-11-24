@@ -259,7 +259,8 @@ impl OvVlmEngine {
     /// plus `tool_calls`/`tool_call_id`/`name` on any message that has them —
     /// see `handlers::chat::extract_vlm_messages`). Image-URL content parts
     /// are stripped to text before calling; pixel data is in `images`
-    /// (decoded by [`crate::image_util::decode_data_uri`]).
+    /// (header-checked by [`crate::image_util::check_data_uri`], decoded and downscaled by
+    /// [`crate::image_util::decode_pending_for_vlm`]).
     ///
     /// `tools` is the `OpenAI` `tools` array, when the request has any active
     /// (`None`/empty otherwise). Handed to `ChatHistory::set_tools()` on the

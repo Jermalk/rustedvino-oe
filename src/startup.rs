@@ -144,29 +144,54 @@ pub fn per_user_config_path(local_app_data: Option<&std::ffi::OsStr>) -> Option<
 /// Returns an error listing every path tried when none is found, or when
 /// `RUSTEDVINO_CONFIG` is set but points at a path that doesn't exist.
 pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("RUSTEDVINO_CONFIG") {
+    let exe_dir_config = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("config.json")));
+    resolve_config_path_from(
+        std::env::var("RUSTEDVINO_CONFIG").ok(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+        cfg!(windows),
+        exe_dir_config,
+        Path::exists,
+    )
+}
+
+/// [`resolve_config_path`] with its inputs passed in, so the search order is testable on any OS
+/// without touching the environment: `env_config` is `RUSTEDVINO_CONFIG` (`None` when unset or
+/// not UTF-8; set but empty is a path that does not exist), `local_app_data` is `LOCALAPPDATA`,
+/// `windows` turns step 3 on, `exe_dir_config` is `<exe-dir>/config.json` (`None` when the
+/// executable's path is unknown), and `exists` is the filesystem probe.
+///
+/// # Errors
+///
+/// As [`resolve_config_path`].
+pub fn resolve_config_path_from(
+    env_config: Option<String>,
+    local_app_data: Option<&std::ffi::OsStr>,
+    windows: bool,
+    exe_dir_config: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> anyhow::Result<PathBuf> {
+    if let Some(p) = env_config {
         let path = PathBuf::from(&p);
         anyhow::ensure!(
-            path.exists(),
+            exists(&path),
             "RUSTEDVINO_CONFIG={p:?} does not exist — check the path"
         );
         return Ok(path);
     }
     let default = Path::new(DEFAULT_CONFIG);
-    if default.exists() {
+    if exists(default) {
         return Ok(default.to_path_buf());
     }
-    if cfg!(windows)
-        && let Some(p) = per_user_config_path(std::env::var_os("LOCALAPPDATA").as_deref())
-        && p.exists()
+    if windows
+        && let Some(p) = per_user_config_path(local_app_data)
+        && exists(&p)
     {
         return Ok(p);
     }
-    let exe_dir_config = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("config.json")));
     if let Some(ref p) = exe_dir_config
-        && p.exists()
+        && exists(p)
     {
         return Ok(p.clone());
     }
@@ -208,6 +233,38 @@ pub fn push_startup_warning(code: &'static str, message: impl Into<String>) {
             message: message.into(),
         });
     }
+}
+
+/// C27 F5: drop the per-model startup warnings of `model_id` once it is Ready after all: its
+/// `restore_failed` (e.g. an operator's load won a race with the restore) and
+/// (m5) its `preload_skipped` (loaded later with `rv load`). F1a: also the server-wide
+/// `models_dir_missing` / `models_dir_empty`, since a model that loaded proves `models_dir` now
+/// holds a model directory (e.g. the operator created it and added a model after the boot).
+pub fn clear_restore_warning(model_id: &str) {
+    let restore = format!("'{model_id}' ");
+    let preload = format!("preload of '{model_id}' ");
+    if let Ok(mut w) = STARTUP_WARNINGS.lock() {
+        w.retain(|x| {
+            !(x.code == "restore_failed" && x.message.starts_with(&restore)
+                || x.code == "preload_skipped" && x.message.starts_with(&preload)
+                || x.code == WARN_MODELS_DIR_MISSING
+                || x.code == WARN_MODELS_DIR_EMPTY)
+        });
+    }
+}
+
+/// m1: what `/health` (unauthenticated) shows of the startup warnings — how many
+/// and their codes (distinct, in first-seen order), never their text (model names, sizes).
+#[must_use]
+pub fn startup_warning_codes() -> (usize, Vec<&'static str>) {
+    let w = startup_warnings();
+    let mut codes: Vec<&'static str> = Vec::new();
+    for x in &w {
+        if !codes.contains(&x.code) {
+            codes.push(x.code);
+        }
+    }
+    (w.len(), codes)
 }
 
 /// Every startup warning of this process, in order.
@@ -335,9 +392,266 @@ pub fn global_device_check(inventory: &DeviceInventory, config: &Config) -> Glob
     }
 }
 
+/// Startup-warning code: `models_dir` does not exist, is not a directory, or cannot be read (F1a,
+/// FM-5).
+pub const WARN_MODELS_DIR_MISSING: &str = "models_dir_missing";
+/// Startup-warning code: `models_dir` is a readable directory with no model directory in it
+/// (F1a, FM-5).
+pub const WARN_MODELS_DIR_EMPTY: &str = "models_dir_empty";
+
+/// F1a / FM-5: is `models_dir` a directory that holds at least one model directory? `None` when
+/// it is; otherwise the startup-warning code ([`WARN_MODELS_DIR_MISSING`] /
+/// [`WARN_MODELS_DIR_EMPTY`]) and its message, which names the absolute path checked.
+///
+/// The resolution rule is the server's, unchanged: a relative `models_dir` is used as is, so it
+/// resolves against the process working directory (`cwd`), not the config file's directory; the
+/// message says so, naming `cwd`, when `models_dir` is relative. A model directory is any
+/// subdirectory (a symlink to one counts) whose name does not start with `.`. Boot continues
+/// either way: the caller only warns.
+#[must_use]
+pub fn models_dir_check(models_dir: &Path, cwd: Option<&Path>) -> Option<(&'static str, String)> {
+    let relative = models_dir.is_relative();
+    let abs = match cwd {
+        Some(cwd) if relative => cwd.join(models_dir),
+        _ => models_dir.to_path_buf(),
+    };
+    let rel_note = match cwd {
+        Some(cwd) if relative => format!(
+            " (a relative models_dir resolves against the server's working directory {}, not \
+             the config file's directory)",
+            cwd.display()
+        ),
+        None if relative => " (a relative models_dir resolves against the server's working \
+                              directory, not the config file's directory)"
+            .to_owned(),
+        _ => String::new(),
+    };
+    let consequence = "no model can be served from it until this is fixed";
+    let missing = |what: String| {
+        Some((
+            WARN_MODELS_DIR_MISSING,
+            format!(
+                "models_dir {} {what}{rel_note}; {consequence}",
+                abs.display()
+            ),
+        ))
+    };
+    match std::fs::metadata(&abs) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return missing("does not exist".to_owned());
+        }
+        Err(e) => return missing(format!("cannot be read ({e})")),
+        Ok(m) if !m.is_dir() => return missing("is not a directory".to_owned()),
+        Ok(_) => {}
+    }
+    let entries = match std::fs::read_dir(&abs) {
+        Ok(entries) => entries,
+        Err(e) => return missing(format!("cannot be read ({e})")),
+    };
+    let has_model_dir = entries.filter_map(Result::ok).any(|entry| {
+        !entry.file_name().to_string_lossy().starts_with('.') && entry.path().is_dir()
+    });
+    if has_model_dir {
+        return None;
+    }
+    Some((
+        WARN_MODELS_DIR_EMPTY,
+        format!(
+            "models_dir {} holds no model directory (each model is a subdirectory named after its \
+             id){rel_note}; {consequence}",
+            abs.display()
+        ),
+    ))
+}
+
 /// Env var naming the supervisor's per-spawn progress file (first-GPU-load deadline, see
 /// `SupervisorConfig::gpu_first_load_deadline_secs`).
+///
+/// The worker appends whole lines (internal format, not user-facing; the supervisor ignores a
+/// torn last line and any line it does not know):
+/// - `gpu_load_started <secs>` / `gpu_load_done` — [`note_gpu_load`];
+/// - `preload_started <secs>` / `preload_done` — [`note_preload`];
+/// - `preload_phase_started` / `preload_phase_done` — [`note_preload`] (the whole preload phase;
+///   a crash between the two is a crash during the preload);
+/// - `stop_budget <secs>` — [`note_stop_budget`];
+/// - `model_ready <id>` / `model_unloaded <id>` / `restore_started <id>` / `preload_model <id>` /
+///   `load_started <id>` / `load_ended <id>` — [`note_model`] (C27: which models to restore after a
+///   crash; `<id>` is the rest of the line).
 pub const PROGRESS_FILE_ENV: &str = "RUSTEDVINO_PROGRESS_FILE";
+
+/// Env var with the models a respawned worker restores (C27): a JSON array of model ids, set
+/// by the supervisor from the crashed worker's `model_ready` / `model_unloaded` lines (see
+/// `supervisor::plan_restore`): the crashed worker's set, `preload` models included. Internal,
+/// not user-facing.
+///
+/// Present (even as `[]`) = this worker targets that set: its preload phase loads only the
+/// `preload` models in it, the rest are restored after listening. Absent = a fresh start, the
+/// full `preload`: on a first spawn (the supervisor removes any inherited value, so a new
+/// supervisor restores nothing) and after a crash during a fresh worker's own preload or before
+/// it had any model Ready.
+pub const RESTORE_MODELS_ENV: &str = "RUSTEDVINO_RESTORE_MODELS";
+
+/// A model event for the supervisor's progress file (C27 respawn restore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelNote<'a> {
+    /// The model became Ready (written for an `Eager` model and for a `preload` model: the
+    /// kinds a respawn brings back).
+    Ready(&'a str),
+    /// The model left Ready (any eviction, deregister included).
+    Unloaded(&'a str),
+    /// A respawned worker starts restoring the model.
+    RestoreStarted(&'a str),
+    /// The preload phase starts loading the model (a fresh start's full `preload`, or a
+    /// respawn's `preload` models that were Ready at the crash).
+    PreloadModel(&'a str),
+    /// A load of the model begins (also a resize's or a KV-wedge recovery's evict + reload):
+    /// a model unloaded before the matching [`ModelNote::LoadEnded`] may be this load's victim,
+    /// kept in the restore set unless the load reaches Ready (M1).
+    LoadStarted(&'a str),
+    /// That load returned (Ready or not).
+    LoadEnded(&'a str),
+}
+
+/// A load window for the supervisor ([`ModelNote::LoadStarted`] now, [`ModelNote::LoadEnded`]
+/// when dropped — on every return path, a cancelled future included).
+#[must_use = "the window closes when the guard is dropped"]
+pub struct LoadWindow(String);
+
+impl LoadWindow {
+    /// Open the window of a load of `model_id`.
+    pub fn open(model_id: &str) -> Self {
+        note_model(ModelNote::LoadStarted(model_id));
+        Self(model_id.to_owned())
+    }
+}
+
+impl Drop for LoadWindow {
+    fn drop(&mut self) {
+        note_model(ModelNote::LoadEnded(&self.0));
+    }
+}
+
+/// The progress-file line for `note` (with its `\n`), or `None` for an id containing a line
+/// break (it would split the line; such a model is simply not restored).
+fn model_note_line(note: ModelNote<'_>) -> Option<String> {
+    let (kind, id) = match note {
+        ModelNote::Ready(id) => ("model_ready", id),
+        ModelNote::Unloaded(id) => ("model_unloaded", id),
+        ModelNote::RestoreStarted(id) => ("restore_started", id),
+        ModelNote::PreloadModel(id) => ("preload_model", id),
+        ModelNote::LoadStarted(id) => ("load_started", id),
+        ModelNote::LoadEnded(id) => ("load_ended", id),
+    };
+    (!id.contains(['\n', '\r'])).then(|| format!("{kind} {id}\n"))
+}
+
+/// Every model note this test process wrote, supervised or not — lets a unit test see which
+/// notes a `ModelManager` operation produced (filter by model id: tests run in parallel).
+#[cfg(test)]
+pub(crate) static TEST_MODEL_NOTES: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a model event in the supervisor's progress file (best-effort; no-op when not
+/// supervised). One whole line per write; see [`model_note_line`] for what is not written.
+///
+/// Opening the file per note, with no lock between writers, is fine (as for [`note_gpu_load`] and
+/// [`note_preload`]): each note is one `O_APPEND` write of one short line, which the kernel
+/// appends whole, and the notes are rare (a load or an eviction each).
+pub fn note_model(note: ModelNote<'_>) {
+    use std::io::Write as _;
+    let Some(line) = model_note_line(note) else {
+        return;
+    };
+    #[cfg(test)]
+    if let Ok(mut notes) = TEST_MODEL_NOTES.lock() {
+        notes.push(line.clone());
+    }
+    let Some(path) = std::env::var_os(PROGRESS_FILE_ENV) else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// The crashed worker's set this respawned worker targets ([`RESTORE_MODELS_ENV`]); `None` (a
+/// fresh start: the full `preload`) when unset, when this worker is not supervised
+/// ([`SUPERVISED_ENV`] unset: the list is the supervisor's, a stray value in a plain start's
+/// environment is ignored) and when the value is not a JSON array of strings. Read once at
+/// startup: the preload phase and the restore after listening use the same value.
+#[must_use]
+pub fn restore_models_from_env() -> Option<Vec<String>> {
+    parse_restore_models(
+        std::env::var_os(SUPERVISED_ENV).is_some(),
+        std::env::var(RESTORE_MODELS_ENV).ok().as_deref(),
+    )
+}
+
+/// [`restore_models_from_env`], read once per process (so its warnings log once): the boot
+/// preload and the restore after listening use the same value.
+fn respawn_set() -> Option<Vec<String>> {
+    static SET: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(set) = TEST_RESPAWN_SET.with(std::cell::RefCell::take) {
+        return set;
+    }
+    SET.get_or_init(restore_models_from_env).clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Plays [`RESTORE_MODELS_ENV`] for the next [`respawn_set`] call on this thread (taken).
+    #[allow(clippy::option_option)] // outer: set or not; inner: the respawn set itself
+    static TEST_RESPAWN_SET: std::cell::RefCell<Option<Option<Vec<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Build the boot [`ModelManager`] with the crashed worker's set a supervised respawn targets
+/// ([`respawn_set`]; `None` = a fresh start, the full `preload`).
+fn boot_model_manager(
+    config: Config,
+    inventory: Arc<DeviceInventory>,
+) -> impl std::future::Future<Output = anyhow::Result<ModelManager>> {
+    // A respawn's preload phase loads only the `preload` models in the set.
+    let respawn = respawn_set();
+    if let Some(set) = &respawn {
+        tracing::info!(
+            models = ?set,
+            "respawn: bringing back the crashed worker's set (preload models in it load now, \
+             the rest after listening; preload models not in it are skipped)"
+        );
+    }
+    ModelManager::new_production(config, inventory, respawn)
+}
+
+/// [`restore_models_from_env`] on given values. A value that is not a JSON array of strings is
+/// logged and ignored.
+fn parse_restore_models(supervised: bool, raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    if !supervised {
+        tracing::warn!(
+            env = RESTORE_MODELS_ENV,
+            "respawn restore list set but this worker is not supervised — ignored"
+        );
+        return None;
+    }
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            tracing::warn!(
+                env = RESTORE_MODELS_ENV,
+                error = %e,
+                "respawn restore list is not a JSON array of model ids — restoring nothing, \
+                 full preload"
+            );
+            None
+        }
+    }
+}
 
 /// A milestone of this worker's first GPU model load, for the supervisor's deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +671,10 @@ pub enum PreloadNote {
     Started(u64),
     /// That load ended — committed, failed or timed out alike.
     Done,
+    /// The preload phase begins (before its first model, also for an empty `preload`).
+    PhaseStarted,
+    /// The preload phase ended (every model attempted or skipped, or a stop cut it short).
+    PhaseDone,
 }
 
 /// Record a preload milestone in the supervisor's progress file (every call, unlike
@@ -370,6 +688,8 @@ pub fn note_preload(note: PreloadNote) {
     let line = match note {
         PreloadNote::Started(secs) => format!("preload_started {secs}\n"),
         PreloadNote::Done => "preload_done\n".to_owned(),
+        PreloadNote::PhaseStarted => "preload_phase_started\n".to_owned(),
+        PreloadNote::PhaseDone => "preload_phase_done\n".to_owned(),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -863,6 +1183,13 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Resolves once [`shutdown_requested`] holds (at once if it already does). Installs no signal
+/// handler: a request waiting for an on-demand load (F1b) uses it to stop waiting when the server
+/// starts to drain.
+pub async fn stop_requested() {
+    wait_for_flag(&SHUTDOWN_REQUEST, &SHUTDOWN_REQUESTED).await;
+}
+
 /// Records that the server is accepting requests ([`serve`] calls it once the
 /// listener is bound). Before this, a GPU poisoning does not stop the process
 /// (see [`on_gpu_poisoned`]).
@@ -1185,6 +1512,14 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     }
     let _ = PLATFORM_INFO.set(platform);
 
+    // F1a / FM-5: a missing or empty `models_dir` used to boot a healthy server whose every
+    // model request 404s. Warn (WARN log + startup warning) and boot on.
+    let cwd = std::env::current_dir().ok();
+    if let Some((code, msg)) = models_dir_check(&config.models_dir, cwd.as_deref()) {
+        tracing::warn!(code, models_dir = %config.models_dir.display(), "{msg}");
+        push_startup_warning(code, msg);
+    }
+
     // ── Start the model manager (preloads models) ───────────────────────
     // `ModelManager::new()` calls `tokio::task::spawn_blocking` internally
     // for each preload model — the async runtime is not stalled.
@@ -1210,7 +1545,6 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     let (loaded_keys, admin_locked) = load_keys_file_for_boot(&keys_path)?;
     let api_keys = loaded_keys.api_keys.clone();
     let admin_api_keys = loaded_keys.admin_api_keys.clone();
-    let has_keys = !api_keys.is_empty() || !admin_api_keys.is_empty();
 
     // Built before the model manager and shared with it below (same pattern
     // as `voice_pin` just below), so `POST /v1/admin/keys/reload` can
@@ -1231,11 +1565,15 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
 
     // T4.2: resolve the bind address, then enforce the public-bind-requires-
     // auth gate BEFORE any model load — no point spending minutes of GPU JIT
-    // to then abort. `has_keys` comes from the keys file loaded just above,
-    // not from `Config` (see `Config::enforce_open_bind_gate`'s doc comment
-    // for why the gate split in two).
+    // to then abort. The key presence comes from the keys file loaded just
+    // above, not from `Config` (see `Config::enforce_open_bind_gate`'s doc
+    // comment for why the gate split in two). Only `api_keys` close inference
+    // (0.9.1 S3); a refusal is a config error no restart can fix (exit 78).
     let addr = config.validated_bind()?;
-    config.enforce_open_bind_gate(addr, has_keys)?;
+    config
+        .enforce_open_bind_gate(addr, !api_keys.is_empty(), !admin_api_keys.is_empty())
+        .map_err(|e| config_fatal(&e))?;
+    let public_open_inference = !addr.ip().is_loopback() && api_keys.is_empty();
     let socket = reserve_port(addr)
         .map_err(|e| anyhow::anyhow!("cannot bind {addr} (is another server running?): {e}"))?;
 
@@ -1263,7 +1601,7 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
     // tears down before returning an error.
     mark_engines_started();
     let preload_len = config.preload.len();
-    let mut construct = Box::pin(ModelManager::new_production(config, Arc::clone(&inventory)));
+    let mut construct = Box::pin(boot_model_manager(config, Arc::clone(&inventory)));
     let constructed = tokio::select! {
         r = &mut construct => r?,
         () = shutdown_signal() => {
@@ -1343,6 +1681,16 @@ pub async fn bootstrap(log_buffer: LogRingBuffer) -> anyhow::Result<Startup> {
         );
     }
     tracing::info!(?cors_origins, "CORS policy");
+    if public_open_inference {
+        // Reached only with `allow_insecure_public_bind: true` (the gate above refuses
+        // otherwise): say it at WARN, not as a line in the INFO auth summary (0.9.1 S3).
+        tracing::warn!(
+            bind = %addr,
+            admin_keys = admin_api_keys.len(),
+            "inference is open to the network: no api_keys on a non-loopback bind \
+             (allow_insecure_public_bind is set)"
+        );
+    }
     tracing::info!(
         auth = if api_keys.is_empty() {
             "open"
@@ -1474,7 +1822,9 @@ async fn shutdown_signal() {
 async fn teardown_engines(model_manager: &ModelManager) {
     // `shutdown()` commits a stalled load that has returned and then evicts it; count it too
     // (D-04 S6 review: a late result arriving after a stop-wait give-up). Not on a poisoned
-    // context: `shutdown()` skips it there, and committing could run a KV warm-up on it.
+    // context: `shutdown()` evicts nothing there, so a commit would serve no purpose. (The commit
+    // itself makes no engine call and drops no engine, so the request-time reaps are safe on a
+    // poisoned context too: F1b N-3, see `reap_stalled_loads`.)
     if !model_manager.is_gpu_poisoned() {
         model_manager.reap_stalled_loads();
     }
@@ -1523,12 +1873,35 @@ pub fn teardown_incomplete() -> bool {
     TEARDOWN_INCOMPLETE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// The post-drain realtime step of [`serve`] (0.9.1 C5). The HTTP drain does not
+/// wait for upgraded WebSocket connections, so the realtime sessions (told to
+/// stop at the signal; again here for the server-error path, where no signal
+/// fired) get a bounded moment —
+/// [`REALTIME_STOP_WAIT`](crate::realtime_types::REALTIME_STOP_WAIT) — to send
+/// their 1001 `server_stopping` close and finish the handshake before the
+/// engines go and the process exits. Returns `false` if sessions were still
+/// open when the wait ran out. Returns at once when no session is open.
+pub async fn close_realtime_sessions(
+    realtime_sessions: &crate::realtime_types::RealtimeSessionRegistry,
+) -> bool {
+    crate::realtime_types::stop_realtime_sessions(realtime_sessions);
+    crate::realtime_types::wait_realtime_sessions_closed(
+        realtime_sessions,
+        crate::realtime_types::REALTIME_STOP_WAIT,
+    )
+    .await
+}
+
 /// Serves `app` on `socket` (bound by [`reserve_port`] in [`bootstrap`]) with graceful shutdown
 /// (T6.1): stop accepting new
 /// connections on SIGTERM/ctrl-C, give in-flight requests up to
 /// [`DRAIN_DEADLINE`] to finish naturally, then tear down the engines — which
 /// terminates any remaining stream with a clean SSE error + `[DONE]` (T1.3),
 /// joins the engine threads, and frees VRAM via `Drop` before returning.
+///
+/// When the signal arrives, every live `/v1/realtime` session in
+/// `realtime_sessions` is told to close with 1001 `server_stopping` (0.9.1 C5):
+/// the HTTP drain does not track upgraded WebSocket connections.
 ///
 /// # Errors
 ///
@@ -1539,7 +1912,8 @@ pub async fn serve(
     app: axum::Router,
     addr: SocketAddr,
     socket: tokio::net::TcpSocket,
-    model_manager: &ModelManager,
+    model_manager: &Arc<ModelManager>,
+    realtime_sessions: crate::realtime_types::RealtimeSessionRegistry,
 ) -> anyhow::Result<()> {
     // Same backlog as `TcpListener::bind`. A failure here comes after preload (see
     // `reserve_port`'s limitation): tear the engines down before returning, never into the
@@ -1556,10 +1930,24 @@ pub async fn serve(
     #[cfg(feature = "fault-injection")]
     crate::fault_injection::log_arming();
     mark_serving();
+    // C27: after a crash respawn, bring back the models the crashed worker had loaded at
+    // runtime — once listening, one at a time, in the background, never evicting (its `preload`
+    // models were handled by the preload phase).
+    let restore = model_manager
+        .respawn_set()
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
+    if !restore.is_empty() {
+        let mm = Arc::clone(model_manager);
+        tokio::spawn(async move {
+            mm.restore_after_respawn(&restore).await;
+        });
+    }
 
     // The oneshot tells the select below *when* the signal fired so the drain
     // deadline starts then, not at process start.
     let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let stop_sessions = std::sync::Arc::clone(&realtime_sessions);
     // CRASH COURSE — `into_future()`: axum's `WithGracefulShutdown` is not
     // itself a `Future`, only `IntoFuture` (a builder that *yields* one). A
     // bare `.await` converts implicitly, but `select!` must poll it by
@@ -1568,6 +1956,7 @@ pub async fn serve(
         axum::serve(listener, app).with_graceful_shutdown(async move {
             shutdown_signal().await;
             tracing::info!("shutdown signal received — draining in-flight requests");
+            crate::realtime_types::stop_realtime_sessions(&stop_sessions);
             let _ = sig_tx.send(());
         }),
     );
@@ -1612,6 +2001,9 @@ pub async fn serve(
         }
     }
 
+    // 0.9.1 C5: the drain above does not wait for upgraded WebSocket connections.
+    close_realtime_sessions(&realtime_sessions).await;
+
     // Idempotent on the deadline path (everything is already evicted); on the
     // normal path this is where engines drop and VRAM is released.
     // The outcome line ("shutdown complete …" or the in-flight warning) is logged by
@@ -1640,6 +2032,204 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// F1a / FM-5: a missing `models_dir`, a file in its place, and a directory with no model
+    /// directory each give their warning code and name the absolute path; a directory holding a
+    /// model directory gives none. Files and dot-directories are not model directories.
+    #[test]
+    fn models_dir_check_missing_empty_and_healthy() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("nope");
+        let (code, msg) = models_dir_check(&gone, None).unwrap();
+        assert_eq!(code, WARN_MODELS_DIR_MISSING);
+        assert!(msg.contains(&gone.display().to_string()), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(!msg.contains("relative"), "absolute path: no note: {msg}");
+
+        let file = root.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let (code, msg) = models_dir_check(&file, None).unwrap();
+        assert_eq!(code, WARN_MODELS_DIR_MISSING);
+        assert!(msg.contains("is not a directory"), "{msg}");
+
+        let models = root.path().join("models");
+        std::fs::create_dir_all(models.join(".cache")).unwrap();
+        std::fs::write(models.join("README.txt"), b"x").unwrap();
+        let (code, msg) = models_dir_check(&models, None).unwrap();
+        assert_eq!(code, WARN_MODELS_DIR_EMPTY);
+        assert!(msg.contains(&models.display().to_string()), "{msg}");
+        assert!(msg.contains("holds no model directory"), "{msg}");
+
+        std::fs::create_dir_all(models.join("qwen3-8b-int4-ov")).unwrap();
+        assert_eq!(models_dir_check(&models, None), None, "healthy");
+    }
+
+    /// F1a: the `models_dir_*` warnings are dropped once any model reaches Ready (the call every
+    /// Ready transition makes), so `/health` and `rv status` stop reporting a fixed directory.
+    #[test]
+    fn a_model_reaching_ready_clears_the_models_dir_warnings() {
+        push_startup_warning(WARN_MODELS_DIR_MISSING, "models_dir /x does not exist");
+        push_startup_warning(
+            WARN_MODELS_DIR_EMPTY,
+            "models_dir /y holds no model directory",
+        );
+        clear_restore_warning("f1a-any-model");
+        assert!(
+            !startup_warnings()
+                .iter()
+                .any(|w| w.code == WARN_MODELS_DIR_MISSING || w.code == WARN_MODELS_DIR_EMPTY)
+        );
+    }
+
+    /// F1a / FM-5: a relative `models_dir` is checked against the working directory (the
+    /// server's rule, unchanged) and the message says so, naming that directory and the
+    /// absolute path tried.
+    #[test]
+    fn models_dir_check_relative_names_the_working_directory() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (code, msg) = models_dir_check(Path::new("models"), Some(cwd.path())).unwrap();
+        assert_eq!(code, WARN_MODELS_DIR_MISSING);
+        let abs = cwd.path().join("models");
+        assert!(msg.contains(&abs.display().to_string()), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "resolves against the server's working directory {}",
+                cwd.path().display()
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("not the config file's directory"), "{msg}");
+
+        std::fs::create_dir_all(abs.join("m")).unwrap();
+        assert_eq!(
+            models_dir_check(Path::new("models"), Some(cwd.path())),
+            None,
+            "resolved against cwd, found"
+        );
+    }
+
+    /// C27: the progress-file line formats; an id with a line break is not written.
+    #[test]
+    fn model_note_lines() {
+        assert_eq!(
+            model_note_line(ModelNote::Ready("m")).as_deref(),
+            Some("model_ready m\n")
+        );
+        assert_eq!(
+            model_note_line(ModelNote::Unloaded("m")).as_deref(),
+            Some("model_unloaded m\n")
+        );
+        assert_eq!(
+            model_note_line(ModelNote::RestoreStarted("a b")).as_deref(),
+            Some("restore_started a b\n")
+        );
+        assert_eq!(
+            model_note_line(ModelNote::PreloadModel("p")).as_deref(),
+            Some("preload_model p\n")
+        );
+        assert_eq!(
+            model_note_line(ModelNote::LoadStarted("l")).as_deref(),
+            Some("load_started l\n")
+        );
+        assert_eq!(
+            model_note_line(ModelNote::LoadEnded("l")).as_deref(),
+            Some("load_ended l\n")
+        );
+        assert_eq!(model_note_line(ModelNote::Ready("a\nb")), None);
+    }
+
+    /// m6: the boot path hands [`respawn_set`] to the model manager (and `serve`
+    /// restores from the manager's copy). A config with no models: nothing loads.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn the_boot_model_manager_gets_the_respawn_set() {
+        let config = || -> Config {
+            serde_json::from_str(r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":0.0}"#)
+                .unwrap()
+        };
+        TEST_RESPAWN_SET.with(|c| c.replace(Some(Some(vec!["a".to_owned()]))));
+        let mm = boot_model_manager(config(), Arc::new(DeviceInventory::default()))
+            .await
+            .unwrap();
+        assert_eq!(mm.respawn_set(), Some(&["a".to_owned()][..]));
+        TEST_RESPAWN_SET.with(|c| c.replace(Some(None)));
+        let mm = boot_model_manager(config(), Arc::new(DeviceInventory::default()))
+            .await
+            .unwrap();
+        assert_eq!(mm.respawn_set(), None);
+    }
+
+    /// m1: the `/health` summary is the count and the distinct codes, no text.
+    #[test]
+    fn startup_warning_codes_count_and_dedupe() {
+        push_startup_warning("m1_test_code", "first 'secret-model' 4.0 GB");
+        push_startup_warning("m1_test_code", "second");
+        let (count, codes) = startup_warning_codes();
+        assert!(count >= 2);
+        assert_eq!(codes.iter().filter(|c| **c == "m1_test_code").count(), 1);
+    }
+
+    /// C27 F7: the restore list counts only in a supervised worker; a malformed one is ignored.
+    /// Unset, unsupervised and malformed all mean a fresh start (`None`: the full `preload`),
+    /// never an empty set (`Some([])`: no preload) — a stray `[]` must not switch preload off.
+    #[test]
+    fn the_restore_list_is_honoured_only_when_supervised() {
+        assert_eq!(
+            parse_restore_models(true, Some(r#"["a","b"]"#)),
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(parse_restore_models(true, Some("[]")), Some(Vec::new()));
+        assert_eq!(parse_restore_models(false, Some(r#"["a","b"]"#)), None);
+        assert_eq!(parse_restore_models(false, Some("[]")), None);
+        assert_eq!(parse_restore_models(true, None), None);
+        assert_eq!(parse_restore_models(true, Some("a,b")), None);
+    }
+
+    /// m5: `preload_skipped` of a model is cleared with it, and only that model's.
+    #[test]
+    fn clearing_a_model_drops_its_preload_skipped_warning() {
+        push_startup_warning("preload_skipped", "preload of 'm5-x' skipped: no room");
+        push_startup_warning("preload_skipped", "preload of 'm5-xy' skipped: no room");
+        clear_restore_warning("m5-x");
+        let w = startup_warnings();
+        assert!(
+            !w.iter()
+                .any(|x| x.code == "preload_skipped" && x.message.starts_with("preload of 'm5-x' "))
+        );
+        assert!(
+            w.iter().any(
+                |x| x.code == "preload_skipped" && x.message.starts_with("preload of 'm5-xy' ")
+            )
+        );
+    }
+
+    /// C27 F5: reaching Ready clears that model's `restore_failed` warning, and only that one.
+    #[test]
+    fn a_restore_warning_is_cleared_for_its_model_only() {
+        push_startup_warning(
+            "restore_failed",
+            "'f5-x' was loaded before the worker crashed: e",
+        );
+        push_startup_warning(
+            "restore_failed",
+            "'f5-xy' was loaded before the worker crashed: e",
+        );
+        push_startup_warning("preload_failed", "'f5-x' preload failed");
+        clear_restore_warning("f5-x");
+        let w = startup_warnings();
+        assert!(
+            !w.iter()
+                .any(|w| w.code == "restore_failed" && w.message.starts_with("'f5-x' "))
+        );
+        assert!(
+            w.iter()
+                .any(|w| w.code == "restore_failed" && w.message.starts_with("'f5-xy' "))
+        );
+        assert!(
+            w.iter()
+                .any(|w| w.code == "preload_failed" && w.message.starts_with("'f5-x' "))
+        );
+    }
 
     fn minimal_config(extra: &str) -> Config {
         let json =
@@ -1945,6 +2535,54 @@ mod tests {
         assert!(p.starts_with("base"));
         assert_eq!(per_user_config_path(None), None);
         assert_eq!(per_user_config_path(Some(std::ffi::OsStr::new(""))), None);
+    }
+
+    /// Test gap (firmness review): the four-level config search order. Each level wins over the
+    /// ones below it when its file exists; the environment variable wins even over an existing
+    /// default and is an error when it names a missing file; LOCALAPPDATA is consulted only on
+    /// Windows; with nothing found the error lists every place tried.
+    #[test]
+    fn resolve_config_path_search_order() {
+        use std::collections::HashSet;
+        let lad = std::ffi::OsStr::new("lad");
+        let per_user = per_user_config_path(Some(lad)).unwrap();
+        let exe = PathBuf::from("/bundle/config.json");
+        let env = "/home/u/rv/config.json".to_owned();
+        let resolve = |env: Option<String>, windows: bool, present: &[&Path]| {
+            let present: HashSet<PathBuf> = present.iter().map(|p| p.to_path_buf()).collect();
+            resolve_config_path_from(env, Some(lad), windows, Some(exe.clone()), |p| {
+                present.contains(p)
+            })
+        };
+        let default = Path::new(DEFAULT_CONFIG);
+        let all: [&Path; 4] = [Path::new(&env), default, &per_user, &exe];
+
+        // 1. RUSTEDVINO_CONFIG wins over everything that exists.
+        assert_eq!(
+            resolve(Some(env.clone()), true, &all).unwrap(),
+            Path::new(&env)
+        );
+        // ... and is an error, not a fall-through, when it names a missing file (also empty).
+        let err = resolve(Some("/nope.json".to_owned()), true, &all[1..]).unwrap_err();
+        assert!(err.to_string().contains("RUSTEDVINO_CONFIG"), "{err}");
+        assert!(resolve(Some(String::new()), true, &all[1..]).is_err());
+        // 2. The compiled-in default beats the per-user and exe-dir files.
+        assert_eq!(resolve(None, true, &all[1..]).unwrap(), default);
+        // 3. LOCALAPPDATA beats the exe dir, on Windows only.
+        assert_eq!(resolve(None, true, &all[2..]).unwrap(), per_user);
+        assert_eq!(resolve(None, false, &all[2..]).unwrap(), exe);
+        // 4. The exe dir last.
+        assert_eq!(resolve(None, true, &all[3..]).unwrap(), exe);
+        // Nothing: the error names every place tried, the exe-dir one by its real path.
+        let err = resolve(None, true, &[]).unwrap_err().to_string();
+        for want in [
+            "RUSTEDVINO_CONFIG",
+            DEFAULT_CONFIG,
+            "LOCALAPPDATA",
+            "/bundle/config.json",
+        ] {
+            assert!(err.contains(want), "{want}: {err}");
+        }
     }
 
     /// The probe passes on a writable directory (creating it), leaves nothing

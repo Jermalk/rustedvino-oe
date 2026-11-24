@@ -51,6 +51,37 @@ pub fn supports_language(code: &str) -> bool {
     ["en", "pl", "vi"].iter().any(|l| lowered.starts_with(l))
 }
 
+/// Map every Unicode space separator other than U+0020 to a plain space, one character for one
+/// (0.9.1 C6). Runs in front of every TTS backend, before the `SpeechT5` splitter and the
+/// number normaliser, on `/v1/audio/speech` (also with `normalize: false` and for languages
+/// without number words) and on the realtime path. LLMs emit these as typography: gpt-oss
+/// writes "328\u{202f}feet". The set is the Unicode `Zs` category: U+00A0 (no-break space),
+/// U+1680 (ogham space mark), U+2000..=U+200A (en/em quads and spaces, U+2007 figure space,
+/// U+2009 thin space), U+202F (narrow no-break space), U+205F (medium mathematical space) and
+/// U+3000 (ideographic space). Not mapped: U+2028/U+2029 (line and paragraph separators, which
+/// are breaks rather than spaces) and the zero-width characters (U+200B, U+2060, U+FEFF), which
+/// are not spaces at all and would split a word if mapped.
+#[must_use]
+pub fn plain_spaces(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(is_odd_space) {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .map(|c| if is_odd_space(c) { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// A Unicode space separator (`Zs`) other than U+0020; see [`plain_spaces`].
+fn is_odd_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
 /// Normalize `text` for speech synthesis: symbol substitution and digit
 /// expansion, language-aware. `lang` is the client-supplied language code
 /// (e.g. `"en"`, `"pl-PL"`); only the first two lowercased characters are
@@ -785,6 +816,41 @@ fn pl_year_at(chars: &[char], start: usize, end: usize) -> Option<(String, usize
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    // ── 0.9.1 C6: Unicode spaces ───────────────────────────────────────────
+
+    #[test]
+    fn plain_spaces_maps_every_space_separator_one_for_one() {
+        let odd = [
+            '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{202f}',
+            '\u{205f}', '\u{3000}',
+        ];
+        for c in odd {
+            let text = format!("328{c}feet");
+            assert_eq!(plain_spaces(&text), "328 feet", "U+{:04X}", u32::from(c));
+        }
+        // Breaks and zero-width characters are not spaces: left alone.
+        for c in [
+            '\u{2028}', '\u{2029}', '\u{200b}', '\u{2060}', '\u{feff}', '\n', '\t',
+        ] {
+            let text = format!("a{c}b");
+            assert_eq!(plain_spaces(&text), text, "U+{:04X}", u32::from(c));
+        }
+        assert!(matches!(
+            plain_spaces("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The gpt-oss sample: mapped, then the digits are spelled out.
+    #[test]
+    fn a_narrow_no_break_space_before_a_unit_reads_as_a_space() {
+        assert_eq!(
+            normalize_for_speech(&plain_spaces("328\u{202f}feet"), Some("en")),
+            "three hundred twenty eight feet"
+        );
+    }
 
     // ── English cardinals ──────────────────────────────────────────────────
 

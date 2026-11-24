@@ -199,7 +199,9 @@ def _model_ids(target, api_key):
     req = urllib.request.Request(f"{target}/v1/models", headers=_auth_headers(api_key))
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return [m["id"] for m in json.loads(resp.read()).get("data", [])]
+            # Since 0.9.1 the list also carries `on_demand` models that are not
+            # loaded yet (with a "state"); only loaded ones (no "state") count.
+            return [m["id"] for m in json.loads(resp.read()).get("data", []) if "state" not in m]
     except urllib.error.HTTPError as e:
         log(f"{target}/v1/models rejected the request (HTTP {e.code}): {_error_detail(e)}")
         if e.code in (401, 403):
@@ -212,10 +214,12 @@ def _model_ids(target, api_key):
 
 def _stt_models(target, api_key, verbose):
     """Which models on `target` answer /v1/audio/transcriptions. Probed with
-    0.1 s of silence. /v1/models lists only loaded models, and the server
-    rejects a loaded model of another kind straight away, so the probe is
-    cheap and never loads anything. The flip side: an `on_demand` model that
-    isn't loaded yet isn't found — name it with --model."""
+    0.1 s of silence. Only loaded models are probed (a /v1/models entry with
+    no "state"; since 0.9.1 the list also shows `on_demand` models that are
+    not loaded, with a "state", and probing one would start its load), and
+    the server rejects a loaded model of another kind straight away, so the
+    probe is cheap and never loads anything. The flip side: an `on_demand`
+    model that isn't loaded yet isn't probed — name it with --model."""
     ids = _model_ids(target, api_key)
     silence = bytes(SAMPLE_RATE // 10 * 2)
     if verbose:

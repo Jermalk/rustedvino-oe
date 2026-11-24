@@ -116,6 +116,7 @@ impl Api {
         path: &str,
         timeout: Duration,
         body: Option<&Value>,
+        accept_json: bool,
     ) -> Reply {
         let mut req = self
             .client
@@ -123,6 +124,9 @@ impl Api {
             .timeout(timeout);
         if let Some(b) = body {
             req = req.json(b);
+        }
+        if accept_json {
+            req = req.header(reqwest::header::ACCEPT, "application/json");
         }
         if let Some(k) = &self.admin_key {
             req = req.bearer_auth(k);
@@ -169,25 +173,45 @@ impl Api {
     /// `GET path` with the read timeout.
     #[must_use]
     pub fn get(&self, path: &str) -> Reply {
-        self.request(reqwest::Method::GET, path, READ_TIMEOUT, None)
+        self.request(reqwest::Method::GET, path, READ_TIMEOUT, None, false)
     }
 
     /// `DELETE path` with the mutate timeout.
     #[must_use]
     pub fn delete(&self, path: &str) -> Reply {
-        self.request(reqwest::Method::DELETE, path, MUTATE_TIMEOUT, None)
+        self.request(reqwest::Method::DELETE, path, MUTATE_TIMEOUT, None, false)
+    }
+
+    /// [`delete`](Self::delete) with `Accept: application/json`: a 0.9.1+ server answers an
+    /// unload or deregister with its outcome JSON, an older one with its plain text.
+    #[must_use]
+    pub fn delete_accept_json(&self, path: &str) -> Reply {
+        self.request(reqwest::Method::DELETE, path, MUTATE_TIMEOUT, None, true)
     }
 
     /// `PATCH path` with a JSON body and the mutate timeout.
     #[must_use]
     pub fn patch(&self, path: &str, body: &Value) -> Reply {
-        self.request(reqwest::Method::PATCH, path, MUTATE_TIMEOUT, Some(body))
+        self.request(
+            reqwest::Method::PATCH,
+            path,
+            MUTATE_TIMEOUT,
+            Some(body),
+            false,
+        )
     }
 
     /// `POST path` with an optional JSON body and an explicit timeout.
     #[must_use]
     pub fn post(&self, path: &str, body: Option<&Value>, timeout: Duration) -> Reply {
-        self.request(reqwest::Method::POST, path, timeout, body)
+        self.request(reqwest::Method::POST, path, timeout, body, false)
+    }
+
+    /// [`post`](Self::post) with `Accept: application/json` (a load or resize outcome, as
+    /// [`delete_accept_json`](Self::delete_accept_json)).
+    #[must_use]
+    pub fn post_accept_json(&self, path: &str, body: Option<&Value>, timeout: Duration) -> Reply {
+        self.request(reqwest::Method::POST, path, timeout, body, true)
     }
 }
 

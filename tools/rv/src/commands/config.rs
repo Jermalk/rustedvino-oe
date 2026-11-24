@@ -4,9 +4,12 @@
 use serde_json::{Map, Value, json};
 
 use crate::api::{READ_TIMEOUT, Reply, encode_segment};
-use crate::commands::print_error;
 use crate::commands::prompt::confirm;
+use crate::commands::{admin_entry, print_error};
 use crate::ctx::Ctx;
+use crate::sampling::{
+    EntryProfile, OLD_SERVER_WARNING, Operator, SamplingFlags, entry_profile, merge_for_patch,
+};
 
 fn strings(v: &Value, key: &str) -> Vec<String> {
     v.get(key)
@@ -79,7 +82,54 @@ pub fn reload_config(ctx: &Ctx) -> i32 {
             ))
         );
     }
+    // C8: a loaded model's edited stanza is not applied, and unload + load alone would still use
+    // the old entry (reload stages nothing for a live model). An older server omits the key.
+    for (model, fields) in models_not_applied(body) {
+        println!(
+            "{}",
+            st.yellow(&format!(
+                "{} {model} is loaded: changed {} not applied — to apply: rv unload {model}, \
+                 rv reload-config, rv load {model}",
+                st.warn(),
+                fields.join(", ")
+            ))
+        );
+    }
+    // V5: a changed `sampling` on a loaded model is applied to its next request (0.9.1).
+    for line in applied_live_lines(body) {
+        println!("{} {line}", st.ok());
+    }
     0
+}
+
+/// `<model>: sampling applied live`, one per entry of the reload response's `applied_live`
+/// (0.9.1; an older server omits the key).
+fn applied_live_lines(body: &Value) -> Vec<String> {
+    body.get("applied_live")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let model = m.get("model")?.as_str()?;
+            Some(format!(
+                "{model}: {} applied live",
+                strings(m, "fields").join(", ")
+            ))
+        })
+        .collect()
+}
+
+/// `(model, changed fields)` of the reload response's `models_not_applied`, in server order.
+fn models_not_applied(body: &Value) -> Vec<(String, Vec<String>)> {
+    body.get("models_not_applied")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let model = m.get("model")?.as_str()?.to_owned();
+            Some((model, strings(m, "fields")))
+        })
+        .collect()
 }
 
 /// `error: ...` form (no status code), used by the verbs whose Python original
@@ -94,12 +144,13 @@ fn print_plain_error(ctx: &Ctx, r: &Reply) {
 
 /// Flags of `rv patch`. Doc comments here are `--help` text, so doc_markdown is
 /// relaxed.
-#[allow(clippy::doc_markdown)]
+// The bools are independent `--clear-*` CLI switches, not a state machine.
+#[allow(clippy::doc_markdown, clippy::struct_excessive_bools)]
 #[derive(clap::Args, Debug, Clone)]
 pub struct PatchArgs {
     /// model id
     pub model: String,
-    /// VRAM estimate in GB
+    /// VRAM estimate in GiB
     #[arg(long)]
     pub vram_gb: Option<f64>,
     /// never evict this model once loaded
@@ -114,7 +165,8 @@ pub struct PatchArgs {
     /// placement-affecting — rejected while the model is Ready (evict first)
     #[arg(long)]
     pub device: Option<String>,
-    /// clear the device override back to the global config default
+    /// clear the device override: the server places the model again (the global config
+    /// device only with default_placement: "device")
     #[arg(long)]
     pub clear_device: bool,
     /// eviction grace window in seconds
@@ -123,23 +175,70 @@ pub struct PatchArgs {
     /// clear the override back to the global eviction_grace_secs default
     #[arg(long)]
     pub clear_eviction_grace_secs: bool,
+    /// default thinking budget in tokens (0 = thinking off). STRICT: a request that thinks past
+    /// it ends with finish_reason "length" and normally no answer
+    #[arg(long)]
+    pub thinking_budget_tokens: Option<u32>,
+    /// clear the model's default thinking budget (no budget)
+    #[arg(long)]
+    pub clear_thinking_budget_tokens: bool,
+    #[command(flatten)]
+    pub sampling: SamplingFlags,
+    /// drop this model's operator sampling values (back to generation_config.json / server
+    /// defaults)
+    #[arg(long)]
+    pub clear_sampling: bool,
+}
+
+impl PatchArgs {
+    /// The patch touches `sampling` (a value flag or `--clear-sampling`).
+    #[must_use]
+    pub fn touches_sampling(&self) -> bool {
+        self.clear_sampling || self.sampling.any()
+    }
+}
+
+/// Checks of the sampling flags that need no request: `--clear-sampling` against the value
+/// flags, and each value's range (the server's rules, so the error comes before the request).
+///
+/// # Errors
+/// A conflict or an out-of-range value.
+pub fn sampling_precheck(a: &PatchArgs) -> Result<(), String> {
+    if a.clear_sampling && a.sampling.any() {
+        return Err(
+            "error: --clear-sampling and the sampling value flags (--temperature/--top-p/--top-k/\
+             --repetition-penalty/--presence-penalty/--frequency-penalty) are mutually exclusive"
+                .to_owned(),
+        );
+    }
+    a.sampling.operator().validate()
 }
 
 /// Builds the `PATCH` body, or the reason it cannot be built. Pure, so the
-/// flag combinations are unit-testable.
+/// flag combinations are unit-testable. `sampling` is the merged object (or
+/// `null`) from [`merge_for_patch`] when the patch touches sampling.
 ///
 /// # Errors
 ///
-/// A conflicting flag pair, or no field at all.
-pub fn patch_body(a: &PatchArgs) -> Result<Value, &'static str> {
+/// A conflicting flag pair, an out-of-range sampling flag, or no field at all.
+pub fn patch_body(a: &PatchArgs, sampling: Option<&Value>) -> Result<Value, String> {
     if a.clear_device && a.device.is_some() {
-        return Err("error: --device and --clear-device are mutually exclusive");
+        return Err("error: --device and --clear-device are mutually exclusive".to_owned());
     }
     if a.clear_eviction_grace_secs && a.eviction_grace_secs.is_some() {
         return Err(
-            "error: --eviction-grace-secs and --clear-eviction-grace-secs are mutually exclusive",
+            "error: --eviction-grace-secs and --clear-eviction-grace-secs are mutually exclusive"
+                .to_owned(),
         );
     }
+    if a.clear_thinking_budget_tokens && a.thinking_budget_tokens.is_some() {
+        return Err(
+            "error: --thinking-budget-tokens and --clear-thinking-budget-tokens are mutually \
+             exclusive"
+                .to_owned(),
+        );
+    }
+    sampling_precheck(a)?;
     let mut body = Map::new();
     if let Some(v) = a.vram_gb {
         body.insert("vram_gb".into(), json!(v));
@@ -163,12 +262,23 @@ pub fn patch_body(a: &PatchArgs) -> Result<Value, &'static str> {
     } else if a.clear_eviction_grace_secs {
         body.insert("eviction_grace_secs".into(), Value::Null);
     }
+    if let Some(t) = a.thinking_budget_tokens {
+        body.insert("thinking_budget_tokens".into(), json!(t));
+    } else if a.clear_thinking_budget_tokens {
+        body.insert("thinking_budget_tokens".into(), Value::Null);
+    }
+    if let Some(s) = sampling {
+        body.insert("sampling".into(), s.clone());
+    }
     if body.is_empty() {
         return Err(
             "error: no fields supplied -- pass at least one of --vram-gb/--pinned/--priority/\
-             --load/--device/--clear-device/--eviction-grace-secs/--clear-eviction-grace-secs \
-             (anything else -- kv_cache_gb, tier_preference, capabilities, etc. -- needs a raw \
-             curl PATCH; see INTERFACE.md)",
+             --load/--device/--clear-device/--eviction-grace-secs/--clear-eviction-grace-secs/\
+             --thinking-budget-tokens/--clear-thinking-budget-tokens/\
+             --temperature/--top-p/--top-k/--repetition-penalty/--presence-penalty/\
+             --frequency-penalty/--clear-sampling (anything else -- kv_cache_gb, \
+             tier_preference, capabilities, etc. -- needs a raw curl PATCH; see INTERFACE.md)"
+                .to_owned(),
         );
     }
     Ok(Value::Object(body))
@@ -181,10 +291,28 @@ pub fn patch(ctx: &Ctx, a: &PatchArgs) -> i32 {
         return 1;
     }
     let st = ctx.style;
-    let body = match patch_body(a) {
+    // Everything that needs no request first: conflicts, ranges, an empty patch.
+    let precheck = if a.touches_sampling() {
+        patch_body(a, Some(&Value::Null))
+    } else {
+        patch_body(a, None)
+    };
+    if let Err(msg) = precheck {
+        eprintln!("{}", st.red(&msg));
+        return 1;
+    }
+    let merged = if a.touches_sampling() {
+        match sampling_for_patch(ctx, a) {
+            Ok(m) => Some(m),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+    let body = match patch_body(a, merged.as_ref().map(|(_, _, v)| v)) {
         Ok(b) => b,
         Err(msg) => {
-            eprintln!("{}", st.red(msg));
+            eprintln!("{}", st.red(&msg));
             return 1;
         }
     };
@@ -214,11 +342,64 @@ pub fn patch(ctx: &Ctx, a: &PatchArgs) -> i32 {
         }
         let msg = parts.concat();
         println!("{msg}");
+        if let Some((before, after, _)) = &merged {
+            let before = before.as_ref().map_or_else(
+                || "(not reported for this kind)".to_owned(),
+                Operator::summary,
+            );
+            println!("  sampling: {before} → {}", after.summary());
+        }
         return 0;
     }
     print_error(ctx, &r);
     1
 }
+
+/// `rv patch` with sampling flags: GET the model, refuse value flags on a non-text kind or a
+/// server that would drop `sampling`, then merge the flags over the operator values it reports
+/// (all are resent). `--clear-sampling` passes on a non-text kind (the server stores `sampling`
+/// for any kind, so an add that auto-detected a non-text kind must be undoable — review F1); its
+/// `before` is then unknown (`None`). `Err(code)` after printing why; nothing has been sent then.
+fn sampling_for_patch(ctx: &Ctx, a: &PatchArgs) -> Result<Merged, i32> {
+    let st = ctx.style;
+    let entry = admin_entry(ctx, &a.model).map_err(|(code, _)| code)?;
+    match entry_profile(&entry) {
+        EntryProfile::NotApplicable if a.clear_sampling => {
+            Ok((None, Operator::default(), Value::Null))
+        }
+        EntryProfile::NotApplicable => {
+            eprintln!(
+                "{}",
+                st.red(&format!(
+                    "error: '{}' is a model of kind {} — sampling settings apply to text_gen \
+                     and vision models only; nothing was sent",
+                    a.model,
+                    entry["kind"].as_str().unwrap_or("non-text")
+                ))
+            );
+            Err(1)
+        }
+        EntryProfile::OldServer => {
+            eprintln!(
+                "{}",
+                st.red(&format!(
+                    "{} {OLD_SERVER_WARNING} — nothing was sent",
+                    st.warn()
+                ))
+            );
+            Err(1)
+        }
+        EntryProfile::Profile(current) => merge_for_patch(current, &a.sampling, a.clear_sampling)
+            .map(|(before, after, v)| (Some(before), after, v))
+            .map_err(|e| {
+                eprintln!("{}", st.red(&e));
+                1
+            }),
+    }
+}
+
+/// `(before, after, the sampling value sent)` of a patch that touches sampling.
+type Merged = (Option<Operator>, Operator, Value);
 
 /// Flags of `rv preload`.
 #[allow(clippy::doc_markdown)]
@@ -345,12 +526,67 @@ mod tests {
             clear_device: false,
             eviction_grace_secs: None,
             clear_eviction_grace_secs: false,
+            thinking_budget_tokens: None,
+            clear_thinking_budget_tokens: false,
+            sampling: SamplingFlags::default(),
+            clear_sampling: false,
         }
+    }
+
+    /// `--thinking-budget-tokens N` sets it, `--clear-thinking-budget-tokens` sends `null`, both
+    /// together are refused.
+    #[test]
+    fn patch_body_thinking_budget_tokens() {
+        let mut a = args();
+        a.thinking_budget_tokens = Some(2048);
+        assert_eq!(
+            patch_body(&a, None).expect("body"),
+            json!({"thinking_budget_tokens": 2048})
+        );
+        let mut a = args();
+        a.clear_thinking_budget_tokens = true;
+        assert_eq!(
+            patch_body(&a, None).expect("body"),
+            json!({"thinking_budget_tokens": null})
+        );
+        a.thinking_budget_tokens = Some(0);
+        let e = patch_body(&a, None).expect_err("conflict");
+        assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    /// C8: the reload response's `models_not_applied` becomes `(model, fields)`; an older
+    /// server's body (no key) gives none.
+    #[test]
+    fn models_not_applied_reads_the_reload_response() {
+        let body = serde_json::json!({
+            "models_not_applied": [{"model": "lfm2", "fields": ["chat_template", "pinned"]}]
+        });
+        assert_eq!(
+            models_not_applied(&body),
+            vec![(
+                "lfm2".to_owned(),
+                vec!["chat_template".to_owned(), "pinned".to_owned()]
+            )]
+        );
+        assert!(models_not_applied(&serde_json::json!({"added": []})).is_empty());
+    }
+
+    #[test]
+    fn applied_live_reads_the_reload_response() {
+        let body = serde_json::json!({
+            "applied_live": [{"model": "mistral", "fields": ["sampling"]}],
+            "models_not_applied": []
+        });
+        assert_eq!(
+            applied_live_lines(&body),
+            vec!["mistral: sampling applied live"]
+        );
+        assert!(applied_live_lines(&serde_json::json!({"added": []})).is_empty());
     }
 
     #[test]
     fn patch_with_no_fields_is_refused() {
-        assert!(patch_body(&args()).is_err());
+        assert!(patch_body(&args(), None).is_err());
     }
 
     #[test]
@@ -358,11 +594,11 @@ mod tests {
         let mut a = args();
         a.device = Some("GPU".into());
         a.clear_device = true;
-        assert!(patch_body(&a).is_err());
+        assert!(patch_body(&a, None).is_err());
         let mut a = args();
         a.eviction_grace_secs = Some(5.0);
         a.clear_eviction_grace_secs = true;
-        assert!(patch_body(&a).is_err());
+        assert!(patch_body(&a, None).is_err());
     }
 
     #[test]
@@ -374,7 +610,7 @@ mod tests {
         a.clear_device = true;
         a.clear_eviction_grace_secs = true;
         assert_eq!(
-            patch_body(&a).expect("body"),
+            patch_body(&a, None).expect("body"),
             json!({"pinned": true, "priority": -2, "load": "on_demand",
                    "device": null, "eviction_grace_secs": null})
         );
@@ -382,8 +618,44 @@ mod tests {
         a.pinned = Some("false".into());
         a.vram_gb = Some(3.5);
         assert_eq!(
-            patch_body(&a).expect("body"),
+            patch_body(&a, None).expect("body"),
             json!({"vram_gb": 3.5, "pinned": false})
         );
+    }
+
+    #[test]
+    fn sampling_flags_conflict_and_ranges_before_any_request() {
+        let mut a = args();
+        a.sampling.temperature = Some(0.2);
+        a.clear_sampling = true;
+        let e = patch_body(&a, Some(&Value::Null)).expect_err("conflict");
+        assert!(e.contains("mutually exclusive"), "{e}");
+        let mut a = args();
+        a.sampling.top_p = Some(1.5);
+        let e = patch_body(&a, Some(&Value::Null)).expect_err("range");
+        assert!(e.contains("--top-p"), "{e}");
+        let mut a = args();
+        a.sampling.presence_penalty = Some(-2.5);
+        assert!(patch_body(&a, Some(&Value::Null)).is_err());
+    }
+
+    #[test]
+    fn sampling_body_carries_the_merged_object_or_null() {
+        let mut a = args();
+        a.sampling.temperature = Some(0.2);
+        a.pinned = Some("true".into());
+        let merged = json!({"temperature": 0.2, "top_p": 0.8});
+        assert_eq!(
+            patch_body(&a, Some(&merged)).expect("body"),
+            json!({"pinned": true, "sampling": {"temperature": 0.2, "top_p": 0.8}})
+        );
+        let mut a = args();
+        a.clear_sampling = true;
+        assert!(a.touches_sampling());
+        assert_eq!(
+            patch_body(&a, Some(&Value::Null)).expect("body"),
+            json!({"sampling": null})
+        );
+        assert!(!args().touches_sampling());
     }
 }

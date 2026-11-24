@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::model_manager::{
     ModelError, ModelManager, is_genai_memory_budget_error, is_gpu_poison_error,
     is_pool_exhausted_error, is_vlm_kv_wedge_error, kv_wedge_observed_prompt_tokens,
-    pool_exhausted_active_requests,
+    pool_exhausted_active_requests, pool_exhausted_generated_tokens,
 };
 
 /// Marker of `GenAI`'s chat-template failure (the vision pipeline renders the template itself).
@@ -110,6 +110,97 @@ where
 
 const GENERIC_BODY_MESSAGE: &str =
     "malformed request body: expected valid JSON matching the endpoint schema";
+
+// ── Admin JSON bodies (P-C, P8) ──────────────────────────────────────────────
+
+/// Whether an admin route keeps the 422 for an unknown field (`PATCH /v1/admin/models/{id}`
+/// does, at any depth: its body is `deny_unknown_fields`) or answers it like any other bad
+/// body (400 `invalid_body`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UnknownField {
+    /// The pre-0.9.1 axum answer, unchanged: 422, plain text.
+    Keep422,
+    /// 400 `invalid_body`, like a syntax error or a wrong type.
+    InvalidBody,
+}
+
+/// The answer to an admin route's JSON body that axum's `Json` refused (P-C,
+/// P8): malformed JSON, a wrong type and a missing field are the public 400 `invalid_body`
+/// envelope; a missing `Content-Type` (415) and an over-limit body (413) are axum's own
+/// answers, as before; an unknown field is a 422 or a 400 per `unknown`.
+///
+/// Unlike the inference routes ([`JsonBody`]), the message keeps serde's detail (the field path,
+/// and the unknown field's name where there is one): these routes need an admin key, and the
+/// operator needs the typo spelled out (`sampling.temprature`).
+pub(crate) fn admin_json_rejection(
+    rejection: axum::extract::rejection::JsonRejection,
+    unknown: UnknownField,
+) -> Response {
+    use axum::extract::rejection::JsonRejection;
+    match rejection {
+        JsonRejection::JsonDataError(_)
+            if unknown == UnknownField::Keep422
+                && is_unknown_field_error(&rejection.body_text()) =>
+        {
+            rejection.into_response()
+        }
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
+            admin_invalid_body(&rejection.body_text())
+        }
+        other => other.into_response(),
+    }
+}
+
+/// [`admin_json_rejection`] for a route that reads its body as bytes (`/load`, `/resize`: any
+/// `Content-Type`, and `/load` also an empty body): parse `body` as `T`, or the 400
+/// `invalid_body` envelope (an unknown field included). The error is boxed: a `Response` is
+/// large (`clippy::result_large_err`).
+pub(crate) fn admin_json_from_bytes<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+) -> Result<T, Box<Response>> {
+    Json::<T>::from_bytes(body)
+        .map(|Json(v)| v)
+        .map_err(|r| Box::new(admin_json_rejection(r, UnknownField::InvalidBody)))
+}
+
+/// axum's prefix of a [`JsonRejection::JsonDataError`](axum::extract::rejection::JsonRejection)
+/// text (a body that is JSON but does not match the type).
+const AXUM_DATA_PREFIX: &str = "Failed to deserialize the JSON body into the target type: ";
+/// axum's prefix of a `JsonSyntaxError` text (a body that is not JSON).
+const AXUM_SYNTAX_PREFIX: &str = "Failed to parse the request body as JSON: ";
+
+/// Whether axum's data-error text `detail` is serde's unknown-field error, by its shape (P-C
+/// review R-3), not by a substring a string value could echo (`{"vram_gb": "unknown field
+/// `x`"}` is a wrong type): after axum's prefix comes the field path, `: `, then serde's
+/// message, which starts with ``unknown field `<name>`, `` followed by `expected` or
+/// `there are no fields`.
+fn is_unknown_field_error(detail: &str) -> bool {
+    let Some(rest) = detail.strip_prefix(AXUM_DATA_PREFIX) else {
+        return false;
+    };
+    // The path comes first (`sampling`, `.`); serde's message after the first `: `.
+    let message = rest.split_once(": ").map_or(rest, |(_, m)| m);
+    message
+        .strip_prefix("unknown field `")
+        .and_then(|m| m.split_once("`, "))
+        .is_some_and(|(_, after)| {
+            after.starts_with("expected") || after.starts_with("there are no fields")
+        })
+}
+
+/// The 400 `invalid_body` envelope with serde's detail, axum's prefix dropped.
+fn admin_invalid_body(detail: &str) -> Response {
+    let detail = detail
+        .strip_prefix(AXUM_DATA_PREFIX)
+        .or_else(|| detail.strip_prefix(AXUM_SYNTAX_PREFIX))
+        .unwrap_or(detail);
+    openai_error(
+        StatusCode::BAD_REQUEST,
+        format!("invalid JSON body: {detail}"),
+        "invalid_request_error",
+        Some("invalid_body"),
+    )
+}
 
 /// A path segment is safe to echo only if it is a plain identifier/index path.
 fn is_safe_path(p: &str) -> bool {
@@ -289,10 +380,16 @@ pub(crate) fn sse_inference_error_event(
     raw: &str,
 ) -> axum::response::sse::Event {
     match classify_inference_error(mm, model_id, raw) {
-        InferenceErrorKind::PoolExhausted => sse_error_frame(
-            "the model is momentarily at capacity — retry shortly",
-            "pool_exhausted",
-        ),
+        // 0.9.1 S1: an SSE frame cannot carry `Retry-After`; the text says what to do.
+        InferenceErrorKind::GenerationStalled => {
+            sse_error_frame(GENERATION_STALLED_MESSAGE, "generation_stalled")
+        }
+        InferenceErrorKind::PoolExhausted(None) => {
+            sse_error_frame(POOL_EXHAUSTED_MESSAGE, "pool_exhausted")
+        }
+        InferenceErrorKind::PoolExhausted(Some(generated)) => {
+            sse_error_frame(&output_growth_message(generated), "pool_exhausted")
+        }
         InferenceErrorKind::VlmKvWedge => sse_error_frame(
             "model temporarily unavailable — recovering from a KV-cache capacity \
              issue; retry shortly",
@@ -475,17 +572,17 @@ pub(crate) fn load_stall_response(e: &ModelError) -> Response {
 /// `NotLoaded` omits it because it will not resolve on its own — an eager model
 /// never self-loads.
 ///
-/// On-demand caveat (Slice 3c): `chat`, `embeddings`, `reranking`, and the
-/// image/STT media handlers all intercept a `NotLoaded` `on_demand` model to
-/// kick off a background load (converting its response to `Loading` +
-/// `Retry-After`) before ever reaching here. Every other endpoint routes
-/// `NotLoaded` straight here, so an `on_demand` model addressed *first* via
-/// `/v1/completions` or `/tokenize` gets a bare 503 and is NOT auto-loaded.
+/// On-demand (Slice 3c, F1b): every inference route (chat, completions, embeddings, reranking,
+/// System One, the media routes) sends a `NotLoaded` `on_demand` model through
+/// `handlers::on_demand` first, which starts its load and waits for it up to
+/// `on_demand_wait_secs`, answering `Loading` + `Retry-After` when it does not become ready in
+/// time. A `NotLoaded` that reaches here is an eager model's (`/tokenize` and `/detokenize`, which
+/// never load, answer `NotLoaded` with their own text before this).
 pub(crate) fn model_error_response(e: ModelError) -> Response {
     match e {
         ModelError::NotFound(id) => openai_error(
             StatusCode::NOT_FOUND,
-            format!("model '{id}' not found — check /v1/models for available models"),
+            unknown_model_message(&id),
             "invalid_request_error",
             Some("model_not_found"),
         ),
@@ -505,23 +602,21 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
             "invalid_request_error",
             Some("model_not_found"),
         ),
-        // All three not-ready states share the 503 `model_unavailable` envelope;
-        // only the *transient* ones (`Loading`/`Evicting`) advertise
-        // `Retry-After` — they resolve on their own, whereas `NotLoaded` will not
-        // (an eager model never self-loads).
-        ModelError::NotLoaded | ModelError::Loading | ModelError::Evicting => {
-            let mut resp = openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model unavailable: {e}"),
-                "server_error",
-                Some("model_unavailable"),
-            );
-            if matches!(e, ModelError::Loading | ModelError::Evicting) {
-                resp.headers_mut()
-                    .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
-            }
-            resp
-        }
+        // Same envelope as `FilesIncomplete`. The path is left out: this body can reach an
+        // inference client (T6.2), and the admin answer and the server log already name it.
+        ModelError::TemplateUnreadable { model, .. } => openai_error(
+            StatusCode::NOT_FOUND,
+            format!("model '{model}': its chat_template override is unreadable (see the log)"),
+            "invalid_request_error",
+            Some("model_not_found"),
+        ),
+        // The not-ready states (and a stalled CPU/NPU model, 0.9.1 S1) share the 503
+        // `model_unavailable` envelope; only the transient `Loading`/`Evicting` advertise
+        // `Retry-After` — they resolve on their own, the others do not.
+        ModelError::NotLoaded
+        | ModelError::Loading
+        | ModelError::Evicting
+        | ModelError::GenerationStalled(_) => model_unavailable_response(&e),
         // G1: a supervised worker draining toward its restart says so; otherwise as before.
         ModelError::GpuPoisoned if crate::startup::gpu_poison_exit_requested() => {
             gpu_poisoned_response("gpu_poisoned")
@@ -588,6 +683,47 @@ pub(crate) fn model_error_response(e: ModelError) -> Response {
     }
 }
 
+/// F1a: the 404 `model_not_found` text for an id that is not registered. It does not send the
+/// client to `/v1/models` alone: that list shows what is usable now, not every registered model.
+pub(crate) fn unknown_model_message(id: &str) -> String {
+    format!("model '{id}' not found among the registered models; check the model id")
+}
+
+/// F1a: the one neutral sentence for a model that is registered but not loaded (the 503
+/// `model_unavailable` body for `NotLoaded`, and the `GET /v1/models/{id}` 404 for a registered
+/// model that is not listed). It names no `rv` command: the body reaches inference clients, who
+/// may hold no admin rights. Since F1b an `on_demand` model never gets it from an inference route:
+/// every route but `/tokenize` and `/detokenize` starts its load, and those two answer with their
+/// own sentence (`handlers::tokenize::NOT_LOADED_MESSAGE`).
+pub(crate) fn not_loaded_message(id: Option<&str>) -> String {
+    let subject = id.map_or_else(|| "the model".to_owned(), |id| format!("model '{id}'"));
+    format!(
+        "{subject} is registered but not loaded; an administrator can load it, or set it to load \
+         on demand"
+    )
+}
+
+/// The 503 `model_unavailable` of [`model_error_response`]'s not-ready arm: `Retry-After` only for
+/// the transient `Loading` / `Evicting`.
+fn model_unavailable_response(e: &ModelError) -> Response {
+    let message = if matches!(e, ModelError::NotLoaded) {
+        format!("model unavailable: {}", not_loaded_message(None))
+    } else {
+        format!("model unavailable: {e}")
+    };
+    let mut resp = openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        message,
+        "server_error",
+        Some("model_unavailable"),
+    );
+    if matches!(e, ModelError::Loading | ModelError::Evicting) {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, RETRY_AFTER_TRANSIENT);
+    }
+    resp
+}
+
 /// 409 `config_file_invalid`: `config.json` was already invalid, so a change that persists to it
 /// was refused before anything was loaded or evicted. The code is what tells `rv` this is not a
 /// bare 409 ("already registered").
@@ -650,9 +786,28 @@ pub(crate) fn inference_error_from_text(
     raw: &str,
 ) -> Response {
     match classify_inference_error(mm, model_id, raw) {
-        InferenceErrorKind::PoolExhausted => openai_error(
+        // 0.9.1 S1: 504 + `Retry-After: 30` — the same wait a supervised worker
+        // restart advertises; the request may be served by another model or after the restart.
+        InferenceErrorKind::GenerationStalled => {
+            let mut resp = openai_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                GENERATION_STALLED_MESSAGE,
+                "server_error",
+                Some("generation_stalled"),
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, RETRY_AFTER_WORKER_RESTART);
+            resp
+        }
+        InferenceErrorKind::PoolExhausted(None) => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "the model is momentarily at capacity — retry shortly",
+            POOL_EXHAUSTED_MESSAGE,
+            "server_error",
+            Some("pool_exhausted"),
+        ),
+        InferenceErrorKind::PoolExhausted(Some(generated)) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            output_growth_message(generated),
             "server_error",
             Some("pool_exhausted"),
         ),
@@ -703,6 +858,25 @@ pub(crate) fn inference_error_from_text(
     }
 }
 
+/// What a client is told when the engine stall watchdog ended its generation (0.9.1 S1). Constant:
+/// the deadline and the elapsed time are in the server's ERROR line, not in the body.
+const GENERATION_STALLED_MESSAGE: &str = "the generation stalled: the model's engine made no \
+     progress within the server's deadline and was marked dead; the model is refused until the \
+     server restarts";
+
+/// The `pool_exhausted` message for every case but the one below: the pool is momentarily full.
+const POOL_EXHAUSTED_MESSAGE: &str = "the model is momentarily at capacity — retry shortly";
+
+/// The `pool_exhausted` message when the only request on the model ran out of KV-cache room
+/// after generating `generated` tokens (E2 amendment): retrying the same request
+/// fails the same way, so the client is told what to change instead.
+fn output_growth_message(generated: usize) -> String {
+    format!(
+        "the answer filled the model's KV cache after {generated} generated tokens; retrying the \
+         same request will fail the same way — lower max_tokens or shorten the prompt"
+    )
+}
+
 /// Prefix of the terminal error the CB engine sends to requests still live when its loop exits
 /// (`cb_engine.rs`); maps to a retryable 503 rather than an opaque 500.
 pub(crate) const ENGINE_SHUTDOWN_MARKER: &str = "engine shutting down";
@@ -714,6 +888,11 @@ pub(crate) const ENGINE_SHUTDOWN_MARKER: &str = "engine shutting down";
 /// SSE frame) can never drift on which markers they recognize or what side
 /// effect each one triggers.
 enum InferenceErrorKind {
+    /// The engine stall watchdog (`stall_watch`) ended the generation: its engine made no progress
+    /// within `stream_first_token_timeout_secs` / `stream_token_gap_timeout_secs`. Its side effects
+    /// (the engine marked dead, the GPU-poisoned flag for a GPU model, the ERROR line) already ran,
+    /// once, in the watcher; none here.
+    GenerationStalled,
     /// CB-scheduler KV-pool exhaustion (`GenerationStatus::IGNORED`). Usually
     /// scoped to the one request — other requests against this model are
     /// fine, and the pool just fluctuates under real multi-tenant load. But
@@ -722,8 +901,13 @@ enum InferenceErrorKind {
     /// the pool — that's not congestion, it's the static formula being
     /// wrong, so `spawn_kv_wedge_recovery` is triggered the same as
     /// [`InferenceErrorKind::VlmKvWedge`]
-    /// (the project's internal engineering log).
-    PoolExhausted,
+    /// (the project's internal engineering log) — unless the request had
+    /// already generated tokens (`generated_tokens >= 1`): then the pool
+    /// filled from the answer, and only the 503 is returned (E2,
+    /// not a sizing miss), carrying that count (`Some`) so the message says that a
+    /// retry of the same request fails again (E2 amendment); `None` for every
+    /// other case (today's "momentarily at capacity" text).
+    PoolExhausted(Option<usize>),
     /// VLM-path KV-admission wedge (`VLM_KV_WEDGE_MARKER`) — the pipeline
     /// itself never self-recovers; `spawn_kv_wedge_recovery` was triggered
     /// (evict + reload the model, learn a tighter ceiling).
@@ -753,6 +937,10 @@ fn classify_inference_error(
     model_id: &str,
     raw: &str,
 ) -> InferenceErrorKind {
+    // First, and with no side effect: the watchdog's own text, never an engine's.
+    if crate::stall_watch::is_generation_stalled_error(raw) {
+        return InferenceErrorKind::GenerationStalled;
+    }
     if is_pool_exhausted_error(raw) {
         // Deliberately NOT mark_gpu_poisoned: this is one request's own
         // scheduling failure (KV pool momentarily full), not a poisoned
@@ -768,8 +956,24 @@ fn classify_inference_error(
         // *is* legitimate and retryable, so misreading "solo" is the wrong
         // direction to be wrong in (see `POOL_EXHAUSTED_MARKER`'s doc
         // comment and the project's internal engineering log).
+        //
+        // E2: a solo request that had already generated tokens filled the pool
+        // with its answer (admission reserves the prompt only), so the prompt-side formula was
+        // not wrong: same 503, but no evict+reload and no ratchet. An absent count (older
+        // message shape) is unknown and keeps the recovery.
         let active_requests = pool_exhausted_active_requests(raw);
-        if active_requests.is_some_and(|n| n <= 1) {
+        let generated_tokens = pool_exhausted_generated_tokens(raw);
+        let output_growth = if active_requests.is_some_and(|n| n <= 1)
+            && let Some(generated_tokens) = generated_tokens.filter(|&g| g >= 1)
+        {
+            tracing::warn!(
+                model_id,
+                prompt_tokens = kv_wedge_observed_prompt_tokens(raw).unwrap_or(0),
+                generated_tokens,
+                "generation stopped — KV pool filled from output growth; no ratchet, no reload"
+            );
+            Some(generated_tokens)
+        } else if active_requests.is_some_and(|n| n <= 1) {
             let observed_prompt_tokens = kv_wedge_observed_prompt_tokens(raw).unwrap_or(0);
             if let Some(mm) = mm {
                 mm.spawn_kv_wedge_recovery(model_id, observed_prompt_tokens);
@@ -781,10 +985,12 @@ fn classify_inference_error(
                 "generation ignored — KV pool exhausted with no other requests in flight, \
                  treating as a static-formula miss and recovering"
             );
+            None
         } else {
             tracing::warn!(model_id, error = %raw, "generation ignored — KV pool exhausted, retryable");
-        }
-        return InferenceErrorKind::PoolExhausted;
+            None
+        };
+        return InferenceErrorKind::PoolExhausted(output_growth);
     }
     if is_vlm_kv_wedge_error(raw) {
         // Parse failure (message shape drifted) still triggers recovery —
@@ -882,6 +1088,27 @@ mod tests {
         });
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(r.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// C8: an unreadable `chat_template` override maps like `FilesIncomplete` (404
+    /// `model_not_found`) and the client-facing body names the model but not the path (T6.2).
+    #[tokio::test]
+    async fn template_unreadable_is_404_model_not_found_without_the_path() {
+        let resp = model_error_response(ModelError::TemplateUnreadable {
+            model: "lfm2".to_owned(),
+            path: "/srv/private/lfm2.jinja".into(),
+            cause: "No such file or directory".to_owned(),
+        });
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("model_not_found") && body.contains("lfm2"),
+            "{body}"
+        );
+        assert!(!body.contains("/srv/private"), "{body}");
     }
 
     /// D-04 S2: a load refused because the server is stopping is a 503 `server_stopping` with no
@@ -983,6 +1210,77 @@ mod tests {
             "OpenCL code leaked: {msg}"
         );
         assert!(!msg.contains("secret-bge"), "model path leaked: {msg}");
+    }
+
+    /// The -14 form (2026-11-15, ext-091): an inference failure whose text carries only
+    /// `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST` is the same scrubbed 503 `model_unavailable`
+    /// as the other poison markers, not an opaque 500 (non-stream body and SSE frame). The
+    /// `Retry-After` header depends on the process-wide poison-exit flag, not on the
+    /// classification; `gpu_poisoned_reply_is_retryable_only_while_restarting` covers it.
+    #[tokio::test]
+    async fn inference_exec_status_minus_14_is_503_model_unavailable_scrubbed() {
+        let raw = "ov_vlm_generate failed: Exception from src/inference/src/cpp/infer_request.cpp:224:\n\
+             Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp:593:\n\
+             [GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST\n\n";
+        let resp = inference_error_from_text(None, "qwen3.5-9B-int4-ov", raw);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "model_unavailable");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("CL_EXEC_STATUS") && !body.contains("ocl_memory"),
+            "{body}"
+        );
+        let frame = format!("{:?}", sse_inference_error_event(None, "m", raw));
+        assert!(frame.contains("model_unavailable"), "{frame}");
+        assert!(!frame.contains("CL_EXEC_STATUS"), "{frame}");
+    }
+
+    /// E2 + its amendment: the `pool_exhausted` JSON body and SSE frame keep
+    /// today's bytes for every case but one — a solo request with `generated_tokens >= 1`, whose
+    /// message says a retry fails the same way (same 503, type and code). The raw field itself
+    /// never reaches an HTTP client. `mm` is `None`, so no recovery runs here.
+    #[tokio::test]
+    async fn pool_exhausted_http_text_is_unchanged_by_the_generated_count() {
+        let marker = crate::model_manager::POOL_EXHAUSTED_MARKER;
+        let raw =
+            |fields: &str| format!("generation ignored by the CB scheduler — {marker} ({fields})");
+        let body = |raw: String| async move {
+            let resp = inference_error_from_text(None, "m", &raw);
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+        let sse = |raw: &str| format!("{:?}", sse_inference_error_event(None, "m", raw));
+        let today = r#"{"error":{"message":"the model is momentarily at capacity — retry shortly","type":"server_error","param":null,"code":"pool_exhausted"}}"#;
+        let today_sse = sse(&raw("observed_prompt_tokens=900 active_requests=3"));
+        for fields in [
+            "observed_prompt_tokens=900 active_requests=3",
+            "observed_prompt_tokens=900 active_requests=3 generated_tokens=41",
+            "observed_prompt_tokens=900 active_requests=1 generated_tokens=0",
+            "observed_prompt_tokens=900 active_requests=1",
+        ] {
+            let b = body(raw(fields)).await;
+            assert_eq!(std::str::from_utf8(&b).unwrap(), today, "{fields}");
+            assert_eq!(sse(&raw(fields)), today_sse, "{fields}");
+        }
+
+        // Solo, after 41 generated tokens: the amended message, same status/type/code.
+        let grown = raw("observed_prompt_tokens=900 active_requests=1 generated_tokens=41");
+        let b = body(grown.clone()).await;
+        assert_eq!(
+            std::str::from_utf8(&b).unwrap(),
+            r#"{"error":{"message":"the answer filled the model's KV cache after 41 generated tokens; retrying the same request will fail the same way — lower max_tokens or shorten the prompt","type":"server_error","param":null,"code":"pool_exhausted"}}"#
+        );
+        let frame = sse(&grown);
+        assert_ne!(frame, today_sse);
+        assert!(frame.contains("after 41 generated tokens"), "{frame}");
+        assert!(frame.contains("pool_exhausted"), "{frame}");
+        assert!(!frame.contains("generated_tokens="), "{frame}");
     }
 
     /// T6.2: a non-OOM inference failure is an opaque 500 — the raw error text
@@ -1240,5 +1538,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn error_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// F1a: `NotLoaded` keeps its 503 `model_unavailable` (no `Retry-After`), and its body is
+    /// one neutral sentence: registered, not loaded, an administrator can load it or set it to
+    /// load on demand. No `rv` command reaches an inference client.
+    #[tokio::test]
+    async fn not_loaded_body_is_the_neutral_sentence() {
+        let (status, json) = error_json(model_error_response(ModelError::NotLoaded)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["code"], "model_unavailable");
+        assert_eq!(json["error"]["type"], "server_error");
+        assert_eq!(
+            json["error"]["message"],
+            "model unavailable: the model is registered but not loaded; an administrator can \
+             load it, or set it to load on demand"
+        );
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("rv "),
+            "no rv command in a client body: {msg}"
+        );
+        // The other not-ready states keep their old text.
+        let (_, loading) = error_json(model_error_response(ModelError::Loading)).await;
+        assert_eq!(
+            loading["error"]["message"],
+            format!("model unavailable: {}", ModelError::Loading)
+        );
+    }
+
+    /// F1a: an unknown id keeps 404 `model_not_found`; the hint no longer points only at
+    /// `/v1/models` (which lists what is usable now, not every registered model).
+    #[tokio::test]
+    async fn unknown_id_body_says_not_registered() {
+        let (status, json) =
+            error_json(model_error_response(ModelError::NotFound("nope".into()))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["code"], "model_not_found");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            json["error"]["message"],
+            "model 'nope' not found among the registered models; check the model id"
+        );
+        assert_eq!(
+            not_loaded_message(Some("m")),
+            "model 'm' is registered but not loaded; an administrator can load it, or set it to \
+             load on demand"
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod admission;
 pub mod app_state;
 pub mod cache_manifest;
 pub mod cb_engine;
+pub mod cli;
 #[cfg(unix)]
 pub mod crash_handler;
 pub mod decision_engine;
@@ -43,15 +44,19 @@ pub mod ov_whisper;
 pub mod pipelines;
 pub mod prompt_builder;
 pub mod realtime_types;
+pub mod reasoning_tokens;
 pub mod rerank_engine;
 #[cfg(unix)]
 pub mod shutdown_signals;
+pub mod stall_watch;
 pub mod startup;
 pub mod streaming;
 #[cfg(unix)]
 pub mod supervisor;
 pub mod systemone;
+pub mod thinking_budget;
 pub mod tts_normalize;
+pub mod tts_split;
 pub mod vlm_engine;
 pub mod voice_pin;
 
@@ -328,8 +333,16 @@ pub fn create_router_with_extension(
 /// `["*"]` (the default) → allow any origin. Any other list → echo only those
 /// origins. Methods and headers are permitted broadly; credentials are not
 /// enabled (which would be incompatible with a wildcard origin anyway).
+/// The `SpeechT5` segment headers (0.9.1 T1) are exposed, so a browser client
+/// on another origin can read them.
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
-    let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    let layer = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers([
+            axum::http::HeaderName::from_static(tts_split::TTS_SEGMENTS_HEADER),
+            axum::http::HeaderName::from_static(tts_split::TTS_SEGMENT_CAP_HEADER),
+        ]);
     if origins.iter().any(|o| o == "*") {
         layer.allow_origin(Any)
     } else {
@@ -717,7 +730,9 @@ async fn require_bearer_auth(
 
     // Inference / general gate. Admin keys also satisfy it (superset credential).
     if keys.api_keys.is_empty() {
-        // No key of any kind is configured, so an admin route is open to whoever can reach the port.
+        // No inference key is configured, so inference is open to whoever can reach the port (on a
+        // network bind only with `allow_insecure_public_bind`, 0.9.1 S3). Reaching this line on an
+        // admin route means no admin key either (the admin gate above returns otherwise).
         // A web page in the operator's browser can reach `127.0.0.1` too, and the permissive default
         // CORS policy plus a body-less POST (no preflight) would let it add, unload or delete models.
         // Browsers always send `Origin` on such a request; curl, `rv` and Prometheus never do.

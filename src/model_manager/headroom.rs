@@ -17,9 +17,19 @@ use crate::gpu_memory::VramProbe;
 /// the cache keeps a burst of requests from scanning `/proc` each.
 const PROBE_TTL: Duration = Duration::from_secs(2);
 
-/// F2-N-5: a reading served this long after it was taken means the background refresh keeps
-/// failing; logged once per device until a refresh succeeds again.
-const STALE_WARN_AFTER: Duration = Duration::from_secs(60);
+/// The oldest outside-memory reading a request-side decision (the vision device-headroom cap) may
+/// use. An older one is refreshed first, synchronously, with one probe read on the blocking pool
+/// ([`HeadroomRuntime::refresh_if_older_than`]); within this age the cached reading and its
+/// background refresh serve as before. E3 (R-01): before this bound the cached reading served at
+/// any age, and the first vision request after an idle gap was capped on a reading up to hours
+/// old. A hard limit on purpose, not a config key.
+pub(crate) const REQUEST_READING_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// The longest a request waits for that synchronous refresh (its turn on the per-device lock and
+/// the scan together). A scan takes about 0.1-0.2 s; past this bound the request logs one WARN and
+/// decides on the cached reading, and the scan finishes (or hangs) on its blocking thread without
+/// a second one being started for the device. Same E3 rule; a hard limit too.
+pub(crate) const REQUEST_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the limit of one vision model on a discrete GPU is computed from.
 #[derive(Clone, Debug, PartialEq)]
@@ -119,11 +129,58 @@ pub(crate) struct HeadroomRuntime {
     own_cache: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
     /// `pdev`s with a background refresh in flight (at most one each).
     refreshing: Arc<Mutex<HashSet<String>>>,
-    /// `pdev`s whose stale reading was already logged (F2-N-5); cleared by a good refresh.
+    /// `pdev`s whose probe failure was already logged (F2-N-5): set when a reading returns
+    /// nothing, cleared by the next good one. The age of a reading alone never sets it: an idle
+    /// server is not a failing probe (S2).
     stale_warned: Arc<Mutex<HashSet<String>>>,
     ttl: Duration,
+    /// One async lock per `pdev` for the request-side synchronous refresh, so concurrent requests
+    /// after an idle gap run one probe per device: the others wait for it and use its reading.
+    request_refresh: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// When the last request-side synchronous scan of each `pdev` started. Within
+    /// [`REQUEST_READING_MAX_AGE`] of it no other one starts, so a probe that returns nothing
+    /// (whose reading therefore stays old) costs one scan per 30 s, not one per request.
+    request_attempts: Arc<Mutex<HashMap<String, Instant>>>,
+    /// `pdev`s with a request-side scan running on the blocking pool. Cleared by the scan's own
+    /// closure (also on a panic), so a waiter that timed out or was cancelled never leads to a
+    /// second scan of a device whose first one is still running.
+    request_scanning: Arc<Mutex<HashSet<String>>>,
+    /// [`REQUEST_REFRESH_TIMEOUT`]; tests shorten it.
+    request_timeout: Duration,
     /// Transient reservations of running long requests: domain -> model -> bytes.
     leases: Arc<Mutex<HashMap<String, HashMap<String, u64>>>>,
+}
+
+/// Store one probe reading of `pdev` and return what to use: the reading, or the last known value
+/// when the probe returned nothing. A probe that returns nothing is logged once per device until a
+/// reading succeeds again (F2-N-5): that, and not the age of a reading, is a failing probe.
+fn record_outside(
+    cache: &Mutex<HashMap<String, (Instant, u64)>>,
+    warned: &Mutex<HashSet<String>>,
+    pdev: &str,
+    fresh: Option<u64>,
+) -> Option<u64> {
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(bytes) = fresh {
+        cache.insert(pdev.to_owned(), (Instant::now(), bytes));
+        warned.remove(pdev);
+        return Some(bytes);
+    }
+    let last = cache.get(pdev).copied();
+    if warned.insert(pdev.to_owned()) {
+        tracing::warn!(
+            pdev,
+            last_reading_age_secs = last.map(|(at, _)| at.elapsed().as_secs()),
+            "device-memory probe returned no reading: using the last one; memory other processes \
+             took since then is covered only by kv_headroom_margin_gib"
+        );
+    }
+    last.map(|(_, b)| b)
 }
 
 impl HeadroomRuntime {
@@ -136,6 +193,10 @@ impl HeadroomRuntime {
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             stale_warned: Arc::new(Mutex::new(HashSet::new())),
             ttl: PROBE_TTL,
+            request_refresh: Arc::new(Mutex::new(HashMap::new())),
+            request_attempts: Arc::new(Mutex::new(HashMap::new())),
+            request_scanning: Arc::new(Mutex::new(HashSet::new())),
+            request_timeout: REQUEST_REFRESH_TIMEOUT,
             leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -146,6 +207,39 @@ impl HeadroomRuntime {
         self.ttl = ttl;
     }
 
+    /// Tests: a shorter bound on the request-side synchronous refresh.
+    #[cfg(test)]
+    pub(crate) fn set_request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = timeout;
+    }
+
+    /// Tests: make every cached outside-memory reading, and every request-side scan attempt, `by`
+    /// older (an idle gap).
+    #[cfg(test)]
+    pub(crate) fn age_readings(&self, by: Duration) {
+        let older = |at: &mut Instant| {
+            if let Some(o) = at.checked_sub(by) {
+                *at = o;
+            }
+        };
+        for (at, _) in self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            older(at);
+        }
+        for at in self
+            .request_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            older(at);
+        }
+    }
+
     /// Whether a probe exists at all (`rv status` reports `headroom: unknown` without one).
     pub(crate) fn has_probe(&self) -> bool {
         self.probe.is_some()
@@ -153,8 +247,16 @@ impl HeadroomRuntime {
 
     /// Bytes other processes hold on `pdev`. The first reading is taken synchronously; after that
     /// a reading older than the TTL is served as it is while one background thread refreshes it,
-    /// so a request never waits for a `/proc` scan. When the probe fails the last known value
-    /// stays; `None` only if it never worked.
+    /// so a request never waits for a `/proc` scan (about 0.1-0.2 s on a desktop). When the probe
+    /// fails the last known value stays; `None` only if it never worked.
+    ///
+    /// The served value can be as old as the last call: after an idle gap it is the reading of the
+    /// previous request or load. Paths that decide a load call [`Self::outside_bytes_fresh`] on
+    /// the blocking pool first (`ModelManager::refresh_device_probes`), so they find a fresh one;
+    /// request paths call [`Self::refresh_if_older_than`] with [`REQUEST_READING_MAX_AGE`] first
+    /// (`ModelManager::get_chat_context_for_request`), so they decide on one at most 30 s old —
+    /// unless the probe returned nothing (the last good reading stays, one retry per 30 s) or the
+    /// scan took longer than [`REQUEST_REFRESH_TIMEOUT`] (the cached reading, logged).
     pub(crate) fn outside_bytes(&self, pdev: &str) -> Option<u64> {
         let probe = self.probe.as_ref()?;
         let cached = self
@@ -165,40 +267,135 @@ impl HeadroomRuntime {
             .copied();
         match cached {
             Some((at, bytes)) if at.elapsed() < self.ttl => Some(bytes),
-            Some((at, bytes)) if !self.ttl.is_zero() => {
-                if at.elapsed() >= STALE_WARN_AFTER
-                    && self
-                        .stale_warned
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(pdev.to_owned())
-                {
-                    tracing::warn!(
-                        pdev,
-                        age_secs = at.elapsed().as_secs(),
-                        "device-memory probe keeps failing: serving its last reading; memory other \
-                         processes took since then is covered only by the headroom margin"
-                    );
-                }
+            Some((_, bytes)) if !self.ttl.is_zero() => {
                 self.refresh_in_background(Arc::clone(probe), pdev);
                 Some(bytes)
             }
-            _ => {
-                // First reading (or a zero TTL): read now, without holding any lock.
-                let fresh = probe.outside_used_bytes(pdev);
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match fresh {
-                    Some(bytes) => {
-                        cache.insert(pdev.to_owned(), (Instant::now(), bytes));
-                        Some(bytes)
-                    }
-                    None => cache.get(pdev).map(|(_, b)| *b),
-                }
-            }
+            // First reading (or a zero TTL): read now.
+            _ => self.read_outside_now(probe.as_ref(), pdev),
         }
+    }
+
+    /// [`Self::outside_bytes`] read from `/proc` now, ignoring the TTL; the last known value when
+    /// the probe returns nothing, `None` if it never worked. Blocking (a scan of every readable
+    /// process): call it from `spawn_blocking`.
+    pub(crate) fn outside_bytes_fresh(&self, pdev: &str) -> Option<u64> {
+        let probe = self.probe.as_ref()?;
+        self.read_outside_now(probe.as_ref(), pdev)
+    }
+
+    /// Whether the reading of `pdev` is missing or older than the TTL, so a caller about to decide
+    /// a load should take a fresh one first. `false` without a probe (there is nothing to read).
+    pub(crate) fn needs_refresh(&self, pdev: &str) -> bool {
+        self.probe.is_some()
+            && self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(pdev)
+                .is_none_or(|(at, _)| at.elapsed() >= self.ttl)
+    }
+
+    /// Whether the reading of `pdev` is missing or at least `max_age` old. `false` without a probe.
+    fn reading_older_than(&self, pdev: &str, max_age: Duration) -> bool {
+        self.probe.is_some()
+            && self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(pdev)
+                .is_none_or(|(at, _)| reached(at.elapsed(), max_age))
+    }
+
+    /// Whether a request-side scan of `pdev` started less than `max_age` ago (so a probe that
+    /// returned nothing is not retried on every request).
+    fn attempted_within(&self, pdev: &str, max_age: Duration) -> bool {
+        self.request_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pdev)
+            .is_some_and(|at| !reached(at.elapsed(), max_age))
+    }
+
+    /// Request side (E3): when the reading of `pdev` is missing or at least `max_age` old, take a
+    /// fresh one before returning — one probe read on the blocking pool (`spawn_blocking`), never
+    /// on the async runtime. Concurrent callers for the same device wait on one per-device lock
+    /// and, finding the reading fresh once they hold it, do not probe again. Within `max_age`
+    /// nothing happens (the synchronous readers serve the cache and refresh it in the
+    /// background). A failed probe keeps the last reading, as [`Self::outside_bytes_fresh`] does,
+    /// and is not retried here for `max_age`. The wait is bounded by [`REQUEST_REFRESH_TIMEOUT`]:
+    /// past it one WARN, and the caller decides on the cached reading.
+    pub(crate) async fn refresh_if_older_than(&self, pdev: &str, max_age: Duration) {
+        if !self.reading_older_than(pdev, max_age) {
+            return;
+        }
+        let started = Instant::now();
+        if tokio::time::timeout(
+            self.request_timeout,
+            self.refresh_single_flight(pdev, max_age),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                pdev,
+                waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "device-memory probe did not answer in time: this request decides on the cached \
+                 reading"
+            );
+        }
+    }
+
+    /// The part of [`Self::refresh_if_older_than`] under its time bound: the per-device lock (a
+    /// waiter behind a live scan waits for it and uses its reading), then at most one scan of
+    /// `pdev` running at a time; none when one started within `max_age`.
+    async fn refresh_single_flight(&self, pdev: &str, max_age: Duration) {
+        let lock = Arc::clone(
+            self.request_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(pdev.to_owned())
+                .or_default(),
+        );
+        let _held = lock.lock().await;
+        // Another request may have refreshed it while this one waited (the common case after an
+        // idle gap), or tried within `max_age` and got nothing back (a failing probe).
+        if !self.reading_older_than(pdev, max_age) || self.attempted_within(pdev, max_age) {
+            return;
+        }
+        if !self
+            .request_scanning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pdev.to_owned())
+        {
+            // A scan whose waiter gave up is still running: use the cache, start no second one.
+            return;
+        }
+        self.request_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pdev.to_owned(), Instant::now());
+        let flag = ScanFlag {
+            set: Arc::clone(&self.request_scanning),
+            pdev: pdev.to_owned(),
+        };
+        let rt = self.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            rt.outside_bytes_fresh(&flag.pdev);
+            drop(flag);
+        })
+        .await
+        {
+            // The cached reading stays; the request decides on it, as before E3.
+            tracing::debug!(pdev, error = %e, "request-side device-memory probe did not finish");
+        }
+    }
+
+    /// One probe reading of `pdev`, stored with [`record_outside`]; no lock is held during the scan.
+    fn read_outside_now(&self, probe: &dyn VramProbe, pdev: &str) -> Option<u64> {
+        let fresh = probe.outside_used_bytes(pdev);
+        record_outside(&self.cache, &self.stale_warned, pdev, fresh)
     }
 
     /// What this process holds on `pdev` according to the driver, cached for the TTL; `None`
@@ -264,16 +461,8 @@ impl HeadroomRuntime {
             .spawn({
                 let pdev = pdev.clone();
                 move || {
-                    if let Some(bytes) = probe.outside_used_bytes(&pdev) {
-                        cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(pdev.clone(), (Instant::now(), bytes));
-                        stale_warned
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&pdev);
-                    }
+                    let fresh = probe.outside_used_bytes(&pdev);
+                    record_outside(&cache, &stale_warned, &pdev, fresh);
                     refreshing
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -337,6 +526,27 @@ impl HeadroomRuntime {
     }
 }
 
+/// Whether something `elapsed` old has reached `max_age` (inclusive: exactly 30 s is too old).
+fn reached(elapsed: Duration, max_age: Duration) -> bool {
+    elapsed >= max_age
+}
+
+/// Marks a request-side scan of `pdev` as running; cleared on drop, inside the blocking closure
+/// that runs the scan (also when the scan panics).
+struct ScanFlag {
+    set: Arc<Mutex<HashSet<String>>>,
+    pdev: String,
+}
+
+impl Drop for ScanFlag {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.pdev);
+    }
+}
+
 /// The transient device-memory reservation of one running long request; released on drop.
 #[derive(Debug)]
 pub struct TransientLease {
@@ -386,17 +596,202 @@ mod tests {
         }
     }
 
-    /// F2-N-5: a reading older than a minute (the refresh keeps failing) is still served and
-    /// marked as logged once; a good refresh re-arms the warning.
+    fn wait_for_refresh(rt: &HeadroomRuntime, pdev: &str) {
+        while rt.refreshing.lock().unwrap().contains(pdev) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// E3: the request-side refresh probes only a reading at least `max_age` old (or missing),
+    /// on a blocking-pool thread, and stores what it read.
+    #[tokio::test]
+    async fn the_request_side_refresh_reads_only_a_reading_past_its_age() {
+        let probe = Arc::new(CountingProbe::default());
+        probe.value.store(9, Ordering::Relaxed);
+        let rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
+        let pdev = "0000:03:00.0";
+        // Missing: read.
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 1);
+        // Fresh: nothing.
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 1);
+        // 29 s: nothing; 31 s: read, and the new value is stored.
+        rt.age_readings(Duration::from_secs(29));
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 1);
+        rt.age_readings(Duration::from_secs(2));
+        probe.value.store(11, Ordering::Relaxed);
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            rt.cache.lock().unwrap().get(pdev).map(|(_, b)| *b),
+            Some(11)
+        );
+        // No probe: nothing to read, and no panic.
+        HeadroomRuntime::new(None)
+            .refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(REQUEST_READING_MAX_AGE, Duration::from_secs(30));
+    }
+
+    /// F7: the age limit is inclusive — a reading exactly 30 s old is refreshed.
     #[test]
-    fn a_stale_reading_is_served_and_logged_once_until_a_refresh_succeeds() {
+    fn exactly_the_age_limit_is_too_old() {
+        assert!(reached(REQUEST_READING_MAX_AGE, REQUEST_READING_MAX_AGE));
+        assert!(!reached(
+            Duration::from_millis(29_999),
+            REQUEST_READING_MAX_AGE
+        ));
+        assert_eq!(REQUEST_REFRESH_TIMEOUT, Duration::from_secs(2));
+    }
+
+    /// A probe whose scan blocks until the test lets it go (a hung `/proc` fdinfo read).
+    #[derive(Debug)]
+    struct StuckProbe {
+        calls: AtomicU64,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl VramProbe for StuckProbe {
+        fn outside_used_bytes(&self, _pdev: &str) -> Option<u64> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let _ = self.release.lock().unwrap().recv();
+            Some(99)
+        }
+    }
+
+    /// F1: a scan that hangs does not hold the request past the bound — it returns with the
+    /// cached reading — and neither a later request nor one after a cancelled waiter starts a
+    /// second scan of the device while the first is stuck. The stuck scan, once released, stores
+    /// its reading and clears its flag itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_scan_is_bounded_and_never_doubled() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = Arc::new(StuckProbe {
+            calls: AtomicU64::new(0),
+            release: Mutex::new(rx),
+        });
+        let mut rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
+        rt.set_request_timeout(Duration::from_millis(200));
+        let pdev = "0000:03:00.0";
+        rt.cache
+            .lock()
+            .unwrap()
+            .insert(pdev.to_owned(), (Instant::now(), 5));
+        rt.age_readings(Duration::from_secs(31));
+
+        let t0 = Instant::now();
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.cache.lock().unwrap().get(pdev).map(|(_, b)| *b), Some(5));
+        assert!(rt.request_scanning.lock().unwrap().contains(pdev));
+
+        // A later request (even past the attempt's own 30 s): the scan is still running, so no
+        // second one, and it returns at once.
+        rt.age_readings(Duration::from_secs(31));
+        let t1 = Instant::now();
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert!(
+            t1.elapsed() < Duration::from_millis(150),
+            "{:?}",
+            t1.elapsed()
+        );
+        // A waiter cancelled mid-wait leaves no second scan behind either.
+        let waiter = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+                    .await;
+            })
+        };
+        waiter.abort();
+        let _ = waiter.await;
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(
+            probe.calls.load(Ordering::Relaxed),
+            1,
+            "never a second scan"
+        );
+
+        // Released: the scan stores its reading and clears its own flag.
+        tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while rt.request_scanning.lock().unwrap().contains(pdev) {
+            assert!(Instant::now() < until, "the scan never cleared its flag");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            rt.cache.lock().unwrap().get(pdev).map(|(_, b)| *b),
+            Some(99)
+        );
+    }
+
+    /// F2: a probe that returns nothing leaves the reading old, but requests retry it once per
+    /// 30 s, not each time: five requests, one synchronous attempt.
+    #[tokio::test]
+    async fn a_failing_probe_is_retried_once_per_age_limit() {
+        let probe = Arc::new(CountingProbe::default());
+        probe.fail.store(true, Ordering::Relaxed);
+        let rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
+        let pdev = "0000:03:00.0";
+        rt.cache
+            .lock()
+            .unwrap()
+            .insert(pdev.to_owned(), (Instant::now(), 5));
+        rt.age_readings(Duration::from_secs(31));
+        for _ in 0..5 {
+            rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+                .await;
+        }
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.cache.lock().unwrap().get(pdev).map(|(_, b)| *b), Some(5));
+        // 30 s later it is tried again.
+        rt.age_readings(Duration::from_secs(31));
+        rt.refresh_if_older_than(pdev, REQUEST_READING_MAX_AGE)
+            .await;
+        assert_eq!(probe.reads.load(Ordering::Relaxed), 2);
+    }
+
+    /// S2: an old reading from a working probe (an idle server) is not a failure: served while a
+    /// thread refreshes it, and nothing is logged.
+    #[test]
+    fn an_old_reading_from_a_working_probe_is_not_logged() {
         let probe = Arc::new(CountingProbe::default());
         probe.value.store(7, Ordering::Relaxed);
         let rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
         let pdev = "0000:03:00.0";
         let old = Instant::now()
-            .checked_sub(STALE_WARN_AFTER + Duration::from_secs(1))
+            .checked_sub(Duration::from_secs(876))
             .unwrap();
+        rt.cache.lock().unwrap().insert(pdev.to_owned(), (old, 5));
+        assert_eq!(rt.outside_bytes(pdev), Some(5), "served as it is");
+        assert!(
+            !rt.stale_warned.lock().unwrap().contains(pdev),
+            "age alone is not logged"
+        );
+        wait_for_refresh(&rt, pdev);
+        assert!(!rt.stale_warned.lock().unwrap().contains(pdev));
+        assert_eq!(rt.outside_bytes(pdev), Some(7), "the refresh landed");
+    }
+
+    /// F2-N-5 / S2: a probe that returns nothing is logged once (the last reading is served), and
+    /// a good reading re-arms the warning; the fresh read behaves the same.
+    #[test]
+    fn a_failing_probe_marks_the_device_warned_until_a_reading_succeeds() {
+        let probe = Arc::new(CountingProbe::default());
+        probe.value.store(7, Ordering::Relaxed);
+        let rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
+        let pdev = "0000:03:00.0";
+        let old = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
         rt.cache.lock().unwrap().insert(pdev.to_owned(), (old, 5));
         probe.fail.store(true, Ordering::Relaxed);
         assert_eq!(
@@ -404,26 +799,60 @@ mod tests {
             Some(5),
             "the last reading is served"
         );
-        assert!(rt.stale_warned.lock().unwrap().contains(pdev), "logged");
-        // Wait for the (failing) background refresh to finish, then let one succeed.
-        while rt.refreshing.lock().unwrap().contains(pdev) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_refresh(&rt, pdev);
         assert!(
             rt.stale_warned.lock().unwrap().contains(pdev),
-            "a failed refresh keeps it"
+            "the failed refresh is logged"
         );
+        assert_eq!(
+            rt.outside_bytes_fresh(pdev),
+            Some(5),
+            "fresh read: last known"
+        );
+        assert!(rt.stale_warned.lock().unwrap().contains(pdev));
         probe.fail.store(false, Ordering::Relaxed);
-        rt.cache.lock().unwrap().insert(pdev.to_owned(), (old, 5));
-        let _ = rt.outside_bytes(pdev);
-        while rt.refreshing.lock().unwrap().contains(pdev) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert_eq!(rt.outside_bytes_fresh(pdev), Some(7));
         assert!(
             !rt.stale_warned.lock().unwrap().contains(pdev),
-            "a good refresh re-arms"
+            "a good reading re-arms"
         );
         assert_eq!(rt.cache.lock().unwrap().get(pdev).map(|(_, b)| *b), Some(7));
+    }
+
+    /// S2: a load path finds out it must re-read (`needs_refresh`), and the fresh read returns the
+    /// value now, not the one cached before the gap.
+    #[test]
+    fn a_fresh_read_replaces_a_reading_taken_before_an_idle_gap() {
+        let probe = Arc::new(CountingProbe::default());
+        probe.value.store(100, Ordering::Relaxed);
+        let rt = HeadroomRuntime::new(Some(probe.clone() as Arc<dyn VramProbe>));
+        let pdev = "p";
+        assert!(rt.needs_refresh(pdev), "never read");
+        assert_eq!(rt.outside_bytes(pdev), Some(100));
+        assert!(!rt.needs_refresh(pdev), "just read");
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(876))
+            .unwrap();
+        rt.cache.lock().unwrap().insert(pdev.to_owned(), (old, 100));
+        probe.value.store(6 << 30, Ordering::Relaxed);
+        assert!(rt.needs_refresh(pdev), "older than the TTL");
+        let reads = probe.reads.load(Ordering::Relaxed);
+        assert_eq!(rt.outside_bytes_fresh(pdev), Some(6 << 30));
+        assert_eq!(
+            probe.reads.load(Ordering::Relaxed),
+            reads + 1,
+            "read now, synchronously"
+        );
+        assert!(!rt.needs_refresh(pdev));
+        assert_eq!(
+            rt.outside_bytes(pdev),
+            Some(6 << 30),
+            "and served from the cache"
+        );
+        assert!(
+            !HeadroomRuntime::new(None).needs_refresh(pdev),
+            "no probe: nothing to read"
+        );
     }
 
     fn spec() -> HeadroomSpec {

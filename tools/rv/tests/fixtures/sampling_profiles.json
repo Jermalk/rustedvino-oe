@@ -1,0 +1,574 @@
+[
+  {
+    "name": "no file: greedy, server default",
+    "generation_config": null,
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "greedy file without do_sample, stale values",
+    "generation_config": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "exporter stub with file penalty 1.05",
+    "generation_config": {
+      "_from_model_config": true,
+      "repetition_penalty": 1.05
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.05,
+        "source": "generation_config.json"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy",
+      "note": "generation_config.json is an exporter stub (no sampling recommendation)"
+    }
+  },
+  {
+    "name": "file package T 1.0 top_p 0.95 top_k 64",
+    "generation_config": {
+      "do_sample": true,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 64
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 1.0,
+        "source": "generation_config.json"
+      },
+      "top_p": {
+        "value": 0.95,
+        "source": "generation_config.json"
+      },
+      "top_k": {
+        "value": 64,
+        "source": "generation_config.json"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "file top_k only: engine default T and top_p",
+    "generation_config": {
+      "do_sample": true,
+      "top_k": 40
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 1.0,
+        "source": "engine default"
+      },
+      "top_p": {
+        "value": 1.0,
+        "source": "engine default"
+      },
+      "top_k": {
+        "value": 40,
+        "source": "generation_config.json"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "operator T + top_p over a greedy file",
+    "generation_config": {
+      "bos_token_id": 1
+    },
+    "operator": {
+      "temperature": 0.15,
+      "top_p": 0.95
+    },
+    "npu": false,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 0.15,
+        "source": "config"
+      },
+      "top_p": {
+        "value": 0.95,
+        "source": "config"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "operator T only: full vocabulary",
+    "generation_config": null,
+    "operator": {
+      "temperature": 0.15
+    },
+    "npu": false,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 0.15,
+        "source": "config"
+      },
+      "top_p": {
+        "value": 1.0,
+        "source": "engine default"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "operator top_p + presence over a file package",
+    "generation_config": {
+      "do_sample": true,
+      "temperature": 0.6,
+      "top_k": 20
+    },
+    "operator": {
+      "top_p": 0.8,
+      "presence_penalty": 1.5
+    },
+    "npu": false,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 0.6,
+        "source": "generation_config.json"
+      },
+      "top_p": {
+        "value": 0.8,
+        "source": "config"
+      },
+      "top_k": {
+        "value": 20,
+        "source": "generation_config.json"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": 1.5,
+        "source": "config"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "operator T 0 blanks the file top_p/top_k",
+    "generation_config": {
+      "do_sample": true,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 64
+    },
+    "operator": {
+      "temperature": 0.0
+    },
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": 0.0,
+        "source": "config"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "NPU with operator penalties",
+    "generation_config": null,
+    "operator": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "repetition_penalty": 1.0,
+      "presence_penalty": 1.5,
+      "frequency_penalty": -0.5
+    },
+    "npu": true,
+    "expected": {
+      "mode": "sample",
+      "temperature": {
+        "value": 0.7,
+        "source": "config"
+      },
+      "top_p": {
+        "value": 0.8,
+        "source": "config"
+      },
+      "top_k": {
+        "value": 20,
+        "source": "config"
+      },
+      "repetition_penalty": {
+        "value": 1.0,
+        "source": "config"
+      },
+      "presence_penalty": {
+        "value": 1.5,
+        "source": "config"
+      },
+      "frequency_penalty": {
+        "value": -0.5,
+        "source": "config"
+      },
+      "tools": "greedy",
+      "ignored_on_device": [
+        "presence_penalty",
+        "frequency_penalty"
+      ]
+    }
+  },
+  {
+    "name": "file penalty 0.9 ignored",
+    "generation_config": {
+      "repetition_penalty": 0.9
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "file penalty 2.5 ignored",
+    "generation_config": {
+      "repetition_penalty": 2.5
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "file penalty string ignored",
+    "generation_config": {
+      "repetition_penalty": "x"
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.1,
+        "source": "server default"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "dropped package keeps the file penalty",
+    "generation_config": {
+      "do_sample": true,
+      "top_p": 7.0,
+      "repetition_penalty": 1.05
+    },
+    "operator": null,
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.05,
+        "source": "generation_config.json"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  },
+  {
+    "name": "operator penalty over file penalty",
+    "generation_config": {
+      "repetition_penalty": 1.05
+    },
+    "operator": {
+      "repetition_penalty": 1.2
+    },
+    "npu": false,
+    "expected": {
+      "mode": "greedy",
+      "temperature": {
+        "value": null,
+        "source": "none"
+      },
+      "top_p": {
+        "value": null,
+        "source": "none"
+      },
+      "top_k": {
+        "value": null,
+        "source": "none"
+      },
+      "repetition_penalty": {
+        "value": 1.2,
+        "source": "config"
+      },
+      "presence_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "frequency_penalty": {
+        "value": null,
+        "source": "none"
+      },
+      "tools": "greedy"
+    }
+  }
+]

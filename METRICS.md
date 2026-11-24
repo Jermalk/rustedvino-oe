@@ -80,7 +80,7 @@ genuinely means unpinned / lowest priority.
 
 **3. A non-zero value can be stale.** `rustedvino_tokens_per_second` is pushed from the
 engine thread and nothing resets it when a model is evicted, so an unloaded model keeps
-reporting its last throughput EMA indefinitely. Always read it against
+reporting its last throughput figure indefinitely. Always read it against
 `rustedvino_model_loaded` for the same model. The same applies to
 `rustedvino_model_load_duration_seconds`, which retains the last-known figure by design.
 Counters and histograms are cumulative since process start and are likewise never reset by
@@ -130,12 +130,14 @@ to `/metrics`. All carry `model`, `device`, `kind`.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `rustedvino_requests_running` | gauge | `model`, `device`, `kind` | Requests that hold an engine slot and have not finished. Forced to `0` when the model is unloaded |
+| `rustedvino_requests_running` | gauge | `model`, `device`, `kind` | Requests that hold an engine slot and have not finished. Forced to `0` when the model is unloaded. A split SpeechT5 request holds one slot for all its pieces |
 | `rustedvino_requests_max` | gauge | `model`, `device`, `kind` | The model's concurrency cap — the point at which further requests get `429`. Resolved per model (`max_concurrent_streams`, else `max_num_seqs`, else the engine's own default), so different kinds legitimately show different numbers. Reads `0` while unloaded |
 | `rustedvino_requests_waiting` | gauge | `model`, `device`, `kind` | Callers parked at the admission gate, not yet running. This is genuine queue pressure: sustained non-zero with `requests_running == requests_max` means the model is the bottleneck. Accounting differs by engine: most maintain a dedicated waiting counter, but the reranking and image-generation engines derive it as in-flight-minus-one, so for those it is not an independent queue measurement |
-| `rustedvino_requests_total` | counter | `model`, `device`, `kind`, `modality` | Requests **accepted by an engine**. Excludes anything rejected earlier (`404`, `429`, `503`, and the prompt gates below) — so this is not a request-rate metric for the HTTP surface, it is an engine admission count. A VLM splits into `modality="text"` and `modality="multimodal"` on the same engine |
+| `rustedvino_requests_total` | counter | `model`, `device`, `kind`, `modality` | Requests **accepted by an engine**. Excludes anything rejected earlier (`404`, `429`, `503`, and the prompt gates below) — so this is not a request-rate metric for the HTTP surface, it is an engine admission count. A VLM splits into `modality="text"` and `modality="multimodal"` on the same engine. **SpeechT5 counts pieces, not HTTP requests:** since 0.9.1 a long `/v1/audio/speech` input is synthesized in pieces of at most 200 characters (the `X-RustedVINO-TTS-Segments` header gives the count), and each piece is one engine request here |
 | `rustedvino_tokens_generated_total` | counter | `model`, `device`, `kind` | Output tokens produced. Incremented by the real per-step token count, so a speculative-decoding step that accepts several draft tokens counts all of them. Only the generation engines (`text_gen`, `vision`) ever increment this; other kinds register the series and leave it at `0` |
-| `rustedvino_tokens_per_second` | gauge | `model`, `device`, `kind` | Exponential moving average of aggregate decode throughput across the engine's live batch — a batch-level figure, not per request. **Not reset on eviction**; see trap 3 above |
+| `rustedvino_tokens_per_second` | gauge | `model`, `device`, `kind` | Output throughput; **what it measures depends on the engine.** Text models on a GPU or the CPU (the continuous-batching engine): an exponential moving average of aggregate decode throughput across the live batch, sampled per step — a batch-level figure, not per request, and prompt processing is not in it. Vision (`kind="vision"`) and NPU models: the **last finished request's** output tokens ÷ its end-to-end time, **prompt processing included** — so on a long prompt it reads well below the real generation speed (measured on an i7-11800H CPU: 4.9 tok/s for a 2,029-token prompt against 10.5 tok/s of actual generation). For prompt speed use `rustedvino_prefill_tokens_per_second`. **Not reset on eviction**; see trap 3 above |
+| `rustedvino_prompt_tokens_total` | counter | `model`, `device`, `kind`, `modality` | Prompt tokens of finished generation requests (text, vision, NPU), the engine's own count — the same figure as `usage.prompt_tokens`. A request that ends in an error, or that its client stopped (disconnected, or not reading fast enough) before its end, is not counted, on every engine. A request the server stopped at its thinking budget (`finish_reason: "length"`, see INTERFACE.md "Thinking control") **is** a finished request and is counted, here and in the two series below. *(since 0.9.1)* |
+| `rustedvino_reasoning_tokens_total` | counter | `model`, `device`, `kind`, `modality` | Reasoning tokens of the same finished requests — the same figure as `usage.completion_tokens_details.reasoning_tokens` (markers included). **Exact on text models, approximate on vision and NPU models** (a tokenizer recount of the reasoning text; see INTERFACE.md "The `usage` object"). Divide by `rustedvino_tokens_generated_total` for the thinking share. *(since 0.9.1)* |
 
 ### Rejection and clamp counters
 
@@ -172,9 +174,10 @@ they aggregate across replicas and work with `histogram_quantile()`. Each expose
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `rustedvino_ttft_seconds` | histogram | `model`, `device`, `kind`, `modality` | Time to first token, measured from handler entry (so it includes admission-queue wait, not just prefill). Recorded only by the generation engines; other kinds register the series and leave `_count` at `0` |
-| `rustedvino_request_duration_seconds` | histogram | `model`, `device`, `kind`, `modality` | End-to-end duration from handler entry to the final token. Recorded by **every** kind, including embeddings, reranking, image generation, STT and TTS — for those it is the only latency signal, since they have no first token |
-| `rustedvino_rtf_ratio` | histogram | `model`, `device`, `kind` | Real-time factor for audio: processing seconds ÷ audio seconds. Below `1.0` is faster than real time. Recorded only by STT and TTS engines, covering both the offline endpoints and the realtime voice pipeline (same engine thread either way) |
+| `rustedvino_ttft_seconds` | histogram | `model`, `device`, `kind`, `modality` | Time to first token, measured from handler entry (so it includes admission-queue wait, not just prefill). *(since 0.9.1)* A request that waited for an on-demand load (`on_demand_wait_secs`) is measured from the end of that wait, as is its `rustedvino_request_duration_seconds`: both measure serving, not loading; the wait itself is in the INFO log line `on-demand wait: done` (`waited_ms`). Recorded only by the generation engines; other kinds register the series and leave `_count` at `0` |
+| `rustedvino_request_duration_seconds` | histogram | `model`, `device`, `kind`, `modality` | End-to-end duration from handler entry to the final token. Recorded by **every** kind, including embeddings, reranking, image generation, STT and TTS — for those it is the only latency signal, since they have no first token. For SpeechT5 each piece of a split `/v1/audio/speech` request is one sample, timed from when that piece is sent to the engine |
+| `rustedvino_prefill_tokens_per_second` | histogram | `model`, `device`, `kind`, `modality` | **Effective prefill (prefix-cache hits included)**: prompt tokens ÷ (first generated token − the engine's start of this request). Recorded once per request, only when the prompt has at least **256** tokens (`PREFILL_MIN_PROMPT_TOKENS`, a constant, not a config key); the two token counters above count every finished request. See "Reading the prefill histogram" below. *(since 0.9.1)* |
+| `rustedvino_rtf_ratio` | histogram | `model`, `device`, `kind` | Real-time factor for audio: processing seconds ÷ audio seconds. Below `1.0` is faster than real time. Recorded only by STT and TTS engines, covering both the offline endpoints and the realtime voice pipeline (same engine thread either way). For SpeechT5 one sample per piece of a split request |
 
 **Bucket edges (seconds, except RTF which is dimensionless):**
 
@@ -185,6 +188,34 @@ they aggregate across replicas and work with `histogram_quantile()`. Each expose
 | `rustedvino_realtime_stt_duration_seconds` | 0.05, 0.1, 0.2, 0.5, 1, 2, 5 |
 | `rustedvino_realtime_llm_duration_seconds` | 0.5, 1, 2, 5, 10, 20, 30 |
 | `rustedvino_rtf_ratio` | 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 5 |
+| `rustedvino_prefill_tokens_per_second` (tokens/s) | 10, 25, 50, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3000, 5000 |
+
+The three 0.9.1 series carry the `modality` label as `rustedvino_ttft_seconds` does (a vision model splits text-only
+and image requests, whose prefill differs a lot), at the cost of one more label value per vision model.
+
+### Reading the prefill histogram
+
+*(since 0.9.1)*
+
+- **Effective, not raw, prefill.** OpenVINO GenAI 2026.4.1 reports no per-request prefix-cache hit count, so a
+  follow-up request whose prompt prefix was cached divides all its prompt tokens by a short interval: a cache hit
+  shows up as a high rate, not as a separate number.
+- **Queue and admission time are left out.** The interval starts when the engine thread takes the request: on the
+  text engine just before it is handed to the continuous-batching pipeline, on the vision and NPU engines when the
+  engine starts the generation call. The admission-gate wait and the command-queue wait are before that point (they
+  stay in `rustedvino_ttft_seconds`, which counts from handler entry).
+- **Continuous batching (text engine).** The interval also holds the pipeline scheduler's own wait for room in the
+  batch and the steps it spends on other requests (their decode, their prefill chunks) before this request's first
+  token. Under load the rate therefore reads lower than the hardware's prefill speed. This is documented, not
+  corrected.
+- **Vision engine.** The interval holds image preprocessing, the vision encoder and the chat template (all run
+  inside the one generation call), and the prompt count is the pipeline's own input-token count. Whether that count
+  includes the image's visual tokens has not been verified on hardware. The first point is the first text chunk, which
+  can hold more than one token.
+- **NPU engine.** The prompt count is the tokenizer's count of the rendered prompt; the first point is the first
+  delivered text chunk.
+- A request whose first token never came (an error, a disconnect before it), or that its client stopped before its
+  end, records no sample.
 
 ## VRAM
 
@@ -215,7 +246,7 @@ reserves. These two are *measured* from the kernel (`/proc/self/fdinfo`, DRM dri
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `rustedvino_process_gpu_memory_bytes` | gauge | `driver`, `pdev`, `region` | Device memory this server process holds, read at scrape time. `pdev` is the PCI device, so two GPUs on one driver stay separate. `region` is the driver's own name, passed through verbatim: on `xe` for example `gtt` / `system` / `stolen` / `vram0`, on `i915` for example `system0` / `local0`, and `memory` for the NPU (`intel_vpu`). Real bytes, not converted from GiB figures |
-| `rustedvino_model_gpu_memory_estimate_bytes` | gauge | `model`, `device`, `kind` | Per loaded model: the measured change across its load, plus runtime growth for embedding engines (the batch cache OpenVINO keeps until eviction). **NaN** while loaded but unknown; 0 once evicted |
+| `rustedvino_model_gpu_memory_estimate_bytes` | gauge | `model`, `device`, `kind` | Per loaded model, with its whole KV pool: the measured change across its load, or the measured weights plus the booked pool when the pool was not resident at the end of the load (see below), plus runtime growth for embedding engines (the batch cache OpenVINO keeps until eviction). **NaN** while loaded but unknown; 0 once evicted |
 
 The per-model figure is an **estimate** taken from the process-wide counter, so the server
 only trusts a measurement taken while nothing else changed memory. It reports NaN (and
@@ -226,12 +257,61 @@ only trusts a measurement taken while nothing else changed memory. It reports Na
   model's memory about 11 s *after* the eviction returns (measured on Lunar Lake);
 - for an embedding model, any batch hit either of those conditions.
 
-A reload in a quiet moment measures it again. Use it to check `vram_gb`: when an estimate exceeds its model's `vram_gb` plus its KV pool (`kv_cache_gb`, which the
-measurement includes), the accounting under-counts that model. The server also logs this once per load, and
+A reload in a quiet moment measures it again. *(Since 0.9.1)* a load that was not measured logs why at
+debug level (`RUST_LOG=rustedvino::model_manager=debug`): `load memory not measured` with a `reason`
+(`within_quiet_period_after_release` and `since_release_s`, `lifecycle_event_during_window`,
+`lease_active_during_window`, `no_reading` or `negative_delta`). One exception logs nothing: a load that
+returned only after the stalled-load reaper gave up waiting (log line `stalled load returned after N s — committed`)
+is committed unmeasured, with no `not measured` line. **A model on the CPU holds no device memory**, so its
+measurement reads about zero: the load logs `load memory measured … path="fallback" … delta_mib=0`, and
+`GET /v1/admin/models` shows `gpu_memory_estimate_gb: 0.0` with no `vram_measured_mib`. That `0.0` is not its RAM
+use (see the process memory gauges for that). Use the line to check `vram_gb`: when an estimate exceeds its model's `vram_gb` plus its KV pool (`kv_cache_gb`, which the
+estimate includes), the accounting under-counts that model. The server also logs this once per load, and
 `GET /v1/admin/models` shows it as `gpu_memory_estimate_gb`.
 
+**The KV pool is not always resident when a load ends.** The one-token warm-up after a GPU load
+(`kv_warmup`) is meant to allocate it, but when the warm-up is off, fails, or does not allocate it
+on that machine, the pool is allocated at the model's first request. That was measured for a vision
+pool on a B70: 7.4 GiB appeared in full at the first request. For a text pool it is **not verified
+on hardware**; it is what the GenAI 2026.4.1 source does (both engines allocate their KV tensors at
+the first scheduler step).
+
+*(since 0.9.1)* So, for a vision model and a text model without a draft on a GPU (with or without `kv_warmup`), the
+server also reads device memory after the engine is built and before the warm-up, and splits the
+load in two: the weights (the change across construction) and the part of the pool that became
+resident (the change across the warm-up, `kv_pool_resident_mib` in `GET /v1/admin/models`). When
+less than 90 % of the pool became resident, the estimate is the measured weights plus the booked
+pool, so it still includes the whole pool.
+
+The split is not used (the load is measured as before: the estimate is the load's change, and
+`kv_pool_resident_mib` is absent) when:
+
+- the reading is missing: a draft-attached text engine, CPU and NPU, other kinds;
+- the readings are not monotonic, or the warm-up grew more than twice the pool plus 1 GiB (noise,
+  mostly on shared-memory boxes, where the reading is all of the process's GPU-driver memory);
+- a text model's warm-up made less than 90 % of the pool resident while its construction took at
+  least the pool (the construction figure might hold part of the pool). So a text model whose pool
+  the warm-up did not touch (warm-up off or failed) keeps the old, low figure;
+- a vision model's construction took at least its weight files on disk (the top-level `*.bin`
+  files) plus 90 % of the pool: the pool was probably built at construction. This is a sanity
+  bound and can misfire at the margins: runtime overhead on top of a small pool can cause a false
+  fallback, and a submodel placed on another device makes the bound loose.
+
+The server logs which way each load was measured: `load memory measured`, with `path` = `direct` or
+`fallback` and, for a fallback, a `reason` (`no_mid_reading`, `missing_reading`, `no_pool`,
+`not_monotonic`, `absurd_warm_up_growth`, `text_pool_not_seen_resident`,
+`vision_above_disk_size`). It warns when a vision model's warm-up succeeded but its pool did not
+appear during it (the pool may then have been built at construction, which would make the weights
+figure include it; check on hardware).
+
+Limit: when the pool appeared during the warm-up, the warm-up's own scratch memory (activations,
+kernels compiled at the first generate) is counted with the pool. `kv_pool_resident_mib` is capped at
+the booked pool, but the estimate, which is then the load's change, includes that scratch.
+
 The same measurement gives `vram_measured_mib` in `GET /v1/admin/models`: the weights as measured
-at the last load (the load's device-memory delta minus the KV pool it allocated, MiB), omitted under
+at the last load, MiB — the change across engine construction when the load was split, else the
+load's device-memory change minus the KV pool it booked (which under-states the weights by any part
+of the pool that was not resident yet). It is omitted under
 the same conditions and also for every pool sized in whole GiB (`kv_pool_blocks` absent: the legacy
 gate, or a model without an exact KV layout), whose real size is not known to the byte. A vision model that has admitted requests with images since its last
 load carries `kv_admission_low_confidence: true` and `uncounted_image_admissions: <n>`: image tokens
@@ -242,6 +322,25 @@ wait and reload to get one. `server.headroom` of the same response (every caller
 each discrete GPU's total, what other processes hold, what this process holds, the running
 leases and what is left for one prompt, with `probe` `fdinfo` or `none`; `rv status` prints it
 under the VRAM bars.
+
+## Process and host memory (Linux)
+
+*(since 0.9.1)* Read from the kernel at scrape time (`/proc/self/status`, `/proc/meminfo`), in bytes (the kernel's
+kB figures times 1024). No labels. Each is absent (not `0`) where the OS cannot measure it: on
+Windows and other non-Linux hosts none of the four is exported, so alert with `absent()`.
+Limit: a gauge keeps its last value if a later read fails (only if `/proc` becomes unreadable
+mid-run); the exporter cannot remove a single series.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rustedvino_process_resident_memory_bytes` | gauge | none | Resident memory of the server process (`VmRSS`): anonymous plus file-backed pages, such as model files the CPU or NPU plugin mapped. Includes pages the kernel can drop and re-read, so it can exceed what the process really costs the host |
+| `rustedvino_process_rss_anon_bytes` | gauge | none | Anonymous resident memory of the server process (`RssAnon`): the part that leaves `MemAvailable`. The figure the system-RAM admission measures loads and CPU requests with |
+| `rustedvino_host_memory_available_bytes` | gauge | none | Host memory available without swapping (`MemAvailable`: free plus reclaimable). The live figure the system-RAM admission floor checks a load against |
+| `rustedvino_host_memory_total_bytes` | gauge | none | Total host memory (`MemTotal`) |
+
+Under `--supervise` the process gauges describe the worker that serves `/metrics`, not the
+supervisor. On a UMA box (iGPU, NPU) device memory comes out of the same RAM: compare
+`rustedvino_process_gpu_memory_bytes` with these.
 
 ## KV cache
 
@@ -256,12 +355,18 @@ conclusion from this endpoint.
 | `rustedvino_kv_cache_usage_supported` | gauge | `model`, `device`, `kind` | `1` if the percent gauge above is a trustworthy live reading for this model; `0` if it is structurally unqueryable and therefore indistinguishable from a genuinely empty pool |
 | `rustedvino_kv_cache_pressure_flagged` | gauge | `model`, `device`, `kind` | `1` while this model's occupancy has stayed continuously at or above `kv_pressure_threshold_pct` for at least `kv_pressure_sustained_secs`. Detect-and-flag only — nothing is evicted or resized as a result |
 
+`rv ps` and `rv status` follow this rule: their `KV%` column shows `n/a` when `_usage_supported` is `0` (the VLM
+engine today) and the percent otherwise. A text (CB) model reads `0%` while idle; its gauge moves only during a
+generation. Both read the series of the device the model is on now (the server keeps a moved model's old
+device's series with their last values). `GET /v1/admin/models` (and so `rv ps --json`) carries the raw percent as `kv_cache_usage_pct` beside the same flag as
+`kv_cache_usage_supported` (bool).
+
 ### Admission
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `rustedvino_kv_gate_mode` | gauge | `model`, `mode` | `1` for the prompt-length gate mode a loaded GPU/CPU text or vision model uses (NPU models have no KV gate and no series), `0` once it is unloaded. `mode="exact"` = the limit comes from the model's real KV layout and exact pool, `mode="legacy"` = the older estimate (a model reads 1 on exactly one of the two). Labels are `model` and `mode` only (no `device`/`kind`), so join with `on(model)`. |
-| `rustedvino_kv_scheduler_drop_total` | counter | `model` | Requests the continuous-batching scheduler ignored because the KV pool had no room for them (the client gets a retryable 503). Text (continuous-batching) and vision models on any device, including a vision model on the NPU (a vision model's KV capacity wedge, `kv_capacity_wedge`, counts too); NPU text models and other kinds have no series. A rising count means the prompt-length gate admits more than the pool holds; see `kv_cache_precision` in `CONFIG.md`. |
+| `rustedvino_kv_scheduler_drop_total` | counter | `model` | Requests the continuous-batching scheduler ignored because the KV pool had no room for them (the client gets a retryable 503). Text (continuous-batching) and vision models on any device, including a vision model on the NPU (a vision model's KV capacity wedge, `kv_capacity_wedge`, counts too); NPU text models and other kinds have no series. A rising count means the prompt-length gate admits more than the pool holds; see `kv_cache_precision` in `CONFIG.md`. It also counts a request whose answer filled the pool after it started generating (admission reserves the prompt only), which can happen with a correct gate; the server log says which ("KV pool filled from output growth"). |
 
 ### `supported = 0` is not "the pool is empty"
 
@@ -371,8 +476,11 @@ the pipeline, not one engine. None of them appear until the first realtime conne
 | `stt_error` | Transcription failed |
 | `llm_error` | Generation failed |
 | `cancelled` | Turn cancelled before completion |
-| `barge_in` | The user spoke over the response and pre-empted it — normal conversational behaviour, not an error |
-| `admission_rejected` | The turn could not get an engine slot |
+| `barge_in` | The transcript contained the session's barge-in phrase, and the server answered with its stop reply (see [REALTIME.md](REALTIME.md) "Barge-in phrase turn") — normal use, not an error |
+| `admission_rejected` | The turn could not get its device admission (the [`device_budgets`](CONFIG.md) caps) |
+
+A skipped turn (empty or too-short transcript) and a turn not started because the client
+hung up count under no `result`.
 
 Only `stt_error` and `llm_error` are faults. `barge_in` and `cancelled` are expected in
 normal use, and alerting on total turns minus `ok` will fire constantly.

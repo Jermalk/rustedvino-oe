@@ -194,6 +194,12 @@ impl DeviceBudgets {
         )
     }
 
+    /// Free admission tokens on `device` (`None` when it has no budget) — test seam.
+    #[cfg(test)]
+    pub(crate) fn available(&self, device: &str) -> Option<usize> {
+        self.devices.get(device).map(|s| s.available_permits())
+    }
+
     /// Whether `device` has a configured budget (otherwise `admit` is a pass-through).
     #[must_use]
     pub fn is_budgeted(&self, device: &str) -> bool {

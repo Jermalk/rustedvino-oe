@@ -230,11 +230,24 @@ fn go_duration_valid(s: &str) -> bool {
         else {
             return false;
         };
-        total += int * u128::from(scale);
+        // Checked: a huge digit string (2^116 hours is a multiple of 2^128 ns) would wrap to a
+        // "valid" 0 in release and panic in a debug build; Go rejects it as an overflow.
+        let Some(t) = int
+            .checked_mul(u128::from(scale))
+            .and_then(|v| total.checked_add(v))
+        else {
+            return false;
+        };
+        total = t;
         if !frac.is_empty() {
+            // At most 18 digits times a scale below 2^42: far below u128::MAX.
             let digits = frac.len().min(18);
             let f: u128 = frac[..digits].parse().unwrap_or(0);
-            total += f * u128::from(scale) / 10u128.pow(u32::try_from(digits).unwrap_or(18));
+            let part = f * u128::from(scale) / 10u128.pow(u32::try_from(digits).unwrap_or(18));
+            let Some(t) = total.checked_add(part) else {
+                return false;
+            };
+            total = t;
         }
         if total > LIMIT {
             return false;
@@ -297,4 +310,31 @@ fn string_or_null(raw: &RawValue, field: &str) -> Result<String, SystemOneError>
             "json: cannot unmarshal into Go struct field {field} of type string"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_duration_valid;
+
+    #[test]
+    fn duration_accepts_ordinary_values() {
+        for s in ["0", "5m", "1h30m", "-1.5s", "+300ms", "2562047h"] {
+            assert!(go_duration_valid(s), "{s}");
+        }
+    }
+
+    /// FM-10: 2^116 hours times 3.6e12 ns is a multiple of 2^128, so unchecked arithmetic wrapped
+    /// to 0 and passed (and panicked in a debug build). Go refuses it as an overflow.
+    #[test]
+    fn duration_refuses_overflowing_digit_strings() {
+        for s in [
+            "83076749736557242056487941267521536h",
+            "340282366920938463463374607431768211455ns",
+            "99999999999999999999999999999999999999999999h",
+            "2562048h",
+            "1h83076749736557242056487941267521536h",
+        ] {
+            assert!(!go_duration_valid(s), "{s}");
+        }
+    }
 }

@@ -71,10 +71,11 @@ pub(crate) enum TtsCommand {
         speed: f32,
         reply: oneshot::Sender<anyhow::Result<Vec<f32>>>,
         started_at: Instant,
-        /// Admission-gate permit, held until this synthesis finishes. Dropped
-        /// after the engine thread sends its reply, releasing the slot for
-        /// the next waiting caller. See [`TtsHandle::synthesize`].
-        permit: OwnedSemaphorePermit,
+        /// Admission-gate permit (shared: one per HTTP request, across all its
+        /// pieces — see [`TtsHandle::synthesize_pieces`]), held until this synthesis finishes. The
+        /// engine thread drops its share just before it sends its reply
+        /// ([`crate::in_flight::finish`]). See [`TtsHandle::synthesize`].
+        permit: Arc<OwnedSemaphorePermit>,
     },
 }
 
@@ -106,10 +107,23 @@ pub struct TtsHandle {
     /// by the checkpoint: the default for text normalisation on
     /// `/v1/audio/speech` when the request names none. `None` = unknown.
     language: Option<Arc<str>>,
+    /// Longest input, in characters, the engine reads well in one synthesis call:
+    /// `Some(200)` for `SpeechT5` only (0.9.1 T1), whose `/v1/audio/speech` input is
+    /// split into sentence pieces of at most this size ([`crate::tts_split`]).
+    /// `None` = the engine takes the whole input in one call (Kokoro, Coqui VITS, Piper).
+    segment_cap: Option<usize>,
     /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after the admission
     /// permit is held. Shared by every clone of this handle; a reload builds a new engine with a
     /// clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3a; nothing sets it yet.
     closing: Arc<AtomicBool>,
+    /// Set (`SeqCst`) once an eviction of this model has committed (forced, or
+    /// non-forced past the busy check): [`synthesize_pieces`](Self::synthesize_pieces)
+    /// then stops a split request before its next piece with
+    /// [`AdmitError::Closing`] (0.9.1 T1 N1). Unlike `closing`, a refused
+    /// non-forced eviction never sets it, so it never cuts a request that the
+    /// eviction left running. Shared by every clone; a reload builds a new
+    /// engine with it clear.
+    eviction_committed: Arc<AtomicBool>,
 }
 
 impl TtsHandle {
@@ -132,6 +146,12 @@ impl TtsHandle {
         self.language.as_deref()
     }
 
+    /// The per-call input cap this engine needs, if any (see the field doc).
+    #[must_use]
+    pub fn segment_cap(&self) -> Option<usize> {
+        self.segment_cap
+    }
+
     /// Build a handle around an existing command channel — test seam only.
     #[cfg(test)]
     #[must_use]
@@ -145,8 +165,10 @@ impl TtsHandle {
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
             language: None,
+            segment_cap: None,
         }
     }
 
@@ -167,8 +189,10 @@ impl TtsHandle {
             queue_timeout: Duration::from_millis(queue_timeout_ms),
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
             language: None,
+            segment_cap: None,
         }
     }
 
@@ -192,6 +216,34 @@ impl TtsHandle {
         voice: Option<String>,
         speed: f32,
     ) -> Result<Vec<f32>, AdmitError> {
+        self.synthesize_pieces(vec![text], voice, speed).await
+    }
+
+    /// Synthesise `pieces` in order under **one** admission permit and return
+    /// their PCM joined (0.9.1 T1: a `SpeechT5` request split by
+    /// [`crate::tts_split`]). The permit is taken once, before the first piece,
+    /// and is held until the last piece is done, so `active()` counts the
+    /// request between pieces (a non-forced eviction is refused, not let in
+    /// mid-request) and a long request never re-queues behind later arrivals.
+    /// The closing flag is checked once, at admission, as for a single call;
+    /// between pieces only a *committed* eviction stops the request
+    /// ([`ManagedEngine::mark_eviction_committed`]) with [`AdmitError::Closing`].
+    ///
+    /// The permit travels to the engine with each piece as a shared
+    /// `Arc`: it is released only when both this caller and the engine are
+    /// done with it, so a caller that disconnects mid-piece still leaves the
+    /// slot counted until the engine finishes that piece. [`synthesize`](Self::synthesize)
+    /// is this with one piece.
+    ///
+    /// # Errors
+    /// As [`synthesize`](Self::synthesize); the first failing piece ends the
+    /// request (later pieces are not sent) and releases the permit.
+    pub async fn synthesize_pieces(
+        &self,
+        pieces: Vec<String>,
+        voice: Option<String>,
+        speed: f32,
+    ) -> Result<Vec<f32>, AdmitError> {
         // `InFlightGuard` (not just an increment) so a cancelled caller — an
         // HTTP client disconnecting while parked at the gate — still
         // decrements: its `Drop` runs even if this `.await` is torn down
@@ -201,7 +253,7 @@ impl TtsHandle {
             tokio::time::timeout(self.queue_timeout, Arc::clone(&self.sem).acquire_owned()).await
         };
         let permit = match permit_result {
-            Ok(Ok(p)) => p,
+            Ok(Ok(p)) => Arc::new(p),
             Ok(Err(_)) => return Err(AdmitError::EngineDead), // semaphore closed (shouldn't happen)
             Err(_) => return Err(AdmitError::AtCapacity),     // timed out waiting for a permit
         };
@@ -214,6 +266,41 @@ impl TtsHandle {
             return Err(AdmitError::Closing);
         }
 
+        let mut joined: Vec<f32> = Vec::new();
+        for (i, text) in pieces.into_iter().enumerate() {
+            // Every piece carries a share; this caller keeps its own until it has
+            // the last reply, so the request stays counted from admission to the
+            // end, between pieces too (the engine drops its share after replying).
+            let piece_permit = Arc::clone(&permit);
+            // N1: an eviction that has committed (not a refused one) stops the
+            // request between pieces, so a forced eviction does not wait out
+            // the rest of a long split request. The first piece was admitted
+            // under the closing check above.
+            if i > 0 && self.eviction_committed.load(Ordering::SeqCst) {
+                return Err(AdmitError::Closing);
+            }
+            let samples = self
+                .synthesize_one(text, voice.clone(), speed, piece_permit)
+                .await?;
+            if joined.is_empty() {
+                joined = samples;
+            } else {
+                joined.extend_from_slice(&samples);
+            }
+        }
+        drop(permit);
+        Ok(joined)
+    }
+
+    /// Send one piece to the engine with a share of the request's permit and
+    /// await its PCM.
+    async fn synthesize_one(
+        &self,
+        text: String,
+        voice: Option<String>,
+        speed: f32,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<Vec<f32>, AdmitError> {
         let started_at = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -232,7 +319,7 @@ impl TtsHandle {
             return Err(AdmitError::EngineDead);
         }
 
-        // 10-minute hard ceiling — SpeechT5 decoder can loop indefinitely on
+        // 10-minute hard ceiling per piece — SpeechT5 decoder can loop indefinitely on
         // pathological input (no EOS). First call on a new device triggers OV
         // kernel compilation (~6 min); subsequent calls are 2–8 s. The engine
         // thread stays stuck until the C++ call returns, but the realtime
@@ -252,6 +339,10 @@ impl ManagedEngine for TtsHandle {
 
     fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    fn mark_eviction_committed(&self) {
+        self.eviction_committed.store(true, Ordering::SeqCst);
     }
 
     /// Accepted-but-unfinished requests (queued + the one synthesizing) —
@@ -329,11 +420,10 @@ pub fn spawn_tts_engine(
                         "SpeechT5 synthesis complete"
                     );
                 }
-                // Client may have disconnected — ignore a dropped receiver.
-                let _ = reply.send(result);
                 // Balance the handle's admission acquire, whatever the outcome —
-                // releases the slot for the next waiting caller.
-                drop(permit);
+                // releases the slot for the next waiting caller — and then reply
+                // (0.9.1 C2: release before reply).
+                crate::in_flight::finish(permit, reply, result);
             }
             tracing::info!(
                 model_id = %model_id_owned,
@@ -351,8 +441,10 @@ pub fn spawn_tts_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
             language: Some(Arc::from("en")),
+            segment_cap: Some(crate::tts_split::SPEECHT5_SEGMENT_CAP),
         },
         thread,
     ))
@@ -452,8 +544,7 @@ pub fn spawn_kokoro_engine(
                             "Kokoro synthesis complete"
                         );
                     }
-                    let _ = reply.send(result);
-                    drop(permit);
+                    crate::in_flight::finish(permit, reply, result); // release, then reply (0.9.1 C2)
                 }
                 tracing::info!(
                     model_id = %model_id_owned,
@@ -477,8 +568,10 @@ pub fn spawn_kokoro_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: KOKORO_SAMPLE_RATE,
             language: Some(Arc::from("en")),
+            segment_cap: None,
         },
         thread,
     ))
@@ -737,8 +830,7 @@ pub fn spawn_coqui_vits_engine(
                         "Coqui VITS synthesis complete"
                     );
                 }
-                let _ = reply.send(result);
-                drop(permit);
+                crate::in_flight::finish(permit, reply, result); // release, then reply (0.9.1 C2)
             }
             tracing::info!(
                 model_id = %model_id_owned,
@@ -759,8 +851,10 @@ pub fn spawn_coqui_vits_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: COQUI_VITS_PL_SAMPLE_RATE,
             language: Some(Arc::from("pl")),
+            segment_cap: None,
         },
         thread,
     ))
@@ -903,8 +997,7 @@ pub fn spawn_piper_engine(
                     let duration_s = samples.len() as f64 / f64::from(sample_rate);
                     metrics.record_rtf(elapsed.as_secs_f64() / duration_s.max(0.001));
                 }
-                let _ = reply.send(result);
-                drop(permit);
+                crate::in_flight::finish(permit, reply, result); // release, then reply (0.9.1 C2)
             }
             tracing::info!(
                 model_id = %model_id_owned,
@@ -925,8 +1018,10 @@ pub fn spawn_piper_engine(
             queue_timeout,
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate,
             language: Some(language),
+            segment_cap: None,
         },
         thread,
     ))
@@ -945,9 +1040,8 @@ pub(crate) fn spawn_mock_tts(model_id: &str) -> (TtsHandle, std::thread::JoinHan
 
     let thread = std::thread::spawn(move || {
         while let Some(TtsCommand::Synthesize { reply, permit, .. }) = rx.blocking_recv() {
-            // One second of 16 kHz silence.
-            let _ = reply.send(Ok(vec![0.0_f32; TTS_SAMPLE_RATE as usize]));
-            drop(permit);
+            // One second of 16 kHz silence, released then replied as the real threads do.
+            crate::in_flight::finish(permit, reply, Ok(vec![0.0_f32; TTS_SAMPLE_RATE as usize]));
         }
     });
 
@@ -960,8 +1054,98 @@ pub(crate) fn spawn_mock_tts(model_id: &str) -> (TtsHandle, std::thread::JoinHan
             queue_timeout: Duration::from_secs(30),
             waiting: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
             sample_rate: TTS_SAMPLE_RATE,
             language: None,
+            segment_cap: None,
+        },
+        thread,
+    )
+}
+
+/// One mock sample per character of `text`, encoding the character, so a test
+/// can read the text back out of joined audio (and so see the piece order).
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss)] // values < 128
+pub(crate) fn mock_samples_for(text: &str) -> Vec<f32> {
+    text.chars()
+        .map(|c| (u32::from(c) % 128) as f32 / 256.0)
+        .collect()
+}
+
+/// A piece containing this word makes [`spawn_mock_speecht5_tts`] fail it.
+#[cfg(test)]
+pub(crate) const MOCK_FAIL_MARKER: &str = "mockfailpiece";
+
+/// A piece containing this word makes [`spawn_mock_speecht5_tts`] take
+/// [`MOCK_SLOW_PIECE_MS`] (so a test can act while a split request runs).
+#[cfg(test)]
+pub(crate) const MOCK_SLOW_MARKER: &str = "mockslowpiece";
+
+/// How long a [`MOCK_SLOW_MARKER`] piece takes in the mock engine.
+#[cfg(test)]
+pub(crate) const MOCK_SLOW_PIECE_MS: u64 = 300;
+
+/// Pieces each [`spawn_mock_speecht5_tts`] engine has received, by model id
+/// (a test that counts uses a model id of its own; tests run in parallel).
+#[cfg(test)]
+static MOCK_PIECES_SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many pieces the `SpeechT5` mock for `model_id` has received so far.
+#[cfg(test)]
+pub(crate) fn mock_pieces_seen(model_id: &str) -> usize {
+    MOCK_PIECES_SEEN
+        .lock()
+        .map_or(0, |m| m.get(model_id).copied().unwrap_or(0))
+}
+
+/// A mock engine that behaves like `SpeechT5` towards the handler: it carries
+/// the `SpeechT5` segment cap and answers each piece with
+/// [`mock_samples_for`] that piece. The manager's mock factory uses it for a
+/// model whose name contains `speecht5`.
+#[cfg(test)]
+pub(crate) fn spawn_mock_speecht5_tts(model_id: &str) -> (TtsHandle, std::thread::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(TTS_CHANNEL_CAP);
+    let sem = Arc::new(Semaphore::new(TTS_CHANNEL_CAP));
+
+    let seen_key = model_id.to_owned();
+    let thread = std::thread::spawn(move || {
+        while let Some(TtsCommand::Synthesize {
+            text,
+            reply,
+            permit,
+            ..
+        }) = rx.blocking_recv()
+        {
+            if let Ok(mut seen) = MOCK_PIECES_SEEN.lock() {
+                *seen.entry(seen_key.clone()).or_insert(0) += 1;
+            }
+            if text.contains(MOCK_SLOW_MARKER) {
+                std::thread::sleep(Duration::from_millis(MOCK_SLOW_PIECE_MS));
+            }
+            let result = if text.contains(MOCK_FAIL_MARKER) {
+                Err(anyhow::anyhow!("mock SpeechT5 piece failed"))
+            } else {
+                Ok(mock_samples_for(&text))
+            };
+            crate::in_flight::finish(permit, reply, result);
+        }
+    });
+
+    (
+        TtsHandle {
+            tx,
+            model_id: Arc::from(model_id),
+            sem,
+            cap: TTS_CHANNEL_CAP,
+            queue_timeout: Duration::from_secs(30),
+            waiting: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
+            eviction_committed: Arc::new(AtomicBool::new(false)),
+            sample_rate: TTS_SAMPLE_RATE,
+            language: Some(Arc::from("en")),
+            segment_cap: Some(crate::tts_split::SPEECHT5_SEGMENT_CAP),
         },
         thread,
     )
@@ -1084,7 +1268,7 @@ mod tests {
         assert_eq!(handle.active(), 0, "no permit was ever held");
     }
 
-    /// When a slot opens (permit released after the first reply), a waiting
+    /// When a slot opens (the first request's permit is released), a waiting
     /// `synthesize` completes instead of returning `AtCapacity`.
     #[tokio::test]
     async fn synthesize_waits_and_succeeds_when_slot_opens() {
@@ -1197,5 +1381,226 @@ mod active_contract_tests {
         assert_eq!(h.active(), 1, "accepted: the command reached the engine");
         drop(cmd);
         let _ = caller.await;
+    }
+
+    // ── T1 F1/F2: one admission per multi-piece request ───────────────────
+
+    /// Wait (bounded) until every share of the request's permit is dropped.
+    async fn settle_active(h: &TtsHandle) -> usize {
+        for _ in 0..200 {
+            if h.active() == 0 {
+                return 0;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.active()
+    }
+
+    #[tokio::test]
+    async fn a_failing_piece_ends_the_request_and_releases_its_one_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender_with_cap(tx, "t-tts", 4, 500);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_engine = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(TtsCommand::Synthesize {
+                text,
+                reply,
+                permit,
+                ..
+            }) = rx.recv().await
+            {
+                let r = if text == "two" {
+                    Err(anyhow::anyhow!("piece failed"))
+                } else {
+                    Ok(vec![0.5_f32; 3])
+                };
+                seen_engine.lock().unwrap().push(text);
+                let _ = reply.send(r);
+                drop(permit);
+            }
+        });
+        let pieces = ["one", "two", "three"].map(str::to_owned).to_vec();
+        let r = h.synthesize_pieces(pieces, None, 1.0).await;
+        assert!(matches!(r, Err(AdmitError::Failed(_))), "{r:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["one", "two"],
+            "piece 3 is never sent"
+        );
+        assert_eq!(
+            settle_active(&h).await,
+            0,
+            "the request's permit is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn pieces_are_joined_in_order_under_one_permit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender_with_cap(tx, "t-tts", 4, 500);
+        let h_engine = h.clone();
+        tokio::spawn(async move {
+            while let Some(TtsCommand::Synthesize {
+                text,
+                reply,
+                permit,
+                ..
+            }) = rx.recv().await
+            {
+                // N2: drop the engine's share of the permit FIRST, then look: one
+                // admission per request means the caller still holds its share, so
+                // the slot stays taken (per-piece admission would read 0 here).
+                drop(permit);
+                assert_eq!(h_engine.active(), 1, "the request holds its slot");
+                let _ = reply.send(Ok(mock_samples_for(&text)));
+            }
+        });
+        let out = h
+            .synthesize_pieces(vec!["ab".into(), "cd".into(), "e".into()], None, 1.0)
+            .await
+            .unwrap();
+        assert_eq!(out, mock_samples_for("abcde"));
+        assert_eq!(settle_active(&h).await, 0);
+    }
+
+    /// The reviewer's live failure, in miniature: a 3-piece request admitted
+    /// first must not lose its slot to a later arrival between its pieces.
+    /// Cap 1; the mock takes 1 ms per character. A (3 × 100 chars) starts at
+    /// t=0, B (190 chars) arrives at t=20 ms, queue timeout 140 ms. Per-piece
+    /// admission let B in after A's first piece and timed A out (A waited
+    /// ~190 ms); one admission per request keeps A's slot until it is done, so
+    /// B is the one that waits past the timeout.
+    #[tokio::test]
+    async fn the_first_arriving_long_request_is_not_the_one_rejected() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender_with_cap(tx, "t-tts", 1, 140);
+        tokio::spawn(async move {
+            while let Some(TtsCommand::Synthesize {
+                text,
+                reply,
+                permit,
+                ..
+            }) = rx.recv().await
+            {
+                tokio::time::sleep(Duration::from_millis(text.len() as u64)).await;
+                let _ = reply.send(Ok(vec![0.0_f32; 1]));
+                drop(permit);
+            }
+        });
+        let a = tokio::spawn({
+            let h = h.clone();
+            async move {
+                let pieces = vec!["a".repeat(100), "a".repeat(100), "a".repeat(100)];
+                h.synthesize_pieces(pieces, None, 1.0).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let b = h.synthesize("b".repeat(190), None, 1.0).await;
+        let a = a.await.unwrap();
+        assert!(a.is_ok(), "the first, long request completes: {a:?}");
+        assert!(matches!(b, Err(AdmitError::AtCapacity)), "{b:?}");
+        assert_eq!(settle_active(&h).await, 0);
+    }
+
+    /// A mock engine that pauses after piece 1: it drops its permit share,
+    /// signals `at_gap`, waits for `go`, then replies. Every piece's text is
+    /// recorded.
+    fn gap_engine(
+        mut rx: tokio::sync::mpsc::Receiver<TtsCommand>,
+    ) -> (
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (at_gap_tx, at_gap_rx) = oneshot::channel::<()>();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_engine = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut at_gap = Some(at_gap_tx);
+            let mut go = Some(go_rx);
+            while let Some(TtsCommand::Synthesize {
+                text,
+                reply,
+                permit,
+                ..
+            }) = rx.recv().await
+            {
+                seen_engine.lock().unwrap().push(text.clone());
+                drop(permit);
+                if let (Some(signal), Some(wait)) = (at_gap.take(), go.take()) {
+                    let _ = signal.send(());
+                    let _ = wait.await;
+                }
+                let _ = reply.send(Ok(mock_samples_for(&text)));
+            }
+        });
+        (at_gap_rx, go_tx, seen)
+    }
+
+    /// No eviction gap between pieces (F2, discriminating since N2): with the
+    /// engine's share of piece 1's permit already dropped, `active()` still
+    /// reads 1 — so a non-forced `begin_evict` in that gap is refused. Such a
+    /// refused eviction (closing raised, then cleared) does not cut the request.
+    #[tokio::test]
+    async fn the_request_stays_counted_between_pieces() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender_with_cap(tx, "t-tts", 4, 500);
+        let (at_gap, go, seen) = gap_engine(rx);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.synthesize_pieces(vec!["one".into(), "two".into()], None, 1.0)
+                    .await
+            }
+        });
+        at_gap.await.unwrap();
+        assert_eq!(h.active(), 1, "counted between pieces");
+        // What `begin_evict` does on a refused, non-forced eviction: raise
+        // `closing`, read `active()` (> 0: refused), clear `closing`. The flag is
+        // held raised across the piece boundary here, so the request would see it
+        // if it (wrongly) checked `closing` between pieces.
+        ManagedEngine::set_closing(&h, true);
+        assert!(h.active() > 0);
+        go.send(()).unwrap();
+        let out = caller.await.unwrap();
+        ManagedEngine::set_closing(&h, false);
+        assert_eq!(
+            out.unwrap(),
+            mock_samples_for("onetwo"),
+            "a refused eviction cuts nothing"
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["one", "two"]);
+        assert_eq!(settle_active(&h).await, 0);
+    }
+
+    /// N1: once an eviction has committed, a split request stops before its
+    /// next piece with `Closing`, and releases its slot.
+    #[tokio::test]
+    async fn a_committed_eviction_stops_the_request_between_pieces() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TtsCommand>(8);
+        let h = TtsHandle::from_sender_with_cap(tx, "t-tts", 4, 500);
+        let (at_gap, go, seen) = gap_engine(rx);
+        let caller = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.synthesize_pieces(vec!["one".into(), "two".into(), "three".into()], None, 1.0)
+                    .await
+            }
+        });
+        at_gap.await.unwrap();
+        // What `begin_evict` does once it proceeds (forced, or past the busy check).
+        ManagedEngine::set_closing(&h, true);
+        ManagedEngine::mark_eviction_committed(&h);
+        go.send(()).unwrap();
+        let out = caller.await.unwrap();
+        assert!(matches!(out, Err(AdmitError::Closing)), "{out:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["one"],
+            "no piece after the commit"
+        );
+        assert_eq!(settle_active(&h).await, 0);
     }
 }

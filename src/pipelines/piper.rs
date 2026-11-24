@@ -108,36 +108,130 @@ pub fn load_config(path: &Path) -> anyhow::Result<PiperConfig> {
 /// pipeline can be unit-tested without espeak-ng installed.
 pub type EspeakFn = dyn Fn(&str, &str) -> anyhow::Result<String> + Send + Sync;
 
+/// How long one espeak-ng run (one clause) may take before it is killed (FM-9). A clause takes
+/// milliseconds; 10 s leaves room for a cold start on a slow disk or an antivirus scan of the
+/// binary, while a hung child (a broken voice-data path, a held file) no longer parks the TTS
+/// engine thread for good — the request fails with an error naming the limit.
+pub const ESPEAK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The real espeak-ng: `espeak-ng -v <voice> -q --ipa` with the clause on
-/// stdin (never a shell — the text is data, not a command line).
+/// stdin (never a shell — the text is data, not a command line), bounded by
+/// [`ESPEAK_TIMEOUT`].
 ///
 /// # Errors
-/// espeak-ng missing from PATH, or exiting non-zero.
+/// espeak-ng missing from PATH, exiting non-zero, or not answering in time.
 pub fn espeak_cli(voice: &str, text: &str) -> anyhow::Result<String> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("espeak-ng")
-        .args(["-v", voice, "-q", "--ipa"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context(
-            "running espeak-ng — Piper voices need it installed and on PATH \
-             (e.g. `apt install espeak-ng`); it runs as a separate program, never linked",
-        )?;
-    child
-        .stdin
-        .take()
-        .context("espeak-ng stdin")?
-        .write_all(text.as_bytes())
-        .context("writing to espeak-ng")?;
-    let out = child.wait_with_output().context("waiting for espeak-ng")?;
+    let mut cmd = std::process::Command::new("espeak-ng");
+    cmd.args(["-v", voice, "-q", "--ipa"]);
+    let out = run_with_deadline(cmd, text.as_bytes(), ESPEAK_TIMEOUT).map_err(|e| match e {
+        ChildError::Spawn(e) => anyhow::anyhow!(
+            "running espeak-ng: {e} — Piper voices need espeak-ng installed and on PATH (from \
+             your system's package manager or espeak-ng's own releases); it runs as a separate \
+             program, never linked"
+        ),
+        ChildError::Io(e) => anyhow::anyhow!("talking to espeak-ng: {e}"),
+        ChildError::TimedOut(d) => anyhow::anyhow!(
+            "espeak-ng did not answer within {} s and was stopped — check the espeak-ng \
+             installation and its voice data",
+            d.as_secs()
+        ),
+    })?;
     anyhow::ensure!(
         out.status.success(),
         "espeak-ng failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Why [`run_with_deadline`] produced no output.
+#[derive(Debug)]
+enum ChildError {
+    /// The program could not be started.
+    Spawn(std::io::Error),
+    /// Waiting for it failed.
+    Io(std::io::Error),
+    /// It ran past the deadline; it was killed and reaped.
+    TimedOut(std::time::Duration),
+}
+
+/// Runs `cmd` with `input` on stdin and returns its output, or kills and reaps it once
+/// `deadline` passes. Stdin is written and stdout/stderr are drained on helper threads, so
+/// neither a child that never reads nor one that fills a pipe can block the deadline check.
+/// (A grandchild that inherited the pipes would keep the helpers waiting after the kill;
+/// espeak-ng starts none.)
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    input: &[u8],
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, ChildError> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ChildError::Spawn)?;
+    let stdin = child.stdin.take();
+    let input = input.to_vec();
+    // A write error (the child exited or was killed first) is not the interesting failure: the
+    // exit status or the timeout says what happened. Dropping `stdin` closes it (EOF).
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input);
+        }
+    });
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() >= deadline => {
+                // Kill, then wait: the wait reaps it, so no zombie is left behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(ChildError::TimedOut(deadline));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(ChildError::Io(e));
+            }
+        }
+    };
+    // The child is gone, so its pipes are closed and the helpers finish.
+    let _ = writer.join();
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
 }
 
 /// Text → phonemes grouped by sentence (each phoneme one NFD codepoint, as a
@@ -379,6 +473,47 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// FM-9: the child gets its stdin and its output comes back whole.
+    #[cfg(unix)]
+    #[test]
+    fn child_with_deadline_passes_input_and_output() {
+        let out = run_with_deadline(
+            std::process::Command::new("cat"),
+            b"hello espeak",
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hello espeak");
+    }
+
+    /// FM-9: a child that does not answer is killed and reaped at the deadline, and the error
+    /// names the limit; it does not wait for the child's own 30 s.
+    #[cfg(unix)]
+    #[test]
+    fn child_past_the_deadline_is_killed() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_with_deadline(cmd, b"", std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(
+            matches!(err, ChildError::TimedOut(d) if d == std::time::Duration::from_millis(200)),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn missing_program_is_a_spawn_error() {
+        let err = run_with_deadline(
+            std::process::Command::new("rustedvino-no-such-program-fm9"),
+            b"",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChildError::Spawn(_)), "{err:?}");
+    }
 
     #[test]
     fn vietnamese_numbers_read_correctly() {

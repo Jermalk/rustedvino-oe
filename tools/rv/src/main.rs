@@ -10,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use rv::ansi::Style;
 use rv::commands::config::{self, PatchArgs, PreloadArgs};
 use rv::commands::lifecycle::{self, AddArgs, LoadArgs};
-use rv::commands::{check, logs, models, ops, service, status};
+use rv::commands::{check, logs, metrics, models, ops, service, status};
 use rv::ctx::{Common, Ctx};
 use rv::resolve::{Inputs, resolve};
 
@@ -50,8 +50,13 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// full server report
-    Status(Common),
+    /// full server report; with a model id, that model's state and sampling profile
+    Status {
+        /// model id (optional): show only this model, with its sampling profile
+        model: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
     /// every registered model, any state
     List(Common),
     /// loaded models only, with live load
@@ -60,6 +65,25 @@ enum Cmd {
     Check {
         /// model id
         model: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// the server's /metrics (admin key), with a speed line per loaded model first
+    #[command(
+        long_about = "Fetches /metrics with rv's admin key. First one line per loaded model: \
+                      effective prefill p50 (tok/s, from the rustedvino_prefill_tokens_per_second \
+                      buckets summed over modality; prefix-cache hits included, prompts of 256+ \
+                      tokens only) and decode tok/s; '-' when the model has no sample yet, \
+                      'unknown' against a server older than 0.9.1. Then the raw samples, \
+                      unlabelled ones included. key_suffix label values are masked to their \
+                      last 2 characters. --json prints {models: [...], samples: [{name, labels, \
+                      value}]}."
+    )]
+    Metrics {
+        /// show only the samples whose line contains this text (plain substring, not a regex;
+        /// matched after masking; the per-model lines are always shown)
+        #[arg(long)]
+        grep: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -89,12 +113,14 @@ enum Cmd {
     #[command(
         long_about = "A model with a request running is not evicted: the server refuses (409) \
                       and the request finishes undisturbed. --force drains it (up to 2 minutes) \
-                      and then aborts what is left."
+                      and then aborts what is left; rv prints the running requests first, then \
+                      whether they finished during the drain or were still running at the deadline (\"unknown\" \
+                      against a server older than 0.9.1)."
     )]
     Unload {
         /// model id
         model: String,
-        /// evict even if a request is running (it is drained, then aborted)
+        /// evict even if a request is running (it is drained, then aborted); prints what it did
         #[arg(long)]
         force: bool,
         #[command(flatten)]
@@ -108,7 +134,7 @@ enum Cmd {
         /// don't prompt for confirmation
         #[arg(short = 'y', long)]
         yes: bool,
-        /// evict even if a request is running (it is drained, then aborted)
+        /// evict even if a request is running (it is drained, then aborted); prints what it did
         #[arg(long)]
         force: bool,
         #[command(flatten)]
@@ -149,13 +175,13 @@ enum Cmd {
     Resize {
         /// model id
         model: String,
-        /// the new KV-cache pool target in GB
+        /// the new KV-cache pool target in GiB
         #[arg(long, allow_hyphen_values = true)]
         kv_cache_gb: f64,
         /// don't prompt for confirmation
         #[arg(short = 'y', long)]
         yes: bool,
-        /// resize even if a request is running (it is drained, then aborted)
+        /// resize even if a request is running (it is drained, then aborted); prints what it did
         #[arg(long)]
         force: bool,
         #[command(flatten)]
@@ -292,10 +318,20 @@ fn main() -> ExitCode {
         Some(Cmd::Restart { force, common }) => {
             with_margin(&common, |ctx| service::restart(ctx, force))
         }
-        Some(Cmd::Status(c)) => with_margin(&c, status::run),
+        Some(Cmd::Status {
+            model: None,
+            common,
+        }) => with_margin(&common, status::run),
+        Some(Cmd::Status {
+            model: Some(id),
+            common,
+        }) => with_margin(&common, |ctx| status::model(ctx, &id)),
         Some(Cmd::List(c)) => with_margin(&c, models::list),
         Some(Cmd::Ps(c)) => with_margin(&c, models::ps),
         Some(Cmd::Check { model, common }) => with_margin(&common, |ctx| check::run(ctx, &model)),
+        Some(Cmd::Metrics { grep, common }) => {
+            with_margin(&common, |ctx| metrics::run(ctx, grep.as_deref()))
+        }
         Some(Cmd::Logs { n, common }) => with_margin(&common, |ctx| logs::run(ctx, n)),
         Some(Cmd::Add { args, common }) => with_margin(&common, |ctx| lifecycle::add(ctx, &args)),
         Some(Cmd::Load { args, common }) => with_margin(&common, |ctx| lifecycle::load(ctx, &args)),

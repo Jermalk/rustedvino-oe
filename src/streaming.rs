@@ -71,6 +71,12 @@ pub enum StreamEvent {
     /// `LLMPipeline` streamer can pack several tokens into one chunk), so each
     /// chunk can go out immediately and the count is corrected here instead.
     CompletionTokens(usize),
+    /// The request's reasoning-token count (`usage.completion_tokens_details.reasoning_tokens`),
+    /// sent at most once by the engine after the last `Token` and before `Done` (0.9.1
+    /// V1-usage). Exact on the text CB engine (per-delta token counts); a tokenizer recount of
+    /// the reasoning text on VLM / NPU, clamped to the generated total, so approximate there.
+    /// Absent → 0.
+    ReasoningTokens(usize),
     /// Normal end of generation. Carries why generation stopped so the
     /// `OpenAI` `finish_reason` field reflects EOS vs the token budget.
     Done(FinishReason),
@@ -99,6 +105,20 @@ pub type TokenReceiver = mpsc::Receiver<StreamEvent>;
 #[must_use]
 pub fn stream_channel() -> (TokenSender, TokenReceiver) {
     mpsc::channel(CHANNEL_CAPACITY)
+}
+
+/// The events of one request as a `Stream` that ends right after the terminal `Done` — not when
+/// the engine drops its sender. A stalled engine's thread never drops it (0.9.1 S1): the verdict's
+/// `Error` + `Done` are the last events the request gets, and its response must end there.
+pub fn until_done(rx: TokenReceiver) -> impl futures_util::Stream<Item = StreamEvent> {
+    futures_util::stream::unfold((rx, false), |(mut rx, done)| async move {
+        if done {
+            return None;
+        }
+        let event = rx.recv().await?;
+        let done = matches!(event, StreamEvent::Done(_));
+        Some((event, (rx, done)))
+    })
 }
 
 // ============================================================

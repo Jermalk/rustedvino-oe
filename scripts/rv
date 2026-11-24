@@ -187,7 +187,9 @@ class Api:
 # ── formatting helpers ──────────────────────────────────────────────────────
 
 def human_bytes(n: float) -> str:
-    return f"{n / 1e9:.1f} GB"
+    # GiB (n / 2^30), the unit of the server's budgets and vram metrics since 0.9.0 (E1 R-12);
+    # labelled "GB" like the rest of rv. The add estimate below is GiB too (decisions-075, R-12).
+    return f"{n / 1073741824:.1f} GB"
 
 
 def bar(used: float, total: float, width: int = 20) -> str:
@@ -201,15 +203,18 @@ def bar(used: float, total: float, width: int = 20) -> str:
     return f"[{color(glyph)}] {pct:4.0f}%"
 
 
-VRAM_ESTIMATE_MARGIN = 1.08  # OpenVINO's own device-side allocation runs a bit
-                              # above raw weight bytes (alignment/padding) --
-                              # calibrated against ministral-3-3b-int8-ov: its
-                              # openvino_model.bin is ~3.2 GiB on disk against a
-                              # real, working configured vram_gb of 3.3.
+# The margin on the on-disk size in GiB (2^30 bytes, the unit the server reads
+# vram_gb in since 0.9.0). The same explicit 1.07 as the Rust `rv add`
+# (decisions-075, R-12): it replaces the ~7.4 % the old decimal (1e9) divisor
+# added by accident. Measured ratios: ministral-3b 0.96x, qwen3.6-35b 1.005x,
+# Intel's mixed qwen3-14b 1.11x its disk size. Revisited after the planned
+# measured-footprint run.
+VRAM_ESTIMATE_MARGIN = 1.07
+BYTES_PER_GIB = 1073741824
 
 
 def estimate_vram_gb(model_dir: str) -> tuple[float, float] | None:
-    """(raw_disk_gb, estimated_vram_gb), or None if the directory has nothing
+    """(raw_disk_gib, estimated_vram_gib), or None if the directory has nothing
     in it (missing/empty) to estimate from. Sums every file under the model's
     directory recursively -- not just the obvious `openvino_model.bin` --
     since some kinds (image-gen's unet/vae/text_encoder, VLM's separate
@@ -227,7 +232,7 @@ def estimate_vram_gb(model_dir: str) -> tuple[float, float] | None:
                 pass
     if not found:
         return None
-    raw_gb = total_bytes / 1e9
+    raw_gb = total_bytes / BYTES_PER_GIB
     return raw_gb, round(raw_gb * VRAM_ESTIMATE_MARGIN, 1)
 
 
@@ -407,6 +412,17 @@ def metric_by_label(rows, name: str, **match) -> float | None:
         if n == name and all(labels.get(k) == v for k, v in match.items()):
             return val
     return None
+
+
+def kv_percent_cell(rows, model: str) -> str:
+    """The KV% cell, as the Rust rv: n/a when the percent is missing or the server says it is not
+    measurable for this model (rustedvino_kv_cache_usage_supported == 0, e.g. the VLM engine, or a
+    kind with no KV pool); a server without the supported series keeps the plain reading (C21)."""
+    supported = metric_by_label(rows, "rustedvino_kv_cache_usage_supported", model=model)
+    if supported is not None and supported < 0.5:
+        return "n/a"
+    kv = metric_by_label(rows, "rustedvino_kv_cache_usage_percent", model=model)
+    return f"{kv:.0f}%" if kv is not None else "n/a"
 
 
 def state_glyph(state: str) -> str:
@@ -785,13 +801,14 @@ def cmd_status(ctx: Ctx, args):
             mid = m["id"]
             a = by_id.get(mid, {})
             vram = f"{a['vram_gb']:.1f} GB" if "vram_gb" in a else "n/a"
-            kv = metric_by_label(metrics_rows, "rustedvino_kv_cache_usage_percent", model=mid)
             running = metric_by_label(metrics_rows, "rustedvino_requests_running", model=mid)
             waiting = metric_by_label(metrics_rows, "rustedvino_requests_waiting", model=mid)
             maxr = metric_by_label(metrics_rows, "rustedvino_requests_max", model=mid)
             req = f"{int(running)}/{int(waiting)}/{int(maxr)}" if None not in (running, waiting, maxr) else "n/a"
-            rows.append([mid, a.get("state", "?"), a.get("device", "?"), vram,
-                         f"{kv:.0f}%" if kv is not None else "n/a", req])
+            # Without an admin key, fall back to the /v1/models "state" (since 0.9.1:
+            # "not_loaded" / "loading" for an on_demand model not loaded yet).
+            rows.append([mid, a.get("state", m.get("state", "?")), a.get("device", "?"), vram,
+                         kv_percent_cell(metrics_rows, mid), req])
         print(bold("Models"))
         print_table(["ID", "STATE", "DEVICE", "VRAM", "KV%", "RUN/WAIT/MAX"], rows, colored_col=1)
         print()
@@ -918,13 +935,12 @@ def cmd_ps(ctx: Ctx, args):
     rows = []
     for m in models:
         mid = m["id"]
-        kv = metric_by_label(metrics_rows, "rustedvino_kv_cache_usage_percent", model=mid)
         running = metric_by_label(metrics_rows, "rustedvino_requests_running", model=mid)
         waiting = metric_by_label(metrics_rows, "rustedvino_requests_waiting", model=mid)
         maxr = metric_by_label(metrics_rows, "rustedvino_requests_max", model=mid)
         req = f"{int(running)}/{int(waiting)}/{int(maxr)}" if None not in (running, waiting, maxr) else "n/a"
         rows.append([mid, m["device"], m["kind"], f"{m['vram_gb']:.1f} GB",
-                     f"{m['cache_size_gb']:.1f} GB", f"{kv:.0f}%" if kv is not None else "n/a", req,
+                     f"{m['cache_size_gb']:.1f} GB", kv_percent_cell(metrics_rows, mid), req,
                      ctx.policy_flags(mid)])
     print(bold(f"{len(models)} model(s) loaded"))
     print_table(["ID", "DEVICE", "KIND", "VRAM", "KV GB", "KV%", "RUN/WAIT/MAX", "POLICY"], rows)
@@ -992,7 +1008,7 @@ def cmd_add(ctx: Ctx, args):
         # which -y/--yes skips printing entirely. An auto-detected number
         # that only shows up when someone happens to read the prompt isn't
         # transparent, it's a coin flip on whether they noticed.
-        print(f"{dim(f'auto-detected vram_gb: {raw_gb:.1f} GB on disk -> {vram_gb:.1f} GB with headroom '
+        print(f"{dim(f'auto-detected vram_gb: {raw_gb:.1f} GiB on disk -> {vram_gb:.1f} GiB with headroom '
                       f'(override with --vram-gb)')}")
 
     # `add_model` funnels through the same evicting `load_model` path `rv
@@ -1001,7 +1017,7 @@ def cmd_add(ctx: Ctx, args):
     # (check_admission needs the model already in the registry, which by
     # definition it isn't yet) -- so this can't preview `would_evict` before
     # acting, and needs the same confirmation gate `deregister` uses instead.
-    if not _confirm(f"register '{args.model}' as {vram_gb:.1f} GB (persists to config.json) and load it "
+    if not _confirm(f"register '{args.model}' as {vram_gb:.1f} GiB (persists to config.json) and load it "
                      f"now — may evict other resident models to make room, with no dry-run preview "
                      f"available for a not-yet-registered model. Proceed?", args.yes):
         print("aborted")
@@ -1149,6 +1165,15 @@ def cmd_reload_config(ctx: Ctx, args):
         # beyond it, so neither does this line.
         print(yellow(f"{WARN} {len(globals_skipped)} global setting(s) not applied by reload — "
                       f"restart to pick them up: {', '.join(globals_skipped)}"))
+    # C8: a loaded model's edited stanza is not applied, and unload + load
+    # alone would still use the old entry (reload stages nothing for a live
+    # model). Same line as the Rust rv; an older server omits the key.
+    for m in body.get("models_not_applied", []) or []:
+        if not isinstance(m, dict) or not isinstance(m.get("model"), str):
+            continue
+        model, fields = m["model"], [f for f in m.get("fields", []) if isinstance(f, str)]
+        print(yellow(f"{WARN} {model} is loaded: changed {', '.join(fields)} not applied — "
+                      f"to apply: rv unload {model}, rv reload-config, rv load {model}"))
     return 0
 
 
@@ -1292,7 +1317,7 @@ def main() -> int:
     p = sub.add_parser("add", help="register an on-disk model (rv list) and load it", parents=[common])
     p.add_argument("model", help="must match a directory name under models_dir (see `rv list`)")
     p.add_argument("--vram-gb", type=float, default=None,
-                    help="VRAM estimate in GB (0.0 to skip VRAM gating). "
+                    help="VRAM estimate in GiB (0.0 to skip VRAM gating). "
                          "Omit to auto-detect from the model directory's on-disk size")
     p.add_argument("--kind", default=None,
                     help="text_gen|vision|embedding|stt|tts|image_gen|reranking (default: auto-detect)")

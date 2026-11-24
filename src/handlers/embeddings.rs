@@ -26,12 +26,11 @@ use base64ct::{Base64, Encoding as _};
 use serde::{Deserialize, Serialize};
 
 use super::error::{
-    JsonBody, device_admission_error_response, inference_error_response, model_error_response,
-    openai_error, unsupported_param,
+    JsonBody, device_admission_error_response, inference_error_response, openai_error,
+    unsupported_param,
 };
 use crate::app_state::AppState;
 use crate::embed_engine::EmbeddingHandle;
-use crate::model_manager::{ModelError, OnDemandLoad};
 
 /// Conservative worst-case bytes-per-token, mirrors `handlers::chat`'s
 /// `MAX_BYTES_PER_TOKEN` — a cheap pre-tokenize length check so a
@@ -325,19 +324,16 @@ pub async fn embeddings(
 
     // Resolve vectors + token count + the model name to report.
     let (vectors, prompt_tokens, model_name) = if let Some(mm) = state.model_manager.as_ref() {
-        let handle = match mm.get_embedding_handle(&req.model) {
+        // Slice 3c parity (mirrors the chat + media paths): an `on_demand` embedding model loads
+        // on first request; F1b: the request waits for it up to `on_demand_wait_secs`, else
+        // 503 Loading + Retry-After while it loads.
+        let handle = match super::on_demand::resolve_with_wait(mm, &req.model, || {
+            mm.get_embedding_handle(&req.model)
+        })
+        .await
+        {
             Ok(h) => h,
-            // Slice 3c parity (mirrors the chat + media paths): lazy-load an
-            // `on_demand` embedding model on first request — 503 Loading +
-            // Retry-After while it loads — rather than failing flat with NotLoaded.
-            Err(ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-                    OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
-                };
-            }
-            Err(e) => return model_error_response(e),
+            Err(u) => return u.into_response(&req.model),
         };
 
         // L0 length gate — before the device-admission lease below, so an

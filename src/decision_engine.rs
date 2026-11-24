@@ -486,10 +486,11 @@ pub fn spawn_decision_engine(
                     }
                 }
                 metrics.record_duration(Modality::Text, started_at.elapsed().as_secs_f64());
-                let _ = reply.send(result);
-                // Only now is the request really finished: `active()` stays above 0 for the
-                // whole prefill, so eviction waits for it instead of racing the join deadline.
-                drop(turn);
+                // Only now is the request really finished: `turn` (in-flight guard + gate
+                // permit) is held through the whole prefill, so `active()` stays above 0 and
+                // eviction waits for it instead of racing the join deadline. It is released
+                // just before the reply (0.9.1 C2, `in_flight::finish`).
+                crate::in_flight::finish(turn, reply, result);
             }
             tracing::info!(model_id = model_id_owned, kind = ModelKind::Decision.label(), "decision engine thread exiting — all handles dropped");
         })?;
@@ -573,8 +574,8 @@ fn spawn_mock(
                 },
                 || reply.is_closed(),
             );
-            let _ = reply.send(result);
-            drop(turn);
+            // Released, then replied, as the real engine thread does.
+            crate::in_flight::finish(turn, reply, result);
         }
     });
     (
@@ -751,6 +752,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.logits, vec![vec![0.0, 1.0, 2.0], vec![0.0, 1.0]]);
         assert_eq!(out.prompt_tokens, vec![3, 2]);
+        assert_eq!(
+            h.active(),
+            0,
+            "the turn is released before the reply (0.9.1 C2, in_flight::finish)"
+        );
         // The second prompt is too long: the whole request fails, naming prompt 1.
         let err = h
             .decide(vec!["ok".into(), "x".repeat(8195)], vec![2, 2])

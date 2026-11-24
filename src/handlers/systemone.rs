@@ -28,6 +28,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::app_state::AppState;
 use crate::decision_engine::DecideError;
+use crate::handlers::on_demand::{self, Unready};
 use crate::model_manager::{ModelError, OnDemandLoad};
 use crate::systemone::{SystemOneError, answer, compile, decode_request};
 
@@ -41,38 +42,56 @@ fn status_of(e: &SystemOneError) -> StatusCode {
 
 /// Resolve the decision model — Ollama's 404/400 for unknown or non-decision models, and
 /// 503 (with `Retry-After` while loading) for one that is not ready, starting an on-demand
-/// load if its policy allows.
-fn resolve_decision_handle(
+/// load if its policy allows. F1b: through the shared on-demand wait (`on_demand_wait_secs`);
+/// a failed load the request waited for is answered through [`decision_model_error`].
+async fn resolve_decision_handle(
     mm: &std::sync::Arc<crate::model_manager::ModelManager>,
     model: &str,
 ) -> Result<crate::decision_engine::DecisionHandle, Box<Response>> {
-    match mm.get_decision_handle(model) {
-        Ok(h) => Ok(h),
-        Err(ModelError::NotFound(_)) => Err(Box::new(ollama_error(
-            StatusCode::NOT_FOUND,
-            format!("model '{model}' not found"),
-        ))),
-        Err(ModelError::WrongKind(msg)) => {
-            Err(Box::new(ollama_error(StatusCode::BAD_REQUEST, msg)))
+    let unready =
+        match on_demand::resolve_with_wait(mm, model, || mm.get_decision_handle(model)).await {
+            Ok(h) => return Ok(h),
+            Err(u) => u,
+        };
+    Err(Box::new(match unready {
+        Unready::OnDemand(OnDemandLoad::Loading) => {
+            not_ready_transient(model, &ModelError::Loading)
         }
-        Err(ModelError::NotLoaded) => Err(Box::new(match mm.request_on_demand_load(model) {
-            OnDemandLoad::Loading => not_ready_transient(model, &ModelError::Loading),
-            OnDemandLoad::ShuttingDown => ollama_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model '{model}' is not ready: {}", ModelError::ShuttingDown),
-            ),
-            OnDemandLoad::NotApplicable => ollama_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model '{model}' is not ready: {}", ModelError::NotLoaded),
-            ),
-        })),
-        Err(e @ (ModelError::Loading | ModelError::Evicting)) => {
-            Err(Box::new(not_ready_transient(model, &e)))
+        Unready::OnDemand(OnDemandLoad::ShuttingDown) => ollama_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("model '{model}' is not ready: {}", ModelError::ShuttingDown),
+        ),
+        Unready::OnDemand(OnDemandLoad::NotApplicable) => ollama_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("model '{model}' is not ready: {}", ModelError::NotLoaded),
+        ),
+        Unready::Model(e) | Unready::LoadFailed(Some(e)) => decision_model_error(model, e),
+        Unready::LoadFailed(None) => ollama_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("model '{model}' failed to load; see the server log"),
+        ),
+    }))
+}
+
+/// This route's answer to a model lookup error (and to the error of a load it waited for), in
+/// Ollama's `{"error": "..."}` shape.
+fn decision_model_error(model: &str, e: ModelError) -> Response {
+    match e {
+        ModelError::NotFound(_) => {
+            ollama_error(StatusCode::NOT_FOUND, format!("model '{model}' not found"))
         }
-        Err(e) => Err(Box::new(ollama_error(
+        ModelError::WrongKind(msg) => ollama_error(StatusCode::BAD_REQUEST, msg),
+        e @ (ModelError::Loading | ModelError::Evicting) => not_ready_transient(model, &e),
+        // A load past its deadline (F1b): the 504 the other routes give, in
+        // Ollama's shape (no code field). A stalled device stays the 503 below.
+        e @ ModelError::LoadTimeout { .. } => ollama_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("model '{model}' is not ready: {e}"),
+        ),
+        e => ollama_error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("model '{model}' is not ready: {e}"),
-        ))),
+        ),
     }
 }
 
@@ -127,7 +146,7 @@ pub async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
             "model manager is not available",
         );
     };
-    let handle = match resolve_decision_handle(mm, &req.model) {
+    let handle = match resolve_decision_handle(mm, &req.model).await {
         Ok(h) => h,
         Err(resp) => return *resp,
     };
@@ -564,7 +583,10 @@ mod tests {
                 .with_device_budgets(Arc::clone(&budgets)),
         );
         // Another decision request is "running": it holds the model's turn.
-        let handle = super::resolve_decision_handle(&mm, DECIDE).ok().unwrap();
+        let handle = super::resolve_decision_handle(&mm, DECIDE)
+            .await
+            .ok()
+            .unwrap();
         let running = handle
             .wait_turn(std::time::Duration::from_secs(1))
             .await
@@ -618,7 +640,10 @@ mod tests {
                 .with_model_manager(Arc::clone(&mm))
                 .with_device_budgets(budgets),
         );
-        let handle = super::resolve_decision_handle(&mm, DECIDE).ok().unwrap();
+        let handle = super::resolve_decision_handle(&mm, DECIDE)
+            .await
+            .ok()
+            .unwrap();
         let _running = handle
             .wait_turn(std::time::Duration::from_secs(1))
             .await
@@ -672,5 +697,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// F1b: a load past its deadline is a 504 here too (Ollama's shape).
+    #[test]
+    fn a_load_past_its_deadline_is_a_504() {
+        let resp = super::decision_model_error(
+            "d",
+            crate::model_manager::ModelError::LoadTimeout {
+                model: "d".to_owned(),
+                secs: 600,
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

@@ -77,6 +77,48 @@ impl Transcription {
     }
 }
 
+// ── Language hint ───────────────────────────────────────────────────────────
+
+/// The language codes Whisper's tokenizer has a `<|xx|>` token for (`openai/whisper`
+/// `tokenizer.py` `LANGUAGES`, the same set every multilingual Whisper checkpoint, fine-tunes
+/// included, carries). The bridge builds `"<|" + language + "|>"`; a code outside this set has no
+/// such token and used to fail inside the pipeline as a 500 (FM-3).
+pub const WHISPER_LANGUAGES: [&str; 100] = [
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it",
+    "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur",
+    "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn",
+    "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si",
+    "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo",
+    "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln",
+    "ha", "ba", "jw", "su", "yue",
+];
+
+/// Normalises a client's STT `language` hint before it reaches the bridge (FM-3).
+///
+/// Trimmed and lower-cased; a region or script suffix after `-` or `_` is dropped (`pl-PL`,
+/// `PL`, `zh_TW` become `pl`, `pl`, `zh`). Empty or `auto` means "detect": `Ok(None)`, the same as
+/// no field. The result must be one of [`WHISPER_LANGUAGES`].
+///
+/// # Errors
+/// Any other value: a client-facing message naming the accepted form (a 400 on the HTTP routes).
+pub fn normalize_language(raw: &str) -> Result<Option<String>, String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    if lowered.is_empty() || lowered == "auto" {
+        return Ok(None);
+    }
+    let base = lowered.split(['-', '_']).next().unwrap_or_default();
+    if WHISPER_LANGUAGES.contains(&base) {
+        return Ok(Some(base.to_owned()));
+    }
+    let shown: String = raw.trim().chars().take(32).collect();
+    Err(format!(
+        "unsupported language '{shown}' — use a language code Whisper knows (ISO 639-1, such as \
+         \"en\" or \"pl\"; a region suffix such as \"pl-PL\" is accepted), or \"auto\" or no \
+         language field to detect the language"
+    ))
+}
+
+// ── Commands ────────────────────────────────────────────────────────────────
 // ── Commands ────────────────────────────────────────────────────────────────
 
 /// What the Whisper model does with the audio.
@@ -104,8 +146,9 @@ pub(crate) enum SttCommand {
         /// Wall-clock start (handler entry) for the duration metric.
         started_at: Instant,
         /// Admission-gate permit, held until this transcription finishes.
-        /// Dropped after the engine thread sends its reply, releasing the slot
-        /// for the next waiting caller. See [`SttHandle::transcribe`].
+        /// Dropped by the engine thread just before it sends its reply, releasing
+        /// the slot for the next waiting caller, so a woken caller never counts
+        /// itself in `active()`. See [`SttHandle::transcribe`].
         permit: OwnedSemaphorePermit,
     },
 }
@@ -143,6 +186,14 @@ pub struct SttHandle {
 }
 
 impl SttHandle {
+    /// Occupy one admission slot, returning the held permit, to simulate an in-flight request in
+    /// tests (as `cb_engine::EngineHandle::occupy_slot_for_test`): while it is alive,
+    /// `active()` reports one more running request.
+    #[cfg(test)]
+    pub(crate) fn occupy_slot_for_test(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.sem).try_acquire_owned().ok()
+    }
+
     /// `false` only when the model is known not to translate (English-only);
     /// `true` when it can, or when that's unknown.
     #[must_use]
@@ -329,6 +380,7 @@ pub fn spawn_stt_engine(
     device: &str,
     queue_timeout: Duration,
     can_translate: Option<bool>,
+    max_audio_duration_secs: u64,
 ) -> anyhow::Result<(SttHandle, std::thread::JoinHandle<()>)> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SttCommand>(STT_CHANNEL_CAP);
     let sem = Arc::new(Semaphore::new(STT_CHANNEL_CAP));
@@ -368,6 +420,7 @@ pub fn spawn_stt_engine(
                     language.as_deref(),
                     timestamps,
                     task,
+                    max_audio_duration_secs,
                 );
                 let elapsed = started_at.elapsed();
                 metrics.record_duration(Modality::Text, elapsed.as_secs_f64());
@@ -378,11 +431,10 @@ pub fn spawn_stt_engine(
                     metrics.record_rtf(elapsed.as_secs_f64() / audio_s.max(0.001));
                 }
                 let result = elapsed_result.map(|(t, _)| t);
-                // The receiver may be gone if the client disconnected — ignore.
-                let _ = reply.send(result);
                 // Balance the handle's admission acquire, whatever the outcome —
-                // releases the slot for the next waiting caller.
-                drop(permit);
+                // releases the slot for the next waiting caller — BEFORE the reply
+                // (0.9.1 C2, see `in_flight::finish`).
+                crate::in_flight::finish(permit, reply, result);
             }
             tracing::info!(
                 model_id = model_id_owned,
@@ -424,8 +476,9 @@ fn run_transcribe(
     language: Option<&str>,
     timestamps: bool,
     task: SttTask,
+    max_audio_duration_secs: u64,
 ) -> anyhow::Result<(Transcription, usize)> {
-    let samples = prepare_samples(audio_bytes)?;
+    let samples = prepare_samples(audio_bytes, max_audio_duration_secs)?;
     let n = samples.len();
     // Step 6c: visible to the watchdog (past its allowance) and to the exit decision while the
     // OpenVINO call runs, also after the caller gave up or the record left Ready.
@@ -482,10 +535,14 @@ impl std::error::Error for BadAudio {}
 
 /// Decode an uploaded audio file and resample it to Whisper's 16 kHz mono f32.
 ///
+/// `max_secs` is [`crate::model_manager::Config::max_audio_duration_secs`]: longer audio is
+/// refused (0.9.1 S4) — up front when the container declares its length, otherwise as soon
+/// as decoding passes it, so memory stays bounded whatever the compressed size.
+///
 /// # Errors
 /// Returns an error if the container/codec is unsupported, the bytes are
-/// malformed, or no audio track is present.
-pub fn prepare_samples(audio_bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
+/// malformed, no audio track is present, or the audio is longer than `max_secs`.
+pub fn prepare_samples(audio_bytes: &[u8], max_secs: u64) -> anyhow::Result<Vec<f32>> {
     // Every decode failure is a property of the upload, not of the server:
     // typed so the HTTP layer answers 400, not 500 (Windows pass 2, D9).
     //
@@ -493,7 +550,7 @@ pub fn prepare_samples(audio_bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
     // symphonia's `TimeBase::new`). On the engine thread that kills the thread and with it every later
     // transcription (503 "engine unavailable" until the model is reloaded) - found by the overnight
     // torture run. Treat a panic in the decoder exactly like any other undecodable upload.
-    let decoded = std::panic::catch_unwind(|| decode_to_mono(audio_bytes));
+    let decoded = std::panic::catch_unwind(|| decode_to_mono(audio_bytes, max_secs));
     let (samples, sample_rate) = match decoded {
         Ok(result) => result.map_err(|e| anyhow::Error::new(BadAudio(e.to_string())))?,
         Err(_) => {
@@ -505,10 +562,180 @@ pub fn prepare_samples(audio_bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
     resample_to_16k(&samples, sample_rate)
 }
 
+/// ISO BMFF (MP4/M4A/MOV) sample tables whose entry count the demuxer pre-allocates for, with
+/// the bytes per entry. symphonia's isomp4 reader calls `Vec::with_capacity(count)` on these
+/// during `probe()` — before any check of ours can run — so a 3 KB file declaring
+/// 0xFFFFFFFF `stsc` entries asks for 48 GiB and the allocator aborts the process (0.9.1 S4b,
+/// Fable review; reproduced: "memory allocation of 68719476720 bytes failed", SIGABRT).
+/// `stsz` counts only when its `sample_size` is 0 (a per-sample table).
+const BMFF_TABLES: [(&[u8; 4], u64); 5] = [
+    (b"stts", 8),
+    (b"stsc", 12),
+    (b"stco", 4),
+    (b"co64", 8),
+    (b"stsz", 4),
+];
+
+/// Plain container boxes the walk descends into: the path to the sample tables, metadata
+/// (`udta`, `ilst` and its items), the `QuickTime` `wave` decoder-parameter box.
+const BMFF_CONTAINERS: [&[u8; 4]; 13] = [
+    b"moov", b"trak", b"mdia", b"minf", b"stbl", b"mvex", b"moof", b"traf", b"edts", b"dinf",
+    b"udta", b"wave", b"ilst",
+];
+
+/// Audio sample entries whose child boxes (`esds`, `alac`, `dfLa`, `dOps`, `wave`, ...) the
+/// demuxer reads after a version-dependent header.
+const BMFF_AUDIO_ENTRIES: [&[u8; 4]; 14] = [
+    b"mp4a", b"alac", b"fLaC", b"Opus", b"lpcm", b"sowt", b"twos", b"in24", b"in32", b"fl32",
+    b"fl64", b"raw ", b"ulaw", b"alaw",
+];
+
+/// Refuse an MP4 the demuxer would allocate more for than RAM before reading it (0.9.1 S4b/S4c,
+/// Fable reviews; both reproduced as process aborts):
+/// - a sample table ([`BMFF_TABLES`]) declaring more entries than its box holds (a 3 KB M4A
+///   with 0xFFFFFFFF `stsc` entries asked for 64 GiB);
+/// - a box declaring a **64-bit** size larger than its parent (an 84-byte M4A with a 2^50-byte
+///   `moov/udta/meta/ilst/©ART/data` box: symphonia never clamps a size to the stream and
+///   reads some payloads with `read_boxed_slice_exact`, i.e. `vec![0; size]` up front).
+///
+/// Every other length a reachable symphonia reader allocates from is 32 bits or less: at most
+/// 4 GiB, lazily zeroed and filled from at most the 50 MiB body, so it cannot abort. The walk
+/// visits every box the demuxer reads on the way: plain containers ([`BMFF_CONTAINERS`]),
+/// `meta` (a full box), `stsd` and the audio sample entries in it. symphonia's probe finds a
+/// file by an `ftyp` marker anywhere in its search window, so every `ftyp` occurrence is
+/// tried as a root. A walk that meets a 32-bit size running past its parent just stops
+/// (symphonia fails there too, and a chance `ftyp` in audio data must not reject a good file);
+/// only the two impossible shapes above are refused.
+fn check_bmff_tables(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut from = 0;
+    while let Some(i) = bytes[from..].windows(4).position(|w| w == b"ftyp") {
+        let at = from + i;
+        if at >= 4 {
+            walk_bmff(bytes, at - 4, bytes.len(), 0, false)?;
+        }
+        from = at + 4;
+    }
+    Ok(())
+}
+
+fn be_u32(b: &[u8], at: usize) -> Option<u64> {
+    b.get(at..at + 4)
+        .map(|s| u64::from(u32::from_be_bytes([s[0], s[1], s[2], s[3]])))
+}
+
+fn be_u16(b: &[u8], at: usize) -> Option<u16> {
+    b.get(at..at + 2).map(|s| u16::from_be_bytes([s[0], s[1]]))
+}
+
+/// `items`: every box at this level is a container (the children of `ilst`: `©ART`, `trkn`,
+/// ..., each holding `data`/`name`/`mean`).
+fn walk_bmff(
+    bytes: &[u8],
+    mut off: usize,
+    end: usize,
+    depth: u8,
+    items: bool,
+) -> anyhow::Result<()> {
+    // Real files nest a few levels (moov/trak/mdia/minf/stbl/stsd/mp4a/esds); stop well past it.
+    if depth > 16 {
+        return Ok(());
+    }
+    while off + 8 <= end {
+        let Some(size32) = be_u32(bytes, off) else {
+            return Ok(());
+        };
+        let typ = &bytes[off + 4..off + 8];
+        let room = (end - off) as u64;
+        let (size, header) = match size32 {
+            0 => (room, 8_usize),
+            1 => {
+                let (Some(hi), Some(lo)) = (be_u32(bytes, off + 8), be_u32(bytes, off + 12)) else {
+                    return Ok(());
+                };
+                let size = (hi << 32) | lo;
+                if size > room {
+                    anyhow::bail!(
+                        "malformed MP4: a '{}' box declares {size} bytes, more than the {room} its parent holds",
+                        String::from_utf8_lossy(typ)
+                    );
+                }
+                (size, 16)
+            }
+            n => (n, 8),
+        };
+        let Ok(size_us) = usize::try_from(size) else {
+            return Ok(());
+        };
+        if size_us < header || size > room {
+            return Ok(()); // malformed 32-bit size: the demuxer stops here too
+        }
+        let body = off + header;
+        let box_end = off + size_us;
+        let payload = (size_us - header) as u64;
+        if let Some((name, entry)) = BMFF_TABLES.iter().find(|(t, _)| typ == &t[..]) {
+            // Full box: version/flags (4), then for stsz sample_size (4) + count, else count.
+            let (count_at, fixed) = if *name == b"stsz" {
+                (body + 8, 12)
+            } else {
+                (body + 4, 8)
+            };
+            let per_sample_table = *name != b"stsz" || be_u32(bytes, body + 4) == Some(0);
+            if let Some(count) = be_u32(bytes, count_at)
+                && per_sample_table
+                && count.saturating_mul(*entry) > payload.saturating_sub(fixed)
+            {
+                anyhow::bail!(
+                    "malformed MP4: the '{}' table declares {count} entries, more than its box holds",
+                    String::from_utf8_lossy(&name[..])
+                );
+            }
+        } else if items || BMFF_CONTAINERS.iter().any(|c| typ == &c[..]) {
+            walk_bmff(bytes, body, box_end, depth + 1, typ == b"ilst")?;
+        } else if typ == b"meta" {
+            walk_bmff(bytes, body + 4, box_end, depth + 1, false)?; // full box: version/flags first
+        } else if typ == b"stsd" {
+            walk_bmff(bytes, body + 8, box_end, depth + 1, false)?; // version/flags + entry count
+        } else if BMFF_AUDIO_ENTRIES.iter().any(|c| typ == &c[..]) {
+            // 6 reserved + 2 data-ref index, then the version: v0 header 28 bytes, v1 44, v2 64.
+            let skip = match be_u16(bytes, body + 8) {
+                Some(0) => 28,
+                Some(1) => 44,
+                Some(2) => 64,
+                _ => 0,
+            };
+            if skip > 0 && body + skip <= box_end {
+                walk_bmff(bytes, body + skip, box_end, depth + 1, false)?;
+            }
+        }
+        off = box_end;
+    }
+    Ok(())
+}
+
+/// Highest source sample rate accepted. The duration cap is counted in samples at the
+/// source rate, so the worst-case decode memory is `max_audio_duration_secs` x this x 4 bytes
+/// (0.9.1 S4b): 48 kHz keeps 2 h to ~1.4 GB and covers every common speech rate (8-48 kHz).
+/// Whisper hears 16 kHz, so a higher rate gains nothing; such a file is a 400.
+const MAX_SOURCE_SAMPLE_RATE: u32 = 48_000;
+
+/// Most frames per packet a track may declare before its decoder is built (0.9.1 S4c).
+const MAX_FRAMES_PER_PACKET: u64 = 1 << 20;
+
+/// Lowest source sample rate accepted (0.9.1 S4c). 4 kHz is below any real speech recording
+/// (telephony is 8 kHz).
+const MIN_SOURCE_SAMPLE_RATE: u32 = 4_000;
+
+/// The refusal for audio longer than the server's limit — the caller's error (a 400).
+fn too_long(max_secs: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "audio is longer than this server's limit of {max_secs} s (max_audio_duration_secs)"
+    )
+}
+
 /// Decode any `symphonia`-supported container to mono f32 PCM, returning the
 /// samples and their source sample rate. Multi-channel audio is downmixed by
-/// averaging channels.
-fn decode_to_mono(audio_bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
+/// averaging channels. Stops with an error past `max_secs` of audio.
+fn decode_to_mono(audio_bytes: &[u8], max_secs: u64) -> anyhow::Result<(Vec<f32>, u32)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
     use symphonia::core::errors::Error as SymErr;
@@ -517,6 +744,8 @@ fn decode_to_mono(audio_bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
+    // Before the probe: the MP4 demuxer pre-allocates its sample tables while probing.
+    check_bmff_tables(audio_bytes)?;
     // symphonia needs an owned, seekable source; copy the upload into a cursor.
     let owned = audio_bytes.to_vec();
     let mss = MediaSourceStream::new(
@@ -544,14 +773,47 @@ fn decode_to_mono(audio_bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
         .codec_params
         .sample_rate
         .context("audio track has no sample rate")?;
+    // A floor too: resampling 1 Hz to 16 kHz is a 16 000x expansion inside rubato (Fable nit).
+    anyhow::ensure!(
+        sample_rate >= MIN_SOURCE_SAMPLE_RATE,
+        "audio sample rate {sample_rate} Hz is below the supported {MIN_SOURCE_SAMPLE_RATE} Hz"
+    );
+    anyhow::ensure!(
+        sample_rate <= MAX_SOURCE_SAMPLE_RATE,
+        "audio sample rate {sample_rate} Hz is above the supported {MAX_SOURCE_SAMPLE_RATE} Hz"
+    );
+    // Mono samples at the source rate the cap allows. usize: ≤ 384 000 × max_secs, and a
+    // config large enough to overflow would saturate to "no practical cap", never wrap.
+    let max_samples =
+        usize::try_from(max_secs.saturating_mul(u64::from(sample_rate))).unwrap_or(usize::MAX);
+    // Refuse before decoding anything when the container declares a longer track.
+    let declared = track
+        .codec_params
+        .n_frames
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    if declared.is_some_and(|n| n > max_samples) {
+        return Err(too_long(max_secs));
+    }
 
+    // A decoder sizes its packet buffer from `max_frames_per_packet` when it is built: the
+    // PCM decoder takes an MP4 LPCM sample entry's u32 `frames_per_packet` as is, so a file
+    // could ask for frames x channels x 8 bytes (~1 TiB) and abort the process (0.9.1 S4c).
+    // Real codecs use at most 65 535 (FLAC); 2^20 frames is ~22 s at 48 kHz in one packet.
+    if let Some(frames) = track.codec_params.max_frames_per_packet {
+        anyhow::ensure!(
+            frames <= MAX_FRAMES_PER_PACKET,
+            "audio declares {frames} frames per packet, above the supported {MAX_FRAMES_PER_PACKET}"
+        );
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .context("no decoder for this audio codec")?;
 
     // Any error ends decoding (EOF is reported as an IoError) — we keep whatever
     // we decoded so far and stop.
-    let mut mono: Vec<f32> = Vec::new();
+    // Reserved once from the declared length (already ≤ the cap) so growth never doubles the
+    // peak; an undeclared or wrong length still stops at the cap in the loop below.
+    let mut mono: Vec<f32> = Vec::with_capacity(declared.unwrap_or(0));
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
             continue;
@@ -564,6 +826,11 @@ fn decode_to_mono(audio_bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
         };
         let spec = *pcm_ref.spec();
         let channels = spec.channels.count().max(1);
+        // Checked before the packet's frames are kept: a declared length can be absent or
+        // wrong, so this bound is the one that holds memory to `max_samples`.
+        if mono.len().saturating_add(pcm_ref.frames()) > max_samples {
+            return Err(too_long(max_secs));
+        }
         let mut buf = SampleBuffer::<f32>::new(pcm_ref.capacity() as u64, spec);
         buf.copy_interleaved_ref(pcm_ref);
         for frame in buf.samples().chunks(channels) {
@@ -659,27 +926,31 @@ pub(crate) fn spawn_mock_stt(model_id: &str) -> (SttHandle, std::thread::JoinHan
             ..
         }) = rx.blocking_recv()
         {
-            let _ = reply.send(Ok(Transcription {
-                text: match task {
-                    SttTask::Transcribe => "This is a mock transcription.",
-                    SttTask::Translate => "This is a mock translation.",
-                }
-                .to_owned(),
-                language: language.unwrap_or_else(|| "english".to_owned()),
-                segments: vec![
-                    Segment {
-                        start: 0.0,
-                        end: 1.5,
-                        text: "This is a mock".to_owned(),
-                    },
-                    Segment {
-                        start: 1.5,
-                        end: 2.8,
-                        text: "transcription.".to_owned(),
-                    },
-                ],
-            }));
-            drop(permit);
+            // Released, then replied, as the real engine thread does.
+            crate::in_flight::finish(
+                permit,
+                reply,
+                Ok(Transcription {
+                    text: match task {
+                        SttTask::Transcribe => "This is a mock transcription.",
+                        SttTask::Translate => "This is a mock translation.",
+                    }
+                    .to_owned(),
+                    language: language.unwrap_or_else(|| "english".to_owned()),
+                    segments: vec![
+                        Segment {
+                            start: 0.0,
+                            end: 1.5,
+                            text: "This is a mock".to_owned(),
+                        },
+                        Segment {
+                            start: 1.5,
+                            end: 2.8,
+                            text: "transcription.".to_owned(),
+                        },
+                    ],
+                }),
+            );
         }
     });
 
@@ -797,7 +1068,7 @@ mod tests {
         assert_eq!(handle.active(), 0, "no permit was ever held");
     }
 
-    /// When a slot opens (permit released after the first reply), a waiting
+    /// When a slot opens (the first request's permit is released), a waiting
     /// `transcribe` completes instead of returning `AtCapacity`.
     #[tokio::test]
     async fn transcribe_waits_and_succeeds_when_slot_opens() {
@@ -857,7 +1128,7 @@ mod tests {
     fn decode_mono_wav_recovers_samples() {
         let samples: Vec<f32> = (0..1600).map(|i| ((i as f32) * 0.01).sin() * 0.5).collect();
         let wav = wav_mono_i16(16_000, &samples);
-        let (decoded, rate) = decode_to_mono(&wav).expect("decode wav");
+        let (decoded, rate) = decode_to_mono(&wav, 60).expect("decode wav");
         assert_eq!(rate, 16_000);
         assert_eq!(decoded.len(), 1600, "one mono sample per input frame");
     }
@@ -904,7 +1175,7 @@ mod tests {
     fn prepare_samples_decodes_and_resamples() {
         let samples: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.03).sin() * 0.4).collect();
         let wav = wav_mono_i16(8_000, &samples);
-        let prepared = prepare_samples(&wav).expect("prepare");
+        let prepared = prepare_samples(&wav, 60).expect("prepare");
         let ratio = prepared.len() as f32 / samples.len() as f32;
         assert!((1.8..2.2).contains(&ratio), "8k→16k ~doubles, got {ratio}");
     }
@@ -914,17 +1185,171 @@ mod tests {
     #[test]
     fn wav_with_sample_rate_zero_is_bad_audio_not_a_panic() {
         let wav = wav_mono_i16(0, &[0.1_f32; 64]);
-        let err = prepare_samples(&wav).expect_err("sample rate 0 must be rejected");
+        let err = prepare_samples(&wav, 60).expect_err("sample rate 0 must be rejected");
         assert!(
             err.downcast_ref::<BadAudio>().is_some(),
             "typed, so the API answers 400: {err}"
         );
     }
 
+    /// A WAV header that patches the data-chunk size: the container then declares `frames`
+    /// frames whatever the bytes that follow (S4 test helper).
+    fn with_declared_frames(mut wav: Vec<u8>, frames: u32) -> Vec<u8> {
+        wav[4..8].copy_from_slice(&(36 + frames * 2).to_le_bytes());
+        wav[40..44].copy_from_slice(&(frames * 2).to_le_bytes());
+        wav
+    }
+
+    /// 0.9.1 S4 (I-01): a container declaring 10 h of audio is refused before decoding, with
+    /// a typed error (400), and the message names the limit.
+    #[test]
+    fn declared_length_over_the_cap_is_refused_before_decoding() {
+        let wav = with_declared_frames(wav_mono_i16(8_000, &[0.1_f32; 64]), 8_000 * 36_000);
+        let err = prepare_samples(&wav, 7_200).expect_err("10 h must be refused");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        assert!(
+            err.to_string().contains("limit of 7200 s"),
+            "names the limit: {err}"
+        );
+    }
+
+    /// The cap is inclusive: exactly `max_secs` decodes, one sample more does not.
+    #[test]
+    fn audio_exactly_at_the_cap_decodes_and_one_sample_more_does_not() {
+        let at_cap = wav_mono_i16(8_000, &vec![0.1_f32; 8_000]);
+        let (decoded, _) = decode_to_mono(&at_cap, 1).expect("1 s at a 1 s cap");
+        assert_eq!(decoded.len(), 8_000);
+        let over = wav_mono_i16(8_000, &vec![0.1_f32; 8_001]);
+        let err = decode_to_mono(&over, 1).expect_err("1 s + 1 sample over a 1 s cap");
+        assert!(err.to_string().contains("limit of 1 s"), "{err}");
+    }
+
+    /// The bound inside the decode loop holds when the container's length is wrong. Fixture:
+    /// 0.3 s of 160 kb/s MP3 followed by 3 s of 8 kb/s silence, no Xing header. symphonia
+    /// estimates the length from the first frames' bitrate — about 0.83 s — so the up-front
+    /// check passes a 1 s cap, while the file decodes to about 3.5 s. A low-bitrate tail is the
+    /// shape of the attack (outside review I-01), so this is the bound that matters.
+    #[test]
+    fn decode_loop_stops_at_the_cap_when_the_declared_length_understates() {
+        let mp3 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/stt_vbr_understated_3s.mp3"
+        ));
+        let (full, rate) = decode_to_mono(mp3, 60).expect("decodes under a generous cap");
+        assert_eq!(rate, 16_000);
+        assert!(full.len() > 3 * 16_000, "fixture is > 3 s: {}", full.len());
+        let err = decode_to_mono(mp3, 1).expect_err("3.5 s over a 1 s cap");
+        assert!(err.to_string().contains("limit of 1 s"), "{err}");
+    }
+
+    /// The cap is counted in source samples, so the rate ceiling bounds the memory: above
+    /// 48 kHz is a 400 (0.9.1 S4b), 48 kHz itself decodes.
+    #[test]
+    fn sample_rate_above_48_khz_is_bad_audio() {
+        let wav = wav_mono_i16(96_000, &[0.1_f32; 64]);
+        let err = prepare_samples(&wav, 7_200).expect_err("96 kHz must be refused");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        let (_, rate) = decode_to_mono(&wav_mono_i16(48_000, &[0.1_f32; 64]), 7_200).unwrap();
+        assert_eq!(rate, 48_000);
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    /// 0.9.1 S4b: a 3 KB M4A whose `stsc` declares 0xFFFFFFFF entries made symphonia's probe
+    /// ask for 64 GiB and abort the process (reproduced). It is now a 400 before the probe; the
+    /// same file unpatched still decodes.
+    #[test]
+    fn m4a_with_an_impossible_sample_table_is_refused_before_the_probe() {
+        let (decoded, rate) = decode_to_mono(&fixture("stt_1s_aac.m4a"), 60).expect("clean M4A");
+        assert_eq!(rate, 16_000);
+        assert!(decoded.len() >= 16_000);
+        let err = prepare_samples(&fixture("stt_m4a_stsc_count_overflow.m4a"), 60)
+            .expect_err("must be refused");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        assert!(err.to_string().contains("'stsc' table declares"), "{err}");
+    }
+
+    /// The guard tries every `ftyp` as a root, as symphonia's probe scans for it: junk in
+    /// front of the bad file does not get it past.
+    #[test]
+    fn the_mp4_guard_also_finds_a_root_behind_leading_junk() {
+        let mut shifted = vec![0x55_u8; 37];
+        shifted.extend_from_slice(&fixture("stt_m4a_stsc_count_overflow.m4a"));
+        let err = check_bmff_tables(&shifted).expect_err("must be refused");
+        assert!(err.to_string().contains("'stsc'"), "{err}");
+        // A chance "ftyp" in other data, with no valid boxes behind it, is not a refusal.
+        let mut noise = vec![0_u8; 64];
+        noise[20..24].copy_from_slice(b"ftyp");
+        assert!(check_bmff_tables(&noise).is_ok());
+    }
+
+    /// 0.9.1 S4c (Fable adversarial review, reproduced): an 84-byte M4A whose
+    /// `moov/udta/meta/ilst/©ART/data` box declares a 2^50-byte 64-bit size made symphonia's
+    /// probe allocate it and abort the process. Refused before the probe now.
+    #[test]
+    fn m4a_with_an_impossible_64_bit_box_size_is_refused_before_the_probe() {
+        let bad = fixture("stt_m4a_metadata_largesize.m4a");
+        assert_eq!(bad.len(), 84);
+        let err = prepare_samples(&bad, 60).expect_err("must be refused");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        assert!(err.to_string().contains("'data' box declares"), "{err}");
+        // The clean M4A (with its own boxes) still passes the scan.
+        assert!(check_bmff_tables(&fixture("stt_1s_aac.m4a")).is_ok());
+    }
+
+    /// 0.9.1 S4c: a `QuickTime` LPCM (v2) sample entry declaring 2^32 - 1 frames per packet;
+    /// the PCM decoder would allocate frames x channels x sample size when built. Refused
+    /// before the decoder exists. Built from an ffmpeg MOV with the sample entry replaced.
+    #[test]
+    fn lpcm_entry_with_huge_frames_per_packet_is_refused_before_the_decoder() {
+        let err = prepare_samples(&fixture("stt_mov_lpcm_frames_per_packet_overflow.mov"), 60)
+            .expect_err("must be refused");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        assert!(err.to_string().contains("frames per packet"), "{err}");
+    }
+
+    /// The MP4 walk must not refuse ordinary files: ffmpeg MOVs with each PCM sample-entry
+    /// version (v0 `sowt`, v1 `fl32`) and the AAC M4A decode. (A byte scan for 64-bit sizes
+    /// was tried first and refused an ffmpeg MOV: table data looks like box headers.)
+    #[test]
+    fn the_mp4_walk_passes_ordinary_files() {
+        for f in [
+            "stt_1s_aac.m4a",
+            "stt_mov_sowt_v0.mov",
+            "stt_mov_fl32_v1.mov",
+        ] {
+            let (decoded, _) =
+                decode_to_mono(&fixture(f), 60).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(!decoded.is_empty(), "{f}");
+        }
+    }
+
+    /// A sample rate under 4 kHz is a 400 (it would expand thousands of times when resampled).
+    #[test]
+    fn sample_rate_below_4_khz_is_bad_audio() {
+        let err = prepare_samples(&wav_mono_i16(1, &[0.1_f32; 64]), 7_200).expect_err("1 Hz");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+        decode_to_mono(&wav_mono_i16(8_000, &[0.1_f32; 64]), 7_200).expect("8 kHz decodes");
+    }
+
+    /// ALAC is not decoded any more (its decoder sizes a buffer from the file's magic cookie
+    /// before any packet, 0.9.1 S4b): an ALAC M4A is a 400, not a decode.
+    #[test]
+    fn alac_is_refused() {
+        let err = prepare_samples(&fixture("stt_1s_alac.m4a"), 60).expect_err("ALAC is off");
+        assert!(err.downcast_ref::<BadAudio>().is_some(), "typed: {err}");
+    }
+
     /// Garbage bytes are rejected with an error, not a panic.
     #[test]
     fn prepare_samples_rejects_garbage() {
-        let err = prepare_samples(b"not audio at all");
+        let err = prepare_samples(b"not audio at all", 60);
         let err = err.expect_err("non-audio bytes must error");
         assert!(
             err.downcast_ref::<BadAudio>().is_some(),
@@ -994,5 +1419,51 @@ mod active_contract_tests {
         assert_eq!(h.active(), 1, "accepted: the command reached the engine");
         drop(cmd);
         let _ = caller.await;
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::normalize_language;
+
+    /// FM-3: the unambiguous forms normalise; `auto` and empty mean detect.
+    #[test]
+    fn language_hint_normalises_unambiguous_forms() {
+        for (raw, want) in [
+            ("pl", Some("pl")),
+            ("PL", Some("pl")),
+            (" pl-PL ", Some("pl")),
+            ("en_US", Some("en")),
+            ("zh-Hant-TW", Some("zh")),
+            ("haw", Some("haw")),
+            ("yue", Some("yue")),
+            ("auto", None),
+            ("AUTO", None),
+            ("", None),
+            ("  ", None),
+        ] {
+            assert_eq!(normalize_language(raw).unwrap().as_deref(), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn language_hint_refuses_what_whisper_has_no_token_for() {
+        for raw in [
+            "xx",
+            "polish",
+            "p",
+            "-pl",
+            "pl!",
+            "<|pl|>",
+            "e\u{301}n",
+            "x\0y",
+        ] {
+            let msg = normalize_language(raw).unwrap_err();
+            assert!(
+                msg.contains("pl-PL") && msg.contains("auto"),
+                "{raw:?}: {msg}"
+            );
+        }
     }
 }

@@ -23,8 +23,9 @@ pub(crate) const RERANK_CHANNEL_CAP: usize = 8;
 /// The result of one reranking request.
 #[derive(Clone, Debug)]
 pub struct RerankOutput {
-    /// `(original_index, relevance_score)` sorted by score descending.
-    /// Already trimmed to the requested `top_n` by the handler.
+    /// `(original_index, relevance_score)` for every document, sorted by
+    /// score descending (equal scores: lower index first). Not trimmed: the
+    /// handler applies the request's `top_n`.
     pub results: Vec<(usize, f32)>,
 }
 
@@ -248,7 +249,7 @@ pub fn spawn_rerank_engine(
                         documents,
                         reply,
                         started_at,
-                        guard: _guard,
+                        guard,
                     } => {
                         metrics.request_accepted(Modality::Text);
                         let result = engine
@@ -285,7 +286,8 @@ pub fn spawn_rerank_engine(
                             }
                         }
                         metrics.record_duration(Modality::Text, started_at.elapsed().as_secs_f64());
-                        let _ = reply.send(result);
+                        // Out of `active()` BEFORE the reply (0.9.1 C2, `in_flight::finish`).
+                        crate::in_flight::finish(guard, reply, result);
                     }
                     RerankCommand::CountTokens {
                         query,
@@ -327,7 +329,10 @@ pub(crate) fn spawn_mock_rerank(model_id: &str) -> (RerankingHandle, std::thread
         while let Some(command) = rx.blocking_recv() {
             match command {
                 RerankCommand::Rerank {
-                    documents, reply, ..
+                    documents,
+                    reply,
+                    guard,
+                    ..
                 } => {
                     // Mock: return documents in reverse order with descending
                     // scores. `rank` is bounded by the test's own document
@@ -341,7 +346,8 @@ pub(crate) fn spawn_mock_rerank(model_id: &str) -> (RerankingHandle, std::thread
                         .enumerate()
                         .map(|(rank, (orig_idx, _))| (orig_idx, 1.0_f32 - rank as f32 * 0.1))
                         .collect();
-                    let _ = reply.send(Ok(RerankOutput { results }));
+                    // Released, then replied, as the real engine thread does.
+                    crate::in_flight::finish(guard, reply, Ok(RerankOutput { results }));
                 }
                 // No real tokenizer behind the mock — answer with a rough
                 // word-count stand-in so a caller exercising the length gate
@@ -379,18 +385,6 @@ mod tests {
 
     use super::*;
 
-    /// The engine thread drops the in-flight guard right after it sends the reply, so a caller that
-    /// has just received the reply may observe `active()` a moment before it reaches 0.
-    async fn settle_to_idle(h: &RerankingHandle) {
-        for _ in 0..200 {
-            if h.active() == 0 {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(h.active(), 0, "counter settled back to zero");
-    }
-
     #[test]
     fn waiting_is_in_flight_minus_running() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<RerankCommand>(RERANK_CHANNEL_CAP);
@@ -412,7 +406,8 @@ mod tests {
             .await
             .expect("mock rerank");
         assert_eq!(out.results.len(), 3);
-        settle_to_idle(&handle).await;
+        // Released before the reply (0.9.1 C2, `in_flight::finish`): no settling needed.
+        assert_eq!(handle.active(), 0, "counter settled back to zero");
     }
 
     #[tokio::test]

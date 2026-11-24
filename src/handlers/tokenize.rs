@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{JsonBody, model_error_response, openai_error, openai_error_with_param};
 use crate::app_state::AppState;
+use crate::model_manager::ModelError;
 use crate::model_manager::engine::TokenizerHandle;
 
 /// Text the bridge puts in the error for an id outside the model's vocabulary
@@ -75,6 +76,14 @@ struct DetokenizeResponse {
 /// The error half is boxed: a full `Response` is large (>128 bytes), and
 /// `clippy::result_large_err` flags returning it by value in a `Result`. The
 /// happy path (an `EngineHandle`) stays unboxed and cheap.
+///
+/// These two routes never load a model (a token count is not a reason to start a load): they
+/// are NOT on the F1b on-demand path. An `on_demand` model that is not loaded
+/// gets the plain not-loaded 503 (no `Retry-After`, no load, no wait) at every
+/// `on_demand_wait_secs`, as in 0.9.0. A token count must never evict a loaded model to make
+/// room: the Pyramu panel's speed widget calls `/tokenize` for counts only and relies on this.
+/// The wrong-kind 400 that `get_tokenizer` gives before any load (kind certain) stays: it
+/// loads nothing either.
 fn resolve_handle(state: &AppState, model: &str) -> Result<TokenizerHandle, Box<Response>> {
     let Some(mm) = state.model_manager.as_ref() else {
         return Err(Box::new(openai_error(
@@ -84,9 +93,26 @@ fn resolve_handle(state: &AppState, model: &str) -> Result<TokenizerHandle, Box<
             Some("model_unavailable"),
         )));
     };
-    mm.get_tokenizer(model)
-        .map_err(|e| Box::new(model_error_response(e)))
+    // Deliberately a plain lookup, not `on_demand::resolve_with_wait`: see above.
+    mm.get_tokenizer(model).map_err(|e| {
+        Box::new(match e {
+            // The shared not-loaded text suggests setting the model to load on demand, which
+            // means nothing here (P-C review R-6): same status, code and no `Retry-After`, a
+            // neutral sentence for these two routes.
+            ModelError::NotLoaded => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                NOT_LOADED_MESSAGE,
+                "server_error",
+                Some("model_unavailable"),
+            ),
+            e => model_error_response(e),
+        })
+    })
 }
+
+/// The 503 text of `/tokenize` and `/detokenize` for a model that is not loaded.
+pub(crate) const NOT_LOADED_MESSAGE: &str = "model unavailable: the model is not loaded; \
+     /tokenize and /detokenize never load a model, so load it first";
 
 // ---- Handlers --------------------------------------------------------
 

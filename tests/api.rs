@@ -737,6 +737,170 @@ async fn admin_load_rejects_unknown_field_with_400() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // P-C: the public envelope, naming the unknown field (it was plain text).
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["code"], "invalid_body");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("kv_cache")
+    );
+}
+
+/// P-C (P8): every admin route with a JSON body answers malformed JSON, a wrong
+/// type and a missing field with the 400 `invalid_body` envelope. Unknown fields: 400 envelope
+/// everywhere except `PATCH`, which keeps its plain-text 422. A missing `Content-Type` keeps
+/// axum's 415 on the `Json` routes; `/load` and `/resize` still take any `Content-Type`, and
+/// `/load` an empty body (both then reach the manager check: 503 in mock mode).
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one route table and its checks
+async fn admin_bad_json_is_the_400_envelope_on_every_admin_route() {
+    const M: &str = "/v1/admin/models/m";
+    let send = |method: &'static str, uri: String, ct: bool, body: &'static str| async move {
+        let mut b = Request::builder().method(method).uri(uri);
+        if ct {
+            b = b.header("content-type", "application/json");
+        }
+        rustedvino::create_router(AppState::mock())
+            .oneshot(b.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    };
+    let load = format!("{M}/load");
+    let resize = format!("{M}/resize");
+    let add = "/v1/admin/models/add".to_owned();
+    let preload = "/v1/admin/config/preload".to_owned();
+    // (method, uri, body) answered 400 `invalid_body`.
+    let bad: Vec<(&str, String, &str)> = vec![
+        ("POST", load.clone(), "{not json"),
+        ("POST", load.clone(), r#"{"kv_cache_gb": "four"}"#),
+        ("POST", load.clone(), r#"{"kv_cache": 4.0}"#),
+        ("POST", resize.clone(), "{not json"),
+        ("POST", resize.clone(), r#"{"kv_cache_gb": "four"}"#),
+        ("POST", resize.clone(), "{}"),
+        (
+            "POST",
+            resize.clone(),
+            r#"{"kv_cache_gb": 2.0, "forse": true}"#,
+        ),
+        ("PATCH", M.to_owned(), "{not json"),
+        ("PATCH", M.to_owned(), r#"{"vram_gb": "big"}"#),
+        // Review R-3: a wrong type whose string value echoes serde's unknown-field words is
+        // still a wrong type (400), not the PATCH unknown-field 422.
+        (
+            "PATCH",
+            M.to_owned(),
+            r#"{"vram_gb": "unknown field `x`, expected one of `a`"}"#,
+        ),
+        (
+            "PATCH",
+            M.to_owned(),
+            r#"{"sampling": {"temperature": "unknown field `x`"}}"#,
+        ),
+        ("PATCH", M.to_owned(), ""),
+        ("POST", add.clone(), "{not json"),
+        ("POST", add.clone(), r#"{"model_id": 7}"#),
+        ("POST", add.clone(), r#"{"vram_gb": 1.0}"#),
+        (
+            "POST",
+            add.clone(),
+            r#"{"model_id": "x", "sampling": {"temprature": 1}}"#,
+        ),
+        ("POST", preload.clone(), "{not json"),
+        ("POST", preload.clone(), r#"{"model_ids": "a"}"#),
+    ];
+    for (method, uri, body) in bad {
+        let resp = send(method, uri.clone(), true, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{method} {uri} {body}"
+        );
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(
+            json["error"]["code"], "invalid_body",
+            "{method} {uri} {body}"
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("invalid JSON body: "), "{json}");
+        // Review R-7: axum's own prefixes are stripped, so a changed axum text would show here.
+        assert!(
+            !message.contains("Failed to deserialize") && !message.contains("Failed to parse"),
+            "{json}"
+        );
+    }
+    // PATCH: an unknown field, top level or nested, keeps the plain-text 422.
+    for body in [r#"{"vram_gbb": 1.0}"#, r#"{"sampling": {"temprature": 1}}"#] {
+        let resp = send("PATCH", M.to_owned(), true, body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let text = body_string(resp.into_body()).await;
+        assert!(text.contains("unknown field"), "{text}");
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_err());
+    }
+    // No `Content-Type` on the `Json` routes: axum's 415, unchanged.
+    for (method, uri, body) in [
+        ("PATCH", M.to_owned(), r#"{"vram_gb": 1.0}"#),
+        ("POST", add.clone(), r#"{"model_id": "x"}"#),
+        ("POST", preload.clone(), r#"{"from_live": true}"#),
+    ] {
+        let resp = send(method, uri.clone(), false, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{method} {uri}"
+        );
+    }
+    // `/load` and `/resize`: any `Content-Type`, and `/load` an empty body, pass the parse.
+    for (uri, ct, body) in [
+        (load.clone(), false, r#"{"kv_cache_gb": 4.0}"#),
+        (load.clone(), false, ""),
+        (load.clone(), true, ""),
+        (resize.clone(), false, r#"{"kv_cache_gb": 2.0}"#),
+    ] {
+        let resp = send("POST", uri.clone(), ct, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} ct={ct} {body:?}"
+        );
+    }
+}
+
+/// P-C review R-7: a body over the request limit keeps axum's 413 on every admin route with a
+/// JSON body (passed through, not turned into a 400).
+#[tokio::test]
+async fn admin_body_over_the_limit_keeps_413() {
+    const M: &str = "/v1/admin/models/m";
+    let (load, resize) = (format!("{M}/load"), format!("{M}/resize"));
+    let add = "/v1/admin/models/add".to_owned();
+    let preload = "/v1/admin/config/preload".to_owned();
+    let big = vec![b' '; 51 * 1024 * 1024];
+    for (method, uri) in [
+        ("PATCH", M.to_owned()),
+        ("POST", add.clone()),
+        ("POST", preload.clone()),
+        ("POST", load.clone()),
+        ("POST", resize.clone()),
+    ] {
+        let resp = rustedvino::create_router(AppState::mock())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(big.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {uri}"
+        );
+    }
 }
 
 /// A valid override body still reaches the manager check (503 here) — proves a
@@ -1344,6 +1508,44 @@ async fn cors_explicit_allowlist_echoes_only_listed_origin() {
             .is_none(),
         "non-listed origin must not be allowed"
     );
+}
+
+/// 0.9.1 T1 (P7): actual (non-preflight) responses expose the `SpeechT5`
+/// segment headers to a cross-origin browser client, with the default
+/// wildcard and with an explicit allowlist.
+#[tokio::test]
+async fn cors_exposes_the_tts_segment_headers() {
+    for origins in [
+        vec!["*".to_owned()],
+        vec!["https://app.example.com".to_owned()],
+    ] {
+        let app = rustedvino::create_router_with_cors(AppState::mock(), &origins, &[]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header("origin", "https://app.example.com")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"speecht5-tts","input":"Hi."}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(exposed.contains("x-rustedvino-tts-segments"), "{exposed}");
+        assert!(
+            exposed.contains("x-rustedvino-tts-segment-cap"),
+            "{exposed}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------
@@ -2651,6 +2853,37 @@ async fn transcription_srt_format_has_cue_header() {
         body.starts_with("1\n00:00:00,000 --> "),
         "srt format → first cue header, got: {body:?}"
     );
+}
+
+/// FM-3: `PL` / `pl-PL` reach the engine as `pl` (the mock echoes the hint it got), `auto` as no
+/// hint, and a code Whisper has no token for is a 400 `invalid_language` with `param: "language"`
+/// instead of a 500 from the pipeline.
+#[tokio::test]
+async fn transcription_language_is_normalised_or_refused() {
+    for (raw, want) in [(&b"PL"[..], "pl"), (b"pl-PL", "pl"), (b"auto", "english")] {
+        let response = post_transcription(&[
+            ("file", Some("a.wav"), b"RIFFsome-fake-audio"),
+            ("model", None, b"whisper-stt"),
+            ("response_format", None, b"verbose_json"),
+            ("language", None, raw),
+        ])
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response.into_body()).await;
+        assert_eq!(json["language"], want, "{raw:?}");
+    }
+    let response = post_transcription(&[
+        ("file", Some("a.wav"), b"RIFFsome-fake-audio"),
+        ("model", None, b"whisper-stt"),
+        ("language", None, b"xx"),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response.into_body()).await;
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["code"], "invalid_language");
+    assert_eq!(json["error"]["param"], "language");
+    assert!(json["error"]["message"].as_str().unwrap().contains("pl-PL"));
 }
 
 #[tokio::test]

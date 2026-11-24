@@ -241,6 +241,13 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
     let Some(data) = models.get("data").and_then(Value::as_array) else {
         return;
     };
+    // `/v1/models` has no `kind` (it is not an `OpenAI` field): take it from the admin list. No
+    // admin list → every kind is unknown, so the rows come out alphabetically by id.
+    let mut data: Vec<&Value> = data.iter().collect();
+    crate::order::sort_models(&mut data, |m| {
+        let id = m["id"].as_str().unwrap_or("");
+        (by_id(id).and_then(|a| a["kind"].as_str()), id)
+    });
     let table_rows: Vec<Vec<String>> = data
         .iter()
         .map(|m| {
@@ -250,12 +257,15 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
             let vram = get("vram_gb")
                 .and_then(Value::as_f64)
                 .map_or_else(|| "n/a".into(), |v| format!("{v:.1} GB"));
-            let (kv, req) = load_cells(rows_m, id);
             let device = get("device").and_then(Value::as_str).unwrap_or("?");
+            let (kv, req) = load_cells(rows_m, id, Some(device));
             let vram = crate::commands::models::mem_cell(device, vram);
             vec![
                 id.to_owned(),
+                // Without an admin key, the `/v1/models` `state` (since 0.9.1: `not_loaded` /
+                // `loading` for an `on_demand` model not loaded yet; absent when Ready).
                 get("state")
+                    .or_else(|| m.get("state"))
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_owned(),
@@ -291,6 +301,55 @@ fn models_section(ctx: &Ctx, models: &Value, admin_models: Option<&Value>, rows_
         )
     );
     println!();
+}
+
+/// Runs `rv status <id>`: one model's state line plus its sampling profile (V5c). Exit 0 when the
+/// model is registered, 1 otherwise. `--json` prints the model's admin entry.
+#[must_use]
+pub fn model(ctx: &Ctx, id: &str) -> i32 {
+    if !ctx.require_admin_key() {
+        return 1;
+    }
+    let st = ctx.style;
+    let entry = match crate::commands::admin_entry(ctx, id) {
+        Ok(e) => e,
+        Err((code, not_registered)) => {
+            if not_registered {
+                eprintln!(
+                    "  = help: `rv check {id}` previews a model on disk that is not registered; \
+                     `rv list` shows them"
+                );
+            }
+            return code;
+        }
+    };
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entry).unwrap_or_default()
+        );
+        return 0;
+    }
+    println!("{}", model_line(st, id, &entry));
+    crate::commands::print_entry_profile(ctx, id, &entry, crate::commands::OldServerNote::Neutral);
+    0
+}
+
+/// `<id> · <state> · <device> · <vram> · <kind>` of one admin model entry.
+fn model_line(st: crate::ansi::Style, id: &str, m: &Value) -> String {
+    let get = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("?");
+    let vram = m
+        .get("vram_gb")
+        .and_then(Value::as_f64)
+        .map_or_else(|| "n/a".into(), |v| format!("{v:.1} GB"));
+    format!(
+        "{} · {} · {} · {} · {}",
+        st.bold(id),
+        crate::format::state_glyph(st, get("state")),
+        get("device"),
+        crate::commands::models::mem_cell(get("device"), vram),
+        get("kind")
+    )
 }
 
 /// Runs `rv status`. Exit 0 when `/health` answered 200, else 1.

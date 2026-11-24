@@ -31,6 +31,9 @@ pub mod error;
 /// `/v1/images/generations`). 5.0 scaffold: all three return 501.
 pub mod media;
 
+/// F1b: the shared bounded wait on an on-demand load, and the streaming keep-alive splice.
+pub(crate) mod on_demand;
+
 /// Tokenizer helper handlers (`POST /tokenize`, `POST /detokenize`).
 pub mod tokenize;
 

@@ -6,8 +6,8 @@
 use serde_json::{Value, json};
 
 use crate::api::{LOAD_TIMEOUT, Payload, READ_TIMEOUT, encode_segment};
-use crate::commands::print_error;
 use crate::commands::prompt::confirm;
+use crate::commands::{outcome, print_error};
 use crate::ctx::Ctx;
 use crate::format::table;
 
@@ -56,13 +56,13 @@ pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool, force: bool) 
             "resizing '{model}' — evict + reload, can take 10-60s..."
         ))
     );
+    let path = format!("/v1/admin/models/{}/resize", encode_segment(model));
+    if force {
+        return forced_resize(ctx, model, &path, kv_cache_gb);
+    }
     let r = ctx.api.post(
-        &format!("/v1/admin/models/{}/resize", encode_segment(model)),
-        Some(&if force {
-            json!({ "kv_cache_gb": kv_cache_gb, "force": true })
-        } else {
-            json!({ "kv_cache_gb": kv_cache_gb })
-        }),
+        &path,
+        Some(&json!({ "kv_cache_gb": kv_cache_gb })),
         LOAD_TIMEOUT,
     );
     if r.code == Some(200) {
@@ -70,11 +70,68 @@ pub fn resize(ctx: &Ctx, model: &str, kv_cache_gb: f64, yes: bool, force: bool) 
         println!("{} {msg}", st.ok());
         return 0;
     }
-    print_error(ctx, &r);
-    if crate::commands::error_code(&r).as_deref() == Some("model_busy") {
+    resize_failed(ctx, &r, model, kv_cache_gb)
+}
+
+/// A forced resize (V1-rv P1): the pre-call line, the POST with `Accept: application/json`, then
+/// what the force did — the model's own eviction and any model its forced reload evicted.
+fn forced_resize(ctx: &Ctx, model: &str, path: &str, kv_cache_gb: f64) -> i32 {
+    let st = ctx.style;
+    let running = outcome::running(outcome::scrape(ctx).as_deref(), &[model]);
+    println!(
+        "{}",
+        st.dim(&outcome::precall_line(running, outcome::EVICT_DRAIN_S))
+    );
+    let r = ctx.api.post_accept_json(
+        path,
+        Some(&json!({ "kv_cache_gb": kv_cache_gb, "force": true })),
+        LOAD_TIMEOUT,
+    );
+    if r.code != Some(200) {
+        return resize_failed(ctx, &r, model, kv_cache_gb);
+    }
+    let got = outcome::parse(r.body.as_ref());
+    let head = match (&got, r.body.as_ref()) {
+        (Some(_), body) => {
+            crate::commands::lifecycle::json_message(body, &format!("model '{model}' resized"))
+        }
+        (None, body) => body.and_then(Payload::text).unwrap_or("resized").to_owned(),
+    };
+    let others: Vec<&str> = got
+        .iter()
+        .flat_map(|o| o.evicted.iter().map(String::as_str))
+        .filter(|m| *m != model)
+        .collect();
+    // R-10: the figures are summed over every eviction, the reload's victims included, so the
+    // model's own running count no longer words the drained case.
+    let (running, note) = if others.is_empty() {
+        (running, String::new())
+    } else {
+        (
+            None,
+            format!(
+                " (the drain figure includes {}, which the reload evicted to make room)",
+                others.join(", ")
+            ),
+        )
+    };
+    println!(
+        "{} {head} \u{2014} {}{note}",
+        st.ok(),
+        outcome::clause(got.as_ref(), running)
+    );
+    outcome::warn_if_still_running(ctx, got.as_ref(), &format!("resize {model}"));
+    0
+}
+
+/// The error report of a failed resize.
+fn resize_failed(ctx: &Ctx, r: &crate::api::Reply, model: &str, kv_cache_gb: f64) -> i32 {
+    let st = ctx.style;
+    print_error(ctx, r);
+    if crate::commands::error_code(r).as_deref() == Some("model_busy") {
         crate::commands::print_busy_hint(
             ctx,
-            &r,
+            r,
             &format!("resize {model} --kv-cache-gb {kv_cache_gb}"),
         );
     } else if r.code == Some(409) {
@@ -122,7 +179,10 @@ pub fn completeness(ctx: &Ctx) -> i32 {
             .unwrap_or_default();
         v.join(", ")
     };
-    let rows: Vec<Vec<String>> = models
+    // Each entry carries the server's `kind`, so no admin-list lookup is needed.
+    let mut sorted: Vec<&Value> = models.iter().collect();
+    crate::order::sort_values(&mut sorted);
+    let rows: Vec<Vec<String>> = sorted
         .iter()
         .map(|m| {
             let complete = m.get("complete").and_then(Value::as_bool).unwrap_or(false);
@@ -188,6 +248,17 @@ pub fn reload_keys(ctx: &Ctx) -> i32 {
             st.yellow(&format!(
                 "{} the file's admin_api_keys is empty while admin keys are live — that downgrade \
                  was refused, the live admin keys are kept",
+                st.warn()
+            ))
+        );
+    }
+    if flag("inference_open_on_network") {
+        println!(
+            "{}",
+            st.yellow(&format!(
+                "{} no api_keys remain and the server binds a network address — inference is open \
+                 to anyone who can reach the port (admin keys protect only /v1/admin/*). Add an \
+                 api_keys entry; without allow_insecure_public_bind the next start refuses this file",
                 st.warn()
             ))
         );

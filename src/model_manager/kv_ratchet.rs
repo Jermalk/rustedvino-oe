@@ -196,13 +196,45 @@ pub(crate) fn write_ratchet_v2(model_dir: &Path, observed_prompt_tokens: usize, 
     // Per-process temp name: two instances sharing a model directory must not clobber each
     // other's half-written file.
     let tmp_path = model_dir.join(format!("{RATCHET_V2_FILENAME}.{}.tmp", std::process::id()));
-    if let Err(err) = std::fs::write(&tmp_path, &serialized) {
-        tracing::warn!(model_dir = %model_dir.display(), error = %err, "kv capacity ratchet v2: could not write temp file, skipping");
-        return;
+    if let Err((stage, err)) =
+        write_durably(model_dir, &tmp_path, &final_path, serialized.as_bytes())
+    {
+        tracing::warn!(model_dir = %model_dir.display(), error = %err, stage, "kv capacity ratchet v2: write failed, skipping");
     }
-    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
-        tracing::warn!(model_dir = %model_dir.display(), error = %err, "kv capacity ratchet v2: could not commit write");
+}
+
+/// Durable replace of `final_path` with `bytes` through `tmp_path` (both in `dir`), shared by the
+/// v1 and v2 ratchet writers (R-10): write the temp file and `sync_all` it, rename it over the
+/// final file, then sync `dir` so the rename survives a power loss. The directory sync is best
+/// effort (some platforms and filesystems cannot open or sync a directory, Windows among them):
+/// a failure logs at debug and the write still counts. On a temp-write, sync or rename error the
+/// temp file is removed (best effort) and the error is returned with the stage that failed.
+pub(crate) fn write_durably(
+    dir: &Path,
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), (&'static str, std::io::Error)> {
+    let staged = write_synced(tmp_path, bytes)
+        .map_err(|e| ("write temp file", e))
+        .and_then(|()| std::fs::rename(tmp_path, final_path).map_err(|e| ("commit", e)));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(tmp_path); // best effort: it may not exist
+        return staged;
     }
+    if let Err(err) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(dir = %dir.display(), error = %err, "kv capacity ratchet: could not sync the directory after the rename");
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` and `sync_all` it before returning (R-10): the rename that follows
+/// must never publish a file whose contents a power loss could still drop.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Note once per model directory per process that ratchet files found in the model library
@@ -395,6 +427,41 @@ mod tests {
         // The bigger pool's 3,000 scaled to 6,000 blocks (1,416) is stricter than 9,000.
         assert_eq!(read_ratchet_v2(dir.path(), &small), Some(1_416));
         assert_eq!(read_ratchet_v2(dir.path(), &key()), Some(3_000));
+    }
+
+    /// R-10: the synced temp-file write leaves exactly the committed file behind, no `.tmp`.
+    #[test]
+    fn a_write_leaves_only_the_committed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ratchet_v2(dir.path(), 4_000, &key());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![RATCHET_V2_FILENAME.to_owned()]);
+        assert_eq!(read_ratchet_v2(dir.path(), &key()), Some(4_000));
+    }
+
+    /// E1 F9: a failed commit (the final path is a directory, so the rename fails) removes the temp
+    /// file and reports the stage; nothing is left behind.
+    #[test]
+    fn a_failed_commit_removes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("final");
+        std::fs::create_dir(&final_path).unwrap();
+        std::fs::write(final_path.join("occupant"), b"x").unwrap();
+        let tmp = dir.path().join("final.tmp");
+        let Err((stage, _)) = write_durably(dir.path(), &tmp, &final_path, b"{}") else {
+            panic!("renaming a file over a non-empty directory must fail");
+        };
+        assert_eq!(stage, "commit");
+        assert!(!tmp.exists(), "temp file left behind");
+        // A temp path in a missing directory fails at the first stage.
+        let missing = dir.path().join("nope").join("t.tmp");
+        let Err((stage, _)) = write_durably(dir.path(), &missing, &final_path, b"{}") else {
+            panic!("a temp file in a missing directory cannot be written");
+        };
+        assert_eq!(stage, "write temp file");
     }
 
     /// Fable S-2: one entry per key. Another precision learned in between does not erase the first.

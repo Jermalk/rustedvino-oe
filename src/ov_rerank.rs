@@ -5,8 +5,12 @@
 // ov_rerank_create / ov_rerank_documents / ov_rerank_free (the same
 // opaque-handle + callback pattern as the embedding bridge).
 //
-// The pipeline is created with a large top_n so all documents are scored
-// and sorted; Rust applies the per-request top_n trim.
+// The bridge scores each document with its own one-document rerank() call
+// (C27: batched calls hit an upstream heap corruption, see
+// ov_rerank_documents in ov_bridge.cpp), maps every score back to the
+// document's position and sorts the set; `checked_rerank_order` re-checks
+// that here. The pipeline is created with a large top_n so nothing is
+// dropped; Rust applies the per-request top_n trim.
 // ============================================================
 
 use std::ffi::{CString, c_void};
@@ -193,7 +197,7 @@ impl OvRerankEngine {
             anyhow::bail!("ov_rerank_documents failed: {}", last_error());
         }
 
-        Ok(ctx.results)
+        checked_rerank_order(ctx.results, texts.len())
     }
 
     /// Count the tokens `query` and `document` need combined (summed from two
@@ -232,6 +236,57 @@ impl Drop for OvRerankEngine {
     }
 }
 
+// ── Result check ──────────────────────────────────────────────────────────────
+
+/// Check the bridge's `(original_index, score)` results for `n` documents and
+/// return them sorted by score descending (equal scores: lower index first; a
+/// NaN score last) — the order the bridge already delivers, so this sort is a
+/// no-op on a correct result.
+///
+/// C27: the bridge scores one document per pipeline call, and the pipeline
+/// numbers results within its own call (always index 0). A mapping slip there
+/// would hand every result index 0 — the response would then repeat
+/// `documents[0]`'s text under every score, with no error. So the indices must
+/// be exactly a permutation of `0..n`; anything else is an error, never a
+/// response.
+///
+/// # Errors
+/// Returns an error when the result count is not `n`, or an index is out of
+/// range or repeated.
+pub(crate) fn checked_rerank_order(
+    mut results: Vec<(usize, f32)>,
+    n: usize,
+) -> anyhow::Result<Vec<(usize, f32)>> {
+    if results.len() != n {
+        anyhow::bail!(
+            "reranking returned {} results for {n} documents",
+            results.len()
+        );
+    }
+    let mut seen = vec![false; n];
+    for &(index, _) in &results {
+        match seen.get_mut(index) {
+            Some(slot) if !*slot => *slot = true,
+            Some(_) => anyhow::bail!("reranking returned document index {index} twice"),
+            None => anyhow::bail!("reranking returned document index {index} for {n} documents"),
+        }
+    }
+    let key = |score: f32| {
+        if score.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            score
+        }
+    };
+    results.sort_by(|a, b| {
+        key(b.1)
+            .partial_cmp(&key(a.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(results)
+}
+
 // ── Callback trampoline ───────────────────────────────────────────────────────
 
 struct RerankCtx {
@@ -249,5 +304,70 @@ unsafe extern "C" fn rerank_trampoline(user_data: *mut c_void, index: usize, sco
     .is_err()
     {
         ctx.panicked = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::checked_rerank_order;
+
+    /// The C27 trap: one document per pipeline call, and every call's result
+    /// says index 0. Passed through, the response would label every score with
+    /// `documents[0]`. It must be an error instead.
+    #[test]
+    fn every_document_as_index_0_is_rejected() {
+        let all_zero = vec![(0, 0.9), (0, 0.5), (0, 0.1)];
+        let err = checked_rerank_order(all_zero, 3).unwrap_err().to_string();
+        assert!(err.contains("index 0 twice"), "{err}");
+    }
+
+    #[test]
+    fn per_document_scores_come_back_mapped_and_sorted_descending() {
+        // Delivered in document order (as a bridge without its sort would).
+        let in_doc_order = vec![(0, 0.2), (1, 0.9), (2, 0.05), (3, 0.6)];
+        let out = checked_rerank_order(in_doc_order, 4).unwrap();
+        assert_eq!(out, vec![(1, 0.9), (3, 0.6), (0, 0.2), (2, 0.05)]);
+    }
+
+    #[test]
+    fn an_already_sorted_result_is_unchanged() {
+        let sorted = vec![(2, 0.99), (0, 0.5), (1, 0.5), (3, 0.0)];
+        assert_eq!(checked_rerank_order(sorted.clone(), 4).unwrap(), sorted);
+    }
+
+    #[test]
+    fn equal_scores_keep_the_lower_index_first() {
+        let ties = vec![(0, 0.5), (1, 0.7), (2, 0.5), (3, 0.5)];
+        let out = checked_rerank_order(ties, 4).unwrap();
+        assert_eq!(out, vec![(1, 0.7), (0, 0.5), (2, 0.5), (3, 0.5)]);
+    }
+
+    #[test]
+    fn equal_scores_delivered_out_of_index_order_are_reordered_by_index() {
+        let ties = vec![(3, 0.5), (1, 0.7), (2, 0.5), (0, 0.5)];
+        let out = checked_rerank_order(ties, 4).unwrap();
+        assert_eq!(out, vec![(1, 0.7), (0, 0.5), (2, 0.5), (3, 0.5)]);
+    }
+
+    #[test]
+    fn a_nan_score_sorts_last() {
+        let out = checked_rerank_order(vec![(0, f32::NAN), (1, 0.1)], 2).unwrap();
+        assert_eq!(out[0], (1, 0.1));
+        assert_eq!(out[1].0, 0);
+        assert!(out[1].1.is_nan());
+    }
+
+    #[test]
+    fn a_missing_or_out_of_range_index_is_rejected() {
+        assert!(checked_rerank_order(vec![(0, 0.5)], 2).is_err());
+        assert!(checked_rerank_order(vec![(0, 0.5), (2, 0.4)], 2).is_err());
+        assert!(checked_rerank_order(vec![(0, 0.5), (1, 0.4), (1, 0.3)], 2).is_err());
+    }
+
+    #[test]
+    fn no_documents_is_an_empty_result() {
+        assert!(checked_rerank_order(Vec::new(), 0).unwrap().is_empty());
     }
 }

@@ -233,6 +233,7 @@ pub struct ProbeCmd {
 ///
 /// # Errors
 /// As [`run_supervised`].
+#[allow(clippy::too_many_lines)] // one linear respawn loop; each step is a call or a guarded exit
 pub async fn run_supervised_with_probe(
     exe: &Path,
     args: &[String],
@@ -249,6 +250,8 @@ pub async fn run_supervised_with_probe(
     // deadline kill (0.9.0 review E, shutdown-1); only the deadline itself is once per episode.
     let mut run_probe = false;
     let mut spawn_no: u64 = 0;
+    // C27: the set the next worker targets (`None` for the first spawn: the full preload).
+    let mut restore = RestoreState::default();
 
     loop {
         let now = Instant::now();
@@ -304,7 +307,14 @@ pub async fn run_supervised_with_probe(
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&progress);
-        let mut child = worker_command(exe, args, &watchdog_token, &progress).spawn()?;
+        let mut child = worker_command(
+            exe,
+            args,
+            &watchdog_token,
+            &progress,
+            restore.handed.as_deref(),
+        )
+        .spawn()?;
         let deadline = (arm_gpu_deadline && cfg.gpu_first_load_deadline_secs > 0)
             .then(|| Duration::from_secs(cfg.gpu_first_load_deadline_secs));
         tracing::info!(
@@ -327,7 +337,7 @@ pub async fn run_supervised_with_probe(
             &mut no_teardown,
         )
         .await;
-        let _ = std::fs::remove_file(&progress);
+        end_attempt_progress(&outcome, &progress, &mut restore, cfg, no_teardown);
         // Once per episode: a worker this deadline killed does not arm it again (no loop), but the
         // next worker is still probed first.
         run_probe = no_teardown;
@@ -370,12 +380,29 @@ struct WorkerProgress<'a> {
 /// `no_teardown` when this worker itself left without teardown (exit 75/76, a signal, or a kill
 /// by this supervisor) — the caller arms the deadline for the next one.
 /// The worker's command line and environment, set to end with the supervisor (MR-5d).
-fn worker_command(exe: &Path, args: &[String], watchdog_token: &str, progress: &Path) -> Command {
+/// `restore` (C27) goes in [`crate::startup::RESTORE_MODELS_ENV`], `Some([])` as `[]` (a respawn
+/// whose crashed set was empty: no preload); for `None` (a fresh start) the variable is removed,
+/// so a value inherited by the supervisor never reaches a worker.
+fn worker_command(
+    exe: &Path,
+    args: &[String],
+    watchdog_token: &str,
+    progress: &Path,
+    restore: Option<&[String]>,
+) -> Command {
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .env(crate::startup::SUPERVISED_ENV, "1")
         .env(crate::startup::WATCHDOG_TOKEN_ENV, watchdog_token)
         .env(crate::startup::PROGRESS_FILE_ENV, progress);
+    match restore.map(serde_json::to_string) {
+        Some(Ok(json)) => {
+            cmd.env(crate::startup::RESTORE_MODELS_ENV, json);
+        }
+        _ => {
+            cmd.env_remove(crate::startup::RESTORE_MODELS_ENV);
+        }
+    }
     terminate_with_supervisor(&mut cmd);
     cmd
 }
@@ -538,6 +565,358 @@ fn left_without_teardown(status: &std::io::Result<ExitStatus>) -> bool {
 /// without its `\n` is still being written and is left out.
 fn complete_lines(contents: &str) -> std::str::Lines<'_> {
     contents[..contents.rfind('\n').unwrap_or(0)].lines()
+}
+
+/// C27: how many times one model is restored after a crash respawn within
+/// [`SupervisorConfig::restart_window_secs`]. A model loaded again (by an operator) and resident
+/// at a later crash inside the window is not restored a second time.
+pub const MAX_RESTORES_PER_WINDOW: usize = 1;
+
+/// C27 respawn restore bookkeeping, kept across the spawns of one supervisor (a new supervisor
+/// starts empty: a clean service restart restores nothing).
+#[derive(Debug, Default)]
+pub struct RestoreState {
+    /// The set handed to the current worker in [`crate::startup::RESTORE_MODELS_ENV`]: `None` =
+    /// a fresh start (variable absent, full `preload`); `Some` = a respawn targeting that set
+    /// (`preload` models included; `Some([])` = nothing, no preload).
+    pub handed: Option<Vec<String>>,
+    /// When each of `handed` was first handed over.
+    handed_at: std::collections::HashMap<String, Instant>,
+    /// Restores that really started (a `restore_started` line), stamped with their hand-over
+    /// time; pruned to the restart window. Counts toward [`MAX_RESTORES_PER_WINDOW`].
+    history: std::collections::HashMap<String, Vec<Instant>>,
+}
+
+/// Why a model is not handed to the next worker although the crashed one had it (or was asked
+/// to restore it). Each is logged as a WARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreDrop {
+    /// Its restore started in the crashed worker but never reached Ready (the load may be what
+    /// crashed it).
+    RestoreNeverReady(String),
+    /// It was restored, and the worker crashed again while it was resident, within the restart
+    /// window of its hand-over.
+    ResidentAtSecondCrash(String),
+    /// It was already restored [`MAX_RESTORES_PER_WINDOW`] time(s) within the restart window.
+    RestoredRecently(String),
+}
+
+/// What the crashed worker's progress file says: resident models at the crash (in first-ready
+/// order), restores started, restores that reached Ready after their start, the models its
+/// preload phase started, whether it crashed inside that phase, and whether any model was ever
+/// Ready in it.
+///
+/// M1: a `model_unloaded` inside an open load window (`load_started` …
+/// `load_ended`) is that load's possible victim. It stays in `resident` only while a load open at
+/// its eviction is still open at the end of the file (the worker crashed during it). It is out
+/// once those loads all returned — Ready or not (a load that failed without crashing really did
+/// evict it, and the worker kept serving without it) — or when a later `model_ready` /
+/// `model_unloaded` of the victim itself decides. A file with no window lines reads as before.
+struct ProgressModels {
+    resident: Vec<String>,
+    started: std::collections::HashSet<String>,
+    reached_ready: std::collections::HashSet<String>,
+    preload_reached: std::collections::HashSet<String>,
+    /// `preload_phase_started` without a later `preload_phase_done`. A file with neither (a
+    /// worker that does not write them) reads as a finished phase.
+    in_preload_phase: bool,
+    any_ready: bool,
+    /// Loads whose window is still open at the end of the file (the crash came during them).
+    open_at_end: std::collections::HashSet<String>,
+    /// The victims the last load window released when it closed without Ready, if no model
+    /// event came after it (the worker may have left because of that load: a poisoned GPU, a
+    /// stalled call). Kept only after an abnormal exit, see [`plan_restore_after`].
+    released_at_end: Vec<String>,
+}
+
+fn progress_models(progress: &str) -> ProgressModels {
+    let mut p = ProgressModels {
+        resident: Vec::new(),
+        started: std::collections::HashSet::new(),
+        reached_ready: std::collections::HashSet::new(),
+        preload_reached: std::collections::HashSet::new(),
+        in_preload_phase: false,
+        any_ready: false,
+        open_at_end: std::collections::HashSet::new(),
+        released_at_end: Vec::new(),
+    };
+    // Open load windows (nested ones of one id counted), and each victim's loads.
+    let mut open: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut victims: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for line in complete_lines(progress) {
+        let model_event = [
+            "load_started ",
+            "load_ended ",
+            "model_ready ",
+            "model_unloaded ",
+            "restore_started ",
+            "preload_model ",
+            "preload_phase_",
+        ]
+        .iter()
+        .any(|k| line.starts_with(k));
+        if model_event {
+            // Something happened after the last released window: the worker went on serving.
+            p.released_at_end.clear();
+        }
+        if let Some(id) = line.strip_prefix("load_started ") {
+            *open.entry(id.to_owned()).or_default() += 1;
+        } else if let Some(id) = line.strip_prefix("load_ended ") {
+            if let Some(n) = open.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    open.remove(id);
+                    // That load returned: a victim of no other open load is really out.
+                    let out: Vec<String> = victims
+                        .iter_mut()
+                        .filter_map(|(v, loads)| {
+                            loads.remove(id);
+                            loads.is_empty().then(|| v.clone())
+                        })
+                        .collect();
+                    for v in &out {
+                        victims.remove(v);
+                        p.resident.retain(|r| r != v);
+                    }
+                    p.released_at_end = out;
+                }
+            }
+        } else if line == "preload_phase_started" {
+            p.in_preload_phase = true;
+        } else if line == "preload_phase_done" {
+            p.in_preload_phase = false;
+        } else if let Some(id) = line.strip_prefix("preload_model ") {
+            p.preload_reached.insert(id.to_owned());
+        } else if let Some(id) = line.strip_prefix("model_ready ") {
+            p.any_ready = true;
+            if p.started.contains(id) {
+                p.reached_ready.insert(id.to_owned());
+            }
+            if !p.resident.iter().any(|r| r == id) {
+                p.resident.push(id.to_owned());
+            }
+            victims.remove(id);
+            // The load reached Ready: the models it evicted are really out.
+            let out: Vec<String> = victims
+                .iter()
+                .filter(|(_, loads)| loads.contains(id))
+                .map(|(v, _)| v.clone())
+                .collect();
+            for v in out {
+                victims.remove(&v);
+                p.resident.retain(|r| *r != v);
+            }
+        } else if let Some(id) = line.strip_prefix("model_unloaded ") {
+            if open.is_empty() || !p.resident.iter().any(|r| r == id) {
+                victims.remove(id);
+                p.resident.retain(|r| r != id);
+            } else {
+                victims.insert(id.to_owned(), open.keys().cloned().collect());
+            }
+        } else if let Some(id) = line.strip_prefix("restore_started ") {
+            p.started.insert(id.to_owned());
+        }
+    }
+    p.open_at_end = open.into_keys().collect();
+    p
+}
+
+/// C27: the set the next worker targets, from the crashed worker's progress file
+/// (`model_ready` / `model_unloaded` / `restore_started` / `preload_model` /
+/// `preload_phase_*` / `load_started` / `load_ended` lines, last event per id wins; a load's victim
+/// counts as resident while that load has not reached Ready, see `ProgressModels`) and the set that worker itself was handed
+/// (`state.handed`). Updates `state` and returns the drops to log.
+///
+/// A fresh crashed worker (handed `None`) that crashed inside its preload phase, or before any
+/// model was Ready, hands `None` on: the next worker runs the full `preload`, as a fresh start.
+/// Otherwise the next set (`Some`, possibly empty) = models resident at the crash, plus handed
+/// models not reached yet: a restore not started, or a `preload` model its preload phase had not
+/// started (or was loading) when it crashed inside that phase. A handed `preload` model its
+/// finished preload phase did not get Ready is not carried (it was not in the set at the crash).
+/// Dropped: a restore that started but never reached Ready; a restored model resident again
+/// at a crash inside `window` of its hand-over (after the window it is an ordinary resident
+/// model); a model whose restore already started [`MAX_RESTORES_PER_WINDOW`] time(s) within
+/// `window`. A model handed over but loaded by an operator before its restore ran counts no
+/// restore. `preload` models load in the preload phase, which writes no `restore_started`, so
+/// these drops never apply to them: a `preload` model Ready at every crash is handed on every
+/// time (as every respawn reloaded `preload` before). The worker writes `model_ready` only for
+/// `Eager` and `preload` models, so nothing else is ever handed over.
+pub fn plan_restore(
+    progress: &str,
+    state: &mut RestoreState,
+    now: Instant,
+    window: Duration,
+) -> Vec<RestoreDrop> {
+    plan_restore_after(progress, state, now, window, false)
+}
+
+/// [`plan_restore`] knowing how the crashed worker left. `abnormal` = it left without its
+/// teardown (exit 75 poisoned GPU, 76 a stalled call, a signal, a kill by this supervisor): then
+/// the victims of the last load window that closed without Ready, with no model event after it,
+/// are kept too — that load may be what took the worker down (a poisoned GPU load returns an error
+/// and closes its window before the exit). After a clean exit, or once anything happened after
+/// that window, they are out (M1 review, N1).
+pub fn plan_restore_after(
+    progress: &str,
+    state: &mut RestoreState,
+    now: Instant,
+    window: Duration,
+    abnormal: bool,
+) -> Vec<RestoreDrop> {
+    let mut p = progress_models(progress);
+    if abnormal {
+        for v in std::mem::take(&mut p.released_at_end) {
+            if !p.resident.contains(&v) {
+                p.resident.push(v);
+            }
+        }
+    }
+    let handed_some = state.handed.take();
+    let fresh = handed_some.is_none();
+    let handed = handed_some.unwrap_or_default();
+    let mut handed_at = std::mem::take(&mut state.handed_at);
+    // A restore counts when it really started (F4), stamped with its hand-over time.
+    for id in handed.iter().filter(|id| p.started.contains(*id)) {
+        let at = handed_at.get(id).copied().unwrap_or(now);
+        state.history.entry(id.clone()).or_default().push(at);
+    }
+    for times in state.history.values_mut() {
+        times.retain(|&t| now.duration_since(t) < window);
+    }
+    state.history.retain(|_, times| !times.is_empty());
+    if fresh && (p.in_preload_phase || !p.any_ready) {
+        // Nothing was serving yet (no runtime load before the listener), or nothing was ever
+        // Ready: the next worker starts as fresh, with the full `preload`.
+        return Vec::new();
+    }
+
+    let mut drops = Vec::new();
+    let mut next: Vec<String> = Vec::new();
+    let mut next_at = std::collections::HashMap::new();
+    let mut dropped: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in &handed {
+        let at = handed_at.remove(id).unwrap_or(now);
+        if !p.started.contains(id) {
+            // Not reached before the crash: carried over — unless it is resident anyway (an
+            // operator loaded it first, or its preload phase did), then it is an ordinary
+            // resident model below; or it is a `preload` model a finished preload phase did not
+            // get Ready (refused, failed): not in the set at the crash.
+            // A `preload` model whose own load the crash interrupted (its window still open: a
+            // deferred one, M2, loads after the phase) is carried, as one loading
+            // inside the phase is.
+            let preload_missed = p.preload_reached.contains(id)
+                && !p.in_preload_phase
+                && !p.open_at_end.contains(id);
+            if !p.resident.contains(id) && !preload_missed {
+                next.push(id.clone());
+                next_at.insert(id.clone(), at);
+            }
+        } else if !p.reached_ready.contains(id) {
+            drops.push(RestoreDrop::RestoreNeverReady(id.clone()));
+            dropped.insert(id);
+        } else if p.resident.contains(id) && now.duration_since(at) < window {
+            drops.push(RestoreDrop::ResidentAtSecondCrash(id.clone()));
+            dropped.insert(id);
+        }
+    }
+    for id in &p.resident {
+        if dropped.contains(id.as_str()) || next.contains(id) {
+            continue;
+        }
+        if state.history.get(id).map_or(0, Vec::len) >= MAX_RESTORES_PER_WINDOW {
+            drops.push(RestoreDrop::RestoredRecently(id.clone()));
+            continue;
+        }
+        next.push(id.clone());
+        next_at.insert(id.clone(), now);
+    }
+    state.handed = Some(next);
+    state.handed_at = next_at;
+    drops
+}
+
+/// The progress file's text (lossy: a torn multibyte last line must not cost the whole file;
+/// [`complete_lines`] drops that line anyway). Empty when it cannot be read.
+fn read_progress(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The end of one attempt's progress file: C27 [`plan_restore`] from it (the models the next
+/// worker restores) — only after a crash (the outcomes that respawn; a clean stop or a
+/// config-fatal exit ends the loop, and the set is cleared) — then delete it.
+fn end_attempt_progress(
+    outcome: &AttemptOutcome,
+    progress: &Path,
+    restore: &mut RestoreState,
+    cfg: &SupervisorConfig,
+    abnormal: bool,
+) {
+    if matches!(
+        outcome,
+        AttemptOutcome::Failed
+            | AttemptOutcome::WatchdogKilled
+            | AttemptOutcome::FfiStalled
+            | AttemptOutcome::GpuDeadlineKilled
+    ) {
+        let contents = read_progress(progress);
+        let drops = plan_restore_after(
+            &contents,
+            restore,
+            Instant::now(),
+            Duration::from_secs(cfg.restart_window_secs),
+            abnormal || *outcome == AttemptOutcome::GpuDeadlineKilled,
+        );
+        log_restore_plan(&drops, restore.handed.as_deref());
+    } else {
+        restore.handed = None;
+        restore.handed_at.clear();
+    }
+    let _ = std::fs::remove_file(progress);
+}
+
+/// Log [`plan_restore`]'s drops and hand-over (one WARN per drop).
+fn log_restore_plan(drops: &[RestoreDrop], handed: Option<&[String]>) {
+    for drop in drops {
+        match drop {
+            RestoreDrop::RestoreNeverReady(id) => tracing::warn!(
+                model = %id,
+                reason = "restore_never_ready",
+                "respawn restore: not restoring the model again - its restore started in the \
+                 crashed worker and never reached Ready"
+            ),
+            RestoreDrop::ResidentAtSecondCrash(id) => tracing::warn!(
+                model = %id,
+                reason = "resident_at_second_crash",
+                "respawn restore: not restoring the model again - the worker crashed again while \
+                 the restored model was loaded"
+            ),
+            RestoreDrop::RestoredRecently(id) => tracing::warn!(
+                model = %id,
+                reason = "restored_recently",
+                max = MAX_RESTORES_PER_WINDOW,
+                "respawn restore: not restoring the model - already restored within the restart \
+                 window"
+            ),
+        }
+    }
+    match handed {
+        None => tracing::info!(
+            "respawn restore: the crashed worker had not finished its preload (or had nothing \
+             Ready) - the next worker loads the full preload"
+        ),
+        Some([]) => tracing::info!(
+            "respawn restore: nothing was loaded at the crash - the next worker restores nothing \
+             and skips the preload"
+        ),
+        Some(models) => tracing::info!(
+            models = ?models,
+            "respawn restore: the next worker brings back these models (preload models in its \
+             preload phase, the rest after listening)"
+        ),
+    }
 }
 
 /// What the worker's progress file says about its first GPU load: (started, with the load
@@ -793,10 +1172,33 @@ async fn generation_watchdog(addr: SocketAddr, cfg: &SupervisorConfig, token: &s
     }
 }
 
+/// Upper bound of one whole watchdog probe (connect, write, read) inside
+/// [`generation_watchdog`] — the same 2 s as [`HEALTH_PROBE_TIMEOUT`].
+const WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Single probe of [`crate::WATCHDOG_PATH`], authenticated with this worker's
 /// per-spawn `token`: `Ok(Some(age))`, `Ok(None)` for an explicit `null` (nothing
-/// generating), or `Err` with the reason the state could not be read.
+/// generating), or `Err` with the reason the state could not be read. The whole probe is
+/// bounded by [`WATCHDOG_PROBE_TIMEOUT`] (P-01): a worker that accepts the connection but
+/// never answers (a stuck registry lock, every async thread busy) is an `Err`
+/// ("timed out after 2 s"), so the watchdog logs itself blind instead of waiting forever.
 async fn probe_watchdog_once(addr: SocketAddr, token: &str) -> Result<Option<f64>, String> {
+    probe_watchdog_within(addr, token, WATCHDOG_PROBE_TIMEOUT).await
+}
+
+/// [`probe_watchdog_once`] with an explicit `bound` (tests use a short one).
+async fn probe_watchdog_within(
+    addr: SocketAddr,
+    token: &str,
+    bound: Duration,
+) -> Result<Option<f64>, String> {
+    tokio::time::timeout(bound, probe_watchdog_unbounded(addr, token))
+        .await
+        .unwrap_or_else(|_| Err(format!("timed out after {} s", bound.as_secs_f64())))
+}
+
+/// The probe itself, with no time bound — only [`probe_watchdog_within`] calls it.
+async fn probe_watchdog_unbounded(addr: SocketAddr, token: &str) -> Result<Option<f64>, String> {
     let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -1089,8 +1491,38 @@ mod tests {
         AttemptOutcome, KILL_SLACK, backoff_delay, classify_exit, declared_stop_budgets,
         gpu_load_progress, health_deadline, is_config_fatal_exit, is_ffi_stalled_exit,
         is_poison_exit, left_without_teardown, parse_watchdog_response, preload_kill_grace_for,
-        preload_milestones, prune_old_attempts, watchdog_kill_grace, watchdog_kill_window,
+        preload_milestones, probe_watchdog_within, prune_old_attempts, watchdog_kill_grace,
+        watchdog_kill_window,
     };
+
+    /// P-01: a worker that accepts the connection and then never answers makes the probe an
+    /// `Err` within its bound (the watchdog's "blind" ERROR path), not an endless wait.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // test-only: a failed bind/accept is a broken test host
+    async fn watchdog_probe_times_out_on_a_silent_worker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold the socket open without ever writing a byte.
+        let holder = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let bound = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let outcome = probe_watchdog_within(addr, "token", bound).await;
+        let waited = started.elapsed();
+        holder.abort();
+        let Err(reason) = outcome else {
+            panic!("a silent worker must be an error, got {outcome:?}");
+        };
+        assert!(reason.contains("timed out after 0.2 s"), "{reason}");
+        assert!(waited >= bound, "returned before the bound: {waited:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "bound not honoured: {waited:?}"
+        );
+    }
 
     /// A 200 with an age or an explicit `null` is readable; anything else — the admin gate's
     /// 401/503 that blinded the watchdog, a body without the field, garbage — is an error, not
@@ -1424,5 +1856,517 @@ mod tests {
         let mut attempts = Vec::new();
         prune_old_attempts(&mut attempts, &cfg, Instant::now());
         assert!(attempts.is_empty());
+    }
+
+    // ── C27 respawn restore ──────────────────────────────────────────────────
+
+    const W: Duration = Duration::from_secs(600);
+
+    #[test]
+    fn restore_plan_hands_over_what_was_ready_at_the_crash() {
+        let mut st = super::RestoreState::default();
+        let drops = super::plan_restore(
+            "model_ready a\nmodel_ready b\nmodel_unloaded b\nmodel_ready c\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert!(drops.is_empty());
+        assert_eq!(st.handed, Some(vec!["a".to_owned(), "c".to_owned()]));
+    }
+
+    #[test]
+    fn restore_plan_ignores_a_torn_last_line_and_other_lines() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "preload_started 600\npreload_done\nmodel_ready a\nmodel_ready b",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn restore_plan_drops_a_restore_that_never_reached_ready_and_carries_the_rest() {
+        let mut st = super::RestoreState {
+            handed: Some(vec!["a".to_owned(), "b".to_owned()]),
+            ..Default::default()
+        };
+        let drops = super::plan_restore("restore_started a\n", &mut st, Instant::now(), W);
+        assert_eq!(
+            drops,
+            vec![super::RestoreDrop::RestoreNeverReady("a".to_owned())]
+        );
+        assert_eq!(st.handed, Some(vec!["b".to_owned()]));
+    }
+
+    #[test]
+    fn restore_plan_drops_a_restored_model_resident_at_a_second_crash() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        super::plan_restore("model_ready a\n", &mut st, t0, W);
+        let drops = super::plan_restore("restore_started a\nmodel_ready a\n", &mut st, t0, W);
+        assert_eq!(
+            drops,
+            vec![super::RestoreDrop::ResidentAtSecondCrash("a".to_owned())]
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+    }
+
+    #[test]
+    fn restore_plan_restores_a_model_once_per_window() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        super::plan_restore("model_ready a\n", &mut st, t0, W);
+        // Restored, then unloaded on purpose: not handed over.
+        super::plan_restore(
+            "restore_started a\nmodel_ready a\nmodel_unloaded a\n",
+            &mut st,
+            t0,
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+        // Loaded again by an operator and resident at a third crash, inside the window.
+        let drops =
+            super::plan_restore("model_ready a\n", &mut st, t0 + Duration::from_secs(60), W);
+        assert_eq!(
+            drops,
+            vec![super::RestoreDrop::RestoredRecently("a".to_owned())]
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+        // After the window it may be restored again.
+        let drops = super::plan_restore(
+            "model_ready a\n",
+            &mut st,
+            t0 + W + Duration::from_secs(1),
+            W,
+        );
+        assert!(drops.is_empty());
+        assert_eq!(st.handed, Some(vec!["a".to_owned()]));
+    }
+
+    /// C27 F1: a restored model resident at a crash after the restart window of its hand-over is
+    /// an ordinary resident model: restored again.
+    #[test]
+    fn restore_plan_restores_a_model_resident_at_a_crash_after_the_window() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        super::plan_restore("model_ready a\n", &mut st, t0, W);
+        let drops = super::plan_restore(
+            "restore_started a\nmodel_ready a\n",
+            &mut st,
+            t0 + W + Duration::from_secs(1),
+            W,
+        );
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, Some(vec!["a".to_owned()]));
+    }
+
+    /// C27 F4: a handed-over model an operator loaded before its restore ran counts no restore:
+    /// resident at the next crash, it is handed over again, not dropped as restored recently.
+    #[test]
+    fn restore_plan_counts_only_restores_that_started() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        super::plan_restore("model_ready a\n", &mut st, t0, W);
+        let drops = super::plan_restore("model_ready a\n", &mut st, t0 + Duration::from_secs(5), W);
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, Some(vec!["a".to_owned()]));
+    }
+
+    /// The ids as a handover (`Some`).
+    #[allow(clippy::unnecessary_wraps)]
+    fn handover(ids: &[&str]) -> Option<Vec<String>> {
+        Some(ids.iter().map(|&id| id.to_owned()).collect())
+    }
+
+    /// A fresh worker that finished its preload: the preload models Ready at the crash are in the
+    /// handed set, with the runtime ones.
+    #[test]
+    fn restore_plan_hands_over_preload_models_ready_at_the_crash() {
+        let mut st = super::RestoreState::default();
+        let drops = super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_model q\n\
+             model_ready q\npreload_phase_done\nmodel_ready r\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, handover(&["p", "q", "r"]));
+    }
+
+    /// The 2026-11-16 16:40 shape: preload 9b + tts, 9b unloaded and 4b loaded at runtime (e5
+    /// too) — the next worker targets tts, e5, 4b, not 9b.
+    #[test]
+    fn restore_plan_the_1640_shape_hands_over_the_runtime_swap_not_the_unloaded_preload() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "preload_phase_started\npreload_model 9b\nmodel_ready 9b\npreload_model tts\n\
+             model_ready tts\npreload_phase_done\nmodel_ready e5\nmodel_unloaded 9b\n\
+             model_ready 4b\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["tts", "e5", "4b"]));
+    }
+
+    /// A fresh worker that crashed inside its preload phase hands nothing on: the next worker is
+    /// a fresh start (full preload), not one targeting the half-loaded set.
+    #[test]
+    fn restore_plan_a_crash_during_a_fresh_preload_means_a_full_preload() {
+        let mut st = super::RestoreState::default();
+        let drops = super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_model q\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert!(drops.is_empty());
+        assert_eq!(st.handed, None);
+    }
+
+    /// A fresh worker that never had a model Ready hands nothing on (full preload), however its
+    /// preload ended.
+    #[test]
+    fn restore_plan_a_fresh_worker_with_nothing_ever_ready_means_a_full_preload() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "preload_phase_started\npreload_model p\npreload_phase_done\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, None);
+        // Without any preload lines (a worker with an empty preload) too.
+        super::plan_restore("", &mut st, Instant::now(), W);
+        assert_eq!(st.handed, None);
+    }
+
+    /// Every model unloaded by the operator before the crash: the next worker targets nothing
+    /// (`Some([])`: no preload), not a fresh start.
+    #[test]
+    fn restore_plan_everything_unloaded_before_the_crash_hands_over_an_empty_set() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_phase_done\n\
+             model_unloaded p\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+        // A respawned worker handed `[]` that crashes with nothing Ready stays at `[]` (never
+        // falls back to the full preload once the set is known).
+        super::plan_restore(
+            "preload_phase_started\npreload_phase_done\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+    }
+
+    /// A respawned worker's finished preload phase: a handed preload model it got Ready stays, one
+    /// it did not (refused, failed) is not carried, a runtime restore not started yet is.
+    #[test]
+    fn restore_plan_a_handed_preload_model_not_ready_after_the_phase_is_not_carried() {
+        let mut st = super::RestoreState {
+            handed: handover(&["p", "q", "r"]),
+            ..Default::default()
+        };
+        let drops = super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_model q\n\
+             preload_phase_done\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, handover(&["r", "p"]));
+    }
+
+    /// A respawned worker that crashed inside its preload phase carries its whole handed set (the
+    /// preload model being loaded and those not reached included).
+    #[test]
+    fn restore_plan_a_crash_during_a_respawn_preload_carries_the_handed_set() {
+        let mut st = super::RestoreState {
+            handed: handover(&["p", "q", "s", "r"]),
+            ..Default::default()
+        };
+        let drops = super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_model q\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, handover(&["q", "s", "r", "p"]));
+    }
+
+    /// No crash-loop rule for preload models: one Ready at a second crash inside the window is
+    /// handed over again (its preload phase writes no `restore_started`), while a restored
+    /// runtime model resident at that crash is dropped as before.
+    #[test]
+    fn restore_plan_a_preload_model_ready_at_a_second_crash_is_handed_over_again() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        let first = "preload_phase_started\npreload_model p\nmodel_ready p\npreload_phase_done\n\
+                     model_ready r\n";
+        super::plan_restore(first, &mut st, t0, W);
+        assert_eq!(st.handed, handover(&["p", "r"]));
+        let drops = super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_phase_done\n\
+             restore_started r\nmodel_ready r\n",
+            &mut st,
+            t0 + Duration::from_secs(5),
+            W,
+        );
+        assert_eq!(
+            drops,
+            vec![super::RestoreDrop::ResidentAtSecondCrash("r".to_owned())]
+        );
+        assert_eq!(st.handed, handover(&["p"]));
+    }
+
+    /// Preload P and runtime r loaded; an `rv load` of big evicts P and the worker crashes before
+    /// big is Ready: P stays in the set (a respawn must not come back with less), big is not in it.
+    #[test]
+    fn restore_plan_keeps_the_victim_of_a_load_that_crashed_before_ready() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_phase_done\n\
+             model_ready r\nload_started big\nmodel_unloaded p\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["p", "r"]));
+    }
+
+    /// The same load reaching Ready: its victim is really out.
+    #[test]
+    fn restore_plan_drops_the_victim_of_a_load_that_reached_ready() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready p\nload_started big\nmodel_unloaded p\nmodel_ready big\n\
+             load_ended big\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["big"]));
+    }
+
+    /// A resize (and a KV-wedge evict + reload, which writes the same lines) evicts the model
+    /// itself: a crash before the reload is Ready keeps it; once Ready it is resident as before.
+    #[test]
+    fn restore_plan_keeps_a_model_whose_resize_or_wedge_reload_crashed() {
+        let mut st = super::RestoreState::default();
+        // Outer window (resize / wedge), self-eviction, inner window of the reload, crash.
+        super::plan_restore(
+            "model_ready m\nload_started m\nmodel_unloaded m\nload_started m\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["m"]));
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready m\nload_started m\nmodel_unloaded m\nload_started m\nmodel_ready m\n\
+             load_ended m\nload_ended m\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["m"]));
+    }
+
+    /// A load that returned without Ready (failed, no crash) really evicted its victim: out (the
+    /// worker kept serving without it); an unload after the window closed is an ordinary unload;
+    /// a later event of the victim decides.
+    #[test]
+    fn restore_plan_victims_after_a_failed_load_and_later_events() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready v\nmodel_ready w\nmodel_ready x\nload_started big\n\
+             model_unloaded v\nmodel_unloaded x\nload_ended big\nmodel_unloaded w\n\
+             model_ready x\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["x"]));
+        // Nested windows (resize / wedge): the inner reload failed, the outer is still open at
+        // the crash: kept. Once the outer one returned too: out.
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready m\nload_started m\nmodel_unloaded m\nload_started m\nload_ended m\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["m"]));
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready m\nload_started m\nmodel_unloaded m\nload_started m\nload_ended m\n\
+             load_ended m\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+        // The victim unloaded again on purpose after the window: out.
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready v\nload_started big\nmodel_unloaded v\nload_ended big\n\
+             model_ready v\nmodel_unloaded v\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+    }
+
+    /// A kept victim persists across a second crash: the respawned worker crashing before its
+    /// preload phase even started carries the whole handed set, the victim included.
+    #[test]
+    fn restore_plan_a_kept_victim_survives_a_second_crash() {
+        let mut st = super::RestoreState::default();
+        let t0 = Instant::now();
+        super::plan_restore(
+            "preload_phase_started\npreload_model p\nmodel_ready p\npreload_phase_done\n\
+             load_started big\nmodel_unloaded p\n",
+            &mut st,
+            t0,
+            W,
+        );
+        assert_eq!(st.handed, handover(&["p"]));
+        let drops = super::plan_restore("", &mut st, t0 + Duration::from_secs(5), W);
+        assert!(drops.is_empty(), "{drops:?}");
+        assert_eq!(st.handed, handover(&["p"]));
+    }
+
+    /// A file without load-window lines (an older worker) reads as before: an unload is out.
+    #[test]
+    fn restore_plan_without_window_lines_an_unload_is_out() {
+        let mut st = super::RestoreState::default();
+        super::plan_restore(
+            "model_ready p\nmodel_unloaded p\nmodel_ready big\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["big"]));
+    }
+
+    /// N1: a load that failed and closed its window just before an abnormal exit (a poisoned
+    /// GPU: exit 75) keeps its victim; a later model event or a clean exit drops it (P14).
+    #[test]
+    fn restore_plan_keeps_the_victim_of_the_last_failed_load_after_an_abnormal_exit() {
+        let lines = "model_ready p\nload_started big\nmodel_unloaded p\nload_ended big\n";
+        let mut st = super::RestoreState::default();
+        super::plan_restore_after(lines, &mut st, Instant::now(), W, true);
+        assert_eq!(st.handed, handover(&["p"]));
+        // A clean exit: out.
+        let mut st = super::RestoreState::default();
+        super::plan_restore_after(lines, &mut st, Instant::now(), W, false);
+        assert_eq!(st.handed, Some(Vec::new()));
+        // A later unrelated model event (the worker went on serving): out, even after 75.
+        let mut st = super::RestoreState::default();
+        super::plan_restore_after(
+            &format!("{lines}model_ready other\n"),
+            &mut st,
+            Instant::now(),
+            W,
+            true,
+        );
+        assert_eq!(st.handed, handover(&["other"]));
+        // A non-model line (the stop's budget) is not an event: still kept.
+        let mut st = super::RestoreState::default();
+        super::plan_restore_after(
+            &format!("{lines}stop_budget 48\n"),
+            &mut st,
+            Instant::now(),
+            W,
+            true,
+        );
+        assert_eq!(st.handed, handover(&["p"]));
+    }
+
+    /// M2: a deferred preload model (loaded after the preload phase) whose own
+    /// load the crash interrupted is carried, like one loading inside the phase; one whose load
+    /// returned without Ready (refused, failed) is not.
+    #[test]
+    fn restore_plan_a_deferred_preload_interrupted_by_the_crash_is_carried() {
+        let mut st = super::RestoreState {
+            handed: handover(&["vlm"]),
+            ..Default::default()
+        };
+        super::plan_restore(
+            "preload_phase_started\npreload_phase_done\npreload_model vlm\nload_started vlm\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, handover(&["vlm"]));
+        let mut st = super::RestoreState {
+            handed: handover(&["vlm"]),
+            ..Default::default()
+        };
+        super::plan_restore(
+            "preload_phase_started\npreload_phase_done\npreload_model vlm\nload_started vlm\n\
+             load_ended vlm\n",
+            &mut st,
+            Instant::now(),
+            W,
+        );
+        assert_eq!(st.handed, Some(Vec::new()));
+    }
+
+    /// The env handover: `Some([])` is written as `[]`, `None` removes the variable.
+    #[test]
+    fn the_worker_command_writes_an_empty_set_and_removes_the_variable_for_a_fresh_start() {
+        let env_of = |restore: Option<&[String]>| {
+            let cmd = super::worker_command(
+                std::path::Path::new("/bin/true"),
+                &[],
+                "t",
+                std::path::Path::new("/nonexistent"),
+                restore,
+            );
+            cmd.as_std()
+                .get_envs()
+                .find(|(k, _)| *k == crate::startup::RESTORE_MODELS_ENV)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env_of(Some(&[])), Some(Some("[]".to_owned())));
+        assert_eq!(
+            env_of(Some(&["a".to_owned()])),
+            Some(Some(r#"["a"]"#.to_owned()))
+        );
+        // Removed (an explicit removal shows as a `None` value).
+        assert_eq!(env_of(None), Some(None));
+    }
+
+    /// C27 F6: a torn multibyte last line costs only that line, not the whole file.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_progress_file_with_a_torn_multibyte_last_line_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress");
+        let mut bytes = b"model_ready a\nmodel_ready \xc3".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut st = super::RestoreState::default();
+        super::plan_restore(&super::read_progress(&path), &mut st, Instant::now(), W);
+        assert_eq!(st.handed, Some(vec!["a".to_owned()]));
+        // The same line completed later is read in full.
+        bytes.extend_from_slice(b"\xa9\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut st = super::RestoreState::default();
+        super::plan_restore(&super::read_progress(&path), &mut st, Instant::now(), W);
+        assert_eq!(st.handed, Some(vec!["a".to_owned(), "\u{e9}".to_owned()]));
     }
 }

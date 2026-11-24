@@ -22,7 +22,7 @@ expect_used = "deny"
 
 [package]
 name = "rustedvino"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -156,7 +156,7 @@ sha2 = "0.10"
 #     `alac` cover the common OpenAI client upload formats. Pure Rust, no GPU.
 #   rubato: resample the decoded PCM to Whisper's required 16 kHz mono f32
 #     (high-quality sinc interpolation). Pure Rust, unit-testable off-GPU.
-symphonia = { version = "0.5", features = ["wav", "pcm", "mp3", "ogg", "vorbis", "flac", "isomp4", "aac", "alac"] }
+symphonia = { version = "0.5", features = ["wav", "pcm", "mp3", "ogg", "vorbis", "flac", "isomp4", "aac"] }  # no "alac": its decoder sizes a buffer from the file before any packet (0.9.1 S4b)
 rubato = "0.16"
 
 # Kokoro-82M ONNX TTS (Phase 5.2b): pure-Rust ORT inference via kokoro-tts.
@@ -195,12 +195,17 @@ libc = "0.2"
 cc = "1"
 
 [dev-dependencies]
+# Paused-time tests (0.9.1 S1 stall watchdog): `tokio::time::pause` / `advance`, test builds only.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 # Parity test only (tests/rv_keys_path_parity.rs): pins rv's copy of the keys-file
 # path rule to the server's. rv itself never depends on this crate.
 rv = { path = "tools/rv" }
+# Realtime close-frame tests (tests/realtime_close.rs, 0.9.1 C5): a real WebSocket
+# client against the router. Same version axum 0.8's `ws` feature already pulls in.
+tokio-tungstenite = "0.29"
 
 [features]
 # Test-only fault injection (step 7 live test): `RUSTEDVINO_FAULT_POISON_AT_STEP=N` makes the Nth

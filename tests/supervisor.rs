@@ -692,3 +692,195 @@ async fn no_probe_without_a_no_teardown_exit() {
     assert!(result.is_err());
     assert!(!dir.path().join("probes").exists(), "the probe never ran");
 }
+
+// ── C27 respawn restore ──────────────────────────────────────────────────────
+
+fn restore_cfg() -> SupervisorConfig {
+    SupervisorConfig {
+        backoff_base_secs: 0,
+        backoff_max_secs: 0,
+        max_restarts: 10,
+        restart_window_secs: 600,
+        health_timeout_secs: 5,
+        hang_kill_grace_secs: 1,
+        watchdog_poll_secs: 30,
+        watchdog_hang_ceiling_secs: 0,
+        gpu_first_load_deadline_secs: 0,
+        gpu_probe_deadline_secs: 0,
+    }
+}
+
+/// Run the `restore` fake-worker scenario (`spec`, see `fake_worker::restore`; its last step
+/// should exit 78 so the supervisor stops) and return what each spawn was handed.
+async fn run_restore_scenario(spec: &str, port: u16) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let result = run_supervised(
+        &fake_worker(),
+        &[
+            "restore".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+            addr.clone(),
+            spec.to_string(),
+        ],
+        addr.parse().unwrap(),
+        &restore_cfg(),
+    )
+    .await;
+    assert!(result.is_err(), "the scenario ends with exit 78");
+    let spawns: u32 = std::fs::read_to_string(dir.path().join("spawns"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (1..=spawns)
+        .map(|k| std::fs::read_to_string(dir.path().join(format!("restore-{k}"))).unwrap())
+        .collect()
+}
+
+/// The models Ready at the crash are handed to the next worker; one unloaded on purpose before
+/// the crash is not; the first spawn gets nothing.
+#[tokio::test]
+async fn a_crash_hands_the_ready_models_to_the_next_worker() {
+    let got = run_restore_scenario(
+        "ready=rerank,ready=e5,unloaded=e5,ready=other,exit=1;exit=78",
+        18221,
+    )
+    .await;
+    assert_eq!(got, vec!["-", r#"["rerank","other"]"#]);
+}
+
+/// A restored model resident when the worker crashes again is not restored a second time; the
+/// worker after that is a respawn with an empty set (`[]`: no preload), not a fresh start.
+#[tokio::test]
+async fn a_restored_model_resident_at_a_second_crash_is_dropped() {
+    let got = run_restore_scenario(
+        "ready=rerank,exit=1;started=rerank,ready=rerank,exit=1;exit=78",
+        18222,
+    )
+    .await;
+    assert_eq!(got, vec!["-", r#"["rerank"]"#, "[]"]);
+}
+
+/// A restore that started but never reached Ready (its load may be what crashed the worker) is
+/// dropped; a handed model whose restore had not started yet is carried over.
+#[tokio::test]
+async fn a_restore_that_never_reached_ready_is_dropped_and_the_rest_carried() {
+    let got = run_restore_scenario("ready=a,ready=b,exit=1;started=a,exit=1;exit=78", 18223).await;
+    assert_eq!(got, vec!["-", r#"["a","b"]"#, r#"["b"]"#]);
+}
+
+/// A model unloaded on purpose in the restoring worker is not restored after its crash, and a
+/// later reload inside the restart window is not restored again (one restore per window).
+#[tokio::test]
+async fn a_deliberately_unloaded_model_is_not_restored_and_restores_are_capped() {
+    let got = run_restore_scenario(
+        "ready=a,exit=1;started=a,ready=a,unloaded=a,exit=1;ready=a,exit=1;exit=78",
+        18224,
+    )
+    .await;
+    assert_eq!(got, vec!["-", r#"["a"]"#, "[]", "[]"]);
+}
+
+/// The 2026-11-16 16:40 shape: the crashed worker preloaded 9b and tts, unloaded 9b and loaded
+/// e5 and 4b at runtime — the next worker is handed tts, e5, 4b (it skips the 9b preload).
+#[tokio::test]
+async fn the_1640_shape_hands_the_runtime_swap_not_the_unloaded_preload() {
+    let got = run_restore_scenario(
+        "phase_start,preload=9b,ready=9b,preload=tts,ready=tts,phase_done,ready=e5,unloaded=9b,\
+         ready=4b,exit=1;exit=78",
+        18226,
+    )
+    .await;
+    assert_eq!(got, vec!["-", r#"["tts","e5","4b"]"#]);
+}
+
+/// A fresh worker crashing inside its own preload phase: the next worker is a fresh start (the
+/// variable is absent: full preload), not one targeting the half-loaded set.
+#[tokio::test]
+async fn a_crash_during_the_first_preload_means_a_full_preload() {
+    let got = run_restore_scenario(
+        "phase_start,preload=p,ready=p,preload=q,exit=1;exit=78",
+        18227,
+    )
+    .await;
+    assert_eq!(got, vec!["-", "-"]);
+}
+
+/// m6: everything unloaded before the crash hands `[]` (a respawn with nothing: no
+/// preload), and a worker handed `[]` that crashes with nothing loaded hands `[]` again.
+#[tokio::test]
+async fn an_empty_set_is_handed_as_an_empty_list() {
+    let got = run_restore_scenario("ready=a,unloaded=a,exit=1;exit=1;exit=78", 18228).await;
+    assert_eq!(got, vec!["-", "[]", "[]"]);
+}
+
+/// m6: a respawned worker crashing before its preload phase even started carries
+/// its whole set to the next one.
+#[tokio::test]
+async fn a_respawn_crashing_before_its_preload_carries_the_set() {
+    let got = run_restore_scenario(
+        "phase_start,preload=p,ready=p,phase_done,ready=r,exit=1;exit=1;exit=78",
+        18229,
+    )
+    .await;
+    assert_eq!(got, vec!["-", r#"["p","r"]"#, r#"["p","r"]"#]);
+}
+
+/// A clean stop (SIGTERM to the supervisor) restores nothing, and a new supervisor — even one
+/// started with the restore variable in its own environment — hands its first worker nothing.
+#[tokio::test]
+async fn a_clean_stop_and_a_new_supervisor_restore_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let health_addr = "127.0.0.1:18225";
+    let spawn_harness = || {
+        tokio::process::Command::new(harness())
+            .arg(fake_worker())
+            .arg("restore")
+            .arg(dir.path())
+            .arg(health_addr)
+            .arg("ready=a,healthy")
+            .env("HARNESS_HEALTH_ADDR", health_addr)
+            .env("HARNESS_HEALTH_TIMEOUT_SECS", "5")
+            .env("HARNESS_HANG_KILL_GRACE_SECS", "2")
+            .env("RUSTEDVINO_RESTORE_MODELS", r#"["inherited"]"#)
+            .spawn()
+            .expect("spawn supervise_harness")
+    };
+    for round in 1..=2 {
+        let mut proc = spawn_harness();
+        let up = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if tokio::net::TcpStream::connect(health_addr).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(up, "round {round}: worker never came up");
+        let pid = proc.id().expect("harness pid");
+        // Safety: our own just-spawned child's PID, read immediately before the call.
+        #[allow(clippy::cast_possible_wrap)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        let status = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+            .await
+            .expect("harness did not stop")
+            .expect("wait harness");
+        assert!(
+            status.success(),
+            "round {round}: clean stop, got {status:?}"
+        );
+        // Wait for the port to be free before the next round.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let spawns = std::fs::read_to_string(dir.path().join("spawns")).unwrap();
+    assert_eq!(spawns.trim(), "2", "one worker per supervisor, no respawn");
+    for k in 1..=2 {
+        let got = std::fs::read_to_string(dir.path().join(format!("restore-{k}"))).unwrap();
+        assert_eq!(got, "-", "spawn {k} must be handed nothing");
+    }
+}

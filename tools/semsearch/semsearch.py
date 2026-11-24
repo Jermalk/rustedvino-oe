@@ -273,9 +273,16 @@ def _embedding_models(target, api_key=None, verbose=True):
         print(f"semsearch: cannot reach {target}/v1/models ({e})", file=sys.stderr)
         sys.exit(1)
 
-    ids = [m["id"] for m in data.get("data", [])]
+    # Since 0.9.1 /v1/models also lists `on_demand` models that are not loaded
+    # yet (they carry a "state"). Probing one would start its load, which can
+    # evict others, so only loaded models (no "state") are probed.
+    entries = data.get("data", [])
+    ids = [m["id"] for m in entries if "state" not in m]
+    skipped = [(m["id"], m["state"]) for m in entries if "state" in m]
     if verbose:
         print(f"semsearch: probing {len(ids)} model(s) on {target} for /v1/embeddings support:")
+        for mid, state in skipped:
+            print(f"  {mid}  — not probed (state: {state})")
     embedders = []
     for mid in ids:
         ok, detail = _probe_model_kind(target, mid, api_key)

@@ -56,9 +56,10 @@ pub(crate) enum EmbedCommand {
         reply: oneshot::Sender<anyhow::Result<EmbedOutput>>,
         /// Wall-clock start (handler entry) for the duration metric.
         started_at: Instant,
-        /// Admission-gate permit, held until this batch finishes. Dropped
-        /// after the engine thread sends its reply, releasing the slot for
-        /// the next waiting caller. See [`EmbeddingHandle::embed`].
+        /// Admission-gate permit, held until this batch finishes. Dropped by
+        /// the engine thread just before it sends its reply
+        /// ([`crate::in_flight::finish`]), releasing the slot for the next
+        /// waiting caller. See [`EmbeddingHandle::embed`].
         permit: OwnedSemaphorePermit,
     },
     /// Count `text`'s tokens via the pipeline's tokenizer. Not
@@ -114,8 +115,7 @@ pub struct EmbeddingHandle {
     mem_tainted: Arc<AtomicBool>,
     /// Set (`SeqCst`) by `begin_evict` before it reads `active()`; checked after this request
     /// has been counted in `active()`. Shared by every clone of this handle; a reload builds a
-    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b; nothing
-    /// sets it yet.
+    /// new engine with a clear flag. See `cb_engine::EngineHandle::closing`. D3-S1.D3b.
     closing: Arc<AtomicBool>,
 }
 
@@ -364,11 +364,9 @@ pub fn spawn_embed_engine(
                             }
                         }
                         metrics.record_duration(Modality::Text, started_at.elapsed().as_secs_f64());
-                        // The receiver may be gone if the client disconnected — ignore.
-                        let _ = reply.send(result);
                         // Balance the handle's admission acquire, whatever the
-                        // outcome — releases the slot for the next waiting caller.
-                        drop(permit);
+                        // outcome — BEFORE the reply (0.9.1 C2, `in_flight::finish`).
+                        crate::in_flight::finish(permit, reply, result);
                     }
                     EmbedCommand::CountTokens { text, reply } => {
                         let _ = reply.send(engine.count_tokens(&text).map_err(|e| e.to_string()));
@@ -445,11 +443,15 @@ pub(crate) fn spawn_mock_embed(model_id: &str) -> (EmbeddingHandle, std::thread:
                     ..
                 } => {
                     let vectors = texts.iter().map(|_| vec![0.1, 0.2, 0.3, 0.4]).collect();
-                    let _ = reply.send(Ok(EmbedOutput {
-                        vectors,
-                        prompt_tokens: texts.len(),
-                    }));
-                    drop(permit);
+                    // Released, then replied, as the real engine thread does.
+                    crate::in_flight::finish(
+                        permit,
+                        reply,
+                        Ok(EmbedOutput {
+                            vectors,
+                            prompt_tokens: texts.len(),
+                        }),
+                    );
                 }
                 // No real tokenizer behind the mock — answer with a rough
                 // word-count stand-in so a caller exercising the length gate
@@ -527,7 +529,7 @@ mod tests {
         );
     }
 
-    /// When a slot opens (permit released after the first reply), a waiting
+    /// When a slot opens (the first request's permit is released), a waiting
     /// `embed` completes instead of returning `AtCapacity`.
     #[tokio::test]
     async fn embed_waits_and_succeeds_when_slot_opens() {

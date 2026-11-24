@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::ctx::Ctx;
 use crate::format::table;
 use crate::metrics::{self, Sample};
+use crate::order;
 
 /// Raw fetch of the registry. No "missing key" messaging: that is the caller's
 /// job (`list` and `ps` word the same condition differently). `None` silently
@@ -122,9 +123,9 @@ pub(crate) fn kv_prec_cell(m: &Value) -> String {
     format!("{prec}{tag}")
 }
 
-/// `running/waiting/max`, or `n/a` unless all three metrics exist.
-fn req_triplet(rows: &[Sample], model: &str) -> String {
-    let get = |name| metrics::by_label(rows, name, &[("model", model)]);
+/// `running/waiting/max` on the model's current `device`, or `n/a` unless all three metrics exist.
+fn req_triplet(rows: &[Sample], model: &str, device: Option<&str>) -> String {
+    let get = |name| metrics::by_model_on_device(rows, name, model, device);
     match (
         get("rustedvino_requests_running"),
         get("rustedvino_requests_waiting"),
@@ -136,13 +137,28 @@ fn req_triplet(rows: &[Sample], model: &str) -> String {
     }
 }
 
-fn kv_percent(rows: &[Sample], model: &str) -> String {
-    metrics::by_label(
-        rows,
-        "rustedvino_kv_cache_usage_percent",
-        &[("model", model)],
-    )
-    .map_or_else(|| "n/a".into(), |kv| format!("{kv:.0}%"))
+/// The KV% cell. `n/a` when the percent metric is missing, and also when the
+/// server says the reading is not measurable for this model
+/// (`rustedvino_kv_cache_usage_supported == 0`, e.g. the VLM engine): that
+/// percent is a permanent `0` that cannot be told from an empty pool (C21). A
+/// server without the `supported` series keeps the plain reading. Both read the model's current
+/// `device` ([`metrics::by_model_on_device`]).
+fn kv_percent(rows: &[Sample], model: &str, device: Option<&str>) -> String {
+    let get = |name| metrics::by_model_on_device(rows, name, model, device);
+    // A 0/1 gauge: compare against the midpoint, not with float equality.
+    if get("rustedvino_kv_cache_usage_supported").is_some_and(|v| v < 0.5) {
+        return "n/a".into();
+    }
+    get("rustedvino_kv_cache_usage_percent").map_or_else(|| "n/a".into(), |kv| format!("{kv:.0}%"))
+}
+
+/// The device a model's metric cells read: its admin-list `device`, else the device of its only
+/// `rustedvino_model_loaded == 1` series (as `rv metrics` does), else `None`.
+fn cell_device(rows: &[Sample], model: &str, admin_device: Option<&str>) -> Option<String> {
+    admin_device
+        .filter(|d| !d.is_empty() && *d != "?")
+        .map(str::to_owned)
+        .or_else(|| crate::commands::metrics::sole_loaded_device(rows, model))
 }
 
 /// Runs `rv list`: the registry (needs an admin key) beside a local scan of
@@ -170,7 +186,9 @@ pub fn list(ctx: &Ctx) -> i32 {
         .map(|m| s(m, "id"))
         .collect();
     if let Some(reg) = &registered {
-        let rows: Vec<Vec<String>> = reg
+        let mut sorted: Vec<&Value> = reg.iter().collect();
+        order::sort_values(&mut sorted);
+        let rows: Vec<Vec<String>> = sorted
             .iter()
             .map(|m| {
                 vec![
@@ -205,10 +223,11 @@ pub fn list(ctx: &Ctx) -> i32 {
     let models_dir = ctx.res.models_dir.as_deref().unwrap_or("");
     if let Some(dirs) = &disk_dirs {
         if registered.is_some() {
-            let unregistered: Vec<&String> = dirs
+            let mut unregistered: Vec<&String> = dirs
                 .iter()
                 .filter(|d| !reg_ids.contains(&d.as_str()))
                 .collect();
+            unregistered.sort_by(|a, b| order::cmp_ids(a, b));
             println!(
                 "{}{}",
                 st.bold(&format!(
@@ -233,7 +252,9 @@ pub fn list(ctx: &Ctx) -> i32 {
                 st.bold(&format!("{} model director{noun} on disk", dirs.len())),
                 st.dim(&format!("  ({models_dir})"))
             );
-            for d in dirs {
+            let mut sorted: Vec<&String> = dirs.iter().collect();
+            sorted.sort_by(|a, b| order::cmp_ids(a, b));
+            for d in sorted {
                 println!("  {d}");
             }
         }
@@ -257,7 +278,7 @@ pub fn ps(ctx: &Ctx) -> i32 {
     let Some(all) = fetch_admin_models(ctx) else {
         return 1;
     };
-    let ready: Vec<Value> = all
+    let mut ready: Vec<Value> = all
         .into_iter()
         // A GPU model on a poisoned context ("unavailable (gpu_poisoned)") is still
         // resident in VRAM, so it stays in the table; the state column says why.
@@ -276,10 +297,18 @@ pub fn ps(ctx: &Ctx) -> i32 {
         );
         return 0;
     }
+    // After the `--json` print: that keeps the server's order.
+    order::sort_models(&mut ready, |m| {
+        (
+            m.get("kind").and_then(Value::as_str),
+            m.get("id").and_then(Value::as_str).unwrap_or(""),
+        )
+    });
     let rows: Vec<Vec<String>> = ready
         .iter()
         .map(|m| {
             let id = s(m, "id");
+            let (kv, req) = load_cells(&rows_m, id, Some(s(m, "device")));
             vec![
                 id.to_owned(),
                 s(m, "device").to_owned(),
@@ -288,8 +317,8 @@ pub fn ps(ctx: &Ctx) -> i32 {
                 kv_pool_cell(m),
                 ctx_cell(m),
                 kv_prec_cell(m),
-                kv_percent(&rows_m, id),
-                req_triplet(&rows_m, id),
+                kv,
+                req,
                 ctx.policy_flags(id),
             ]
         })
@@ -321,10 +350,16 @@ pub fn ps(ctx: &Ctx) -> i32 {
     0
 }
 
-/// Per-model request/KV cells shared with `status`.
+/// Per-model request/KV cells shared with `status`, read on the model's current device:
+/// `admin_device` (the admin list's `device`; `None` or `?` when unknown), else the device of its
+/// only loaded series.
 #[must_use]
-pub fn load_cells(rows: &[Sample], model: &str) -> (String, String) {
-    (kv_percent(rows, model), req_triplet(rows, model))
+pub fn load_cells(rows: &[Sample], model: &str, admin_device: Option<&str>) -> (String, String) {
+    let device = cell_device(rows, model, admin_device);
+    (
+        kv_percent(rows, model, device.as_deref()),
+        req_triplet(rows, model, device.as_deref()),
+    )
 }
 
 #[cfg(test)]
@@ -340,8 +375,85 @@ mod mem_cell_tests {
 
 #[cfg(test)]
 mod kv_cell_tests {
-    use super::{ctx_cell, kv_pool_cell, kv_prec_cell};
+    use super::{ctx_cell, kv_percent, kv_pool_cell, kv_prec_cell, load_cells};
+    use crate::metrics;
     use serde_json::json;
+
+    /// C21: an unmeasurable pool reads `n/a`, not `0%`; a measurable one keeps
+    /// its percentage; a server without the `supported` series keeps the reading.
+    #[test]
+    fn kv_percent_is_na_when_unsupported() {
+        let rows = metrics::parse(
+            "rustedvino_kv_cache_usage_percent{model=\"vlm\",device=\"GPU\",kind=\"vlm\"} 0\n\
+             rustedvino_kv_cache_usage_supported{model=\"vlm\",device=\"GPU\",kind=\"vlm\"} 0\n\
+             rustedvino_kv_cache_usage_percent{model=\"cb\",device=\"GPU\",kind=\"text_gen\"} 23.8\n\
+             rustedvino_kv_cache_usage_supported{model=\"cb\",device=\"GPU\",kind=\"text_gen\"} 1\n\
+             rustedvino_kv_cache_usage_percent{model=\"old\"} 7\n",
+        );
+        assert_eq!(kv_percent(&rows, "vlm", None), "n/a");
+        assert_eq!(kv_percent(&rows, "cb", None), "24%");
+        assert_eq!(kv_percent(&rows, "cb", Some("GPU")), "24%");
+        assert_eq!(kv_percent(&rows, "old", None), "7%");
+        assert_eq!(kv_percent(&rows, "old", Some("GPU")), "7%");
+        assert_eq!(kv_percent(&rows, "absent", None), "n/a");
+    }
+
+    /// A model that moved CPU → `GPU.0`: the server keeps the CPU series (listed first here, so a
+    /// first-match read would show it). Round LFO P4.
+    const MOVED: &str = "\
+rustedvino_model_loaded{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 0\n\
+rustedvino_model_loaded{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 1\n\
+rustedvino_kv_cache_usage_percent{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 81\n\
+rustedvino_kv_cache_usage_supported{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 1\n\
+rustedvino_kv_cache_usage_percent{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 12\n\
+rustedvino_kv_cache_usage_supported{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 1\n\
+rustedvino_requests_running{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 0\n\
+rustedvino_requests_waiting{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 0\n\
+rustedvino_requests_max{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 4\n\
+rustedvino_requests_running{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 3\n\
+rustedvino_requests_waiting{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 1\n\
+rustedvino_requests_max{model=\"m\",device=\"GPU.0\",kind=\"text_gen\"} 16\n";
+
+    #[test]
+    fn two_devices_the_current_device_picks_the_cells() {
+        let rows = metrics::parse(MOVED);
+        assert_eq!(
+            load_cells(&rows, "m", Some("GPU.0")),
+            ("12%".to_owned(), "3/1/16".to_owned())
+        );
+        assert_eq!(
+            load_cells(&rows, "m", Some("CPU")),
+            ("81%".to_owned(), "0/0/4".to_owned())
+        );
+        // No admin device: the only `model_loaded == 1` series names it.
+        assert_eq!(
+            load_cells(&rows, "m", None),
+            ("12%".to_owned(), "3/1/16".to_owned())
+        );
+        assert_eq!(
+            load_cells(&rows, "m", Some("?")),
+            ("12%".to_owned(), "3/1/16".to_owned())
+        );
+    }
+
+    #[test]
+    fn two_devices_without_a_series_on_the_current_one_read_na() {
+        let rows = metrics::parse(MOVED);
+        // Just moved to GPU.1, nothing exported there yet: not the old devices' figures.
+        assert_eq!(
+            load_cells(&rows, "m", Some("GPU.1")),
+            ("n/a".to_owned(), "n/a".to_owned())
+        );
+        // Unknown current device and two loaded series: ambiguous, so `n/a`, never one at random.
+        let both = metrics::parse(&MOVED.replace(
+            "model_loaded{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 0",
+            "model_loaded{model=\"m\",device=\"CPU\",kind=\"text_gen\"} 1",
+        ));
+        assert_eq!(
+            load_cells(&both, "m", None),
+            ("n/a".to_owned(), "n/a".to_owned())
+        );
+    }
 
     #[test]
     fn kv_pool_shows_gib_and_mib() {

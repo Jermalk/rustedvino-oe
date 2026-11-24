@@ -477,7 +477,8 @@ def run_entry(entry: dict, args: argparse.Namespace, ctx: dict, prefix_caching: 
                 return {**res, "error": "server exited: " + "".join(open(work / 'server.log').readlines()[-3:])[:300]}
             try:
                 with urllib.request.urlopen(BASE + "/v1/models", timeout=2) as r:
-                    if model in [m["id"] for m in json.load(r)["data"]]:
+                    # An entry with a "state" (since 0.9.1: an on_demand model not loaded yet) is not loaded.
+                    if model in [m["id"] for m in json.load(r)["data"] if "state" not in m]:
                         break
             except (urllib.error.URLError, OSError, ValueError):
                 pass

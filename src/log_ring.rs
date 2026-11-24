@@ -72,12 +72,14 @@ impl LogRingBuffer {
 }
 
 /// A `tracing_subscriber::fmt` writer that duplicates every formatted event
-/// to both stdout (unchanged behaviour) and the ring buffer.
-pub struct TeeWriter {
+/// to both stdout (unchanged behaviour) and the ring buffer. `W` is the
+/// pass-through sink: stdout in the server, a test double in the tests.
+pub struct TeeWriter<W = io::Stdout> {
     buffer: LogRingBuffer,
+    sink: W,
 }
 
-impl io::Write for TeeWriter {
+impl<W: io::Write> io::Write for TeeWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // `fmt`'s writer receives one already-formatted event (including its
         // trailing newline) per `write` call — treat each call as one line.
@@ -85,11 +87,16 @@ impl io::Write for TeeWriter {
         // always valid UTF-8) rather than dropping the line entirely.
         self.buffer
             .push_line(String::from_utf8_lossy(buf).trim_end_matches('\n'));
-        io::stdout().write(buf)
+        // FM-8: the whole event goes to the sink here and the whole length is
+        // reported. Returning a short count from a partial stdout write (a
+        // console writing in bounded chunks) made the caller's `write_all`
+        // call again with the rest, which was pushed as a second "line".
+        self.sink.write_all(buf)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        io::stdout().flush()
+        self.sink.flush()
     }
 }
 
@@ -99,6 +106,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogRingBuffer {
     fn make_writer(&'a self) -> Self::Writer {
         TeeWriter {
             buffer: self.clone(),
+            sink: io::stdout(),
         }
     }
 }
@@ -160,5 +168,35 @@ mod tests {
         let n = io::Write::write(&mut writer, b"hello world\n").unwrap();
         assert_eq!(n, 12);
         assert_eq!(buf.tail(1), vec!["hello world".to_owned()]);
+    }
+
+    /// Accepts at most 10 bytes per `write`, like a console that writes in
+    /// bounded chunks.
+    struct Chunked(Vec<u8>);
+
+    impl io::Write for Chunked {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = buf.len().min(10);
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// FM-8: a long event through a sink that takes 10 bytes per call is one
+    /// ring line, and the sink still receives every byte once.
+    #[test]
+    fn long_event_through_a_partial_writer_is_one_line() {
+        let buf = LogRingBuffer::new();
+        let event = format!("{}\n", "x".repeat(5000));
+        let mut writer = TeeWriter {
+            buffer: buf.clone(),
+            sink: Chunked(Vec::new()),
+        };
+        io::Write::write_all(&mut writer, event.as_bytes()).unwrap();
+        assert_eq!(buf.tail(10), vec!["x".repeat(5000)]);
+        assert_eq!(writer.sink.0, event.as_bytes());
     }
 }

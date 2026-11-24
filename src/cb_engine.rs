@@ -130,10 +130,15 @@ struct ActiveRequest {
     requested_at: Instant,
     /// Whether the first token has been emitted yet (so TTFT is recorded once).
     first_token_seen: bool,
-    /// Semaphore permit held for the lifetime of this request.
-    /// Dropped automatically when the route is removed → slot released.
-    #[allow(dead_code)] // held for its Drop side-effect; never read directly
-    permit: OwnedSemaphorePermit,
+    /// Semaphore permit held while this request runs. Released (taken out and
+    /// dropped, see [`ActiveRequest::release_slot`]) right BEFORE the request's
+    /// terminal event (`Error` / `Done`) is sent, so a client that acts on
+    /// `Done` — e.g. evicts the model at once — never sees its own finished
+    /// request still counted in `active()` (0.9.1 C29, the streaming form of
+    /// C2). `None` from that moment; a route removed without a terminal event
+    /// (client disconnected) still releases it through `Drop`. `Option` adds
+    /// no size (the permit holds an `Arc`, whose niche `None` uses).
+    permit: Option<OwnedSemaphorePermit>,
     /// Tail of the rendered prompt (last 500 chars), captured at submission
     /// time. Used only for the `pool_exhausted` warn log in `step_and_route`
     /// (the project's internal engineering log) — not shown to
@@ -148,9 +153,87 @@ struct ActiveRequest {
     /// way it already does for the VLM wedge marker
     /// (the project's internal engineering log).
     prompt_tokens: usize,
+    /// Tokens the engine has generated for this request so far — the sum of every callback's
+    /// `new_tokens`, including a terminal callback whose text is empty (the bridge can report
+    /// held-back tokens there). Embedded in the `pool_exhausted` message's `generated_tokens=`
+    /// field: a pool that filled after the answer started is not a sizing miss (E2),
+    /// so `classify_inference_error` skips the wedge recovery and the ratchet.
+    generated_tokens: usize,
+    /// When the engine thread took this request (just before `add_request`): the start of its
+    /// effective-prefill interval (0.9.1 V1-usage, P2). Leaves out the handler's admission wait
+    /// and the command-channel queue; holds the CB scheduler's own wait and other requests'
+    /// steps interleaved before this request's first token (documented, not corrected).
+    engine_started_at: Instant,
+    /// The request's reasoning split (from [`GenParams::reasoning`]).
+    reasoning: crate::prompt_builder::ReasoningSplit,
+    /// Exact per-delta reasoning tally (`crate::reasoning_tokens`, rule 1).
+    tally: crate::reasoning_tokens::DeltaTally,
+    /// The strict thinking budget's running detector (0.9.1), fed with the same exact per-delta
+    /// counts as [`Self::tally`]; `None` when the request has no budget.
+    budget: Option<crate::thinking_budget::BudgetTracker>,
+    /// The effective-prefill interval, taken at the first token and recorded only when the request
+    /// finishes ([`finish_usage`]), so a request its client stops records no sample (review N-1).
+    prefill: Option<Duration>,
+}
+
+impl ActiveRequest {
+    /// Release this request's admission slot now (idempotent). Called once per
+    /// request, just before its terminal event is sent — never per token.
+    fn release_slot(&mut self) {
+        drop(self.permit.take());
+    }
+
+    /// Per non-empty delta: on the request's very first token, record its time-to-first-token
+    /// (from handler entry) exactly once and keep its effective-prefill interval (from the engine
+    /// start, 0.9.1 V1-usage) for [`finish_usage`]; then add the delta to the reasoning tally.
+    fn record_delta(&mut self, delta: &str, new_tokens: usize, metrics: &HotMetrics) {
+        if !self.first_token_seen {
+            self.first_token_seen = true;
+            metrics.record_ttft(Modality::Text, self.requested_at.elapsed().as_secs_f64());
+            self.prefill = crate::metrics::prefill_interval(
+                self.requested_at,
+                self.engine_started_at,
+                Some(Instant::now()),
+            );
+        }
+        self.tally.push(delta, new_tokens);
+    }
+
+    /// 0.9.1 strict thinking budget: feed this callback's delta to the budget (the same exact
+    /// per-delta count as the usage tally) and return `(budget_stop, finish to report)`. A
+    /// natural finish in the same callback wins over the budget; a `length` finish while still
+    /// inside the reasoning block is reported as [`FinishReason::ThinkingBudget`] too (no answer
+    /// came). Without a budget, `(false, finish)`. Hot path: with a budget armed the tracker
+    /// costs a couple of small `String` allocations per delta (three on gpt-oss); nothing without.
+    fn apply_budget(
+        &mut self,
+        id: u64,
+        delta: &str,
+        new_tokens: usize,
+        finish: Option<FinishReason>,
+    ) -> (bool, Option<FinishReason>) {
+        let Some(budget) = self.budget.as_mut() else {
+            return (false, finish);
+        };
+        let spent = budget.push(delta, new_tokens) == crate::thinking_budget::BudgetStep::Stop;
+        if spent && finish.is_none() {
+            tracing::debug!(
+                request_id = id,
+                reasoning_tokens = budget.counted(),
+                "thinking budget spent — stopping the request (finish_reason length)"
+            );
+            return (true, Some(FinishReason::ThinkingBudget));
+        }
+        let inside = budget.inside();
+        (false, finish.map(|r| r.with_budget(false, inside)))
+    }
 }
 
 /// A message from an async handler to the engine thread.
+// `AddRequest` (240 bytes since 0.9.1's `GenParams::thinking_budget`) is one message per request
+// through a bounded channel: its size costs nothing measurable, and boxing it would add a heap
+// allocation per request for no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum EngineCommand {
     /// Enqueue a new generation request.
     AddRequest {
@@ -170,8 +253,10 @@ pub enum EngineCommand {
         token_tx: TokenSender,
         /// Handler-entry timestamp — the zero point for TTFT + duration metrics.
         requested_at: Instant,
-        /// Capacity permit — dropped when the engine finishes or drops this request,
-        /// returning the slot to the semaphore so waiting handlers can proceed.
+        /// Capacity permit — moved into the request's route and released just
+        /// before its terminal event (`Error` / `Done`, 0.9.1 C29), or when the
+        /// route is dropped after a client disconnect; a failed submit releases
+        /// it before its `Error`. Returns the slot so waiting handlers proceed.
         permit: OwnedSemaphorePermit,
     },
     /// Encode text → token ids on the engine thread (the only thread allowed to
@@ -196,7 +281,9 @@ pub enum EngineCommand {
 /// Result of submitting a request to the engine.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SubmitResult {
-    /// Request accepted — the engine thread owns `token_tx` until done.
+    /// Request accepted — the engine thread owns `token_tx` until done. Also returned when the
+    /// engine stalled while the caller waited for admission (0.9.1 S1): its `generation_stalled`
+    /// terminal pair is then already on `token_tx`, so the caller's normal read answers it.
     Submitted,
     /// Engine is at its `max_num_seqs` limit — caller should return HTTP 429.
     AtCapacity,
@@ -294,6 +381,10 @@ pub struct EngineHandle {
     /// eviction started is refused (retryable) instead of being drained and then aborted.
     /// D3-S1.D1; nothing sets it yet.
     closing: Arc<AtomicBool>,
+    /// This engine's liveness (0.9.1 S1, [`crate::stall_watch`]): the engine thread reports its
+    /// calls and progress to it, its watcher declares a stall. Shared by every clone and the
+    /// engine thread; a reload builds a new engine with a fresh one.
+    liveness: crate::stall_watch::EngineLiveness,
     /// Live KV-cache occupancy percentage (0–100), as `f32` bits, published by
     /// the engine thread after each step and read sync by `/metrics`
     /// (`rustedvino_kv_cache_usage_percent`, co-residency Slice 3a). `0.0` while
@@ -322,6 +413,15 @@ impl EngineHandle {
     /// (`1000`) and a long timeout so tests never hit the admission gate.
     #[cfg(test)]
     pub(crate) fn from_sender(cmd_tx: mpsc::Sender<EngineCommand>) -> Self {
+        Self::from_sender_live(cmd_tx, crate::stall_watch::EngineLiveness::new())
+    }
+
+    /// [`Self::from_sender`] with the liveness the test's engine thread reports to (0.9.1 S1).
+    #[cfg(test)]
+    pub(crate) fn from_sender_live(
+        cmd_tx: mpsc::Sender<EngineCommand>,
+        liveness: crate::stall_watch::EngineLiveness,
+    ) -> Self {
         let max_seqs = 1000;
         Self {
             cmd_tx,
@@ -331,6 +431,7 @@ impl EngineHandle {
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             closing: Arc::new(AtomicBool::new(false)),
+            liveness,
             cache_usage: Arc::new(AtomicU64::new(0)),
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         }
@@ -352,6 +453,7 @@ impl EngineHandle {
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             closing: Arc::new(AtomicBool::new(false)),
+            liveness: crate::stall_watch::EngineLiveness::new(),
             cache_usage: Arc::new(AtomicU64::new(0)),
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         }
@@ -365,6 +467,12 @@ impl EngineHandle {
     #[cfg(test)]
     pub(crate) fn occupy_slot_for_test(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&self.sem).try_acquire_owned().ok()
+    }
+
+    /// This engine instance's liveness (0.9.1 S1 stall watchdog).
+    #[must_use]
+    pub fn liveness(&self) -> &crate::stall_watch::EngineLiveness {
+        &self.liveness
     }
 
     /// Signal the engine thread to stop promptly, regardless of whether other
@@ -418,7 +526,20 @@ impl EngineHandle {
         // mid-poll, unlike a bare `fetch_sub` placed after the await.
         let permit_result = {
             let _waiting_guard = crate::in_flight::InFlightGuard::new(&self.waiting);
-            tokio::time::timeout(self.queue_timeout, Arc::clone(&self.sem).acquire_owned()).await
+            tokio::select! {
+                biased;
+                r = tokio::time::timeout(
+                    self.queue_timeout,
+                    Arc::clone(&self.sem).acquire_owned(),
+                ) => r,
+                // 0.9.1 S1: the engine stalled while this caller waited — the stuck thread holds
+                // the slots, none will free. The request ends like the ones in the engine: its
+                // verdict pair is put on its own channel, and the caller reads it as usual.
+                () = self.liveness.dead() => {
+                    crate::stall_watch::send_stalled_pair_now(&token_tx);
+                    return SubmitResult::Submitted;
+                }
+            }
         };
         let permit = match permit_result {
             Ok(Ok(p)) => p,
@@ -437,9 +558,13 @@ impl EngineHandle {
 
         // Permit acquired. Send to engine — if the channel is closed, the
         // permit drops here and the slot is returned to the semaphore.
-        let sent = self
-            .cmd_tx
-            .send(EngineCommand::AddRequest {
+        // 0.9.1 S1 (review N7): a full command channel in front of a stuck engine thread never
+        // frees; the verdict releases this caller too, with the pair on its own channel (the
+        // command, its permit and its sender are dropped with the unsent future).
+        let verdict_tx = token_tx.clone();
+        let Ok(sent) = self
+            .liveness
+            .unless_dead(self.cmd_tx.send(EngineCommand::AddRequest {
                 id,
                 prompt,
                 prompt_ids,
@@ -447,8 +572,13 @@ impl EngineHandle {
                 token_tx,
                 requested_at,
                 permit,
-            })
-            .await;
+            }))
+            .await
+        else {
+            crate::stall_watch::send_stalled_pair_now(&verdict_tx);
+            return SubmitResult::Submitted;
+        };
+        drop(verdict_tx);
 
         if sent.is_err() {
             // The permit was moved into the EngineCommand; .send() returns it
@@ -535,12 +665,14 @@ impl EngineHandle {
     /// dropped) or the tokenizer itself fails.
     pub async fn tokenize(&self, text: String) -> anyhow::Result<Vec<i64>> {
         let (reply, reply_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCommand::Tokenize { text, reply })
-            .await
+        self.liveness
+            .unless_dead(self.cmd_tx.send(EngineCommand::Tokenize { text, reply }))
+            .await?
             .map_err(|_| anyhow::anyhow!("inference engine unavailable"))?;
-        reply_rx
-            .await
+        // 0.9.1 S1: a stuck engine thread never replies; the verdict releases the caller.
+        self.liveness
+            .unless_dead(reply_rx)
+            .await?
             .map_err(|_| anyhow::anyhow!("engine dropped tokenize reply"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
@@ -554,12 +686,14 @@ impl EngineHandle {
     /// Returns an error if the engine thread is gone or the detokenizer fails.
     pub async fn detokenize(&self, ids: Vec<i64>) -> anyhow::Result<String> {
         let (reply, reply_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCommand::Detokenize { ids, reply })
-            .await
+        self.liveness
+            .unless_dead(self.cmd_tx.send(EngineCommand::Detokenize { ids, reply }))
+            .await?
             .map_err(|_| anyhow::anyhow!("inference engine unavailable"))?;
-        reply_rx
-            .await
+        // 0.9.1 S1: a stuck engine thread never replies; the verdict releases the caller.
+        self.liveness
+            .unless_dead(reply_rx)
+            .await?
             .map_err(|_| anyhow::anyhow!("engine dropped detokenize reply"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
@@ -661,6 +795,9 @@ pub fn spawn_engine(
     // reads it sync (Slice 3a). Shared the same way as `shutting_down`.
     let cache_usage = Arc::new(AtomicU64::new(0));
     let cache_usage_engine = Arc::clone(&cache_usage);
+    // 0.9.1 S1: the engine thread reports its steps to the same liveness the handle carries.
+    let liveness = crate::stall_watch::EngineLiveness::new();
+    let liveness_engine = liveness.clone();
 
     // Resolve the metric label handles once, here, off the hot path.
     let metrics =
@@ -680,6 +817,8 @@ pub fn spawn_engine(
                 device = device_log,
                 "CB engine thread started"
             );
+            // 0.9.1 S1: however this thread exits (shutdown mid-batch, panic), it is not left busy.
+            let _idle_on_exit = liveness_engine.idle_on_drop();
             // Step 6d: registered once per engine; each step is one atomic store at each end.
             let step_slot = crate::ffi_watch::global().register_step_slot(
                 &model_id_log,
@@ -693,6 +832,7 @@ pub fn spawn_engine(
                 shutting_down_engine,
                 cache_usage_engine,
                 &step_slot,
+                &liveness_engine,
             );
             drop(step_slot);
             tracing::info!(
@@ -711,6 +851,7 @@ pub fn spawn_engine(
             waiting: Arc::new(AtomicUsize::new(0)),
             shutting_down,
             closing: Arc::new(AtomicBool::new(false)),
+            liveness,
             cache_usage,
             admitted_prompt_tokens: Arc::new(AtomicUsize::new(0)),
         },
@@ -831,6 +972,7 @@ fn engine_loop<E: CbEngineOps>(
     shutting_down: Arc<AtomicBool>,
     cache_usage: Arc<AtomicU64>,
     step_slot: &crate::ffi_watch::StepSlot<'_>,
+    liveness: &crate::stall_watch::EngineLiveness,
 ) {
     // request_id → routing + timing state for that request.
     let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
@@ -857,7 +999,12 @@ fn engine_loop<E: CbEngineOps>(
         if !channel_closed {
             loop {
                 match cmd_rx.try_recv() {
-                    Ok(cmd) => handle_command(cmd, &mut engine, &mut routes, &metrics),
+                    Ok(cmd) => {
+                        // 0.9.1 S1: a command can start a busy period (and AddRequest's own
+                        // OpenVINO call can hang) — signalled before it runs.
+                        liveness.begin_if_idle();
+                        handle_command(cmd, &mut engine, &mut routes, &metrics);
+                    }
                     Err(TryRecvError::Empty) => break,
                     // All handles dropped. Do NOT exit yet: routine eviction
                     // relies on this loop draining any live request to its
@@ -901,7 +1048,14 @@ fn engine_loop<E: CbEngineOps>(
         //    or, if the channel is already closed, exit: nothing left to wait
         //    for.
         if engine.has_unfinished() {
-            step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema, step_slot);
+            step_and_route(
+                &mut engine,
+                &mut routes,
+                &metrics,
+                &mut tps_ema,
+                step_slot,
+                liveness,
+            );
             // Slice 3a: publish live KV occupancy for /metrics. `get_metrics()`
             // is a cached-struct read, so this is negligible against the step
             // we just ran. On FFI failure keep the prior value (don't flap to 0).
@@ -914,8 +1068,13 @@ fn engine_loop<E: CbEngineOps>(
             // Idle: no live batch holds KV blocks, so report 0 occupancy
             // (the plan's idle→0 clamp) rather than a stale last-step value.
             cache_usage.store(0.0_f64.to_bits(), Ordering::Relaxed);
+            // 0.9.1 S1: idle — the stall watchdog does not count this wait.
+            liveness.end();
             match cmd_rx.blocking_recv() {
-                Some(cmd) => handle_command(cmd, &mut engine, &mut routes, &metrics),
+                Some(cmd) => {
+                    liveness.begin_if_idle();
+                    handle_command(cmd, &mut engine, &mut routes, &metrics);
+                }
                 None => break 'run, // channel closed → shut down
             }
         }
@@ -973,27 +1132,28 @@ fn engine_loop<E: CbEngineOps>(
 }
 
 /// Fail every live route with a terminal pair — `Error(msg)` then
-/// `Done(Stop)` — and remove it (dropping its `ActiveRequest` releases the
-/// capacity permit). Used when the whole batch dies at once: a failed engine
+/// `Done(Stop)` — and remove it, releasing its capacity permit BEFORE the
+/// pair is sent (0.9.1 C29). Used when the whole batch dies at once: a failed engine
 /// step, or engine-loop exit with requests still in flight (T1.3).
 ///
 /// `try_send`, best-effort: a stalled client's full channel must never block
 /// the engine thread — dropping the route closes its stream either way.
 fn fail_all_routes(routes: &mut HashMap<u64, ActiveRequest>, msg: &str) {
-    for (_id, req) in routes.drain() {
+    for (_id, mut req) in routes.drain() {
+        req.release_slot();
         let _ = req.token_tx.try_send(StreamEvent::Error(msg.to_owned()));
         let _ = req.token_tx.try_send(StreamEvent::Done(FinishReason::Stop));
-        // req drops here, releasing its permit automatically
     }
 }
 
 /// Apply one command to the engine + route table.
 ///
 /// Capacity slots are managed via `OwnedSemaphorePermit`:
-/// - On success: the permit is stored in `ActiveRequest` and released when
-///   the route is eventually removed (finish, drop, or step error).
-/// - On failure: the permit drops at the end of the `Err` arm, returning
-///   the slot to the semaphore immediately — no explicit release needed.
+/// - On success: the permit is stored in `ActiveRequest` and released just
+///   before the request's terminal event (finish, step error, panic, loop
+///   exit), or when its route is removed after a client disconnect.
+/// - On failure: the permit is dropped before the `Error`/`Done` pair is sent
+///   (0.9.1 C29), returning the slot to the semaphore first.
 fn handle_command<E: CbEngineOps>(
     cmd: EngineCommand,
     engine: &mut E,
@@ -1010,6 +1170,7 @@ fn handle_command<E: CbEngineOps>(
             requested_at,
             permit,
         } => {
+            let engine_started_at = Instant::now();
             // T7.3: prefer the gate's pre-tokenized ids — submitting them skips
             // a redundant tokenize pass the string path would do inside the
             // pipeline. The handler's L0 gate already encoded this prompt; reuse
@@ -1043,8 +1204,8 @@ fn handle_command<E: CbEngineOps>(
                         },
                     };
                     if let Some(n) = prompt_tokens {
-                        // try_send: the per-request channel is fresh (this is its
-                        // first event), so Full is impossible; and the engine thread
+                        // try_send: the per-request channel is fresh (its first event),
+                        // so Full is impossible; and the engine thread
                         // must never block on a client channel.
                         let _ = token_tx.try_send(StreamEvent::PromptTokens(n));
                     }
@@ -1062,23 +1223,33 @@ fn handle_command<E: CbEngineOps>(
                             token_tx,
                             requested_at,
                             first_token_seen: false,
-                            permit, // held until the route is removed → slot released then
+                            permit: Some(permit), // released just before the terminal event
                             prompt_tail,
                             max_new_tokens: gen_params.max_new_tokens,
                             prompt_tokens: prompt_tokens.unwrap_or(0),
+                            generated_tokens: 0,
+                            engine_started_at,
+                            reasoning: gen_params.reasoning,
+                            tally: crate::reasoning_tokens::DeltaTally::default(),
+                            budget: crate::thinking_budget::tracker_for(
+                                gen_params.reasoning,
+                                gen_params.thinking_budget,
+                            ),
+                            prefill: None,
                         },
                     );
                 }
                 Err(e) => {
-                    // Submission failed — `permit` drops at end of this arm,
-                    // returning the slot automatically. Report on this request's
-                    // own stream; other requests are unaffected.
+                    // Submission failed — release the slot first (0.9.1 C29: the
+                    // client must not see its own request in `active()` once it
+                    // has the terminal pair), then report on this request's own
+                    // stream; other requests are unaffected.
                     tracing::error!(request_id = id, error = %e, "CB add_request failed");
+                    drop(permit);
                     // try_send: fresh channel (see PromptTokens above) — and the
                     // engine thread must never block on a client channel.
                     let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
                     let _ = token_tx.try_send(StreamEvent::Done(FinishReason::Stop));
-                    drop(permit); // explicit for clarity — slot released here
                 }
             }
         }
@@ -1150,13 +1321,36 @@ fn deliver_or_drop(req: &ActiveRequest, id: u64, event: StreamEvent) -> bool {
     }
 }
 
+/// A finished (not pool-exhausted) request's usage tail (0.9.1 V1-usage): resolve its exact
+/// reasoning count (`crate::reasoning_tokens`, rule 1), count the prompt and reasoning series, and
+/// send `ReasoningTokens` ahead of the terminal `Done`. Once per request, never per token.
+/// Returns `true` when the client is gone (as [`deliver_or_drop`]).
+fn finish_usage(req: &ActiveRequest, id: u64, metrics: &HotMetrics) -> bool {
+    let reasoning = req.tally.resolve(req.reasoning);
+    if reasoning.approximate {
+        tracing::debug!(
+            request_id = id,
+            reasoning_tokens = reasoning.tokens,
+            "reasoning split approximate: a multi-token delta straddled the reasoning block edge \
+             and was counted wholly as reasoning"
+        );
+    }
+    // Recorded before delivering: a client found gone only in this finishing callback still
+    // counts — its generation reached its end ("before its end" in METRICS.md, review N-2).
+    metrics.record_request_tokens(Modality::Text, req.prompt_tokens, reasoning.tokens);
+    if let Some(prefill) = req.prefill {
+        metrics.record_prefill(Modality::Text, req.prompt_tokens, prefill);
+    }
+    deliver_or_drop(req, id, StreamEvent::ReasoningTokens(reasoning.tokens))
+}
+
 /// Run one model step and fan the produced tokens out to their requests.
 ///
 /// Two cleanups happen after the step (collected during it to avoid borrowing
 /// `engine` while it is mutably borrowed by `step`):
-/// - finished requests are removed from the route table; removing an
-///   `ActiveRequest` drops its `OwnedSemaphorePermit`, releasing the slot
-///   automatically — no explicit counter decrement needed;
+/// - finished requests are removed from the route table (their permits were
+///   already released in the callback, just before each terminal event —
+///   0.9.1 C29; a disconnected request's permit drops with its route);
 /// - requests whose client has disconnected are cancelled in the pipeline.
 ///
 /// HOT PATH: the callback runs once per produced token across the live batch.
@@ -1172,6 +1366,7 @@ fn step_and_route<E: CbEngineOps>(
     metrics: &HotMetrics,
     tps_ema: &mut f64,
     step_slot: &crate::ffi_watch::StepSlot<'_>,
+    liveness: &crate::stall_watch::EngineLiveness,
 ) {
     let mut finished: Vec<u64> = Vec::new();
     let mut disconnected: Vec<u64> = Vec::new();
@@ -1181,6 +1376,8 @@ fn step_and_route<E: CbEngineOps>(
 
     // Step 6d: visible to the watchdog and the exit decision while the OpenVINO step runs.
     let step_run = step_slot.running(step_start);
+    // 0.9.1 S1: a step on an idle engine starts a busy period (normally a command already did).
+    liveness.begin_if_idle();
     let step_result = engine.step(|id, delta, new_tokens, finish, pool_exhausted| {
         // Captured before the `get_mut` borrow below (which would otherwise
         // conflict with a second borrow of `routes` for its length): how many
@@ -1193,26 +1390,42 @@ fn step_and_route<E: CbEngineOps>(
         // `model_manager::POOL_EXHAUSTED_MARKER`'s doc comment.
         let active_requests = routes.len();
         if let Some(req) = routes.get_mut(&id) {
+            // 0.9.1: a request its thinking budget stopped earlier in this step already has its
+            // terminal events; the pipeline is cancelled after the step (`disconnected`).
+            if req
+                .budget
+                .as_ref()
+                .is_some_and(crate::thinking_budget::BudgetTracker::stopped)
+            {
+                return;
+            }
             let mut client_gone = false;
+            // E2: every callback's count, the empty-text terminal one included.
+            req.generated_tokens = req.generated_tokens.saturating_add(new_tokens);
             if !delta.is_empty() {
                 // Count the engine's own reported token count, not 1 per
                 // callback: a speculative-decoding verification step can
                 // accept several draft tokens at once, all landing in this
                 // same callback (found live 2026-07-19, see the project's internal engineering log).
-                // On this request's very first token, record its
-                // time-to-first-token exactly once.
                 let new_tokens_u64 = new_tokens as u64;
                 tokens_this_step += new_tokens_u64;
                 metrics.token_generated(new_tokens_u64);
-                if !req.first_token_seen {
-                    req.first_token_seen = true;
-                    metrics.record_ttft(Modality::Text, req.requested_at.elapsed().as_secs_f64());
-                }
+                req.record_delta(delta, new_tokens, metrics);
                 if deliver_or_drop(req, id, StreamEvent::Token(delta.to_owned(), new_tokens)) {
                     client_gone = true;
                 }
             }
+            // 0.9.1: a budget stop finishes the request here, through the same tail as a natural
+            // finish (usage counted, `Done`), then is cancelled in the pipeline like a disconnect.
+            let (budget_stop, finish) = req.apply_budget(id, delta, new_tokens, finish);
             if let Some(reason) = finish {
+                // 0.9.1 C29: release the admission slot before the terminal
+                // event(s) below reach the client. Once per request (only on
+                // its finishing callback), never on the per-token path. The
+                // route itself stays until after the step, so `routes.len()`
+                // (the `active_requests=` figure) is unchanged for the other
+                // requests finishing in this same step.
+                req.release_slot();
                 if pool_exhausted {
                     metrics.kv_scheduler_drop();
                     // 2026-08-21 (found live, instant-EOS-stall investigation):
@@ -1230,18 +1443,23 @@ fn step_and_route<E: CbEngineOps>(
                     // this one just couldn't fit in the pool at this moment).
                     let _ = req.token_tx.try_send(StreamEvent::Error(format!(
                         "generation ignored by the CB scheduler — {POOL_EXHAUSTED_MARKER} \
-                         (observed_prompt_tokens={} active_requests={active_requests})",
-                        req.prompt_tokens
+                         (observed_prompt_tokens={} active_requests={active_requests} \
+                         generated_tokens={})",
+                        req.prompt_tokens, req.generated_tokens
                     )));
                     tracing::warn!(
                         request_id = id,
                         max_new_tokens = req.max_new_tokens,
                         prompt_tokens = req.prompt_tokens,
                         active_requests,
+                        generated_tokens = req.generated_tokens,
                         prompt_tail = %req.prompt_tail,
                         "CB generation hit KV-pool exhaustion (GenerationStatus::IGNORED) \
                          — reporting as an error, not a fake completion"
                     );
+                }
+                if !pool_exhausted && finish_usage(req, id, metrics) {
+                    client_gone = true;
                 }
                 if deliver_or_drop(req, id, StreamEvent::Done(reason)) {
                     client_gone = true;
@@ -1249,7 +1467,8 @@ fn step_and_route<E: CbEngineOps>(
                 // Generation completed — record the end-to-end duration.
                 metrics.record_duration(Modality::Text, req.requested_at.elapsed().as_secs_f64());
             }
-            if client_gone {
+            // A budget stop is cancelled in the pipeline exactly like a disconnect (once).
+            if client_gone || budget_stop {
                 disconnected.push(id);
             }
         }
@@ -1258,6 +1477,9 @@ fn step_and_route<E: CbEngineOps>(
         }
     });
     drop(step_run);
+    // 0.9.1 S1: a step that returned is progress — whether or not any sequence got visible text
+    // (a chunked prefill step, a preempted or starved sequence in a batch that keeps stepping).
+    liveness.progress();
     #[cfg(feature = "fault-injection")]
     let step_result = if crate::fault_injection::poison_this_step() {
         Err(anyhow::anyhow!(
@@ -1276,7 +1498,8 @@ fn step_and_route<E: CbEngineOps>(
         metrics.set_tokens_per_second(*tps_ema);
     }
 
-    // Remove finished routes. Dropping `ActiveRequest` drops its permit → slot released.
+    // Remove finished routes. Their permits were already released in the
+    // callback, just before each terminal event (C29).
     for id in finished {
         routes.remove(&id);
     }
@@ -1317,11 +1540,13 @@ fn step_and_route<E: CbEngineOps>(
 /// requests are untouched — the firewall isolates the failure to its request.
 fn route_out_panicked(routes: &mut HashMap<u64, ActiveRequest>, panicked: &[u64]) {
     for id in panicked {
-        if let Some(req) = routes.remove(id) {
+        if let Some(mut req) = routes.remove(id) {
             tracing::error!(
                 request_id = id,
                 "token routing panicked — failing this request only"
             );
+            // Slot first, then the terminal pair (0.9.1 C29).
+            req.release_slot();
             // try_send, best-effort: never block the engine thread on a
             // client channel (the route is dropped either way, closing the
             // stream).
@@ -1329,7 +1554,6 @@ fn route_out_panicked(routes: &mut HashMap<u64, ActiveRequest>, panicked: &[u64]
                 "internal error while streaming this response".to_owned(),
             ));
             let _ = req.token_tx.try_send(StreamEvent::Done(FinishReason::Stop));
-            // req drops here, releasing its permit automatically
         }
     }
 }
@@ -1469,7 +1693,15 @@ mod tests {
                     None,
                     Duration::ZERO,
                 );
-                engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage, &slot);
+                engine_loop(
+                    engine,
+                    cmd_rx,
+                    metrics,
+                    shutting_down,
+                    cache_usage,
+                    &slot,
+                    &crate::stall_watch::EngineLiveness::new(),
+                );
             }
         });
 
@@ -1523,7 +1755,8 @@ mod tests {
                 }
                 StreamEvent::Token(..)
                 | StreamEvent::PromptTokens(_)
-                | StreamEvent::CompletionTokens(_) => {}
+                | StreamEvent::CompletionTokens(_)
+                | StreamEvent::ReasoningTokens(_) => {}
             }
         }
         assert!(saw_done, "must see a natural Done(Stop) after the drain");
@@ -1561,7 +1794,15 @@ mod tests {
                     None,
                     Duration::ZERO,
                 );
-                engine_loop(engine, cmd_rx, metrics, shutting_down, cache_usage, &slot);
+                engine_loop(
+                    engine,
+                    cmd_rx,
+                    metrics,
+                    shutting_down,
+                    cache_usage,
+                    &slot,
+                    &crate::stall_watch::EngineLiveness::new(),
+                );
             }
         });
 
@@ -1620,7 +1861,9 @@ mod tests {
                         "shutdown let more than one extra step run — not prompt"
                     );
                 }
-                StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => {}
+                StreamEvent::PromptTokens(_)
+                | StreamEvent::CompletionTokens(_)
+                | StreamEvent::ReasoningTokens(_) => {}
                 StreamEvent::Error(_) => saw_error = true,
                 StreamEvent::Done(reason) => {
                     assert_eq!(reason, FinishReason::Stop);
@@ -1739,6 +1982,57 @@ mod tests {
             SubmitResult::Submitted,
             "second request must get slot after first releases it"
         );
+    }
+
+    /// Review N7: the command channel is full in front of a stuck engine thread (nothing reads
+    /// it). A request blocked on that send is released by the verdict: `Submitted`, the stall
+    /// pair on its own channel, and its admission slot returned.
+    #[tokio::test]
+    async fn an_add_request_blocked_on_a_full_channel_ends_on_the_verdict() {
+        use crate::streaming::stream_channel;
+
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(1);
+        let liveness = crate::stall_watch::EngineLiveness::new();
+        let handle = EngineHandle::from_sender_live(tx.clone(), liveness.clone());
+        let (reply, _reply_rx) = oneshot::channel();
+        tx.try_send(EngineCommand::Tokenize {
+            text: String::new(),
+            reply,
+        })
+        .unwrap(); // the channel is full; the engine thread never reads it
+        let (tok_tx, mut tok_rx) = stream_channel();
+        let pending = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .add_request(
+                        1,
+                        "p".into(),
+                        None,
+                        GenParams::default(),
+                        tok_tx,
+                        Instant::now(),
+                    )
+                    .await
+            }
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!pending.is_finished(), "blocked on the full channel");
+        assert_eq!(handle.active(), 1, "holding its slot");
+        liveness.declare_dead_for_test();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("released by the verdict")
+            .unwrap();
+        assert_eq!(result, SubmitResult::Submitted);
+        assert!(matches!(
+            tok_rx.recv().await,
+            Some(StreamEvent::Error(e)) if crate::stall_watch::is_generation_stalled_error(&e)
+        ));
+        assert!(matches!(tok_rx.recv().await, Some(StreamEvent::Done(_))));
+        assert_eq!(handle.active(), 0, "the slot is returned");
     }
 
     /// When no slot opens within `queue_timeout`, `add_request` returns
@@ -1908,10 +2202,16 @@ mod tests {
             token_tx: tx,
             requested_at: Instant::now(),
             first_token_seen: false,
-            permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+            permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
             prompt_tail: String::new(),
             max_new_tokens: 0,
             prompt_tokens: 0,
+            generated_tokens: 0,
+            engine_started_at: Instant::now(),
+            reasoning: crate::prompt_builder::ReasoningSplit::default(),
+            tally: crate::reasoning_tokens::DeltaTally::default(),
+            budget: None,
+            prefill: None,
         };
 
         // Healthy client: delivered, not dropped.
@@ -1966,10 +2266,16 @@ mod tests {
                     token_tx: tx,
                     requested_at: Instant::now(),
                     first_token_seen: false,
-                    permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                    permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
                     prompt_tail: String::new(),
                     max_new_tokens: 0,
                     prompt_tokens: 0,
+                    generated_tokens: 0,
+                    engine_started_at: Instant::now(),
+                    reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                    tally: crate::reasoning_tokens::DeltaTally::default(),
+                    budget: None,
+                    prefill: None,
                 },
             );
         }
@@ -2002,6 +2308,10 @@ mod tests {
     /// without needing a real KV pool to actually run dry.
     struct PoolExhaustedFakeEngine {
         exhausted_id: u64,
+        /// Tokens this request streams earlier in the same step (0 = none).
+        tokens_before: usize,
+        /// `new_tokens` the exhausting (empty-text) callback itself carries.
+        tokens_at_exhaustion: usize,
     }
 
     impl CbEngineOps for PoolExhaustedFakeEngine {
@@ -2022,7 +2332,16 @@ mod tests {
             &mut self,
             mut on_token: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
         ) -> anyhow::Result<Vec<u64>> {
-            on_token(self.exhausted_id, "", 0, Some(FinishReason::Stop), true);
+            if self.tokens_before > 0 {
+                on_token(self.exhausted_id, "ab", self.tokens_before, None, false);
+            }
+            on_token(
+                self.exhausted_id,
+                "",
+                self.tokens_at_exhaustion,
+                Some(FinishReason::Stop),
+                true,
+            );
             Ok(Vec::new())
         }
         fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
@@ -2042,6 +2361,16 @@ mod tests {
     /// produced for id 99 — so a test can assert on the embedded
     /// `observed_prompt_tokens=`/`active_requests=` fields.
     fn run_pool_exhausted_step(prompt_tokens: usize, other_count: usize) -> String {
+        run_pool_exhausted_step_with(prompt_tokens, other_count, (0, 0))
+    }
+
+    /// [`run_pool_exhausted_step`] where request 99 first streams `generated.0` tokens in the same
+    /// step and its exhausting callback carries `generated.1` more (with empty text).
+    fn run_pool_exhausted_step_with(
+        prompt_tokens: usize,
+        other_count: usize,
+        generated: (usize, usize),
+    ) -> String {
         use crate::streaming::stream_channel;
 
         let sem = Arc::new(Semaphore::new(other_count + 1));
@@ -2053,10 +2382,16 @@ mod tests {
                 token_tx: tx,
                 requested_at: Instant::now(),
                 first_token_seen: false,
-                permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
                 prompt_tail: String::new(),
                 max_new_tokens: 1400,
                 prompt_tokens,
+                generated_tokens: 0,
+                engine_started_at: Instant::now(),
+                reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                tally: crate::reasoning_tokens::DeltaTally::default(),
+                budget: None,
+                prefill: None,
             },
         );
         for i in 0..other_count {
@@ -2067,26 +2402,172 @@ mod tests {
                     token_tx: other_tx,
                     requested_at: Instant::now(),
                     first_token_seen: false,
-                    permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                    permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
                     prompt_tail: String::new(),
                     max_new_tokens: 0,
                     prompt_tokens: 0,
+                    generated_tokens: 0,
+                    engine_started_at: Instant::now(),
+                    reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                    tally: crate::reasoning_tokens::DeltaTally::default(),
+                    budget: None,
+                    prefill: None,
                 },
             );
         }
 
-        let mut engine = PoolExhaustedFakeEngine { exhausted_id: 99 };
+        let mut engine = PoolExhaustedFakeEngine {
+            exhausted_id: 99,
+            tokens_before: generated.0,
+            tokens_at_exhaustion: generated.1,
+        };
         let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU")
             .with_kv_scheduler_drops("fake-model");
         let mut tps_ema = 0.0;
         let slot =
             crate::ffi_watch::global().register_step_slot("fake-model", None, Duration::ZERO);
-        step_and_route(&mut engine, &mut routes, &metrics, &mut tps_ema, &slot);
+        step_and_route(
+            &mut engine,
+            &mut routes,
+            &metrics,
+            &mut tps_ema,
+            &slot,
+            &crate::stall_watch::EngineLiveness::new(),
+        );
 
-        match rx.try_recv().unwrap() {
-            StreamEvent::Error(msg) => msg,
-            other => panic!("expected an Error event, got {other:?}"),
+        loop {
+            match rx.try_recv().unwrap() {
+                StreamEvent::Error(msg) => return msg,
+                StreamEvent::Token(..) => {}
+                other => panic!("expected an Error event, got {other:?}"),
+            }
         }
+    }
+
+    /// A batch whose sequences get no visible text — one starved (no callback at all), one in
+    /// chunked prefill (empty deltas) — while its steps keep completing (0.9.1 S1, review F2).
+    struct SilentFakeEngine {
+        starved: u64,
+        prefilling: u64,
+    }
+
+    impl CbEngineOps for SilentFakeEngine {
+        fn add_request(&mut self, _: u64, _: &str, _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn add_request_ids(&mut self, _: u64, _: &[i64], _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn drop_request(&mut self, _: u64) {}
+        fn has_unfinished(&self) -> bool {
+            true
+        }
+        fn cache_usage_pct(&self) -> Option<f64> {
+            Some(0.0)
+        }
+        fn step(
+            &mut self,
+            mut on_token: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
+        ) -> anyhow::Result<Vec<u64>> {
+            let _ = self.starved; // gets no callback at all this step
+            on_token(self.prefilling, "", 0, None, false);
+            Ok(Vec::new())
+        }
+        fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn encode(&self, _: &str) -> anyhow::Result<Vec<i64>> {
+            Ok(vec![])
+        }
+        fn decode(&self, _: &[i64]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// 0.9.1 S1 (review F2): every completed step is engine progress, whether or not any
+    /// sequence got visible text — so a starved or prefilling batch that keeps stepping never
+    /// reads as a stall. (Counting only non-empty deltas makes this fail.)
+    #[test]
+    fn every_completed_step_is_progress_even_without_text() {
+        use crate::streaming::stream_channel;
+
+        let sem = Arc::new(Semaphore::new(2));
+        let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+        let mut keep = Vec::new();
+        for id in [1, 2] {
+            let (tx, rx) = stream_channel();
+            keep.push(rx);
+            routes.insert(
+                id,
+                ActiveRequest {
+                    token_tx: tx,
+                    requested_at: Instant::now(),
+                    first_token_seen: false,
+                    permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
+                    prompt_tail: String::new(),
+                    max_new_tokens: 16,
+                    prompt_tokens: 4096,
+                    generated_tokens: 0,
+                    engine_started_at: Instant::now(),
+                    reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                    tally: crate::reasoning_tokens::DeltaTally::default(),
+                    budget: None,
+                    prefill: None,
+                },
+            );
+        }
+        let mut engine = SilentFakeEngine {
+            starved: 1,
+            prefilling: 2,
+        };
+        let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU");
+        let slot =
+            crate::ffi_watch::global().register_step_slot("fake-model", None, Duration::ZERO);
+        let liveness = crate::stall_watch::EngineLiveness::new();
+        let mut tps_ema = 0.0;
+        for _ in 0..5 {
+            step_and_route(
+                &mut engine,
+                &mut routes,
+                &metrics,
+                &mut tps_ema,
+                &slot,
+                &liveness,
+            );
+        }
+        assert_eq!(
+            liveness.signals_for_test(),
+            (5, true),
+            "five steps, five progress signals; the engine is busy"
+        );
+        assert_eq!(routes.len(), 2, "both requests still in the batch");
+        for rx in &mut keep {
+            assert!(rx.try_recv().is_err(), "no text was sent");
+        }
+    }
+
+    /// E2: the message carries how many tokens the request had generated when the pool ran out —
+    /// every callback's count, including tokens the exhausting callback reports with empty text.
+    #[test]
+    fn pool_exhausted_message_embeds_the_generated_token_count() {
+        let msg = run_pool_exhausted_step_with(1_000, 0, (0, 0));
+        assert!(
+            msg.contains("observed_prompt_tokens=1000 active_requests=1 generated_tokens=0)"),
+            "{msg}"
+        );
+        let msg = run_pool_exhausted_step_with(1_000, 0, (37, 0));
+        assert!(msg.contains("generated_tokens=37)"), "{msg}");
+        let msg = run_pool_exhausted_step_with(1_000, 0, (0, 2));
+        assert!(
+            msg.contains("generated_tokens=2)"),
+            "tokens on the empty-text terminal callback count: {msg}"
+        );
+        let msg = run_pool_exhausted_step_with(1_000, 0, (5, 3));
+        assert!(msg.contains("generated_tokens=8)"), "{msg}");
+        assert_eq!(
+            crate::model_manager::pool_exhausted_generated_tokens(&msg),
+            Some(8)
+        );
     }
 
     /// A request the scheduler ignored for lack of pool room is counted (U-25) - once, for the
@@ -2161,10 +2642,16 @@ mod tests {
                     token_tx: tx,
                     requested_at: Instant::now(),
                     first_token_seen: false,
-                    permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                    permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
                     prompt_tail: String::new(),
                     max_new_tokens: 0,
                     prompt_tokens: 0,
+                    generated_tokens: 0,
+                    engine_started_at: Instant::now(),
+                    reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                    tally: crate::reasoning_tokens::DeltaTally::default(),
+                    budget: None,
+                    prefill: None,
                 },
             );
         }
@@ -2347,5 +2834,891 @@ mod active_contract_tests {
         ManagedEngine::set_closing(&h, false);
         assert_eq!(submit(&h).await, SubmitResult::Submitted);
         assert!(rx.try_recv().is_ok(), "the command reached the engine");
+    }
+
+    /// C29 probe: a fake whose `step` emits one token, then the finish for
+    /// request `id` (optionally as KV-pool exhaustion), and after EACH callback
+    /// drains the client's receiver, recording every event with the admission
+    /// count (`cap - available_permits`) seen at the moment the client has it.
+    /// The probe runs inside `step`, i.e. before `step_and_route` removes the
+    /// finished route — exactly when a client woken by `Done` would read
+    /// `active()` — so the observation is deterministic, no sleeps.
+    struct TerminalProbeEngine {
+        id: u64,
+        pool_exhausted: bool,
+        sem: Arc<Semaphore>,
+        cap: usize,
+        rx: crate::streaming::TokenReceiver,
+        seen: Vec<(StreamEvent, usize)>,
+    }
+
+    impl TerminalProbeEngine {
+        fn drain(&mut self) {
+            while let Ok(ev) = self.rx.try_recv() {
+                let active = self.cap - self.sem.available_permits();
+                self.seen.push((ev, active));
+            }
+        }
+    }
+
+    impl CbEngineOps for TerminalProbeEngine {
+        fn add_request(&mut self, _: u64, _: &str, _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn add_request_ids(&mut self, _: u64, _: &[i64], _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn drop_request(&mut self, _: u64) {}
+        fn has_unfinished(&self) -> bool {
+            false
+        }
+        fn cache_usage_pct(&self) -> Option<f64> {
+            Some(0.0)
+        }
+        fn step(
+            &mut self,
+            mut on_token: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
+        ) -> anyhow::Result<Vec<u64>> {
+            on_token(self.id, "x", 1, None, false);
+            self.drain();
+            on_token(
+                self.id,
+                "",
+                0,
+                Some(FinishReason::Stop),
+                self.pool_exhausted,
+            );
+            self.drain();
+            Ok(Vec::new())
+        }
+        fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn encode(&self, _: &str) -> anyhow::Result<Vec<i64>> {
+            Ok(vec![])
+        }
+        fn decode(&self, _: &[i64]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// Runs one request through `step_and_route` with [`TerminalProbeEngine`]
+    /// next to one other in-flight request; returns what the client saw, each
+    /// event with the admission count at that moment.
+    fn run_terminal_probe(pool_exhausted: bool) -> Vec<(StreamEvent, usize)> {
+        use crate::streaming::stream_channel;
+
+        let cap = 2;
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+        let (tx, rx) = stream_channel();
+        let (other_tx, _other_rx) = stream_channel();
+        for (id, token_tx) in [(7u64, tx), (8u64, other_tx)] {
+            routes.insert(
+                id,
+                ActiveRequest {
+                    token_tx,
+                    requested_at: Instant::now(),
+                    first_token_seen: false,
+                    permit: Some(Arc::clone(&sem).try_acquire_owned().unwrap()),
+                    prompt_tail: String::new(),
+                    max_new_tokens: 16,
+                    prompt_tokens: 3,
+                    generated_tokens: 0,
+                    engine_started_at: Instant::now(),
+                    reasoning: crate::prompt_builder::ReasoningSplit::default(),
+                    tally: crate::reasoning_tokens::DeltaTally::default(),
+                    budget: None,
+                    prefill: None,
+                },
+            );
+        }
+        let mut engine = TerminalProbeEngine {
+            id: 7,
+            pool_exhausted,
+            sem: Arc::clone(&sem),
+            cap,
+            rx,
+            seen: Vec::new(),
+        };
+        let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU")
+            .with_kv_scheduler_drops("fake-model");
+        let mut tps_ema = 0.0;
+        let slot =
+            crate::ffi_watch::global().register_step_slot("fake-model", None, Duration::ZERO);
+        step_and_route(
+            &mut engine,
+            &mut routes,
+            &metrics,
+            &mut tps_ema,
+            &slot,
+            &crate::stall_watch::EngineLiveness::new(),
+        );
+        assert!(!routes.contains_key(&7), "the finished route is removed");
+        assert!(routes.contains_key(&8), "the other request is untouched");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "only the other request holds a slot"
+        );
+        engine.seen
+    }
+
+    /// 0.9.1 C29: a finishing CB request's admission slot is released BEFORE
+    /// its `Done` reaches the client — the client reads `active()` == 1 (only
+    /// the other request) the moment it has `Done`, not 2. A non-terminal
+    /// token still holds the slot (2), so the release is not on the token path.
+    #[test]
+    fn cb_releases_the_slot_before_done_reaches_the_client() {
+        let seen = run_terminal_probe(false);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(
+            matches!(&seen[0], (StreamEvent::Token(t, 1), 2) if t == "x"),
+            "{seen:?}"
+        );
+        // 0.9.1 V1-usage: the usage tail's ReasoningTokens comes after the release too.
+        assert!(
+            matches!(&seen[1], (StreamEvent::ReasoningTokens(0), 1)),
+            "{seen:?}"
+        );
+        assert!(
+            matches!(&seen[2], (StreamEvent::Done(FinishReason::Stop), 1)),
+            "the slot must be free when Done arrives: {seen:?}"
+        );
+    }
+
+    /// 0.9.1 C29, error terminal: a KV-pool-exhausted finish sends `Error`
+    /// then `Done`; the slot is already released when the `Error` (the first
+    /// terminal event a collector acts on) arrives. The error text keeps its
+    /// `active_requests=2` (the route is removed only after the step).
+    #[test]
+    fn cb_releases_the_slot_before_a_pool_exhausted_error_reaches_the_client() {
+        let seen = run_terminal_probe(true);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(
+            matches!(&seen[0], (StreamEvent::Token(_, 1), 2)),
+            "{seen:?}"
+        );
+        match &seen[1] {
+            (StreamEvent::Error(msg), 1) => {
+                assert!(msg.contains(POOL_EXHAUSTED_MARKER), "{msg}");
+                assert!(
+                    msg.contains("observed_prompt_tokens=3 active_requests=2"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected Error with the slot released, got {other:?}"),
+        }
+        assert!(
+            matches!(&seen[2], (StreamEvent::Done(FinishReason::Stop), 1)),
+            "{seen:?}"
+        );
+    }
+
+    /// C29 (F2) probe error: its `Display` records how many admission permits
+    /// are held each time it is rendered. The add-request `Err` arm renders it
+    /// (`e.to_string()`) to build the `Error` event, immediately before the
+    /// send — so the LAST recorded value is the held count at the moment the
+    /// client's `Error` is sent. (An enabled tracing subscriber may render it
+    /// earlier too; only the last value is read.)
+    #[derive(Debug)]
+    struct ProbeAddError {
+        sem: Arc<Semaphore>,
+        cap: usize,
+        last_held: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    impl std::fmt::Display for ProbeAddError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            *self.last_held.lock().unwrap() = Some(self.cap - self.sem.available_permits());
+            f.write_str("probe add_request failure")
+        }
+    }
+
+    impl std::error::Error for ProbeAddError {}
+
+    /// A fake whose `add_request` always fails with a [`ProbeAddError`].
+    struct FailingAddEngine {
+        sem: Arc<Semaphore>,
+        cap: usize,
+        last_held: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    impl FailingAddEngine {
+        fn fail(&self) -> anyhow::Error {
+            anyhow::Error::new(ProbeAddError {
+                sem: Arc::clone(&self.sem),
+                cap: self.cap,
+                last_held: Arc::clone(&self.last_held),
+            })
+        }
+    }
+
+    impl CbEngineOps for FailingAddEngine {
+        fn add_request(&mut self, _: u64, _: &str, _: &GenParams) -> anyhow::Result<()> {
+            Err(self.fail())
+        }
+        fn add_request_ids(&mut self, _: u64, _: &[i64], _: &GenParams) -> anyhow::Result<()> {
+            Err(self.fail())
+        }
+        fn drop_request(&mut self, _: u64) {}
+        fn has_unfinished(&self) -> bool {
+            false
+        }
+        fn cache_usage_pct(&self) -> Option<f64> {
+            Some(0.0)
+        }
+        fn step(
+            &mut self,
+            _: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
+        ) -> anyhow::Result<Vec<u64>> {
+            Ok(Vec::new())
+        }
+        fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn encode(&self, _: &str) -> anyhow::Result<Vec<i64>> {
+            Ok(vec![])
+        }
+        fn decode(&self, _: &[i64]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// 0.9.1 C29 (F2): a failed add-request releases its slot before the
+    /// `Error` is sent — 0 permits held when the event is built — and the
+    /// client gets `Error` then `Done(Stop)`; no route is created.
+    #[test]
+    fn cb_add_request_error_releases_the_slot_before_the_error() {
+        use crate::streaming::stream_channel;
+
+        let cap = 1;
+        let sem = Arc::new(Semaphore::new(cap));
+        let last_held = Arc::new(std::sync::Mutex::new(None));
+        let mut engine = FailingAddEngine {
+            sem: Arc::clone(&sem),
+            cap,
+            last_held: Arc::clone(&last_held),
+        };
+        let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+        let metrics = HotMetrics::new(ModelKind::TextGen, "fake-model", "CPU");
+        let (tx, mut rx) = stream_channel();
+        handle_command(
+            EngineCommand::AddRequest {
+                id: 5,
+                prompt: "hi".to_owned(),
+                prompt_ids: None,
+                gen_params: GenParams::default(),
+                token_tx: tx,
+                requested_at: Instant::now(),
+                permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+            },
+            &mut engine,
+            &mut routes,
+            &metrics,
+        );
+        assert_eq!(
+            *last_held.lock().unwrap(),
+            Some(0),
+            "the slot must be free when the Error is sent"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Error(e) if e == "probe add_request failure"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Done(FinishReason::Stop)
+        ));
+        assert!(routes.is_empty());
+        assert_eq!(sem.available_permits(), cap);
+    }
+
+    // ---- 0.9.1 V1-usage: reasoning tokens + prompt / prefill series ----
+
+    /// Streams a scripted list of `(delta, new_tokens)` for request 7, one per step, the last
+    /// carrying `Stop`. The first step sleeps `first_step_delay` (a stand-in for prefill time).
+    struct ScriptedEngine {
+        script: std::collections::VecDeque<(&'static str, usize)>,
+        first_step_delay: Duration,
+        stepped: bool,
+        /// Ids `drop_request` was called with (0.9.1 budget stop = cancel in the pipeline).
+        dropped: Vec<u64>,
+    }
+
+    impl CbEngineOps for ScriptedEngine {
+        fn add_request(&mut self, _: u64, _: &str, _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn add_request_ids(&mut self, _: u64, _: &[i64], _: &GenParams) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn drop_request(&mut self, id: u64) {
+            self.dropped.push(id);
+        }
+        fn has_unfinished(&self) -> bool {
+            !self.script.is_empty()
+        }
+        fn cache_usage_pct(&self) -> Option<f64> {
+            Some(0.0)
+        }
+        fn step(
+            &mut self,
+            mut on_token: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
+        ) -> anyhow::Result<Vec<u64>> {
+            if !self.stepped {
+                self.stepped = true;
+                std::thread::sleep(self.first_step_delay);
+            }
+            if let Some((delta, n)) = self.script.pop_front() {
+                let finish = self.script.is_empty().then_some(FinishReason::Stop);
+                on_token(7, delta, n, finish, false);
+            }
+            Ok(Vec::new())
+        }
+        fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn encode(&self, _: &str) -> anyhow::Result<Vec<i64>> {
+            Ok(vec![])
+        }
+        fn decode(&self, _: &[i64]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    use crate::metrics::test_sample as sample;
+
+    /// Outcome of one scripted CB request: every event it received, and the `/metrics` text.
+    struct ScriptedRun {
+        events: Vec<StreamEvent>,
+        rendered: String,
+        /// Ids the engine was told to drop.
+        dropped: Vec<u64>,
+    }
+
+    /// Submits request 7 with `prompt_len` pre-tokenized ids and `split`, handler entry
+    /// `queued` before the engine takes it, then steps the scripted engine to completion.
+    fn run_scripted(
+        script: &[(&'static str, usize)],
+        prompt_len: usize,
+        split: crate::prompt_builder::ReasoningSplit,
+        queued: Duration,
+        first_step_delay: Duration,
+    ) -> ScriptedRun {
+        run_scripted_budget(script, prompt_len, (split, None), queued, first_step_delay)
+    }
+
+    /// [`run_scripted`] with a thinking budget armed (`GenParams::thinking_budget`).
+    fn run_scripted_budget(
+        script: &[(&'static str, usize)],
+        prompt_len: usize,
+        (split, thinking_budget): (crate::prompt_builder::ReasoningSplit, Option<u32>),
+        queued: Duration,
+        first_step_delay: Duration,
+    ) -> ScriptedRun {
+        use crate::streaming::stream_channel;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (tx, mut rx) = stream_channel();
+        let mut dropped = Vec::new();
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = HotMetrics::new(ModelKind::TextGen, "scripted", "GPU.0");
+            let mut engine = ScriptedEngine {
+                script: script.iter().copied().collect(),
+                first_step_delay,
+                stepped: false,
+                dropped: Vec::new(),
+            };
+            let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+            let sem = Arc::new(Semaphore::new(1));
+            handle_command(
+                EngineCommand::AddRequest {
+                    id: 7,
+                    prompt: String::new(),
+                    prompt_ids: Some(vec![1; prompt_len]),
+                    gen_params: GenParams {
+                        reasoning: split,
+                        thinking_budget,
+                        ..GenParams::default()
+                    },
+                    token_tx: tx,
+                    requested_at: Instant::now().checked_sub(queued).unwrap(),
+                    permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                },
+                &mut engine,
+                &mut routes,
+                &metrics,
+            );
+            let slot =
+                crate::ffi_watch::global().register_step_slot("scripted", None, Duration::ZERO);
+            let liveness = crate::stall_watch::EngineLiveness::new();
+            let mut tps = 0.0;
+            while !routes.is_empty() {
+                step_and_route(
+                    &mut engine,
+                    &mut routes,
+                    &metrics,
+                    &mut tps,
+                    &slot,
+                    &liveness,
+                );
+            }
+            dropped = std::mem::take(&mut engine.dropped);
+        });
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        ScriptedRun {
+            events,
+            rendered: handle.render(),
+            dropped,
+        }
+    }
+
+    fn reasoning_event(events: &[StreamEvent]) -> Option<usize> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::ReasoningTokens(n) => Some(*n),
+            _ => None,
+        })
+    }
+
+    fn completion_sum(events: &[StreamEvent]) -> usize {
+        events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::Token(t, n) if !t.is_empty() => *n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    const THINKING: &[(&str, usize)] = &[
+        ("<think>", 1),
+        ("plan", 1),
+        (" more", 2),
+        ("</think>", 1),
+        ("\n\n", 1),
+        ("Answer", 1),
+    ];
+
+    // ---- 0.9.1 strict thinking budget ----
+
+    const LONG_THINK: &[(&str, usize)] = &[
+        ("<think>", 1),
+        ("a", 1),
+        ("b", 1),
+        ("c", 1),
+        ("d", 1),
+        ("e", 1),
+        ("</think>", 1),
+        ("Answer", 1),
+    ];
+
+    fn qwen_split(starts: bool) -> crate::prompt_builder::ReasoningSplit {
+        crate::prompt_builder::ReasoningSplit::new(
+            Some(crate::model_manager::ReasoningParser::Qwen3),
+            starts,
+        )
+    }
+
+    fn done_of(events: &[StreamEvent]) -> Option<FinishReason> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::Done(r) => Some(*r),
+            _ => None,
+        })
+    }
+
+    /// At the budget the request stops: `Done(ThinkingBudget)` ("length"), `ReasoningTokens`
+    /// = the budget (exact on CB) before it, no token after it, the pipeline told to drop the
+    /// request, and the request counted as FINISHED (prompt + reasoning series, prefill sample).
+    #[test]
+    fn cb_budget_stop_is_length_exact_and_counted_as_finished() {
+        let run = run_scripted_budget(
+            LONG_THINK,
+            300,
+            (qwen_split(false), Some(3)),
+            Duration::ZERO,
+            Duration::from_millis(5),
+        );
+        assert_eq!(done_of(&run.events), Some(FinishReason::ThinkingBudget));
+        assert_eq!(FinishReason::ThinkingBudget.as_openai(), "length");
+        assert_eq!(reasoning_event(&run.events), Some(3));
+        assert_eq!(
+            completion_sum(&run.events),
+            3,
+            "<think>, a, b — nothing after"
+        );
+        assert!(
+            matches!(run.events.last(), Some(StreamEvent::Done(_))),
+            "Done is terminal: {:?}",
+            run.events
+        );
+        assert_eq!(run.dropped, vec![7], "cancelled in the pipeline once");
+        let r = &run.rendered;
+        assert_eq!(
+            sample(r, "rustedvino_prompt_tokens_total", "modality=\"text\""),
+            Some(300.0)
+        );
+        assert_eq!(
+            sample(r, "rustedvino_reasoning_tokens_total", "modality=\"text\""),
+            Some(3.0)
+        );
+        assert_eq!(
+            sample(
+                r,
+                "rustedvino_prefill_tokens_per_second_count",
+                "modality=\"text\""
+            ),
+            Some(1.0)
+        );
+    }
+
+    /// A natural `</think>` before the budget: the request runs to its own finish.
+    #[test]
+    fn cb_natural_close_before_the_budget_is_a_normal_answer() {
+        let run = run_scripted_budget(
+            LONG_THINK,
+            10,
+            (qwen_split(false), Some(7)),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(done_of(&run.events), Some(FinishReason::Stop));
+        assert_eq!(reasoning_event(&run.events), Some(7));
+        assert!(run.dropped.is_empty());
+        assert_eq!(completion_sum(&run.events), 8);
+    }
+
+    /// `starts_in_thinking` (the prompt opened the block): counting starts at the first token.
+    #[test]
+    fn cb_budget_counts_from_the_first_token_when_the_prompt_opened_the_block() {
+        let script: &[(&str, usize)] = &[("x", 1), ("y", 2), ("z", 1), ("</think>", 1), ("A", 1)];
+        let run = run_scripted_budget(
+            script,
+            10,
+            (qwen_split(true), Some(3)),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(done_of(&run.events), Some(FinishReason::ThinkingBudget));
+        assert_eq!(reasoning_event(&run.events), Some(3), "x(1) + y(2)");
+        // Without the prefill the same output has no reasoning: the budget never fires.
+        let run = run_scripted_budget(
+            script,
+            10,
+            (qwen_split(false), Some(3)),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(done_of(&run.events), Some(FinishReason::Stop));
+    }
+
+    /// The engine's own `length` while still inside the reasoning block (budget armed but not
+    /// reached, `max_tokens` came first) is reported as the budget finish: no answer came.
+    #[test]
+    fn cb_length_inside_reasoning_with_a_budget_is_the_budget_finish() {
+        struct LengthEngine(ScriptedEngine);
+        impl CbEngineOps for LengthEngine {
+            fn add_request(&mut self, a: u64, b: &str, c: &GenParams) -> anyhow::Result<()> {
+                self.0.add_request(a, b, c)
+            }
+            fn add_request_ids(&mut self, a: u64, b: &[i64], c: &GenParams) -> anyhow::Result<()> {
+                self.0.add_request_ids(a, b, c)
+            }
+            fn drop_request(&mut self, id: u64) {
+                self.0.drop_request(id);
+            }
+            fn has_unfinished(&self) -> bool {
+                self.0.has_unfinished()
+            }
+            fn cache_usage_pct(&self) -> Option<f64> {
+                None
+            }
+            fn step(
+                &mut self,
+                mut on_token: impl FnMut(u64, &str, usize, Option<FinishReason>, bool),
+            ) -> anyhow::Result<Vec<u64>> {
+                if let Some((delta, n)) = self.0.script.pop_front() {
+                    let finish = self.0.script.is_empty().then_some(FinishReason::Length);
+                    on_token(7, delta, n, finish, false);
+                }
+                Ok(Vec::new())
+            }
+            fn count_tokens(&self, _: &str) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            fn encode(&self, _: &str) -> anyhow::Result<Vec<i64>> {
+                Ok(vec![])
+            }
+            fn decode(&self, _: &[i64]) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        let (tx, mut rx) = crate::streaming::stream_channel();
+        let metrics = HotMetrics::new(ModelKind::TextGen, "len", "GPU.0");
+        let mut engine = LengthEngine(ScriptedEngine {
+            script: [("<think>", 1), ("a", 1), ("b", 1)].into_iter().collect(),
+            first_step_delay: Duration::ZERO,
+            stepped: true,
+            dropped: Vec::new(),
+        });
+        let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+        let sem = Arc::new(Semaphore::new(1));
+        handle_command(
+            EngineCommand::AddRequest {
+                id: 7,
+                prompt: String::new(),
+                prompt_ids: Some(vec![1; 4]),
+                gen_params: GenParams {
+                    reasoning: qwen_split(false),
+                    thinking_budget: Some(100),
+                    ..GenParams::default()
+                },
+                token_tx: tx,
+                requested_at: Instant::now(),
+                permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+            },
+            &mut engine,
+            &mut routes,
+            &metrics,
+        );
+        let slot = crate::ffi_watch::global().register_step_slot("len", None, Duration::ZERO);
+        let liveness = crate::stall_watch::EngineLiveness::new();
+        let mut tps = 0.0;
+        while !routes.is_empty() {
+            step_and_route(
+                &mut engine,
+                &mut routes,
+                &metrics,
+                &mut tps,
+                &slot,
+                &liveness,
+            );
+        }
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(done_of(&events), Some(FinishReason::ThinkingBudget));
+        // Without a budget the same run is a plain `length`.
+        assert_eq!(
+            FinishReason::Length.with_budget(false, false),
+            FinishReason::Length
+        );
+    }
+
+    #[test]
+    fn cb_reports_exact_reasoning_tokens_before_done_and_counts_the_series() {
+        let split = crate::prompt_builder::ReasoningSplit::new(
+            Some(crate::model_manager::ReasoningParser::Qwen3),
+            false,
+        );
+        let run = run_scripted(THINKING, 300, split, Duration::ZERO, Duration::ZERO);
+        let reasoning = reasoning_event(&run.events).expect("ReasoningTokens event");
+        assert_eq!(reasoning, 5, "<think> + plan + ' more'(2) + </think>");
+        assert!(reasoning <= completion_sum(&run.events));
+        // ReasoningTokens comes after the last Token and before Done.
+        let pos = |f: fn(&StreamEvent) -> bool| run.events.iter().position(f).unwrap();
+        let r = pos(|e| matches!(e, StreamEvent::ReasoningTokens(_)));
+        let d = pos(|e| matches!(e, StreamEvent::Done(_)));
+        let last_tok = run
+            .events
+            .iter()
+            .rposition(|e| matches!(e, StreamEvent::Token(..)))
+            .unwrap();
+        assert!(last_tok < r && r < d, "{:?}", run.events);
+        let r = &run.rendered;
+        assert_eq!(
+            sample(r, "rustedvino_prompt_tokens_total", "model=\"scripted\""),
+            Some(300.0)
+        );
+        assert_eq!(
+            sample(r, "rustedvino_reasoning_tokens_total", "modality=\"text\""),
+            Some(5.0)
+        );
+        assert_eq!(
+            sample(
+                r,
+                "rustedvino_prefill_tokens_per_second_count",
+                "kind=\"text_gen\""
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn cb_thinking_off_reports_zero_reasoning() {
+        let run = run_scripted(
+            &[("Hello", 1), (" there", 1)],
+            10,
+            crate::prompt_builder::ReasoningSplit::default(),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(reasoning_event(&run.events), Some(0));
+        assert_eq!(
+            sample(
+                &run.rendered,
+                "rustedvino_reasoning_tokens_total",
+                "scripted"
+            ),
+            Some(0.0)
+        );
+    }
+
+    /// The 256 floor: a 255-token prompt records no prefill sample, but both counters count.
+    #[test]
+    fn cb_prefill_floor_skips_short_prompts_but_counters_count() {
+        let split = crate::prompt_builder::ReasoningSplit::new(None, false);
+        let run = run_scripted(THINKING, 255, split, Duration::ZERO, Duration::ZERO);
+        let r = &run.rendered;
+        assert_eq!(
+            sample(r, "rustedvino_prefill_tokens_per_second_count", "scripted"),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample(r, "rustedvino_prompt_tokens_total", "scripted"),
+            Some(255.0)
+        );
+        assert_eq!(
+            sample(r, "rustedvino_reasoning_tokens_total", "scripted"),
+            Some(5.0)
+        );
+        let run = run_scripted(THINKING, 256, split, Duration::ZERO, Duration::ZERO);
+        assert_eq!(
+            sample(
+                &run.rendered,
+                "rustedvino_prefill_tokens_per_second_count",
+                "scripted"
+            ),
+            Some(1.0)
+        );
+    }
+
+    /// Queue time is excluded: the handler entry is 5 s before the engine takes the request and
+    /// the first step sleeps 50 ms. Both bounds are wall-clock free (review R-8): the rate can
+    /// never exceed 300 tok / 50 ms (the sleep is a floor on the interval), and it must beat the
+    /// with-queue figure, 300 tok / TTFT, because TTFT (from handler entry) holds the 5 s queue
+    /// and the prefill interval does not — however slow the box is.
+    #[test]
+    fn cb_prefill_excludes_queue_time() {
+        let run = run_scripted(
+            THINKING,
+            300,
+            crate::prompt_builder::ReasoningSplit::default(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+        let rate = sample(
+            &run.rendered,
+            "rustedvino_prefill_tokens_per_second_sum",
+            "scripted",
+        )
+        .expect("one prefill sample");
+        let ttft = sample(&run.rendered, "rustedvino_ttft_seconds_sum", "scripted").unwrap();
+        assert!(
+            ttft >= 5.0,
+            "TTFT keeps measuring from handler entry: {ttft}"
+        );
+        let with_queue = 300.0 / ttft;
+        assert!(
+            rate > with_queue,
+            "queue time leaked into prefill: {rate} tok/s vs {with_queue} tok/s with the queue"
+        );
+        assert!(
+            rate <= 300.0 / 0.05,
+            "faster than the scripted 50 ms: {rate} tok/s"
+        );
+    }
+
+    /// N-1: a client that disconnects after the first token leaves all three series unrecorded
+    /// (the prefill interval is only recorded when the request finishes), as on VLM / NPU.
+    #[test]
+    fn cb_client_gone_after_the_first_token_records_nothing() {
+        use crate::streaming::stream_channel;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (tx, mut rx) = stream_channel();
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = HotMetrics::new(ModelKind::TextGen, "scripted", "GPU.0");
+            let mut engine = ScriptedEngine {
+                script: THINKING.iter().copied().collect(),
+                first_step_delay: Duration::ZERO,
+                stepped: false,
+                dropped: Vec::new(),
+            };
+            let mut routes: HashMap<u64, ActiveRequest> = HashMap::new();
+            let sem = Arc::new(Semaphore::new(1));
+            handle_command(
+                EngineCommand::AddRequest {
+                    id: 7,
+                    prompt: String::new(),
+                    prompt_ids: Some(vec![1; 300]),
+                    gen_params: GenParams::default(),
+                    token_tx: tx,
+                    requested_at: Instant::now(),
+                    permit: Arc::clone(&sem).try_acquire_owned().unwrap(),
+                },
+                &mut engine,
+                &mut routes,
+                &metrics,
+            );
+            let slot =
+                crate::ffi_watch::global().register_step_slot("scripted", None, Duration::ZERO);
+            let liveness = crate::stall_watch::EngineLiveness::new();
+            let mut tps = 0.0;
+            step_and_route(
+                &mut engine,
+                &mut routes,
+                &metrics,
+                &mut tps,
+                &slot,
+                &liveness,
+            );
+            assert!(matches!(rx.try_recv(), Ok(StreamEvent::PromptTokens(300))));
+            assert!(matches!(rx.try_recv(), Ok(StreamEvent::Token(..))));
+            drop(rx);
+            let mut steps = 0;
+            while !routes.is_empty() {
+                step_and_route(
+                    &mut engine,
+                    &mut routes,
+                    &metrics,
+                    &mut tps,
+                    &slot,
+                    &liveness,
+                );
+                steps += 1;
+                assert!(steps < 10, "the disconnected route must be dropped");
+            }
+            assert!(
+                !engine.script.is_empty(),
+                "dropped before its end, not finished"
+            );
+        });
+        let r = handle.render();
+        assert_eq!(
+            sample(&r, "rustedvino_prompt_tokens_total", "scripted"),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample(&r, "rustedvino_reasoning_tokens_total", "scripted"),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample(&r, "rustedvino_prefill_tokens_per_second_count", "scripted"),
+            Some(0.0)
+        );
+        // TTFT (handler-entry family, unchanged) was still recorded at the first token.
+        assert_eq!(
+            sample(&r, "rustedvino_ttft_seconds_count", "scripted"),
+            Some(1.0)
+        );
     }
 }

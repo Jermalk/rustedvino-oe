@@ -18,6 +18,7 @@
 //   fake_worker hang-declaring <secs>          (D-04 S8: `hang` + a declared stop budget)
 //   fake_worker no-teardown-then-fatal <dir>   (1st spawn exits 76, later ones log + exit 78)
 //   fake_worker probe <dir> <script>           (GPU probe stand-in: `ok,hang,fail` per call)
+//   fake_worker restore <dir> <bind-addr> <spec>   (C27 respawn restore, see the fn)
 //
 // - "crash": raises a real, hardware-fault SIGSEGV immediately — not a
 //   software `raise()` or Rust's null-check panic->SIGABRT path, both of
@@ -71,6 +72,7 @@ mod unix {
             Some("hang-declaring") => hang_declaring(args.get(2)),
             Some("no-teardown-then-fatal") => no_teardown_then_fatal(args.get(2)),
             Some("probe") => probe(args.get(2), args.get(3)),
+            Some("restore") => restore(&args),
             other => {
                 eprintln!("fake_worker: unknown or missing behavior arg: {other:?}");
                 std::process::exit(2);
@@ -201,6 +203,51 @@ mod unix {
             + 1;
         let _ = std::fs::write(&counter, n.to_string());
         n
+    }
+
+    /// C27 respawn-restore scenario. Spawn k (counted in `<dir>/spawns`) records the
+    /// `RUSTEDVINO_RESTORE_MODELS` it was given in `<dir>/restore-<k>` (`-` when unset), then runs
+    /// the k-th `;`-separated step of `<spec>` (the last one repeats): `,`-separated actions
+    /// `ready=<id>` / `unloaded=<id>` / `started=<id>` / `preload=<id>` / `phase_start` /
+    /// `phase_done` (the progress lines the real worker writes),
+    /// then `exit=<code>` or `healthy` (serve `<addr>` until signalled; pid in `<dir>/pid`).
+    fn restore(args: &[String]) {
+        let (Some(dir), Some(addr), Some(spec)) = (args.get(2), args.get(3), args.get(4)) else {
+            std::process::exit(2);
+        };
+        let k = bump(dir, "spawns");
+        let given = std::env::var("RUSTEDVINO_RESTORE_MODELS").unwrap_or_else(|_| "-".to_owned());
+        let _ = std::fs::write(
+            std::path::Path::new(dir).join(format!("restore-{k}")),
+            given,
+        );
+        let steps: Vec<&str> = spec.split(';').collect();
+        let idx = usize::try_from(k).unwrap_or(usize::MAX).saturating_sub(1);
+        let step = steps.get(idx).or(steps.last()).copied().unwrap_or("exit=2");
+        for action in step.split(',') {
+            if let Some(id) = action.strip_prefix("ready=") {
+                progress_line(&format!("model_ready {id}\n"));
+            } else if let Some(id) = action.strip_prefix("unloaded=") {
+                progress_line(&format!("model_unloaded {id}\n"));
+            } else if let Some(id) = action.strip_prefix("started=") {
+                progress_line(&format!("restore_started {id}\n"));
+            } else if let Some(id) = action.strip_prefix("preload=") {
+                progress_line(&format!("preload_model {id}\n"));
+            } else if action == "phase_start" {
+                progress_line("preload_phase_started\n");
+            } else if action == "phase_done" {
+                progress_line("preload_phase_done\n");
+            } else if let Some(code) = action.strip_prefix("exit=") {
+                std::process::exit(code.parse().unwrap_or(2));
+            } else if action == "healthy" {
+                let _ = std::fs::write(
+                    std::path::Path::new(dir).join("pid"),
+                    std::process::id().to_string(),
+                );
+                healthy(Some(addr));
+            }
+        }
+        std::process::exit(2);
     }
 
     /// Readiness-probe scenario worker: the 1st spawn leaves without teardown (76); every later

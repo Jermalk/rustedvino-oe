@@ -83,6 +83,16 @@ const MAX_HISTORY_TURNS: usize = 20;
 // keeps LLM context cost bounded regardless of pool size.
 const MAX_CLIENT_HISTORY: usize = 200;
 
+/// Keeps the newest [`MAX_CLIENT_HISTORY`] entries of a retrieval pool. Applied
+/// wherever the pool grows: `config.history`, `inject_history`, `reload_history`
+/// and every completed turn (0.9.1 Q5: 0.9.0 skipped the cap for turns, so a long
+/// session grew the pool, and the admin snapshot copy of it, without bound).
+fn cap_retrieval_pool(entries: &mut Vec<ClientHistoryEntry>) {
+    if entries.len() > MAX_CLIENT_HISTORY {
+        entries.drain(..entries.len() - MAX_CLIENT_HISTORY);
+    }
+}
+
 // Embedding-based retrieval tuning.
 const MEMORY_SIM_THRESHOLD: f32 = 0.5;
 const MEMORY_TOP_K: usize = 3;
@@ -91,8 +101,9 @@ const MEMORY_TOP_K: usize = 3;
 // Rotated by turn_id % len so the response varies across turns.
 const STOP_RESPONSES: &[&str] = &["Calming down.", "Going shut up mode."];
 
-// Disconnect an idle client after this duration of no incoming audio.
-const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+// The idle timeout (no committed utterance; an inject/reload batch also
+// restarts it) is `AppState::realtime_idle_timeout`,
+// default `realtime_types::REALTIME_IDLE_TIMEOUT` (5 min).
 
 // ── Sentence splitter tuning ──────────────────────────────────────────────────
 // Don't split until the buffer has at least this many chars, so we don't chop
@@ -121,7 +132,9 @@ enum ClientEvent {
         language: Option<String>,
         stt_model: Option<String>,
         llm_model: Option<String>,
-        /// TTS model id (e.g. `"speecht5-tts-ov"`). Absent → text-only output.
+        /// TTS model id (e.g. `"speecht5-tts-ov"`). Absent → keep the current
+        /// choice (the resolver picks a loaded TTS model when none was named).
+        /// `""` → speech off for the session (0.9.1 Q11).
         tts_model: Option<String>,
         /// Voice name passed to `TtsHandle::synthesize` (e.g. `"af_nicole"`).
         tts_voice: Option<String>,
@@ -233,7 +246,8 @@ enum ServerEvent<'a> {
     /// mid-session re-resolve). STT/LLM/TTS all go through real
     /// server-side arbitration (`resolve_realtime_slot`) — `stt_source`/
     /// `tts_source` mirror `llm_source`'s vocabulary exactly, no longer a
-    /// plain echo of what was requested.
+    /// plain echo of what was requested. `tts_source` can also be `"off"`:
+    /// the client sent `"tts_model": ""` (0.9.1 Q11).
     ModelSelection {
         #[serde(skip_serializing_if = "Option::is_none")]
         stt_model: Option<&'a str>,
@@ -247,7 +261,8 @@ enum ServerEvent<'a> {
         /// `"requested"` | `"default"` | `"substituted"`.
         llm_source: &'a str,
         /// Machine-usable reason, present only when `llm_source !=
-        /// "requested"` or a background load was needed — e.g.
+        /// "requested"` (a granted request has none, even with a background
+        /// load: watch `model_loading` for that) — e.g.
         /// `"would_evict_protected"`, `"not_resident_no_headroom"`.
         #[serde(skip_serializing_if = "Option::is_none")]
         llm_reason: Option<&'a str>,
@@ -283,6 +298,11 @@ struct Session {
     stt_model: Option<String>,
     llm_model: Option<String>,
     tts_model: Option<String>,
+    /// The client turned speech off (`"tts_model": ""`, 0.9.1 Q11). Kept apart
+    /// from `tts_model`, which holds the *resolved* id: the resolver also
+    /// stores `""` when no TTS model could be chosen, and that must not read
+    /// as "off" on the next `config`.
+    tts_off: bool,
     tts_voice: Option<String>,
     language: Option<String>,
     /// System prompt prepended to every LLM turn. `None` = no system message.
@@ -301,6 +321,14 @@ struct Session {
     max_tokens: Option<u32>,
     /// Stop speaking after this many TTS sentences per turn. `None` → unlimited.
     max_sentences: Option<u32>,
+    /// D2: the ids this session has registered in the realtime serving set.
+    /// Changed only by [`swap_serving`], under the session lock, so a `config`
+    /// and a C1b clear cannot both deregister the same id.
+    registered_serving: Vec<String>,
+    /// Set by the session teardown, in the critical section that deregisters
+    /// `registered_serving`: from then on [`swap_serving`] and the C1b clear do
+    /// nothing, so a late watcher cannot re-register the session's ids.
+    closed: bool,
 }
 
 /// Minimal chat message serialisable into the chat template context.
@@ -727,8 +755,9 @@ fn unix_now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Return `true` if `transcript` contains `phrase` after both are normalised
-/// (lowercase, strip non-alphanumeric, collapse whitespace).
+/// Return `true` if `transcript` contains `phrase` as whole words after both
+/// are normalised (lowercase, strip non-alphanumeric, collapse whitespace):
+/// phrase "stop" matches "please stop now" but not "stopwatch" or "stopped".
 fn is_barge_in_phrase(transcript: &str, phrase: &str) -> bool {
     fn normalise(s: &str) -> String {
         s.chars()
@@ -741,7 +770,172 @@ fn is_barge_in_phrase(transcript: &str, phrase: &str) -> bool {
     }
     let norm_t = normalise(transcript);
     let norm_p = normalise(phrase);
-    !norm_p.is_empty() && norm_t.contains(&norm_p)
+    !norm_p.is_empty() && format!(" {norm_t} ").contains(&format!(" {norm_p} "))
+}
+
+/// `source` reported in `model_selection` when the client turned speech off.
+const TTS_OFF_SOURCE: &str = "off";
+
+/// `reason` reported in `model_selection` when no TTS model can serve the
+/// session (0.9.1 C1): speech is silent, `tts_model` is `""`.
+const TTS_NONE_AVAILABLE: &str = "none_available";
+
+/// The TTS resolution for a session no TTS model can serve: `tts_model: ""`
+/// (the field stays a string), `tts_source: "substituted"` (REALTIME.md: "also
+/// used when nothing could be chosen"), `tts_reason: "none_available"`.
+fn tts_none_available() -> crate::model_manager::RealtimeResolution {
+    crate::model_manager::RealtimeResolution {
+        model_id: String::new(),
+        source: "substituted",
+        reason: Some(TTS_NONE_AVAILABLE),
+        loading: false,
+    }
+}
+
+/// Resolve the TTS slot for a `config`. `off` (the client sent `"tts_model": ""`,
+/// [`Session::tts_off`]) turns speech off for the session (0.9.1 Q11): no TTS
+/// model is chosen or loaded, and replies are text only. Otherwise the resolver
+/// runs, also for a stored `""` it produced itself, and picks a loaded TTS model
+/// when none was named.
+///
+/// 0.9.1 C1: when the resolver names no model that
+/// is loaded, loading, or being loaded for this session — nothing requested and
+/// no TTS available; a configured default that is not loaded and does not fit;
+/// a named registered id without room; a named unknown id — the slot resolves
+/// to none ([`tts_none_available`]), so no sentence is attempted, warned about
+/// or counted dropped, and a default that cannot load is not stored for the
+/// session. Done here, not in the shared resolver, so the STT and LLM slots and
+/// the `request_model_load` reply (whose `failed` detail is the resolver's
+/// reason) are unchanged.
+fn resolve_tts_slot(
+    mm: &Arc<crate::model_manager::ModelManager>,
+    off: bool,
+    requested: Option<&str>,
+) -> crate::model_manager::RealtimeResolution {
+    if off {
+        return crate::model_manager::RealtimeResolution {
+            model_id: String::new(),
+            source: TTS_OFF_SOURCE,
+            reason: None,
+            loading: false,
+        };
+    }
+    let requested = requested.filter(|m| !m.is_empty());
+    let res = mm.resolve_realtime_slot(RealtimeSlot::Tts, requested);
+    if res.loading {
+        return res;
+    }
+    if res.model_id.is_empty() {
+        return tts_none_available();
+    }
+    // One read of the state (F1): a load finishing between two reads must not
+    // look like "neither loaded nor loading".
+    match mm.model_state(&res.model_id) {
+        Some(crate::model_manager::ModelState::Ready) => res,
+        // Already being loaded (by another session or `request_model_load`):
+        // a loading resolution for this session too, so it gets `model_loading`
+        // `started` and the load watcher (C1b covers a failure). Same values a
+        // loading resolution gets from the resolver today.
+        Some(crate::model_manager::ModelState::Loading) => {
+            let id = res.model_id.as_str();
+            let (source, reason) = if requested == Some(id) {
+                ("requested", None)
+            } else if mm.slot_default(RealtimeSlot::Tts).as_deref() == Some(id) {
+                ("default", Some("not_resident_no_headroom"))
+            } else {
+                // Another model picked for the session: keep the resolver's labels.
+                (res.source, res.reason)
+            };
+            crate::model_manager::RealtimeResolution {
+                source,
+                reason,
+                loading: true,
+                model_id: res.model_id,
+            }
+        }
+        _ => tts_none_available(),
+    }
+}
+
+/// A stored model id as a resolver request: `""` is no request.
+fn non_empty(id: Option<&String>) -> Option<&str> {
+    id.map(String::as_str).filter(|m| !m.is_empty())
+}
+
+/// The model ids a session depends on, for the D2 serving set. An empty id
+/// (speech off, or a slot nothing could fill) names no model.
+fn serving_ids(s: &Session) -> Vec<String> {
+    [
+        s.stt_model.clone(),
+        s.llm_model.clone(),
+        s.tts_model.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|m| !m.is_empty())
+    .collect()
+}
+
+/// D2: make the serving set match what `s` depends on now ([`serving_ids`]):
+/// deregister what it registered before, register the current ids, and record
+/// them. Called with the session lock held (the voice-pin calls take a short
+/// std lock and never await), so the old/new diff and the counts stay in step.
+///
+/// Registers the new set before deregistering the old one, so an id in both
+/// never drops to zero in between. Does nothing once the session is closed.
+fn swap_serving(s: &mut Session, voice_pin: &crate::voice_pin::VoicePinManager) {
+    if s.closed {
+        return;
+    }
+    let now = serving_ids(s);
+    voice_pin.register_serving(now.iter().map(String::as_str));
+    let before = std::mem::replace(&mut s.registered_serving, now);
+    voice_pin.deregister_serving(before.iter().map(String::as_str));
+}
+
+/// D2 at session teardown: mark the session closed and deregister what it
+/// registered, in one critical section (the caller holds the session lock), so
+/// a C1b clear that runs later is a no-op instead of re-registering its ids.
+fn close_serving(s: &mut Session, voice_pin: &crate::voice_pin::VoicePinManager) {
+    s.closed = true;
+    let registered = std::mem::take(&mut s.registered_serving);
+    voice_pin.deregister_serving(registered.iter().map(String::as_str));
+}
+
+/// Whether a session's model set may become the voice-flow pin: every id set.
+fn pinnable_voice_flow(stt: &str, llm: &str, tts: &str) -> bool {
+    !stt.is_empty() && !llm.is_empty() && !tts.is_empty()
+}
+
+/// What a trimmed STT transcript is, for the turn that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptKind {
+    /// Nothing was transcribed.
+    Empty,
+    /// The configured barge-in phrase matched.
+    BargeIn,
+    /// Fewer than [`MIN_TRANSCRIPT_WORDS`] words: Whisper hallucinates short
+    /// phrases ("Thank you.", "Hmm.") from ambient noise, so these are dropped.
+    TooShort,
+    /// A content turn for the LLM.
+    Content,
+}
+
+/// Content turns need at least this many words (see [`TranscriptKind::TooShort`]).
+const MIN_TRANSCRIPT_WORDS: usize = 3;
+
+/// Classify a trimmed transcript. The barge-in phrase is checked before the
+/// word-count filter, so a one- or two-word phrase can match (Q8a).
+fn classify_transcript(transcript: &str, barge_in_phrase: Option<&str>) -> TranscriptKind {
+    if transcript.is_empty() {
+        TranscriptKind::Empty
+    } else if barge_in_phrase.is_some_and(|p| is_barge_in_phrase(transcript, p)) {
+        TranscriptKind::BargeIn
+    } else if transcript.split_whitespace().count() < MIN_TRANSCRIPT_WORDS {
+        TranscriptKind::TooShort
+    } else {
+        TranscriptKind::Content
+    }
 }
 
 /// Cosine similarity between two equal-length float vectors.
@@ -848,6 +1042,73 @@ async fn send_audio(out: &OutTx, pcm16_bytes: Vec<u8>) {
     let _ = out.send(WsMsg::Binary(pcm16_bytes.into())).await;
 }
 
+/// The immediate answer to a `request_model_load` (0.9.1 Q3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadReply {
+    /// The model is loaded now.
+    Ready,
+    /// A load of the model is running; the watcher reports the end.
+    Started,
+    /// The model cannot be used; the reason code goes in `detail`.
+    Failed(&'static str),
+}
+
+/// Resolves `request_model_load` for `model_id` and decides the reply.
+///
+/// An id the server does not know is refused before the resolver runs: the
+/// resolver would otherwise substitute (or start loading the slot default) and
+/// the reply would carry that substitution's reason instead of `unknown_model`.
+fn request_model_load_reply(
+    mm: &Arc<crate::model_manager::ModelManager>,
+    model_id: &str,
+) -> LoadReply {
+    let Some(kind) = mm.known_model_kind(model_id) else {
+        return LoadReply::Failed("unknown_model");
+    };
+    let slot = match kind {
+        ModelKind::Stt => RealtimeSlot::Stt,
+        ModelKind::Tts => RealtimeSlot::Tts,
+        ModelKind::Embedding => RealtimeSlot::Embed,
+        _ => RealtimeSlot::Llm,
+    };
+    let resolution = mm.resolve_realtime_slot(slot, Some(model_id));
+    model_load_reply(
+        model_id,
+        &resolution,
+        mm.is_ready(model_id),
+        mm.is_loading(model_id),
+    )
+}
+
+/// Decides the reply to `request_model_load` for a known `requested` model.
+///
+/// The resolver's fallback steps name the requested id even when nothing is
+/// loaded or loading (to report what the session waits on), so "the resolver
+/// named it" alone is not "ready": 0.9.0 answered `ready` there, for a default
+/// that does not fit. `ready` now needs `ready_now`, the model's real state, and
+/// a model already loading is `started` even when the resolver, which counts its
+/// reservation against a second copy, would have substituted.
+fn model_load_reply(
+    requested: &str,
+    resolution: &crate::model_manager::RealtimeResolution,
+    ready_now: bool,
+    loading_now: bool,
+) -> LoadReply {
+    const CANNOT_FIT: &str = "not_resident_no_headroom";
+    if resolution.model_id == requested && resolution.loading {
+        return LoadReply::Started;
+    }
+    if ready_now {
+        return LoadReply::Ready;
+    }
+    if loading_now {
+        return LoadReply::Started;
+    }
+    // Not loaded and not loading: say why rather than load something else on
+    // the client's behalf (that is `config`'s job).
+    LoadReply::Failed(resolution.reason.unwrap_or(CANNOT_FIT))
+}
+
 /// D8: watches `model_id` until it becomes `Ready` (or the wait times out)
 /// and emits the matching `model_loading` completion event. Polling, not
 /// event-driven — `ModelManager` has no load-completion notification
@@ -855,10 +1116,23 @@ async fn send_audio(out: &OutTx, pcm16_bytes: Vec<u8>) {
 /// load from `resolve_realtime_llm`/`request_model_load` is genuinely in
 /// flight, never per-turn. `mm.is_ready` is a plain `HashMap` read behind a
 /// short-held `RwLock`, so polling it does not contend with the load itself.
+///
+/// The watcher stops when `shutdown` is cancelled (session end, 0.9.1 Q10):
+/// it holds an `out_tx` clone, and the sender task — so the socket — lives
+/// until every clone is dropped.
+///
+/// `tts_clear` (0.9.1 C1b) is set for the session's TTS load from a `config`:
+/// once the load is seen to have failed (from the second poll on, the model is
+/// neither ready nor loading), the session's TTS id is cleared to none
+/// ([`clear_failed_tts`]), so later sentences are not attempted, warned about
+/// or counted dropped. The events are unchanged: `failed` still comes when the
+/// watch window is up (REALTIME.md), and no second `model_selection` is sent.
 fn spawn_model_ready_watcher(
     mm: Arc<crate::model_manager::ModelManager>,
     model_id: String,
     out_tx: OutTx,
+    shutdown: tokio_util::sync::CancellationToken,
+    tts_clear: Option<TtsLoadFailClear>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     // Cold GPU load ceiling — matches the supervisor's own
@@ -866,8 +1140,25 @@ fn spawn_model_ready_watcher(
     const WATCH_TIMEOUT: Duration = Duration::from_secs(90);
     tokio::spawn(async move {
         let start = Instant::now();
+        let mut tts_clear = tts_clear;
         loop {
-            if mm.is_ready(&model_id) {
+            // One read per poll (F1): "ready" and "failed" come from the same state.
+            let state = mm.model_state(&model_id);
+            // C1b: not on the first poll, where the spawned load may not have
+            // marked the record `Loading` yet.
+            if start.elapsed() >= POLL_INTERVAL
+                && !matches!(
+                    state,
+                    Some(
+                        crate::model_manager::ModelState::Ready
+                            | crate::model_manager::ModelState::Loading
+                    )
+                )
+                && let Some(clear) = tts_clear.take()
+            {
+                clear_failed_tts(&clear, &model_id).await;
+            }
+            if state == Some(crate::model_manager::ModelState::Ready) {
                 send_event(
                     &out_tx,
                     &ServerEvent::ModelLoading {
@@ -891,10 +1182,65 @@ fn spawn_model_ready_watcher(
                 .await;
                 return;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
         }
     });
 }
+
+/// What [`spawn_model_ready_watcher`] needs to clear a session's TTS id when
+/// the TTS load it watches fails (0.9.1 C1b).
+struct TtsLoadFailClear {
+    session: Arc<tokio::sync::Mutex<Session>>,
+    session_snap: Arc<RwLock<SessionSnapshot>>,
+    voice_pin: Arc<crate::voice_pin::VoicePinManager>,
+    conn_id: u64,
+}
+
+/// C1b: the TTS load for `model_id` failed after the slot resolved to it with
+/// `loading: true` (C1 case 5). If the session still uses `model_id` (a later
+/// `config` may have changed it), its TTS id becomes `""` — the same effect as
+/// a `none_available` resolution from then on — in the session and the admin
+/// snapshot; the id leaves the D2 serving set (the next `config` computes what
+/// to deregister from the session, so it would never be removed otherwise);
+/// and one WARN names the model and the session. Returns whether it cleared
+/// (never for a closed session).
+async fn clear_failed_tts(clear: &TtsLoadFailClear, model_id: &str) -> bool {
+    const MSG: &str =
+        "realtime: TTS model failed to load — speech off for this session until the next config";
+    {
+        let mut s = clear.session.lock().await;
+        if s.closed || s.tts_model.as_deref() != Some(model_id) {
+            return false;
+        }
+        s.tts_model = Some(String::new());
+        swap_serving(&mut s, &clear.voice_pin);
+    }
+    let session_id = clear.session_snap.write().ok().map(|mut snap| {
+        snap.tts_model = Some(String::new());
+        snap.id
+    });
+    if let Some(session_id) = session_id {
+        tracing::warn!(conn_id = clear.conn_id, %session_id, model = %model_id, "{MSG}");
+    } else {
+        tracing::warn!(conn_id = clear.conn_id, model = %model_id, "{MSG}");
+    }
+    #[cfg(test)]
+    if let Ok(mut seen) = TTS_CLEARS.lock() {
+        *seen.entry(model_id.to_owned()).or_insert(0) += 1;
+    }
+    true
+}
+
+/// Completed C1b clears by [`clear_failed_tts`] (each logs its one WARN), by
+/// model id. A test that counts uses a model id of its own (tests run in
+/// parallel); a thread-local log capture races with tracing's process-wide
+/// callsite cache, so the clears are counted instead of log lines.
+#[cfg(test)]
+static TTS_CLEARS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Response pipeline
@@ -913,12 +1259,10 @@ async fn run_response(
     cancel_notify: &Notify,
     state: &AppState,
     ctx: &mut TurnCtx,
-    embed_handle: Option<&crate::embed_engine::EmbeddingHandle>,
+    embed_model: Option<&str>,
 ) -> (String, String) {
-    // Pipeline owns the cancel reset. The receiver task only ever sets it to
-    // true; resetting here (before any await) ensures the prior turn has
-    // fully exited before the flag is cleared.
-    cancel.store(false, Ordering::Release);
+    // The cancel reset is the caller's (`begin_turn`, in the session loop), so
+    // it can refuse to start a turn once the client is gone (0.9.1 Q9).
 
     // ── Cross-pipeline device admission (step 3) ─────────────────────────────
     // The turn's whole multi-device cost, acquired atomically before touching
@@ -933,13 +1277,13 @@ async fn run_response(
     // admission lease".
     let mm_ref = state.model_manager.as_ref();
     let stt_device = mm_ref
-        .zip(session.stt_model.as_deref())
+        .zip(session.stt_model.as_deref().filter(|m| !m.is_empty()))
         .map(|(mm, m)| mm.record_device(m));
     let llm_device = mm_ref
-        .zip(session.llm_model.as_deref())
+        .zip(session.llm_model.as_deref().filter(|m| !m.is_empty()))
         .map(|(mm, m)| mm.record_device(m));
     let tts_device = mm_ref
-        .zip(session.tts_model.as_deref())
+        .zip(session.tts_model.as_deref().filter(|m| !m.is_empty()))
         .map(|(mm, m)| mm.record_device(m));
     let mut turn_wants: Vec<(String, u32)> = Vec::new();
     for device in [&stt_device, &llm_device, &tts_device]
@@ -1038,32 +1382,15 @@ async fn run_response(
         transcript = %transcript,
         "realtime: stt transcript"
     );
-    if transcript.is_empty() {
-        ctx.transcript_empty = true;
-        tracing::debug!(
-            conn_id = ctx.conn_id,
-            turn_id = ctx.turn_id,
-            "realtime: empty transcript — skipping turn"
-        );
-        send_event(
-            out,
-            &ServerEvent::Done {
-                turn_id: ctx.turn_id,
-            },
-        )
-        .await;
-        return (String::new(), String::new());
-    }
-    // Whisper hallucinates short phrases ("Thank you.", "Hmm.", etc.) from
-    // ambient noise, especially at session start or during near-silence.
-    // Require at least 3 words before sending to the LLM.
-    if transcript.split_whitespace().count() < 3 {
+    let kind = classify_transcript(&transcript, session.barge_in_phrase.as_deref());
+    if matches!(kind, TranscriptKind::Empty | TranscriptKind::TooShort) {
         ctx.transcript_empty = true;
         tracing::debug!(
             conn_id = ctx.conn_id,
             turn_id = ctx.turn_id,
             transcript = %transcript,
-            "realtime: transcript too short — likely hallucination, skipping"
+            empty = kind == TranscriptKind::Empty,
+            "realtime: transcript empty or too short (likely hallucination), skipping turn"
         );
         send_event(
             out,
@@ -1075,13 +1402,12 @@ async fn run_response(
         return (String::new(), String::new());
     }
 
-    // ── Barge-in check ───────────────────────────────────────────────────────
-    // Must run after hallucination filter, before the cancel check and before
-    // sending the Transcript event (barge-in is a control interaction, not a
-    // content turn — the client gets Stopped instead of Transcript+Done).
-    if let Some(ref phrase) = session.barge_in_phrase
-        && is_barge_in_phrase(&transcript, phrase)
-    {
+    // ── Barge-in ─────────────────────────────────────────────────────────────
+    // Classified before the 3-word filter (Q8a), so a short phrase such as
+    // "stop" still matches. Runs before the cancel check and before the
+    // Transcript event (barge-in is a control interaction, not a content turn —
+    // the client gets Stopped instead of Transcript+Done).
+    if kind == TranscriptKind::BargeIn {
         ctx.cancel_stage = "barge_in";
         // Anchor tts timing so settle_tts_timing can compute tts_first_ms.
         ctx.llm_start = Some(Instant::now());
@@ -1139,7 +1465,7 @@ async fn run_response(
         cancel_notify,
         state,
         ctx,
-        embed_handle,
+        embed_model,
     )
     .await
     {
@@ -1152,7 +1478,8 @@ async fn run_response(
                 err = %e,
                 "realtime: llm error"
             );
-            let message = gpu_poison_client_message(state, session.llm_model.as_deref(), &e)
+            let message = stalled_client_message(&e)
+                .or_else(|| gpu_poison_client_message(state, session.llm_model.as_deref(), &e))
                 .unwrap_or_else(|| e.to_string());
             send_event(
                 out,
@@ -1180,6 +1507,17 @@ async fn run_response(
 /// process, exactly as on the HTTP routes: flag it so the supervisor restarts the worker at once
 /// (instead of the server serving a dead GPU until the next request trips over it), and return the
 /// message to send the client. The raw C++ diagnostics are never put on the wire for it (T6.2).
+/// The client text for an LLM turn ended by the engine stall watchdog (0.9.1 S1, review F7): a
+/// plain sentence, not the internal marker.
+fn stalled_client_message(err: &anyhow::Error) -> Option<String> {
+    crate::stall_watch::is_generation_stalled_error(&err.to_string())
+        .then(|| REALTIME_STALLED_MESSAGE.to_owned())
+}
+
+/// What a realtime client is told when the model's engine stalled during its turn.
+const REALTIME_STALLED_MESSAGE: &str =
+    "the model stopped responding and was taken out of service; the server needs a restart";
+
 fn gpu_poison_client_message(
     state: &AppState,
     model: Option<&str>,
@@ -1211,9 +1549,12 @@ async fn run_stt(
     let handle = mm
         .get_stt_handle(model)
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let t = handle
-        .transcribe(wav_bytes, session.language.clone(), false)
-        .await?;
+    // FM-3: the same normalisation as the HTTP routes (`pl-PL` -> `pl`, `auto` -> detect).
+    let language = match session.language.as_deref() {
+        None => None,
+        Some(raw) => crate::pipelines::stt::normalize_language(raw).map_err(anyhow::Error::msg)?,
+    };
+    let t = handle.transcribe(wav_bytes, language, false).await?;
     Ok(t.text)
 }
 
@@ -1228,7 +1569,7 @@ async fn run_llm_tts(
     cancel_notify: &Notify,
     state: &AppState,
     ctx: &mut TurnCtx,
-    embed_handle: Option<&crate::embed_engine::EmbeddingHandle>,
+    embed_model: Option<&str>,
 ) -> anyhow::Result<String> {
     let Some(mm) = state.model_manager.as_ref() else {
         // No-GPU test path — emit one canned text event and done.
@@ -1250,18 +1591,17 @@ async fn run_llm_tts(
         .ok_or_else(|| anyhow::anyhow!("no LLM model configured — send a config event first"))?;
 
     let chat_ctx = mm
-        .get_chat_context(llm_model)
+        .get_chat_context_for_request(llm_model)
+        .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Retrieve relevant past context via embedding similarity (if available).
-    let memories: Vec<&ClientHistoryEntry> = if let Some(handle) = embed_handle {
-        if session.history_entries.is_empty() {
-            Vec::new()
-        } else {
-            retrieve_memories(user_text, &session.history_entries, handle).await
+    // The handle is fetched for this lookup only and dropped right after it (Q6).
+    let memories: Vec<&ClientHistoryEntry> = match embedding_handle_for(state, embed_model) {
+        Some(handle) if !session.history_entries.is_empty() => {
+            retrieve_memories(user_text, &session.history_entries, &handle).await
         }
-    } else {
-        Vec::new()
+        _ => Vec::new(),
     };
 
     let policy = VoicePolicy::from_parser(chat_ctx.reasoning_parser.as_ref());
@@ -1308,23 +1648,34 @@ async fn run_llm_tts(
     });
 
     let (token_tx, token_rx) = stream_channel();
-    let gen_params = GenParams {
+    // 0.9.1 V5b: realtime follows the model's sampling profile (operator `sampling`
+    // over its generation_config.json over greedy + penalty 1.1). A voice turn has
+    // no client sampling fields and no tools, so the profile applies as is.
+    let mut gen_params = GenParams {
         max_new_tokens: session.max_tokens.map_or(VOICE_MAX_TOKENS, |n| n as usize),
-        temperature: None,
-        top_p: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        // Same safety net chat/completions get — a realtime voice turn has no
-        // per-request override surface, so it always gets the default.
-        repetition_penalty: Some(crate::handlers::chat::DEFAULT_REPETITION_PENALTY),
-        seed: None,
-        stop: vec![],
-        json_schema: None,
-        // No per-request override surface on a voice turn; engine default.
-        top_k: None,
+        ..GenParams::default()
     };
+    crate::handlers::chat::apply_sampling_profile(
+        &mut gen_params,
+        crate::handlers::chat::ClientSampling::default(),
+        false,
+        &chat_ctx.sampling,
+        chat_ctx.handle.is_npu(),
+        llm_model,
+    );
+    let gen_params = gen_params;
 
     ctx.llm_start = Some(Instant::now());
+    // 0.9.1 S1: the same engine stall verdict as the HTTP routes reaches this turn's channel; it
+    // arrives as the stream's error, which the caller sends as `error{stage:"llm"}` + `done`.
+    if let Some(liveness) = chat_ctx.handle.liveness() {
+        liveness.register(
+            &token_tx,
+            &format!("realtime-{}-{}", ctx.conn_id, ctx.turn_id),
+            llm_model,
+            mm,
+        );
+    }
     match chat_ctx.handle {
         EngineHandleKind::TextGen(engine) => {
             let mut prompt = crate::prompt_builder::build_prompt(
@@ -1339,6 +1690,14 @@ async fn run_llm_tts(
             if let Some(pf) = policy.channel_prefill {
                 prompt.push_str(pf);
             }
+            // 0.9.1 V1-usage: the engine's reasoning count (`rustedvino_reasoning_tokens_total`)
+            // uses the same split as the chat route. Thinking is disabled here, so it is
+            // normally 0.
+            let mut gen_params = gen_params;
+            gen_params.reasoning = crate::prompt_builder::ReasoningSplit::new(
+                chat_ctx.reasoning_parser,
+                crate::prompt_builder::prompt_ends_in_thinking(&prompt),
+            );
             match engine
                 .add_request(
                     next_request_id(),
@@ -1431,9 +1790,7 @@ async fn run_llm_tts(
                     vlm_messages,
                     vec![],
                     None,
-                    // No extra template context on the realtime voice path —
-                    // it has no `enable_thinking` request field of its own.
-                    None,
+                    Some(voice_vlm_template_context()),
                     gen_params,
                     token_tx,
                     Instant::now(),
@@ -1537,6 +1894,89 @@ async fn early_done(out: &OutTx, ctx: &mut TurnCtx, full_text: String) -> anyhow
     Ok(full_text)
 }
 
+/// End a cancelled turn: cancel telemetry and `done`. Returns an empty reply,
+/// so the caller records nothing: a cancelled exchange does not enter the
+/// history, and no `turn_history` is sent (0.9.1 Q1).
+///
+/// `cancel_stage` is the telemetry field: `"llm"` or `"tts"`.
+async fn cancelled_done(
+    out: &OutTx,
+    ctx: &mut TurnCtx,
+    cancel_stage: &'static str,
+) -> anyhow::Result<String> {
+    ctx.cancel_stage = cancel_stage;
+    tracing::debug!(
+        conn_id = ctx.conn_id,
+        turn_id = ctx.turn_id,
+        stage = ctx.cancel_stage,
+        "realtime: cancel took effect — drain stopped"
+    );
+    settle_tts_timing(ctx);
+    emit_turn_telemetry(ctx);
+    counter!("rustedvino_realtime_turns_total", "result" => "cancelled").increment(1);
+    send_event(
+        out,
+        &ServerEvent::Done {
+            turn_id: ctx.turn_id,
+        },
+    )
+    .await;
+    Ok(String::new())
+}
+
+/// Where final reply text goes: the client, and the session's TTS.
+struct Emit<'a> {
+    out: &'a OutTx,
+    session: &'a Session,
+    state: &'a AppState,
+    cancel: &'a AtomicBool,
+    cancel_notify: &'a Notify,
+}
+
+/// Count one content piece of the reply: TTFT at the first, `llm_tokens` for each. Called as a
+/// piece arrives, also while gpt-oss's channel prefix is still buffered (C4), so TTFT is the first
+/// content piece and buffered pieces are not undercounted.
+fn note_content_piece(ctx: &mut TurnCtx) {
+    if ctx.llm_tokens == 0 {
+        ctx.llm_ttft_ms = ctx.llm_start.map_or(0, |t| to_ms(t.elapsed()));
+    }
+    ctx.llm_tokens += 1;
+}
+
+/// Send one final piece of reply text: a `text` event, the full text, and the sentence splitter
+/// (a finished sentence goes to TTS). One path for the streaming arm and for what is flushed at
+/// `Done`, so a reply that ends inside a buffer is sent as text too (C4: a gpt-oss reply of 10
+/// bytes or less was spoken but never sent). `true` when the sentence cap ended the turn.
+async fn emit_content(
+    text: &str,
+    full_text: &mut String,
+    splitter: &mut SentenceSplitter,
+    emit: &Emit<'_>,
+    ctx: &mut TurnCtx,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    send_event(emit.out, &ServerEvent::Text { content: text }).await;
+    full_text.push_str(text);
+    if let Some(sentence) = splitter.push(text)
+        && !emit.cancel.load(Ordering::Acquire)
+    {
+        synthesize_and_send(
+            &sentence,
+            emit.session,
+            emit.out,
+            emit.state,
+            ctx,
+            emit.cancel,
+            emit.cancel_notify,
+        )
+        .await;
+        return sentence_cap_reached(emit.session, ctx);
+    }
+    false
+}
+
 /// Drain the LLM token stream, apply thinking-mode filter, split into sentences
 /// for TTS, and emit text events. Returns the full assistant text.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -1552,6 +1992,13 @@ async fn drain_voice_tokens(
 ) -> anyhow::Result<String> {
     let mut splitter = SentenceSplitter::new();
     let mut think_filter = ThinkFilter::default();
+    let emit = Emit {
+        out,
+        session,
+        state,
+        cancel,
+        cancel_notify,
+    };
     let mut full_text = String::new();
     // Buffer the first ≤10 content chars to detect and strip a leaked channel
     // name prefix (only active when the policy requests it, i.e. gpt-oss).
@@ -1565,24 +2012,8 @@ async fn drain_voice_tokens(
     loop {
         if cancel.load(Ordering::Acquire) {
             // Dropping token_rx closes the channel → CB engine cancels generation.
-            ctx.cancel_stage = if ctx.tts_sentences > 0 { "tts" } else { "llm" };
-            tracing::debug!(
-                conn_id = ctx.conn_id,
-                turn_id = ctx.turn_id,
-                stage = ctx.cancel_stage,
-                "realtime: cancel took effect — drain stopped"
-            );
-            settle_tts_timing(ctx);
-            emit_turn_telemetry(ctx);
-            counter!("rustedvino_realtime_turns_total", "result" => "cancelled").increment(1);
-            send_event(
-                out,
-                &ServerEvent::Done {
-                    turn_id: ctx.turn_id,
-                },
-            )
-            .await;
-            break;
+            let at = if ctx.tts_sentences > 0 { "tts" } else { "llm" };
+            return cancelled_done(out, ctx, at).await;
         }
         match token_rx.recv().await {
             // `new_tokens` (real per-event token count) is not threaded into
@@ -1597,6 +2028,8 @@ async fn drain_voice_tokens(
                 for piece in think_filter.process(&delta) {
                     match piece {
                         ThinkPiece::Content(text) => {
+                            // Counted as it arrives, also while gpt-oss's prefix is buffered (C4).
+                            note_content_piece(ctx);
                             // For gpt-oss: buffer until prefix determination is settled.
                             let text = if let Some(ref mut buf) = prefix_buf {
                                 buf.push_str(&text);
@@ -1616,29 +2049,9 @@ async fn drain_voice_tokens(
                             } else {
                                 text
                             };
-                            // Record TTFT on first content token.
-                            if ctx.llm_tokens == 0 {
-                                ctx.llm_ttft_ms = ctx.llm_start.map_or(0, |t| to_ms(t.elapsed()));
-                            }
-                            ctx.llm_tokens += 1;
-                            send_event(out, &ServerEvent::Text { content: &text }).await;
-                            full_text.push_str(&text);
-                            if let Some(sentence) = splitter.push(&text)
-                                && !cancel.load(Ordering::Acquire)
+                            if emit_content(&text, &mut full_text, &mut splitter, &emit, ctx).await
                             {
-                                synthesize_and_send(
-                                    &sentence,
-                                    session,
-                                    out,
-                                    state,
-                                    ctx,
-                                    cancel,
-                                    cancel_notify,
-                                )
-                                .await;
-                                if sentence_cap_reached(session, ctx) {
-                                    return early_done(out, ctx, full_text).await;
-                                }
+                                return early_done(out, ctx, full_text).await;
                             }
                         }
                         ThinkPiece::Reasoning(_) => {
@@ -1650,49 +2063,20 @@ async fn drain_voice_tokens(
             }
             Some(StreamEvent::Done(_)) => {
                 // Flush any buffered prefix — short responses may never exceed 10 chars.
+                // Its pieces were counted as they arrived; sent like any other content (C4).
                 if let Some(buf) = prefix_buf.take() {
                     let (clean, _) = strip_gpt_oss_channel_prefix(&buf);
-                    if !clean.is_empty() {
-                        full_text.push_str(clean);
-                        if let Some(sentence) = splitter.push(clean)
-                            && !cancel.load(Ordering::Acquire)
-                        {
-                            synthesize_and_send(
-                                &sentence,
-                                session,
-                                out,
-                                state,
-                                ctx,
-                                cancel,
-                                cancel_notify,
-                            )
-                            .await;
-                            if sentence_cap_reached(session, ctx) {
-                                return early_done(out, ctx, full_text).await;
-                            }
-                        }
+                    if emit_content(clean, &mut full_text, &mut splitter, &emit, ctx).await {
+                        return early_done(out, ctx, full_text).await;
                     }
                 }
                 for piece in think_filter.flush() {
                     match piece {
                         ThinkPiece::Content(text) => {
-                            full_text.push_str(&text);
-                            if let Some(sentence) = splitter.push(&text)
-                                && !cancel.load(Ordering::Acquire)
+                            note_content_piece(ctx);
+                            if emit_content(&text, &mut full_text, &mut splitter, &emit, ctx).await
                             {
-                                synthesize_and_send(
-                                    &sentence,
-                                    session,
-                                    out,
-                                    state,
-                                    ctx,
-                                    cancel,
-                                    cancel_notify,
-                                )
-                                .await;
-                                if sentence_cap_reached(session, ctx) {
-                                    return early_done(out, ctx, full_text).await;
-                                }
+                                return early_done(out, ctx, full_text).await;
                             }
                         }
                         ThinkPiece::Reasoning(_) => {
@@ -1708,6 +2092,15 @@ async fn drain_voice_tokens(
                     if sentence_cap_reached(session, ctx) {
                         return early_done(out, ctx, full_text).await;
                     }
+                }
+                // A cancel that landed while the last sentences were spoken still
+                // cancels the turn: the client stopped the reply (0.9.1 Q1). The LLM
+                // had finished, so the stage is `tts` even with speech off.
+                // KNOWN TEST GAP (Fable review, 2026-11-07): no test reaches this
+                // check — with no TTS seam, nothing yields between `Done` and here
+                // for a test to set the flag in. Verified by reading.
+                if cancel.load(Ordering::Acquire) {
+                    return cancelled_done(out, ctx, "tts").await;
                 }
                 // Finalise timing fields before emitting telemetry.
                 settle_tts_timing(ctx);
@@ -1726,9 +2119,25 @@ async fn drain_voice_tokens(
                 .await;
                 break;
             }
-            Some(StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_)) => {}
+            Some(
+                StreamEvent::PromptTokens(_)
+                | StreamEvent::CompletionTokens(_)
+                | StreamEvent::ReasoningTokens(_),
+            ) => {}
             Some(StreamEvent::Error(e)) => return Err(anyhow::anyhow!("{e}")),
-            None => break,
+            // The engine closed the stream without a final event: it dropped a
+            // request whose channel was full, or its terminal pair was lost to a
+            // full channel. The reply is cut off, so this is an LLM error (the
+            // caller sends `error` + `done` and records no turn), not a finish
+            // (0.9.1 Q4; 0.9.0 sent no `done` and kept the cut-off text).
+            // A cancel that landed while `recv` was pending wins: the loop top
+            // takes the cancelled path (its telemetry, `done`, `result=cancelled`).
+            None if cancel.load(Ordering::Acquire) => {}
+            None => {
+                return Err(anyhow::anyhow!(
+                    "the LLM stream ended without a finish; the reply was cut off"
+                ));
+            }
         }
     }
     Ok(full_text)
@@ -1785,7 +2194,11 @@ fn emit_turn_telemetry(ctx: &TurnCtx) {
 /// configured language (`Session.language`), reused here rather than adding
 /// a second language field.
 fn sanitize_for_tts(text: &str, lang: Option<&str>) -> String {
-    let normalized = crate::tts_normalize::normalize_for_speech(text, lang);
+    // Unicode spaces become plain ones before anything reads the text (0.9.1 C6). Belt and
+    // braces: `normalize_for_speech` already folds all whitespace to plain spaces, so this
+    // keeps the mapping when that internal detail changes.
+    let text = crate::tts_normalize::plain_spaces(text);
+    let normalized = crate::tts_normalize::normalize_for_speech(&text, lang);
     let cleaned: String = normalized
         .chars()
         .filter(|c| !matches!(c, '*' | '_' | '#' | '`' | '~' | '|') && !is_emoji(*c))
@@ -1828,7 +2241,8 @@ async fn synthesize_and_send(
     let Some(mm) = state.model_manager.as_ref() else {
         return;
     };
-    let Some(tts_model) = session.tts_model.as_deref() else {
+    // `""` is speech off (0.9.1 Q11): no TTS call, no dropped-sentence count.
+    let Some(tts_model) = session.tts_model.as_deref().filter(|m| !m.is_empty()) else {
         return;
     };
 
@@ -1962,6 +2376,7 @@ async fn apply_client_config(
         s.llm_model = Some(v);
     }
     if let Some(v) = tts_model {
+        s.tts_off = v.is_empty();
         s.tts_model = Some(v);
     }
     if let Some(v) = tts_voice {
@@ -1985,9 +2400,7 @@ async fn apply_client_config(
     }
     if let Some(mut entries) = history {
         // Trim to cap — keep the most recent entries.
-        if entries.len() > MAX_CLIENT_HISTORY {
-            entries.drain(..entries.len() - MAX_CLIENT_HISTORY);
-        }
+        cap_retrieval_pool(&mut entries);
         // Rebuild the LLM context window from the most recent turns.
         let start = entries.len().saturating_sub(MAX_HISTORY_TURNS);
         s.history = entries[start..]
@@ -2007,6 +2420,203 @@ async fn apply_client_config(
             .collect();
         s.history_entries = entries;
     }
+}
+
+/// Texts per embedding batch sent by the realtime session (pool back-fill,
+/// `inject_history`, `reload_history`). `EmbeddingHandle::embed` has no input or
+/// token cap of its own (those live in the `/v1/embeddings` handler), so a pool of
+/// 200 long entries is never sent as one padded batch.
+const EMBED_CHUNK_TEXTS: usize = 32;
+
+/// Turns the pool back-fill is skipped for after one of its batches failed.
+const BACKFILL_BACKOFF_TURNS: u64 = 5;
+
+/// Embeds `texts` in chunks of [`EMBED_CHUNK_TEXTS`], in order. Stops at the first
+/// chunk that fails (logged): returns the vectors of the chunks before it (a prefix
+/// of `texts`) and `false`; `true` when every chunk succeeded.
+async fn embed_in_chunks(
+    handle: &crate::embed_engine::EmbeddingHandle,
+    texts: Vec<String>,
+    conn_id: u64,
+) -> (Vec<Vec<f32>>, bool) {
+    let total = texts.len();
+    let mut vectors = Vec::with_capacity(total);
+    for chunk in texts.chunks(EMBED_CHUNK_TEXTS) {
+        match handle.embed(chunk.to_vec()).await {
+            Ok(output) if output.vectors.len() == chunk.len() => vectors.extend(output.vectors),
+            Ok(output) => {
+                tracing::warn!(
+                    conn_id,
+                    model = handle.model_id(),
+                    expected = chunk.len(),
+                    got = output.vectors.len(),
+                    "realtime: embedding batch returned the wrong number of vectors"
+                );
+                return (vectors, false);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_id,
+                    model = handle.model_id(),
+                    error = ?e,
+                    embedded = vectors.len(),
+                    total,
+                    "realtime: embedding batch failed; the rest of the history stays unembedded"
+                );
+                return (vectors, false);
+            }
+        }
+    }
+    (vectors, true)
+}
+
+/// `true` when `entry` must be embedded by the session's model `model`: it has no
+/// vector, or its vector comes from another model (vectors from different models
+/// cannot be compared, so retrieval skips such an entry until it is re-embedded).
+/// A vector with no recorded model is kept as it is.
+fn needs_embedding(entry: &ClientHistoryEntry, model: &str) -> bool {
+    entry.embedding.is_none() || entry.embedding_model.as_deref().is_some_and(|m| m != model)
+}
+
+/// Which pool entry a back-fill vector belongs to: its position when the batch was
+/// read, plus enough of the entry to tell whether it is still there.
+struct BackfillKey {
+    index: usize,
+    user: String,
+    assistant: String,
+    timestamp: u64,
+}
+
+/// Applies back-fill `vectors` from `model` to `pool`, one per key, and returns the
+/// entries that got one (for the `turn_history` echo). A key whose position now
+/// holds another entry, or one that no longer needs embedding, is skipped: the pool
+/// can be replaced (`config.history`) while the batch is being embedded.
+fn apply_backfill(
+    pool: &mut [ClientHistoryEntry],
+    keys: &[BackfillKey],
+    vectors: Vec<Vec<f32>>,
+    model: &str,
+) -> Vec<ClientHistoryEntry> {
+    keys.iter()
+        .zip(vectors)
+        .filter_map(|(key, vector)| {
+            let entry = pool.get_mut(key.index)?;
+            let same = entry.user == key.user
+                && entry.assistant == key.assistant
+                && entry.timestamp == key.timestamp;
+            if !same || !needs_embedding(entry, model) {
+                return None;
+            }
+            entry.embedding = Some(vector);
+            entry.embedding_model = Some(model.to_owned());
+            Some(entry.clone())
+        })
+        .collect()
+}
+
+/// Embeds the pool entries that [`needs_embedding`] for `handle`'s model, then echoes
+/// each one as a `turn_history` with `turn_id: null` so the client can store the
+/// vector. Runs at connect and at every turn start (0.9.1 Q7); a scan of at most
+/// [`MAX_CLIENT_HISTORY`] entries when nothing is missing.
+///
+/// Returns `false` when an embedding batch failed (the entries before it are still
+/// applied), so the caller can back off instead of paying a failing batch every turn.
+async fn backfill_embeddings(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    session_snap: &Arc<RwLock<SessionSnapshot>>,
+    out: &OutTx,
+    handle: &crate::embed_engine::EmbeddingHandle,
+    conn_id: u64,
+) -> bool {
+    let model = handle.model_id().to_owned();
+    let (texts, keys): (Vec<String>, Vec<BackfillKey>) = {
+        let guard = session.lock().await;
+        guard
+            .history_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| needs_embedding(e, &model))
+            .map(|(index, e)| {
+                (
+                    format!("{}\n{}", e.user, e.assistant),
+                    BackfillKey {
+                        index,
+                        user: e.user.clone(),
+                        assistant: e.assistant.clone(),
+                        timestamp: e.timestamp,
+                    },
+                )
+            })
+            .unzip()
+    };
+    if texts.is_empty() {
+        return true;
+    }
+    let (vectors, complete) = embed_in_chunks(handle, texts, conn_id).await;
+    let (embedded, pool) = {
+        let mut guard = session.lock().await;
+        let embedded = apply_backfill(&mut guard.history_entries, &keys, vectors, &model);
+        (embedded, guard.history_entries.clone())
+    };
+    if embedded.is_empty() {
+        return complete;
+    }
+    if let Ok(mut snap) = session_snap.write() {
+        snap.history_entries = pool;
+    }
+    for e in &embedded {
+        send_event(
+            out,
+            &ServerEvent::TurnHistory {
+                turn_id: None,
+                user: &e.user,
+                assistant: &e.assistant,
+                embedding: e.embedding.clone(),
+                timestamp: e.timestamp,
+                embedding_model: Some(model.as_str()),
+                stt_model: None,
+                llm_model: None,
+            },
+        )
+        .await;
+    }
+    complete
+}
+
+/// A handle for the session's embedding model `model`, for one use: callers drop
+/// it when that use ends. `None` when there is no model, no model manager, or the
+/// model is not loaded as an embedding model.
+fn embedding_handle_for(
+    state: &AppState,
+    model: Option<&str>,
+) -> Option<crate::embed_engine::EmbeddingHandle> {
+    state
+        .model_manager
+        .as_ref()?
+        .get_embedding_handle(model?)
+        .ok()
+}
+
+/// Adds a completed turn to both histories and returns the retrieval pool (a copy, for the
+/// admin snapshot). The pool is capped like every other way of filling it (0.9.1 Q5); the
+/// rolling LLM context keeps the last [`MAX_HISTORY_TURNS`] exchanges.
+fn record_completed_turn(s: &mut Session, entry: ClientHistoryEntry) -> Vec<ClientHistoryEntry> {
+    let (user, assistant) = (entry.user.clone(), entry.assistant.clone());
+    s.history_entries.push(entry);
+    cap_retrieval_pool(&mut s.history_entries);
+    // Trim the oldest turn pair when the LLM context cap is reached.
+    if s.history.len() >= MAX_HISTORY_TURNS * 2 {
+        s.history.drain(..2);
+    }
+    s.history.push(RtMessage {
+        role: "user".to_owned(),
+        content: user,
+    });
+    s.history.push(RtMessage {
+        role: "assistant".to_owned(),
+        content: assistant,
+    });
+    s.history_entries.clone()
 }
 
 /// Handle an `InjectHistory` batch from the client.
@@ -2029,15 +2639,14 @@ async fn handle_inject_history(
         let (texts, indices): (Vec<String>, Vec<usize>) = entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.embedding.is_none())
+            .filter(|(_, e)| needs_embedding(e, handle.model_id()))
             .map(|(i, e)| (format!("{}\n{}", e.user, e.assistant), i))
             .unzip();
-        if !texts.is_empty()
-            && let Ok(output) = handle.embed(texts).await
-        {
-            for (&idx, vec) in indices.iter().zip(output.vectors.iter()) {
+        if !texts.is_empty() {
+            let vectors = embed_in_chunks(handle, texts, conn_id).await.0;
+            for (&idx, vec) in indices.iter().zip(vectors) {
                 if let Some(e) = entries.get_mut(idx) {
-                    e.embedding = Some(vec.clone());
+                    e.embedding = Some(vec);
                     e.embedding_model = Some(handle.model_id().to_owned());
                 }
             }
@@ -2050,10 +2659,7 @@ async fn handle_inject_history(
         for entry in entries {
             guard.history_entries.push(entry);
         }
-        if guard.history_entries.len() > MAX_CLIENT_HISTORY {
-            let overflow = guard.history_entries.len() - MAX_CLIENT_HISTORY;
-            guard.history_entries.drain(..overflow);
-        }
+        cap_retrieval_pool(&mut guard.history_entries);
         guard.history_entries.clone()
     };
 
@@ -2107,15 +2713,14 @@ async fn handle_reload_history(
         let (texts, indices): (Vec<String>, Vec<usize>) = entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.embedding.is_none())
+            .filter(|(_, e)| needs_embedding(e, handle.model_id()))
             .map(|(i, e)| (format!("{}\n{}", e.user, e.assistant), i))
             .unzip();
-        if !texts.is_empty()
-            && let Ok(output) = handle.embed(texts).await
-        {
-            for (&idx, vec) in indices.iter().zip(output.vectors.iter()) {
+        if !texts.is_empty() {
+            let vectors = embed_in_chunks(handle, texts, conn_id).await.0;
+            for (&idx, vec) in indices.iter().zip(vectors) {
                 if let Some(e) = entries.get_mut(idx) {
-                    e.embedding = Some(vec.clone());
+                    e.embedding = Some(vec);
                     e.embedding_model = Some(handle.model_id().to_owned());
                 }
             }
@@ -2129,10 +2734,7 @@ async fn handle_reload_history(
         for entry in entries {
             guard.history_entries.push(entry);
         }
-        if guard.history_entries.len() > MAX_CLIENT_HISTORY {
-            let overflow = guard.history_entries.len() - MAX_CLIENT_HISTORY;
-            guard.history_entries.drain(..overflow);
-        }
+        cap_retrieval_pool(&mut guard.history_entries);
         guard.history_entries.clone()
     };
 
@@ -2149,12 +2751,16 @@ async fn handle_reload_history(
 
 /// WebSocket receiver task: reads frames, runs VAD, routes Config/Cancel events.
 /// Dropping `audio_tx` at exit signals the pipeline to shut down.
+///
+/// Returns the frame stream, so the session teardown can read the client's
+/// close reply after a server-initiated close (0.9.1 C5) — and, after a close
+/// the client began, let the WebSocket flush its automatic close reply.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn run_receiver(
+async fn run_receiver<S>(
     // Generic over the frame stream (not the concrete `SplitStream<WebSocket>`)
     // so unit tests can drive it with a mock stream. The real call site passes a
     // `SplitStream<WebSocket>`, which satisfies these bounds.
-    mut stream: impl futures_util::Stream<Item = Result<WsMsg, axum::Error>> + Unpin + Send,
+    mut stream: S,
     out_tx: OutTx,
     cancel: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
@@ -2172,7 +2778,10 @@ async fn run_receiver(
     // no-op, unchanged from pre-D5 behavior.
     model_manager: Option<Arc<crate::model_manager::ModelManager>>,
     voice_pin: Arc<crate::voice_pin::VoicePinManager>,
-) {
+) -> S
+where
+    S: futures_util::Stream<Item = Result<WsMsg, axum::Error>> + Unpin + Send,
+{
     let mut vad = EnergyVad::new();
     let mut speech_start: Option<Instant> = None;
     // NEW-H(A): suppress the per-drop "pipeline busy" Error storm. During a barge-in
@@ -2215,8 +2824,8 @@ async fn run_receiver(
                                 "realtime: speech ended"
                             );
                             send_event(&out_tx, &ServerEvent::SpeechStopped).await;
-                            // The pipeline resets the cancel flag at utterance start
-                            // — the receiver only ever sets it to true.
+                            // The session loop resets the cancel flag at turn start
+                            // (`begin_turn`) — the receiver only ever sets it to true.
                             // try_send keeps this task live for Cancel events even
                             // when the pipeline is backlogged.
                             let utterance = UtteranceCtx {
@@ -2271,22 +2880,6 @@ async fn run_receiver(
                     max_tokens,
                     max_sentences,
                 }) => {
-                    // D2: snapshot what this session currently depends on
-                    // *before* applying the new config, so the serving-set
-                    // update below can deregister exactly what's being
-                    // replaced (not everything, not nothing).
-                    let old_serving: Vec<String> = {
-                        let s = session.lock().await;
-                        [
-                            s.stt_model.clone(),
-                            s.llm_model.clone(),
-                            s.tts_model.clone(),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect()
-                    };
-
                     apply_client_config(
                         &session,
                         language,
@@ -2310,23 +2903,33 @@ async fn run_receiver(
                     // with the *resolved* ids, not the raw request —
                     // mock/test mode (no model_manager) leaves them as
                     // literally requested, unchanged from pre-D5 behavior.
-                    let (requested_stt, requested_llm, requested_tts) = {
+                    let (requested_stt, requested_llm, requested_tts, tts_off) = {
                         let s = session.lock().await;
                         (
                             s.stt_model.clone(),
                             s.llm_model.clone(),
                             s.tts_model.clone(),
+                            s.tts_off,
                         )
                     };
+                    // A stored `""` (the resolver found nothing last time) is no
+                    // request: resolving it as one would report a reason such as
+                    // `would_evict_protected` for a model nobody asked for.
                     let stt_resolution = model_manager.as_ref().map(|mm| {
-                        mm.resolve_realtime_slot(RealtimeSlot::Stt, requested_stt.as_deref())
+                        mm.resolve_realtime_slot(
+                            RealtimeSlot::Stt,
+                            non_empty(requested_stt.as_ref()),
+                        )
                     });
                     let llm_resolution = model_manager.as_ref().map(|mm| {
-                        mm.resolve_realtime_slot(RealtimeSlot::Llm, requested_llm.as_deref())
+                        mm.resolve_realtime_slot(
+                            RealtimeSlot::Llm,
+                            non_empty(requested_llm.as_ref()),
+                        )
                     });
-                    let tts_resolution = model_manager.as_ref().map(|mm| {
-                        mm.resolve_realtime_slot(RealtimeSlot::Tts, requested_tts.as_deref())
-                    });
+                    let tts_resolution = model_manager
+                        .as_ref()
+                        .map(|mm| resolve_tts_slot(mm, tts_off, requested_tts.as_deref()));
                     {
                         let mut s = session.lock().await;
                         if let Some(ref res) = stt_resolution {
@@ -2338,6 +2941,11 @@ async fn run_receiver(
                         if let Some(ref res) = tts_resolution {
                             s.tts_model = Some(res.model_id.clone());
                         }
+                        // D2: swap the realtime serving set — deregister what
+                        // this session registered before, register what it
+                        // depends on now (resolved values, post-D5), in the
+                        // same critical section as the write (F5).
+                        swap_serving(&mut s, &voice_pin);
                     }
                     tracing::debug!(conn_id, "realtime: session config updated");
                     // Mirror updated config into the admin-visible snapshot.
@@ -2367,24 +2975,14 @@ async fn run_receiver(
                         snap.history_entries = hist;
                     }
 
-                    // D2: swap the realtime serving set — deregister what
-                    // this session used to depend on, register what it
-                    // depends on now (resolved values, post-D5).
-                    let new_serving: Vec<String> = [stt.clone(), llm.clone(), tts.clone()]
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    voice_pin.deregister_serving(old_serving.iter().map(String::as_str));
-                    voice_pin.register_serving(new_serving.iter().map(String::as_str));
-
                     if let Some(ref llm_res) = llm_resolution {
-                        for resolution in [
-                            stt_resolution.as_ref(),
-                            Some(llm_res),
-                            tts_resolution.as_ref(),
+                        for (resolution, is_tts) in [
+                            (stt_resolution.as_ref(), false),
+                            (Some(llm_res), false),
+                            (tts_resolution.as_ref(), true),
                         ]
                         .into_iter()
-                        .flatten()
+                        .filter_map(|(r, is_tts)| r.map(|r| (r, is_tts)))
                         {
                             if resolution.loading
                                 && let Some(mm) = model_manager.as_ref()
@@ -2398,10 +2996,19 @@ async fn run_receiver(
                                     },
                                 )
                                 .await;
+                                // C1b: a failed TTS load clears the session's TTS id.
+                                let tts_clear = is_tts.then(|| TtsLoadFailClear {
+                                    session: Arc::clone(&session),
+                                    session_snap: Arc::clone(&session_snap),
+                                    voice_pin: Arc::clone(&voice_pin),
+                                    conn_id,
+                                });
                                 spawn_model_ready_watcher(
                                     Arc::clone(mm),
                                     resolution.model_id.clone(),
                                     out_tx.clone(),
+                                    shutdown.clone(),
+                                    tts_clear,
                                 );
                             }
                         }
@@ -2482,58 +3089,29 @@ async fn run_receiver(
                         .await;
                         continue;
                     };
-                    let slot = match mm.known_model_kind(&model_id) {
-                        Some(ModelKind::Stt) => RealtimeSlot::Stt,
-                        Some(ModelKind::Tts) => RealtimeSlot::Tts,
-                        Some(ModelKind::Embedding) => RealtimeSlot::Embed,
-                        _ => RealtimeSlot::Llm,
+                    let reply = request_model_load_reply(mm, &model_id);
+                    let (stage, detail) = match reply {
+                        LoadReply::Ready => ("ready", None),
+                        LoadReply::Started => ("started", None),
+                        LoadReply::Failed(why) => ("failed", Some(why)),
                     };
-                    let resolution = mm.resolve_realtime_slot(slot, Some(&model_id));
-                    if resolution.model_id == model_id {
-                        if resolution.loading {
-                            send_event(
-                                &out_tx,
-                                &ServerEvent::ModelLoading {
-                                    model_id: &model_id,
-                                    stage: "started",
-                                    detail: None,
-                                },
-                            )
-                            .await;
-                            spawn_model_ready_watcher(
-                                Arc::clone(mm),
-                                model_id.clone(),
-                                out_tx.clone(),
-                            );
-                        } else {
-                            // Already Ready — nothing to wait for.
-                            send_event(
-                                &out_tx,
-                                &ServerEvent::ModelLoading {
-                                    model_id: &model_id,
-                                    stage: "ready",
-                                    detail: None,
-                                },
-                            )
-                            .await;
-                        }
-                    } else {
-                        // The literal request wasn't grantable — say why
-                        // rather than silently loading something else on
-                        // the client's behalf (that's Config's job, not
-                        // this explicit command's).
-                        send_event(
-                            &out_tx,
-                            &ServerEvent::ModelLoading {
-                                model_id: &model_id,
-                                stage: "failed",
-                                detail: resolution.reason.or(Some(
-                                    "would evict a protected model, or is not resident \
-                                     and cannot fit",
-                                )),
-                            },
-                        )
-                        .await;
+                    send_event(
+                        &out_tx,
+                        &ServerEvent::ModelLoading {
+                            model_id: &model_id,
+                            stage,
+                            detail,
+                        },
+                    )
+                    .await;
+                    if reply == LoadReply::Started {
+                        spawn_model_ready_watcher(
+                            Arc::clone(mm),
+                            model_id.clone(),
+                            out_tx.clone(),
+                            shutdown.clone(),
+                            None,
+                        );
                     }
                 }
                 Err(e) => {
@@ -2552,10 +3130,31 @@ async fn run_receiver(
             _ => {}
         }
     }
-    // Signal the pipeline to abort any in-flight turn — same path as the
-    // explicit Cancel event, but fired automatically on connection drop.
+    // The client is gone (close, error, end of stream) or teardown began: end
+    // the session (0.9.1 Q9). `shutdown` first, then `cancel` — `begin_turn`
+    // relies on that order, so a turn about to start sees one or the other.
+    // Queued utterances are then never run, and the in-flight turn aborts —
+    // same path as the explicit Cancel event.
+    shutdown.cancel();
     cancel.store(true, Ordering::Release);
     cancel_notify.notify_waiters();
+    stream
+}
+
+/// Clear the per-turn `cancel` flag for the turn about to start, unless the
+/// session is ending. Returns `false` (and leaves `cancel` set) once
+/// `shutdown` is cancelled: the client hung up, an admin kill landed, or
+/// teardown began (0.9.1 Q9). The receiver cancels `shutdown` before it sets
+/// `cancel`. If the swap reads the receiver's `true`, the acquire makes the
+/// cancelled `shutdown` visible; if it reads an older value, the receiver's
+/// `true` lands after the swap and the turn aborts at its first cancel check.
+fn begin_turn(cancel: &AtomicBool, shutdown: &tokio_util::sync::CancellationToken) -> bool {
+    cancel.swap(false, Ordering::AcqRel);
+    if shutdown.is_cancelled() {
+        cancel.store(true, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 /// C2: bridge an admin kill into an in-flight turn.
@@ -2566,6 +3165,11 @@ async fn run_receiver(
 /// the turn finishes. This task sets `cancel` (the drain loop aborts within
 /// ~one token, emitting its `Done` + cancel telemetry) and cancels `shutdown`
 /// (waking the receiver — same teardown path as C1).
+///
+/// The same bridge carries a server stop (0.9.1 C5): `realtime_session`
+/// spawns it a second time with the session's `stopping` token as `kill`, so a
+/// graceful shutdown aborts the in-flight turn and the 1001 close goes out
+/// while the process is still draining.
 ///
 /// It also selects on `shutdown`: a *normal* close (idle / audio-None) calls
 /// `shutdown.cancel()` at teardown, which lets this task exit. Without that arm
@@ -2609,8 +3213,9 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
     let (out_tx, mut out_rx) = mpsc::channel::<WsMsg>(64);
 
     // Sender task: drains out_rx → WebSocket sink.
-    // Exits when all out_tx clones are dropped.
-    tokio::spawn(async move {
+    // Exits when all out_tx clones are dropped (or a send fails — e.g. after a
+    // close frame went out). Aborted after a bounded wait at teardown.
+    let sender_task = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(msg) = out_rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -2632,7 +3237,7 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
     let (reload_tx, mut reload_rx) = mpsc::channel::<Vec<ClientHistoryEntry>>(4);
 
     // Shared cancel flag: receiver task sets it on `cancel` event;
-    // response pipeline checks it each token and resets it at utterance start.
+    // response pipeline checks it each token; `begin_turn` resets it at turn start.
     let cancel = Arc::new(AtomicBool::new(false));
     // NEW-H(B): paired Notify so synthesize_and_send can select! on cancel
     // instead of blocking the full ~3 s TTS synth. notify_waiters() wakes all
@@ -2677,12 +3282,18 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
     // registry entry and the voice pin (the "zombie session" bug). Cancelling
     // this token on every break path lets the receiver exit and the socket close.
     let shutdown = tokio_util::sync::CancellationToken::new();
+    // Graceful server shutdown (0.9.1 C5): cancelled by `stop_realtime_sessions`
+    // from the shutdown path; the session then closes with 1001.
+    let stopping = tokio_util::sync::CancellationToken::new();
+    // `register` starts the session stopped if the server is already stopping
+    // (an upgrade that raced the stop signal, 0.9.1 C5).
     if let Ok(mut reg) = state.realtime_sessions.write() {
-        reg.insert(
+        reg.register(
             session_id,
             crate::realtime_types::RealtimeSessionEntry {
                 snapshot: Arc::clone(&session_snap),
                 kill: kill.clone(),
+                stopping: stopping.clone(),
             },
         );
     }
@@ -2720,83 +3331,46 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
         kill.clone(),
         shutdown.clone(),
     );
+    // C5: a server stop aborts an in-flight turn the same way, so the 1001
+    // close goes out while the process is still draining, not after the turn.
+    spawn_kill_bridge(
+        Arc::clone(&cancel),
+        Arc::clone(&cancel_notify),
+        stopping.clone(),
+        shutdown.clone(),
+    );
 
-    // ── Embedding handle ──────────────────────────────────────────────────────
-    // Acquired before the main loop. Typically None at session start because no
-    // Config event has been received yet; re-tried each turn when still None.
-    let mut embed_handle: Option<crate::embed_engine::EmbeddingHandle> = {
+    // ── Embedding model ───────────────────────────────────────────────────────
+    // The session's embedding model is pinned at its first successful use and
+    // never changes: vectors from different models are not comparable, so a
+    // change would need the whole pool re-embedded. Only the id is kept; a
+    // handle is fetched for each use and dropped after it (0.9.1 Q6). A handle
+    // kept for the session kept the engine thread alive, so evicting the model
+    // ran into the join timeout, and the kept handle failed (`Closing`) on every
+    // later call, even after the model was loaded again.
+    let embed_handle = {
         let guard = session.lock().await;
-        guard.embed_model.as_deref().and_then(|model| {
-            state
-                .model_manager
-                .as_ref()?
-                .get_embedding_handle(model)
-                .ok()
-        })
-        // guard dropped here — no MutexGuard held across any await
+        let model = guard.embed_model.clone();
+        drop(guard); // no MutexGuard held across any await
+        embedding_handle_for(&state, model.as_deref())
     };
+    let mut embed_pin: Option<String> = embed_handle.as_ref().map(|h| h.model_id().to_owned());
 
-    // Initial back-fill: embed history entries that have no vector yet.
-    // This is a no-op for fresh sessions (history_entries is empty) but
-    // handles the case where the client sends Config+history before the first
-    // audio frame and some entries lack pre-computed embeddings.
+    // Back-fill at connect (also run at every turn start, below).
     if let Some(ref handle) = embed_handle {
-        let model_id = handle.model_id().to_owned();
-        let (texts, indices): (Vec<String>, Vec<usize>) = {
-            let guard = session.lock().await;
-            guard
-                .history_entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.embedding.is_none())
-                .map(|(i, e)| (format!("{}\n{}", e.user, e.assistant), i))
-                .unzip()
-        }; // guard dropped
-        if !texts.is_empty()
-            && let Ok(output) = handle.embed(texts).await
-        {
-            // Apply vectors to entries and collect event data (lock scope).
-            let events: Vec<(String, String, Vec<f32>, u64)> = {
-                let mut guard = session.lock().await;
-                indices
-                    .iter()
-                    .zip(output.vectors.iter())
-                    .filter_map(|(&idx, vec)| {
-                        guard.history_entries.get_mut(idx).map(|entry| {
-                            entry.embedding = Some(vec.clone());
-                            entry.embedding_model = Some(model_id.clone());
-                            (
-                                entry.user.clone(),
-                                entry.assistant.clone(),
-                                vec.clone(),
-                                entry.timestamp,
-                            )
-                        })
-                    })
-                    .collect()
-            }; // guard dropped
-            for (user, assistant, embedding, timestamp) in events {
-                send_event(
-                    &out_tx,
-                    &ServerEvent::TurnHistory {
-                        turn_id: None,
-                        user: &user,
-                        assistant: &assistant,
-                        embedding: Some(embedding),
-                        timestamp,
-                        embedding_model: Some(model_id.as_str()),
-                        stt_model: None,
-                        llm_model: None,
-                    },
-                )
-                .await;
-            }
-        }
+        backfill_embeddings(&session, &session_snap, &out_tx, handle, conn_id).await;
     }
+
+    drop(embed_handle);
 
     // Response pipeline (runs in this task, sequentially — one utterance at a
     // time). Receives committed audio from the VAD via audio_rx.
     let mut turn_id: u64 = 0;
+    // First turn at which the pool back-fill may run again after a failure.
+    let mut backfill_after_turn: u64 = 0;
+    let idle_timeout = state.realtime_idle_timeout;
+    // Set when the idle timeout ended the loop (0.9.1 C5: close 1000).
+    let mut idle = false;
     loop {
         let utterance = tokio::select! {
             // `biased`: a pending admin-kill must win over an already-queued
@@ -2811,13 +3385,23 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
                 tracing::info!(conn_id, "realtime: session killed by admin");
                 break;
             }
+            () = stopping.cancelled() => {
+                tracing::info!(conn_id, "realtime: server stopping — closing session");
+                break;
+            }
+            // The client hung up (the receiver cancels `shutdown` on exit):
+            // drop the queued utterances instead of running them (0.9.1 Q9).
+            () = shutdown.cancelled() => {
+                tracing::debug!(conn_id, "realtime: client gone — dropping queued utterances");
+                break;
+            }
             Some(entries) = inject_rx.recv() => {
                 handle_inject_history(
                     entries,
                     &session,
                     &session_snap,
                     &out_tx,
-                    embed_handle.as_ref(),
+                    embedding_handle_for(&state, embed_pin.as_deref()).as_ref(),
                     conn_id,
                 )
                 .await;
@@ -2829,39 +3413,57 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
                     &session,
                     &session_snap,
                     &out_tx,
-                    embed_handle.as_ref(),
+                    embedding_handle_for(&state, embed_pin.as_deref()).as_ref(),
                     conn_id,
                 )
                 .await;
                 continue;
             }
-            result = time::timeout(IDLE_TIMEOUT, audio_rx.recv()) => match result {
+            result = time::timeout(idle_timeout, audio_rx.recv()) => match result {
                 Ok(Some(u)) => u,
-                Ok(None) => break, // receiver task exited → normal shutdown
+                Ok(None) => break, // receiver gone; normally the `shutdown` arm wins first
                 Err(_) => {
                     tracing::debug!(conn_id, "realtime: idle timeout — closing session");
+                    idle = true;
                     break;
                 }
             }
         };
+
+        // Not pinned yet (the model was not loaded, or `embed_model` came from a
+        // later `config`): pin it now if it is usable.
+        if embed_pin.is_none() {
+            let model = session.lock().await.embed_model.clone();
+            if let Some(model) = model
+                && embedding_handle_for(&state, Some(&model)).is_some()
+            {
+                embed_pin = Some(model);
+            }
+        }
+        // Embed what the pool still lacks (0.9.1 Q7): entries from `config.history`
+        // (applied by the receiver task, so the connect back-fill never saw them),
+        // batches injected before the model was pinned, and entries embedded by
+        // another model. Before the snapshot, so this turn's retrieval sees them.
+        // After a failed batch, skip the back-fill for BACKFILL_BACKOFF_TURNS turns:
+        // a persistent failure must not add its admission wait to every turn.
+        if turn_id >= backfill_after_turn
+            && let Some(handle) = embedding_handle_for(&state, embed_pin.as_deref())
+            && !backfill_embeddings(&session, &session_snap, &out_tx, &handle, conn_id).await
+        {
+            backfill_after_turn = turn_id + BACKFILL_BACKOFF_TURNS;
+        }
 
         let snapshot = {
             let guard = session.lock().await;
             guard.clone()
         };
 
-        // If embed_handle hasn't been acquired yet (embed_model was set by a
-        // Config event after session start), try to acquire it now.
-        if embed_handle.is_none() {
-            embed_handle = snapshot.embed_model.as_deref().and_then(|model| {
-                state
-                    .model_manager
-                    .as_ref()?
-                    .get_embedding_handle(model)
-                    .ok()
-            });
+        // The back-fill above can take a while: re-check that the client is
+        // still there right before the turn starts (0.9.1 Q9).
+        if !begin_turn(&cancel, &shutdown) {
+            tracing::debug!(conn_id, "realtime: client gone — turn not started");
+            break;
         }
-
         let mut ctx = TurnCtx::new(conn_id, turn_id, &utterance);
         let (user_text, assistant_text) = run_response(
             utterance.audio,
@@ -2871,7 +3473,7 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
             &cancel_notify,
             &state,
             &mut ctx,
-            embed_handle.as_ref(),
+            embed_pin.as_deref(),
         )
         .await;
 
@@ -2881,7 +3483,7 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
         if !user_text.is_empty() && !assistant_text.is_empty() {
             // Embed the turn (user+"\n"+assistant) if an embed handle is available.
             let (embedding, embedding_model): (Option<Vec<f32>>, Option<String>) =
-                if let Some(ref handle) = embed_handle {
+                if let Some(handle) = embedding_handle_for(&state, embed_pin.as_deref()) {
                     let text = format!("{user_text}\n{assistant_text}");
                     let vec = handle
                         .embed(vec![text])
@@ -2917,13 +3519,17 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
             // a proven turn ensures the models are confirmed working before
             // being pinned — prevents an explicit-override session that is
             // still loading a model from pinning an unverified set.
+            // A set with an empty id (a text-only session, `tts_model: ""`, or a
+            // slot nothing could fill) is not a voice flow another client can
+            // copy: it is never pinned (0.9.1 Q11).
             if let (Some(stt), Some(llm), Some(tts)) = (
                 snapshot.stt_model.as_ref(),
                 snapshot.llm_model.as_ref(),
                 snapshot.tts_model.as_ref(),
-            ) && state
-                .voice_pin
-                .try_set(stt.clone(), llm.clone(), tts.clone())
+            ) && pinnable_voice_flow(stt, llm, tts)
+                && state
+                    .voice_pin
+                    .try_set(stt.clone(), llm.clone(), tts.clone())
             {
                 tracing::info!(
                     conn_id,
@@ -2935,30 +3541,18 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
             }
 
             let mut guard = session.lock().await;
-            // Push the full entry for embedding-based retrieval.
-            guard.history_entries.push(ClientHistoryEntry {
-                user: user_text.clone(),
-                assistant: assistant_text.clone(),
-                embedding,
-                timestamp,
-                embedding_model,
-                stt_model: snapshot.stt_model.clone(),
-                llm_model: snapshot.llm_model.clone(),
-            });
-            // Trim the oldest turn pair when the LLM context cap is reached.
-            if guard.history.len() >= MAX_HISTORY_TURNS * 2 {
-                guard.history.drain(..2);
-            }
-            guard.history.push(RtMessage {
-                role: "user".to_owned(),
-                content: user_text,
-            });
-            guard.history.push(RtMessage {
-                role: "assistant".to_owned(),
-                content: assistant_text,
-            });
-            // Snapshot for admin API — clone before releasing the tokio lock.
-            let new_entries = guard.history_entries.clone();
+            let new_entries = record_completed_turn(
+                &mut guard,
+                ClientHistoryEntry {
+                    user: user_text,
+                    assistant: assistant_text,
+                    embedding,
+                    timestamp,
+                    embedding_model,
+                    stt_model: snapshot.stt_model.clone(),
+                    llm_model: snapshot.llm_model.clone(),
+                },
+            );
             drop(guard);
             if let Ok(mut snap) = session_snap.write() {
                 snap.turn_count += 1;
@@ -2967,37 +3561,113 @@ async fn realtime_session(socket: WebSocket, state: AppState) {
         }
     }
 
-    tracing::info!(conn_id, turns = turn_id, "realtime: connection closed");
+    // C5: one close path for every exit. A server-side cause sends its close
+    // frame; a client close or a dropped connection has no cause and no frame.
+    let cause = crate::realtime_types::CloseCause::from_signals(
+        kill.is_cancelled(),
+        stopping.is_cancelled(),
+        idle,
+    );
+    let close_deadline = time::Instant::now() + crate::realtime_types::CLOSE_REPLY_WAIT;
+    if let Some(cause) = cause {
+        send_close_frame(&out_tx, cause, close_deadline, conn_id).await;
+    }
+    tracing::info!(
+        conn_id,
+        turns = turn_id,
+        cause = cause.map_or("client", crate::realtime_types::CloseCause::reason),
+        "realtime: connection closed"
+    );
     // Wake the receiver so it exits its frame loop on every break path (kill,
-    // idle, audio-None). Idempotent. Without this, the always-streaming client
-    // keeps the receiver blocked on `stream.next()` and this await never returns.
+    // idle, stop, audio-None). Idempotent. Without this, the always-streaming
+    // client keeps the receiver blocked on `stream.next()` and this await never
+    // returns. It also stops the `model_loading` watchers (Q10).
     shutdown.cancel();
-    receiver_task.await.ok();
+    // Bounded (0.9.1 C5 review F5): a receiver parked in `send_event` on a full
+    // outgoing queue — the sender blocked by a client that stopped reading —
+    // never sees `shutdown`. Unbounded, this await hung forever: the registry
+    // entry and the voice-pin count leaked, and no close frame went out.
+    let mut receiver_task = receiver_task;
+    match time::timeout_at(close_deadline, &mut receiver_task).await {
+        Ok(Ok(stream)) => drain_until_close(stream, close_deadline, conn_id).await,
+        Ok(Err(e)) => tracing::warn!(conn_id, err = %e, "realtime: receiver task failed"),
+        Err(_) => {
+            receiver_task.abort();
+            tracing::warn!(
+                conn_id,
+                wait_ms = u64::try_from(crate::realtime_types::CLOSE_REPLY_WAIT.as_millis())
+                    .unwrap_or(u64::MAX),
+                cause = cause.map_or("client", crate::realtime_types::CloseCause::reason),
+                "realtime: receiver did not stop within the close wait — aborted"
+            );
+        }
+    }
     // D2: release whatever this session's last Config resolution registered
     // into the realtime serving set — otherwise a closed session's models
     // would stay eviction-protected forever.
     {
-        let final_serving: Vec<String> = {
-            let s = session.lock().await;
-            [
-                s.stt_model.clone(),
-                s.llm_model.clone(),
-                s.tts_model.clone(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        };
-        state
-            .voice_pin
-            .deregister_serving(final_serving.iter().map(String::as_str));
+        close_serving(&mut *session.lock().await, &state.voice_pin);
     }
     state.voice_pin.session_closed();
     if let Ok(mut reg) = state.realtime_sessions.write() {
         reg.remove(&session_id);
     }
-    // out_tx (main body's clone) drops here; once receiver_task's clone
-    // also dropped, the sender task's out_rx closes and the sender exits.
+    // Last `out_tx` clone (the receiver's and the watchers' are gone): the
+    // sender drains what is queued and exits. Bounded — a client that stopped
+    // reading must not keep the socket and the task alive.
+    drop(out_tx);
+    let mut sender_task = sender_task;
+    if time::timeout_at(close_deadline, &mut sender_task)
+        .await
+        .is_err()
+    {
+        sender_task.abort();
+    }
+}
+
+/// C5: queue the close frame for `cause`. Bounded by `deadline`: the queue is
+/// full only when the client stopped reading, and then the frame cannot be
+/// delivered anyway.
+async fn send_close_frame(
+    out_tx: &OutTx,
+    cause: crate::realtime_types::CloseCause,
+    deadline: time::Instant,
+    conn_id: u64,
+) {
+    let frame = WsMsg::Close(Some(axum::extract::ws::CloseFrame {
+        code: cause.code(),
+        reason: cause.reason().into(),
+    }));
+    if !matches!(
+        time::timeout_at(deadline, out_tx.send(frame)).await,
+        Ok(Ok(()))
+    ) {
+        tracing::debug!(
+            conn_id,
+            reason = cause.reason(),
+            "realtime: close frame not queued"
+        );
+    }
+}
+
+/// C5: read the remaining frames until the client's close (or the end of the
+/// stream), at most until `deadline`. After a server close this is the close
+/// handshake reply; after a client close, reading on lets the WebSocket flush
+/// its automatic close reply. Audio still in flight is discarded.
+async fn drain_until_close<S>(mut stream: S, deadline: time::Instant, conn_id: u64)
+where
+    S: futures_util::Stream<Item = Result<WsMsg, axum::Error>> + Unpin,
+{
+    loop {
+        match time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(WsMsg::Close(_)) | Err(_)) | None) => return,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => {
+                tracing::debug!(conn_id, "realtime: no close reply within the wait");
+                return;
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3030,10 +3700,28 @@ pub(crate) fn vlm_clamp_and_lease(
     Ok((max_new_tokens, lease))
 }
 
+/// Chat-template context for a vision LLM on the voice path (0.9.1 C3): thinking off, as the
+/// text-gen path gets through `build_prompt(.., Some(false), ..)`. `VLMPipeline` applies the
+/// template itself, so the flag reaches it only as a template variable. Built server-side with
+/// this one key, like the chat VLM path, so nothing can override `bos_token`/`eos_token`.
+fn voice_vlm_template_context() -> serde_json::Value {
+    serde_json::json!({ "enable_thinking": false })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    // ── Voice-path template context (0.9.1 C3) ───────────────────────────────
+
+    #[test]
+    fn voice_vlm_context_disables_thinking_and_carries_nothing_else() {
+        assert_eq!(
+            voice_vlm_template_context(),
+            serde_json::json!({ "enable_thinking": false })
+        );
+    }
 
     // ── SentenceSplitter ─────────────────────────────────────────────────────
 
@@ -3160,6 +3848,17 @@ mod tests {
             sanitize_for_tts("over 1,000 years 🛒", Some("en")),
             "over one thousand years"
         );
+    }
+
+    /// 0.9.1 C6: the realtime TTS path maps Unicode spaces before the normaliser, so the
+    /// digits before a narrow no-break space are spelled out and no odd space survives.
+    #[test]
+    fn sanitize_maps_unicode_spaces_before_normalising() {
+        assert_eq!(
+            sanitize_for_tts("It is 328\u{202f}feet\u{a0}tall.", Some("en")),
+            "It is three hundred twenty eight feet tall."
+        );
+        assert_eq!(sanitize_for_tts("x\u{3000}y\u{205f}z", None), "x y z");
     }
 
     // ── PCM16 utilities ───────────────────────────────────────────────────────
@@ -3309,6 +4008,33 @@ mod tests {
     // ── Helper functions ──────────────────────────────────────────────────────
 
     #[test]
+    fn a_short_barge_in_phrase_is_not_dropped_as_noise() {
+        assert_eq!(
+            classify_transcript("Stop.", Some("stop")),
+            TranscriptKind::BargeIn
+        );
+        assert_eq!(
+            classify_transcript("Ruvi, stop", Some("ruvi stop")),
+            TranscriptKind::BargeIn
+        );
+        // Without a matching phrase, short transcripts are still noise.
+        assert_eq!(classify_transcript("Stop.", None), TranscriptKind::TooShort);
+        assert_eq!(
+            classify_transcript("Thank you.", Some("stop")),
+            TranscriptKind::TooShort
+        );
+        assert_eq!(classify_transcript("", Some("stop")), TranscriptKind::Empty);
+        assert_eq!(
+            classify_transcript("tell me a story", Some("stop")),
+            TranscriptKind::Content
+        );
+        assert_eq!(
+            classify_transcript("please stop talking now", Some("stop talking")),
+            TranscriptKind::BargeIn
+        );
+    }
+
+    #[test]
     fn barge_in_normalises_and_matches() {
         assert!(is_barge_in_phrase(
             "Hey Ruvi, stop talking please!",
@@ -3323,6 +4049,22 @@ mod tests {
         assert!(!is_barge_in_phrase("hello world", "ruvi stop talking"));
         // Empty phrase never matches.
         assert!(!is_barge_in_phrase("whatever", ""));
+        // Whole words only: no match inside a longer word.
+        assert!(is_barge_in_phrase("Please stop.", "stop"));
+        assert!(is_barge_in_phrase("Stop", "stop"));
+        assert!(!is_barge_in_phrase("Stopwatch?", "stop"));
+        assert!(!is_barge_in_phrase("Unstoppable.", "stop"));
+        assert!(!is_barge_in_phrase("it stopped working", "stop"));
+        assert!(!is_barge_in_phrase("Now.", "no"));
+        assert!(!is_barge_in_phrase("ruvi stopping", "ruvi stop"));
+    }
+
+    #[test]
+    fn a_word_containing_the_phrase_is_still_noise() {
+        assert_eq!(
+            classify_transcript("Stopwatch.", Some("stop")),
+            TranscriptKind::TooShort
+        );
     }
 
     #[test]
@@ -3463,6 +4205,145 @@ mod tests {
     }
 
     // ── VoicePolicy ───────────────────────────────────────────────────────────
+
+    /// Feed `deltas` then `Done` through `drain_voice_tokens` with `policy`, no TTS model; return
+    /// the `text` contents sent, the returned full text and the turn context.
+    async fn drain_for_test(
+        deltas: &[&str],
+        policy: &VoicePolicy,
+    ) -> (Vec<String>, String, TurnCtx) {
+        let (tx, rx) = crate::streaming::stream_channel();
+        for d in deltas {
+            tx.send(StreamEvent::Token((*d).to_owned(), 1))
+                .await
+                .unwrap();
+        }
+        tx.send(StreamEvent::Done(crate::ov_cb::FinishReason::Stop))
+            .await
+            .unwrap();
+        drop(tx);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let u = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &u);
+        // A start a little in the past, so a stamped TTFT reads > 0 ms.
+        ctx.llm_start = Instant::now().checked_sub(std::time::Duration::from_millis(5));
+        let full = drain_voice_tokens(
+            rx,
+            &AtomicBool::new(false),
+            &Notify::new(),
+            &out_tx,
+            &Session::default(),
+            &AppState::new(),
+            &mut ctx,
+            policy,
+        )
+        .await
+        .unwrap();
+        drop(out_tx);
+        let mut texts = Vec::new();
+        while let Some(m) = out_rx.recv().await {
+            if let WsMsg::Text(t) = m {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "text" {
+                    texts.push(v["content"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        (texts, full, ctx)
+    }
+
+    /// C4: a gpt-oss reply that never grows past the 10-byte prefix buffer ("Paris.") is sent as
+    /// `text`, counted, and stamps TTFT, not only spoken.
+    #[tokio::test]
+    async fn a_short_gpt_oss_reply_is_sent_as_text() {
+        let gpt_oss = VoicePolicy::from_parser(Some(&ReasoningParser::GptOss));
+        let (texts, full, ctx) = drain_for_test(&["Par", "is."], &gpt_oss).await;
+        assert_eq!(texts.concat(), "Paris.");
+        assert_eq!(full, "Paris.");
+        assert_eq!(ctx.llm_tokens, 2, "each content piece counts");
+        assert!(ctx.llm_ttft_ms > 0, "TTFT stamped");
+    }
+
+    /// C4: a short reply that starts with the leaked channel name is sent without it.
+    #[tokio::test]
+    async fn a_short_gpt_oss_reply_with_the_channel_prefix_is_sent_without_it() {
+        let gpt_oss = VoicePolicy::from_parser(Some(&ReasoningParser::GptOss));
+        let (texts, full, ctx) = drain_for_test(&["final", "8."], &gpt_oss).await;
+        assert_eq!(texts.concat(), "8.");
+        assert_eq!(full, "8.");
+        assert_eq!(ctx.llm_tokens, 2);
+        assert!(ctx.llm_ttft_ms > 0);
+    }
+
+    /// C4: on a longer gpt-oss reply the buffered pieces count too, and the text sent equals the
+    /// full text.
+    #[tokio::test]
+    async fn a_long_gpt_oss_reply_counts_its_buffered_pieces() {
+        let gpt_oss = VoicePolicy::from_parser(Some(&ReasoningParser::GptOss));
+        let (texts, full, ctx) =
+            drain_for_test(&["The ", "capital ", "is ", "Paris."], &gpt_oss).await;
+        assert_eq!(texts.concat(), "The capital is Paris.");
+        assert_eq!(full, "The capital is Paris.");
+        assert_eq!(ctx.llm_tokens, 4);
+    }
+
+    /// C4 (Fable review): TTFT is stamped at the first content piece, not when the gpt-oss prefix
+    /// buffer resolves. The first piece arrives at once, the one that resolves the buffer 80 ms
+    /// later; before the fix TTFT read at least 80 ms.
+    #[tokio::test]
+    async fn gpt_oss_ttft_is_the_first_content_piece() {
+        let (tx, rx) = crate::streaming::stream_channel();
+        let producer = tokio::spawn(async move {
+            tx.send(StreamEvent::Token("The ".to_owned(), 1))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            for d in ["capital ", "is ", "Paris."] {
+                tx.send(StreamEvent::Token(d.to_owned(), 1)).await.unwrap();
+            }
+            tx.send(StreamEvent::Done(crate::ov_cb::FinishReason::Stop))
+                .await
+                .unwrap();
+        });
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let u = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &u);
+        ctx.llm_start = Some(Instant::now());
+        let gpt_oss = VoicePolicy::from_parser(Some(&ReasoningParser::GptOss));
+        drain_voice_tokens(
+            rx,
+            &AtomicBool::new(false),
+            &Notify::new(),
+            &out_tx,
+            &Session::default(),
+            &AppState::new(),
+            &mut ctx,
+            &gpt_oss,
+        )
+        .await
+        .unwrap();
+        producer.await.unwrap();
+        assert!(ctx.llm_ttft_ms < 60, "TTFT {} ms", ctx.llm_ttft_ms);
+        assert_eq!(ctx.llm_tokens, 4);
+    }
+
+    /// C4: content the think filter still holds at `Done` (a trailing `<th` that never became a
+    /// tag) is sent as `text` as well (any model).
+    #[tokio::test]
+    async fn content_flushed_at_done_is_sent_as_text() {
+        let (texts, full, ctx) = drain_for_test(&["It is 3 <th"], &VoicePolicy::default()).await;
+        assert_eq!(full, "It is 3 <th", "the held tail is kept");
+        assert_eq!(texts.concat(), full, "and also sent");
+        assert_eq!(ctx.llm_tokens, 2, "the flushed tail counts as a piece");
+    }
 
     #[test]
     fn voice_policy_gpt_oss() {
@@ -3643,6 +4524,58 @@ mod tests {
         assert!(join.is_ok(), "run_receiver task panicked");
     }
 
+    /// 0.9.1 Q9: when the client's stream ends, the receiver must mark the
+    /// session as ending (`shutdown`) and abort the in-flight turn (`cancel`),
+    /// so the session loop runs none of the queued utterances.
+    #[tokio::test]
+    async fn a_client_hang_up_ends_the_session_and_cancels_the_turn() {
+        use std::sync::atomic::AtomicBool;
+
+        // An empty stream: the client closed the connection.
+        let stream = futures_util::stream::empty::<Result<WsMsg, axum::Error>>();
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, _audio_rx) = mpsc::channel(1);
+        let (inject_tx, _inject_rx) = mpsc::channel(1);
+        let (reload_tx, _reload_rx) = mpsc::channel(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(run_receiver(
+            stream,
+            out_tx,
+            Arc::clone(&cancel),
+            Arc::new(Notify::new()),
+            Arc::new(tokio::sync::Mutex::new(Session::default())),
+            audio_tx,
+            inject_tx,
+            reload_tx,
+            0,
+            empty_snapshot(),
+            shutdown.clone(),
+            None,
+            Arc::new(crate::voice_pin::VoicePinManager::default()),
+        ));
+        let _stream = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_receiver did not exit when the stream ended")
+            .expect("run_receiver task panicked");
+        assert!(shutdown.is_cancelled(), "a hang-up must end the session");
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "a hang-up must cancel the turn"
+        );
+        // And the next queued turn is refused, with `cancel` left set.
+        assert!(!begin_turn(&cancel, &shutdown));
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn begin_turn_clears_cancel_while_the_client_is_there() {
+        let cancel = AtomicBool::new(true); // a client `cancel` from the last turn
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        assert!(begin_turn(&cancel, &shutdown));
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
     // ── spawn_kill_bridge (C2 in-flight kill) ────────────────────────────────
 
     /// An admin kill must set `cancel` (so the in-flight drain aborts) and cancel
@@ -3776,7 +4709,7 @@ mod tests {
         }));
         let shutdown = tokio_util::sync::CancellationToken::new();
 
-        run_receiver(
+        let _stream = run_receiver(
             stream,
             out_tx,
             cancel,
@@ -3846,6 +4779,10 @@ mod tests {
             vram_safety_margin_gb: 0.0,
             npu_footprint_factor: 1.0,
             cpu_image_gen_max_pixels: 1024 * 1024,
+            max_audio_duration_secs: 7_200,
+            max_images_per_request: 16,
+            max_image_pixels_per_request: 64 * 1024 * 1024,
+            max_image_pixels: 4_000_000,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -3874,6 +4811,8 @@ mod tests {
             max_embedding_inputs: 256,
             max_embedding_batch_tokens: 32_768,
             max_tokens_cap: 8192,
+            stream_first_token_timeout_secs: 600,
+            stream_token_gap_timeout_secs: 120,
             bind_addr: "127.0.0.1".to_owned(),
             port: 11_437,
             allow_insecure_public_bind: false,
@@ -3899,6 +4838,7 @@ mod tests {
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
             load_timeout_secs: 600,
+            on_demand_wait_secs: 0,
         }
     }
 
@@ -4107,6 +5047,273 @@ mod tests {
         assert!(t.contains(r#""type":"done"#), "got: {t}");
     }
 
+    /// 0.9.1 S1: a realtime LLM turn on an engine that stalls ends with the stall verdict (the
+    /// same engine watchdog as the HTTP routes), the model is booked as stalled, and the client
+    /// is told in a plain sentence — no marker, no config key (review F7).
+    #[tokio::test]
+    async fn a_stalled_llm_turn_ends_with_a_clean_message() {
+        use crate::model_manager::ModelManager;
+        use crate::model_manager::lifecycle::MockEngineFactory;
+
+        let mut cfg = config_with_model("vlm-test-model", 5.0);
+        cfg.stream_first_token_timeout_secs = 10;
+        cfg.stream_token_gap_timeout_secs = 10;
+        let mm = Arc::new(
+            ModelManager::new(cfg, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("vlm-test-model").await.unwrap();
+        tokio::time::pause();
+        let state = AppState::new().with_model_manager(Arc::clone(&mm));
+        let session = Session {
+            llm_model: Some("vlm-test-model".to_owned()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_notify = Notify::new();
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let utterance = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &utterance);
+        let t0 = tokio::time::Instant::now();
+        let bound = crate::stall_watch::mock::RealTimeBound::start("realtime stall");
+        let err = run_llm_tts(
+            crate::stall_watch::mock::STALL_FIRST,
+            &session,
+            &out_tx,
+            &cancel,
+            &cancel_notify,
+            &state,
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap_err();
+        drop(bound);
+        assert!(t0.elapsed() >= std::time::Duration::from_secs(10));
+        assert!(
+            crate::stall_watch::is_generation_stalled_error(&err.to_string()),
+            "{err}"
+        );
+        let message = stalled_client_message(&err).unwrap();
+        assert!(!message.contains("_secs") && !message.contains("generation_stalled:"));
+        assert!(
+            mm.list_models()
+                .iter()
+                .any(|i| i.id == "vlm-test-model" && i.generation_stalled)
+        );
+    }
+
+    /// 0.9.1 V5b: a realtime turn follows the model's sampling profile (here the operator's
+    /// `sampling`) instead of the former hard-coded greedy + 1.1. The mock text engine records
+    /// the request; it sends no final event, so the turn itself ends as an LLM error.
+    #[tokio::test]
+    async fn run_llm_tts_uses_the_models_sampling_profile() {
+        use crate::model_manager::ModelManager;
+        use crate::model_manager::lifecycle::MockEngineFactory;
+
+        let mut cfg = config_with_model("llm-test-model", 5.0);
+        if let Some(e) = cfg.models.get_mut("llm-test-model") {
+            e.policy.sampling = Some(crate::model_manager::config::SamplingConfig {
+                temperature: Some(0.7),
+                top_p: Some(0.8),
+                top_k: Some(20),
+                repetition_penalty: Some(1.0),
+                presence_penalty: Some(1.5),
+                frequency_penalty: None,
+            });
+        }
+        let factory = Arc::new(MockEngineFactory::default());
+        let recorded = Arc::clone(&factory.recorded_params);
+        let mm = ModelManager::new(cfg, factory).await.unwrap();
+        mm.load_model("llm-test-model").await.unwrap();
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        let session = Session {
+            llm_model: Some("llm-test-model".to_owned()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_notify = Notify::new();
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let utterance = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &utterance);
+        let _ = run_llm_tts(
+            "hello",
+            &session,
+            &out_tx,
+            &cancel,
+            &cancel_notify,
+            &state,
+            &mut ctx,
+            None,
+        )
+        .await;
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1, "one LLM request");
+        let p = &rec[0];
+        assert_eq!(
+            (p.temperature, p.top_p, p.top_k, p.repetition_penalty),
+            (Some(0.7), Some(0.8), Some(20), Some(1.0))
+        );
+        assert_eq!(p.presence_penalty, Some(1.5));
+    }
+
+    /// 0.9.1 V1-usage (review R-2): a realtime text turn hands the engine the model's reasoning
+    /// parser; thinking is disabled on voice, so the output does not start in thinking.
+    #[tokio::test]
+    async fn run_llm_tts_hands_the_engine_its_reasoning_split() {
+        use crate::model_manager::ModelManager;
+        use crate::model_manager::lifecycle::MockEngineFactory;
+
+        let mut cfg = config_with_model("llm-test-model", 5.0);
+        if let Some(e) = cfg.models.get_mut("llm-test-model") {
+            e.policy.reasoning_parser = Some(crate::model_manager::ReasoningParser::Qwen3);
+        }
+        let factory = Arc::new(MockEngineFactory::default());
+        let recorded = Arc::clone(&factory.recorded_params);
+        let mm = ModelManager::new(cfg, factory).await.unwrap();
+        mm.load_model("llm-test-model").await.unwrap();
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        let session = Session {
+            llm_model: Some("llm-test-model".to_owned()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_notify = Notify::new();
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let utterance = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &utterance);
+        let _ = run_llm_tts(
+            "hello",
+            &session,
+            &out_tx,
+            &cancel,
+            &cancel_notify,
+            &state,
+            &mut ctx,
+            None,
+        )
+        .await;
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1, "one LLM request");
+        assert_eq!(
+            rec[0].reasoning,
+            crate::prompt_builder::ReasoningSplit::new(
+                Some(crate::model_manager::ReasoningParser::Qwen3),
+                false
+            )
+        );
+    }
+
+    /// 0.9.1 V5b (review F7): with no operator `sampling`, a realtime turn on a model whose
+    /// `generation_config.json` has `do_sample: true` samples with the file's values and its file
+    /// penalty (0.9.0 ran voice greedy + 1.1) — the ruled behaviour change.
+    #[tokio::test]
+    async fn run_llm_tts_follows_a_file_only_profile() {
+        use crate::model_manager::ModelManager;
+        use crate::model_manager::lifecycle::MockEngineFactory;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("llm-file-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("generation_config.json"),
+            r#"{"do_sample": true, "temperature": 0.6, "top_p": 0.95, "top_k": 20,
+                "repetition_penalty": 1.05}"#,
+        )
+        .unwrap();
+        let mut cfg = config_with_model("llm-file-model", 5.0);
+        cfg.models_dir = dir.path().to_path_buf();
+        let factory = Arc::new(MockEngineFactory::default());
+        let recorded = Arc::clone(&factory.recorded_params);
+        let mm = ModelManager::new(cfg, factory).await.unwrap();
+        mm.load_model("llm-file-model").await.unwrap();
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        let session = Session {
+            llm_model: Some("llm-file-model".to_owned()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_notify = Notify::new();
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let utterance = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &utterance);
+        let _ = run_llm_tts(
+            "hello",
+            &session,
+            &out_tx,
+            &cancel,
+            &cancel_notify,
+            &state,
+            &mut ctx,
+            None,
+        )
+        .await;
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1, "one LLM request");
+        let p = &rec[0];
+        assert_eq!(
+            (p.temperature, p.top_p, p.top_k, p.repetition_penalty),
+            (Some(0.6), Some(0.95), Some(20), Some(1.05))
+        );
+        assert_eq!(p.presence_penalty, None);
+    }
+
+    /// E3 (F3): a realtime turn on a vision model with a device-headroom limit, after an idle gap
+    /// (readings 31 s old), takes exactly one fresh reading off the runtime before deciding.
+    /// Reverting the turn to the cached `get_chat_context` fails this.
+    #[tokio::test]
+    async fn run_llm_tts_reads_an_old_device_reading_first_on_a_vision_llm() {
+        use crate::model_manager::tests::{headroom_of, thread_probe_vision_manager};
+        let (mm, probe) = thread_probe_vision_manager(512 << 20).await;
+        headroom_of(&mm).age_readings(std::time::Duration::from_secs(31));
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        let session = Session {
+            llm_model: Some("vlm-a".to_owned()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_notify = Notify::new();
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let utterance = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &utterance);
+        let result = run_llm_tts(
+            "hello there, how are you today",
+            &session,
+            &out_tx,
+            &cancel,
+            &cancel_notify,
+            &state,
+            &mut ctx,
+            None,
+        )
+        .await;
+        assert_eq!(result.unwrap(), "mock-vlm");
+        let sync = probe.synchronous_calls();
+        assert_eq!(sync.len(), 1, "one synchronous probe: {sync:?}");
+        assert_ne!(sync[0].0, std::thread::current().id(), "not on the runtime");
+    }
+
     /// A kind that is neither `TextGen` nor `Vision` still errors — regression
     /// guard proving the `other` catch-all (and its updated message) survived
     /// the restructure that added the `Vision` arm.
@@ -4198,5 +5405,1281 @@ mod tests {
             !shown.contains("Exception from") && !shown.contains("primitive"),
             "{shown}"
         );
+    }
+
+    /// The -14 form (2026-11-15, ext-091): a realtime turn that fails with only
+    /// `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST` poisons the context like the other markers.
+    #[tokio::test]
+    async fn exec_status_minus_14_in_a_realtime_turn_flags_the_context() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-rt-poison14-models", "device": "CPU", "total_vram_gb": 22.5,
+            "models": { "m": {"vram_gb": 1.0} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = AppState::new().with_model_manager(std::sync::Arc::clone(&mm));
+
+        let oom = anyhow::anyhow!(
+            "ov_vlm_generate failed: Exception from src/inference/src/cpp/infer_request.cpp:224:\n\
+                 Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp:593:\n\
+                 [GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST\n\n"
+        );
+        let shown = gpu_poison_client_message(&state, Some("m"), &oom).unwrap();
+        assert!(mm.is_gpu_poisoned(), "the -14 form poisons the context");
+        assert!(
+            !shown.contains("CL_EXEC_STATUS") && !shown.contains("ocl_memory"),
+            "{shown}"
+        );
+    }
+
+    // ── Retrieval pool cap (0.9.1 Q5) ────────────────────────────────────────
+
+    #[test]
+    fn the_retrieval_pool_keeps_the_newest_entries_up_to_the_cap() {
+        let entry = |n: usize| ClientHistoryEntry {
+            user: format!("u{n}"),
+            assistant: format!("a{n}"),
+            embedding: None,
+            timestamp: 0,
+            embedding_model: None,
+            stt_model: None,
+            llm_model: None,
+        };
+        let mut pool: Vec<_> = (0..MAX_CLIENT_HISTORY).map(entry).collect();
+        cap_retrieval_pool(&mut pool);
+        assert_eq!(
+            pool.len(),
+            MAX_CLIENT_HISTORY,
+            "at the cap nothing is dropped"
+        );
+        pool.push(entry(MAX_CLIENT_HISTORY));
+        cap_retrieval_pool(&mut pool);
+        assert_eq!(pool.len(), MAX_CLIENT_HISTORY);
+        assert_eq!(pool[0].user, "u1", "the oldest entry goes");
+        assert_eq!(
+            pool[MAX_CLIENT_HISTORY - 1].user,
+            format!("u{MAX_CLIENT_HISTORY}")
+        );
+    }
+
+    /// 0.9.0 pushed each completed turn without the cap: the pool grew by one per turn.
+    #[test]
+    fn a_completed_turn_keeps_the_retrieval_pool_at_the_cap() {
+        let entry = |n: usize| ClientHistoryEntry {
+            user: format!("u{n}"),
+            assistant: format!("a{n}"),
+            embedding: None,
+            timestamp: 0,
+            embedding_model: None,
+            stt_model: None,
+            llm_model: None,
+        };
+        let mut s = Session {
+            history_entries: (0..MAX_CLIENT_HISTORY).map(entry).collect(),
+            ..Session::default()
+        };
+        let pool = record_completed_turn(&mut s, entry(MAX_CLIENT_HISTORY));
+        assert_eq!(pool.len(), MAX_CLIENT_HISTORY);
+        assert_eq!(s.history_entries.len(), MAX_CLIENT_HISTORY);
+        assert_eq!(
+            pool[MAX_CLIENT_HISTORY - 1].user,
+            format!("u{MAX_CLIENT_HISTORY}")
+        );
+        assert_eq!(
+            s.history.len(),
+            2,
+            "the turn also enters the rolling LLM context"
+        );
+    }
+
+    // ── LLM stream closed without a final event (0.9.1 Q4) ───────────────────
+
+    /// 0.9.0 broke out of the loop and returned the cut-off text as a finished reply: no
+    /// `done`, and the caller recorded it as a turn. It is now an error, so the caller's
+    /// error path sends `error` + `done` and records nothing.
+    #[tokio::test]
+    async fn a_stream_closed_without_a_finish_is_an_llm_error() {
+        let (tx, rx) = crate::streaming::stream_channel();
+        tx.send(StreamEvent::Token("The answer is forty".to_owned(), 1))
+            .await
+            .unwrap();
+        drop(tx);
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let u = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &u);
+        ctx.llm_start = Some(Instant::now());
+        let result = drain_voice_tokens(
+            rx,
+            &AtomicBool::new(false),
+            &Notify::new(),
+            &out_tx,
+            &Session::default(),
+            &AppState::new(),
+            &mut ctx,
+            &VoicePolicy::default(),
+        )
+        .await;
+        let err = result.expect_err("a cut-off stream must not count as a finished reply");
+        assert!(err.to_string().contains("without a finish"), "{err}");
+    }
+
+    /// A cancel that arrives while the drain waits, followed by the engine closing the stream,
+    /// is a cancelled turn (`done`, `Ok`), not an LLM error.
+    #[tokio::test]
+    async fn a_cancel_before_the_stream_closes_is_a_cancelled_turn() {
+        let (tx, rx) = crate::streaming::stream_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            c.store(true, Ordering::Release);
+            drop(tx);
+        });
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let u = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &u);
+        ctx.llm_start = Some(Instant::now());
+        let result = drain_voice_tokens(
+            rx,
+            &cancel,
+            &Notify::new(),
+            &out_tx,
+            &Session::default(),
+            &AppState::new(),
+            &mut ctx,
+            &VoicePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        drop(out_tx);
+        let mut done = 0;
+        while let Some(m) = out_rx.recv().await {
+            if let WsMsg::Text(t) = m {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                done += usize::from(v["type"] == "done");
+            }
+        }
+        assert_eq!(done, 1);
+    }
+
+    /// 0.9.1 Q1: a turn cancelled after some reply text was generated returns an
+    /// empty reply, so the caller records no history entry and sends no
+    /// `turn_history`. The text already streamed to the client stays sent.
+    #[tokio::test]
+    async fn a_cancelled_turn_returns_no_reply_for_the_history() {
+        let (tx, rx) = crate::streaming::stream_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tx.send(StreamEvent::Token("The answer is forty".to_owned(), 1))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            c.store(true, Ordering::Release);
+            // The engine keeps producing: the next token wakes the drain, whose
+            // loop-top cancel check (the route a live turn takes) ends the turn.
+            tx.send(StreamEvent::Token(" two".to_owned(), 1))
+                .await
+                .unwrap();
+            drop(tx);
+        });
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let u = UtteranceCtx {
+            audio: vec![],
+            energy: 0.0,
+            utterance_duration_ms: 0,
+        };
+        let mut ctx = TurnCtx::new(0, 1, &u);
+        ctx.llm_start = Some(Instant::now());
+        let reply = drain_voice_tokens(
+            rx,
+            &cancel,
+            &Notify::new(),
+            &out_tx,
+            &Session::default(),
+            &AppState::new(),
+            &mut ctx,
+            &VoicePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, "", "a cancelled turn must not be recorded");
+        assert_eq!(ctx.cancel_stage, "llm");
+        drop(out_tx);
+        let (mut texts, mut done) = (0, 0);
+        while let Some(m) = out_rx.recv().await {
+            if let WsMsg::Text(t) = m {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                texts += usize::from(v["type"] == "text");
+                done += usize::from(v["type"] == "done");
+            }
+        }
+        assert!(texts >= 1, "the partial text was streamed");
+        assert_eq!(done, 1);
+    }
+
+    // ── Embedding handle held by a session (0.9.1 Q6) ─────────────────────────
+
+    /// 0.9.0 kept one handle for the session: evicting the embedding model then ran into the
+    /// 8 s join timeout ("engine thread did not exit cleanly") and the kept handle answered
+    /// `Closing` on every call, even after a reload (probed on this mock, 2026-11-07). A handle
+    /// fetched per use and dropped after it lets the eviction finish at once, and the next use
+    /// reaches the reloaded engine.
+    #[tokio::test]
+    async fn an_embedding_handle_fetched_per_use_lets_the_model_be_evicted_and_reloaded() {
+        let mm = q3_mm(q3_config(&[("embed-a", 1.0, false)]), &["embed-a"]).await;
+        let state = AppState::new().with_model_manager(Arc::clone(&mm));
+        let embed_once = || async {
+            let handle = embedding_handle_for(&state, Some("embed-a"))?;
+            handle
+                .embed(vec!["x".to_owned()])
+                .await
+                .ok()
+                .map(|o| o.vectors.len())
+        };
+        assert_eq!(embed_once().await, Some(1));
+
+        let t = Instant::now();
+        mm.evict_model("embed-a").await.unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(embed_once().await, None, "not loaded: no handle");
+
+        mm.load_model("embed-a").await.unwrap();
+        assert_eq!(
+            embed_once().await,
+            Some(1),
+            "the reloaded engine is reached"
+        );
+    }
+
+    // ── Embedding back-fill (0.9.1 Q7) ───────────────────────────────────────
+
+    fn pooled(user: &str, embedding: Option<Vec<f32>>, model: Option<&str>) -> ClientHistoryEntry {
+        ClientHistoryEntry {
+            user: user.to_owned(),
+            ..history_entry(embedding, model)
+        }
+    }
+
+    fn empty_snapshot() -> Arc<RwLock<SessionSnapshot>> {
+        Arc::new(RwLock::new(SessionSnapshot {
+            id: uuid::Uuid::nil(),
+            conn_id: 0,
+            connected_at: 0,
+            stt_model: None,
+            llm_model: None,
+            tts_model: None,
+            tts_voice: None,
+            language: None,
+            system_prompt: None,
+            barge_in_phrase: None,
+            embed_model: None,
+            turn_count: 0,
+            history_entries: Vec::new(),
+        }))
+    }
+
+    /// Runs one back-fill over `pool`; returns the pool after it, the snapshot's copy and
+    /// the users of the echoed `turn_history` events.
+    async fn backfill(
+        pool: Vec<ClientHistoryEntry>,
+    ) -> (
+        Vec<ClientHistoryEntry>,
+        Vec<ClientHistoryEntry>,
+        Vec<String>,
+    ) {
+        let (handle, _thread) = crate::embed_engine::spawn_mock_embed("mock-embed");
+        let session = Arc::new(tokio::sync::Mutex::new(Session {
+            history_entries: pool,
+            ..Session::default()
+        }));
+        let snap = empty_snapshot();
+        let (out_tx, mut out_rx) = mpsc::channel(256); // every echo buffered: read afterwards
+        assert!(backfill_embeddings(&session, &snap, &out_tx, &handle, 0).await);
+        drop(out_tx);
+        let mut echoed = Vec::new();
+        while let Some(m) = out_rx.recv().await {
+            if let WsMsg::Text(t) = m {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "turn_history" {
+                    assert!(v["turn_id"].is_null());
+                    assert_eq!(v["embedding_model"], "mock-embed");
+                    echoed.push(v["user"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        let pool = session.lock().await.history_entries.clone();
+        let snapped = snap.read().unwrap().history_entries.clone();
+        (pool, snapped, echoed)
+    }
+
+    /// 0.9.0 ran the back-fill once, at connect, before `config.history` could arrive: such
+    /// entries were never embedded and so never retrieved. The per-turn back-fill embeds them.
+    #[tokio::test]
+    async fn the_backfill_embeds_entries_without_a_vector_and_echoes_them() {
+        let (pool, snapped, echoed) = backfill(vec![
+            pooled("a", None, None),
+            pooled("b", Some(vec![1.0; 4]), Some("mock-embed")),
+        ])
+        .await;
+        assert_eq!(pool[0].embedding_model.as_deref(), Some("mock-embed"));
+        assert!(pool[0].embedding.is_some());
+        assert_eq!(
+            pool[1].embedding,
+            Some(vec![1.0; 4]),
+            "an entry from the same model is kept"
+        );
+        assert_eq!(echoed, ["a"]);
+        assert_eq!(snapped.len(), 2, "the admin snapshot sees the new vectors");
+        assert!(snapped[0].embedding.is_some());
+    }
+
+    /// An entry embedded by another model is skipped by retrieval; it is re-embedded. A vector
+    /// with no recorded model is kept.
+    #[tokio::test]
+    async fn the_backfill_reembeds_entries_from_another_model() {
+        let (pool, _, echoed) = backfill(vec![
+            pooled("other", Some(vec![9.0; 8]), Some("other-embed")),
+            pooled("unknown", Some(vec![1.0; 4]), None),
+        ])
+        .await;
+        assert_eq!(pool[0].embedding_model.as_deref(), Some("mock-embed"));
+        assert_eq!(pool[0].embedding.as_ref().map(Vec::len), Some(4));
+        assert_eq!(pool[1].embedding, Some(vec![1.0; 4]));
+        assert_eq!(echoed, ["other"]);
+    }
+
+    /// More entries than one chunk: every entry is embedded, in order.
+    #[tokio::test]
+    async fn the_backfill_embeds_a_pool_larger_than_one_chunk() {
+        let pool: Vec<_> = (0..EMBED_CHUNK_TEXTS * 2 + 5)
+            .map(|n| pooled(&format!("e{n}"), None, None))
+            .collect();
+        let (pool, _, echoed) = backfill(pool).await;
+        assert!(pool.iter().all(|e| e.embedding.is_some()));
+        assert_eq!(echoed.len(), EMBED_CHUNK_TEXTS * 2 + 5);
+        assert_eq!(echoed[EMBED_CHUNK_TEXTS], format!("e{EMBED_CHUNK_TEXTS}"));
+    }
+
+    /// A failing batch is reported, so the session loop backs off.
+    #[tokio::test]
+    async fn a_failing_backfill_reports_failure() {
+        use crate::model_manager::engine::ManagedEngine;
+        let (handle, _thread) = crate::embed_engine::spawn_mock_embed("mock-embed");
+        ManagedEngine::set_closing(&handle, true);
+        let session = Arc::new(tokio::sync::Mutex::new(Session {
+            history_entries: vec![pooled("a", None, None)],
+            ..Session::default()
+        }));
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        assert!(!backfill_embeddings(&session, &empty_snapshot(), &out_tx, &handle, 0).await);
+        assert!(session.lock().await.history_entries[0].embedding.is_none());
+    }
+
+    #[test]
+    fn needs_embedding_by_vector_and_model() {
+        assert!(needs_embedding(&pooled("x", None, None), "m"));
+        assert!(needs_embedding(
+            &pooled("x", Some(vec![1.0]), Some("n")),
+            "m"
+        ));
+        assert!(!needs_embedding(
+            &pooled("x", Some(vec![1.0]), Some("m")),
+            "m"
+        ));
+        assert!(!needs_embedding(&pooled("x", Some(vec![1.0]), None), "m"));
+    }
+
+    /// The pool can be replaced while a batch is embedded: a vector is applied only to the
+    /// entry it was computed for.
+    #[test]
+    fn a_backfill_vector_is_not_applied_to_an_entry_that_replaced_its_own() {
+        let key = |index, user: &str| BackfillKey {
+            index,
+            user: user.to_owned(),
+            assistant: "a".to_owned(),
+            timestamp: 0,
+        };
+        let mut pool = vec![pooled("new", None, None), pooled("kept", None, None)];
+        let applied = apply_backfill(
+            &mut pool,
+            &[key(0, "old"), key(1, "kept")],
+            vec![vec![0.5; 4], vec![0.7; 4]],
+            "m",
+        );
+        assert!(
+            pool[0].embedding.is_none(),
+            "the replaced position gets no stale vector"
+        );
+        assert_eq!(pool[1].embedding, Some(vec![0.7; 4]));
+        assert_eq!(applied.len(), 1);
+    }
+
+    // ── request_model_load reply (0.9.1 Q3) ──────────────────────────────────
+
+    fn resolution(
+        model_id: &str,
+        reason: Option<&'static str>,
+        loading: bool,
+    ) -> crate::model_manager::RealtimeResolution {
+        crate::model_manager::RealtimeResolution {
+            model_id: model_id.to_owned(),
+            source: "default",
+            reason,
+            loading,
+        }
+    }
+
+    #[test]
+    fn load_reply_is_ready_only_for_a_loaded_model() {
+        let r = resolution("m", None, false);
+        assert_eq!(model_load_reply("m", &r, true, false), LoadReply::Ready);
+        assert_eq!(
+            model_load_reply("m", &r, false, false),
+            LoadReply::Failed("not_resident_no_headroom")
+        );
+    }
+
+    /// The resolver counts a loading model's reservation against a second copy and may
+    /// substitute; the client must still be told to wait for the load that is running.
+    #[test]
+    fn load_reply_is_started_for_a_model_already_loading() {
+        let substituted = resolution("other", Some("would_evict_protected"), false);
+        assert_eq!(
+            model_load_reply("m", &substituted, false, true),
+            LoadReply::Started
+        );
+    }
+
+    #[test]
+    fn load_reply_keeps_started_and_substitution_failures() {
+        let started = resolution("m", None, true);
+        assert_eq!(
+            model_load_reply("m", &started, false, false),
+            LoadReply::Started
+        );
+        let other = resolution("x", Some("would_evict_busy"), false);
+        assert_eq!(
+            model_load_reply("m", &other, false, false),
+            LoadReply::Failed("would_evict_busy")
+        );
+    }
+
+    /// 0.9.1 Q11: with a TTS model loaded, an omitted `tts_model` still gets it,
+    /// and `""` turns speech off instead of being substituted.
+    #[tokio::test]
+    async fn an_empty_tts_model_turns_speech_off() {
+        let mut cfg = q3_config(&[("tts-a", 1.0, false)]);
+        if let Some(e) = cfg.models.get_mut("tts-a") {
+            e.kind = Some("tts".to_owned());
+        }
+        let mm = q3_mm(cfg, &["tts-a"]).await;
+        assert_eq!(resolve_tts_slot(&mm, false, None).model_id, "tts-a");
+        // A `""` the resolver stored itself (nothing was loaded then) is not "off",
+        // and not a request either: no reason is reported for it.
+        let again = resolve_tts_slot(&mm, false, Some(""));
+        assert_eq!(again.model_id, "tts-a");
+        assert_eq!(again.reason, None);
+        let off = resolve_tts_slot(&mm, true, Some(""));
+        assert_eq!(off.model_id, "");
+        assert_eq!(off.source, TTS_OFF_SOURCE);
+        assert!(!off.loading);
+        assert_eq!(off.reason, None);
+    }
+
+    /// Only a client-sent `""` turns speech off; naming a model turns it back on,
+    /// and a `config` that omits `tts_model` leaves the choice as it was.
+    #[tokio::test]
+    async fn only_a_client_sent_empty_tts_model_is_off() {
+        let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
+        let cfg = |tts: Option<&str>| {
+            let session = Arc::clone(&session);
+            let tts = tts.map(str::to_owned);
+            async move {
+                apply_client_config(
+                    &session, None, None, None, tts, None, None, None, None, None, None, None,
+                )
+                .await;
+            }
+        };
+        cfg(Some("")).await;
+        assert!(session.lock().await.tts_off);
+        cfg(None).await;
+        assert!(
+            session.lock().await.tts_off,
+            "an omitted field keeps speech off"
+        );
+        cfg(Some("tts-a")).await;
+        assert!(
+            !session.lock().await.tts_off,
+            "naming a model turns speech on"
+        );
+    }
+
+    /// The C1 none resolution: `""`, `substituted`, `none_available`, not loading.
+    fn assert_tts_none_available(res: &crate::model_manager::RealtimeResolution) {
+        assert_eq!(res.model_id, "", "no TTS id is stored for the session");
+        assert_eq!(res.source, "substituted");
+        assert_eq!(res.reason, Some("none_available"));
+        assert!(!res.loading, "nothing is loading");
+    }
+
+    /// 0.9.1 C1 cases 1 and 4 (option C): with no TTS model on the server, nothing requested
+    /// and a named unknown id both resolve to none (`none_available`), not to an echoed id.
+    #[tokio::test]
+    async fn c1_no_tts_available_resolves_to_none_available() {
+        let mm = q3_mm(q3_config(&[("llm-a", 1.0, false)]), &["llm-a"]).await;
+        assert_tts_none_available(&resolve_tts_slot(&mm, false, None));
+        assert_tts_none_available(&resolve_tts_slot(&mm, false, Some("ghost-tts")));
+        // Speech off is still `off`, not `none_available`.
+        let off = resolve_tts_slot(&mm, true, Some(""));
+        assert_eq!((off.source, off.reason), (TTS_OFF_SOURCE, None));
+    }
+
+    /// The `model_selection` a none resolution produces keeps `tts_model` as the string `""`
+    /// (wire-safe C1: the field is not omitted).
+    #[test]
+    fn c1_model_selection_keeps_an_empty_tts_model_string() {
+        let none = tts_none_available();
+        let ev = ServerEvent::ModelSelection {
+            stt_model: None,
+            stt_source: None,
+            stt_reason: None,
+            llm_model: "llm-a",
+            llm_source: "requested",
+            llm_reason: None,
+            tts_model: Some(none.model_id.as_str()),
+            tts_source: Some(none.source),
+            tts_reason: none.reason,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["tts_model"], serde_json::json!(""), "{v}");
+        assert_eq!(v["tts_source"], "substituted", "{v}");
+        assert_eq!(v["tts_reason"], "none_available", "{v}");
+    }
+
+    /// Dropped-sentence count (`rustedvino_realtime_tts_sentences_total{result="dropped"}`) for
+    /// two sentences sent through `synthesize_and_send` with the session's TTS id set to `tts`.
+    fn c1_dropped_sentences(rt: &tokio::runtime::Runtime, state: &AppState, tts: &str) -> f64 {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let session = Session {
+                    tts_model: Some(tts.to_owned()),
+                    ..Session::default()
+                };
+                let (out_tx, _out_rx) = mpsc::channel(8);
+                let utterance = UtteranceCtx {
+                    audio: vec![],
+                    energy: 0.0,
+                    utterance_duration_ms: 0,
+                };
+                let mut ctx = TurnCtx::new(0, 1, &utterance);
+                let cancel = AtomicBool::new(false);
+                let notify = Notify::new();
+                for sentence in ["One sentence.", "Another one."] {
+                    synthesize_and_send(
+                        sentence, &session, &out_tx, state, &mut ctx, &cancel, &notify,
+                    )
+                    .await;
+                }
+            });
+        });
+        handle
+            .render()
+            .lines()
+            .find(|l| {
+                l.starts_with("rustedvino_realtime_tts_sentences_total") && l.contains("dropped")
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    fn c1_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// 0.9.1 C1 cases 1 and 4: the id the resolver stores is what the turn uses, so per
+    /// sentence nothing is attempted or counted dropped. A raw unprovidable id (what the
+    /// resolver stored before C1) still counts every sentence: the resolution is the fix.
+    #[test]
+    fn c1_no_tts_available_counts_no_dropped_sentences() {
+        let rt = c1_runtime();
+        let mm = rt.block_on(q3_mm(q3_config(&[("llm-a", 1.0, false)]), &["llm-a"]));
+        let none = resolve_tts_slot(&mm, false, None).model_id;
+        let ghost = resolve_tts_slot(&mm, false, Some("ghost-tts")).model_id;
+        let state = AppState::new().with_model_manager(mm);
+        for id in [none, ghost] {
+            assert!(
+                c1_dropped_sentences(&rt, &state, &id).abs() < f64::EPSILON,
+                "{id:?} is silent"
+            );
+        }
+        assert!(
+            (c1_dropped_sentences(&rt, &state, "ghost-tts") - 2.0).abs() < f64::EPSILON,
+            "control: an unprovidable id itself still drops every sentence"
+        );
+    }
+
+    /// A 10 GB server with a pinned, loaded 9 GB LLM and a 5 GB TTS model that cannot fit.
+    fn c1_no_room_for_tts(default_tts: bool) -> crate::model_manager::Config {
+        let mut cfg = q3_config(&[("llm-a", 9.0, true), ("tts-big", 5.0, false)]);
+        if let Some(e) = cfg.models.get_mut("tts-big") {
+            e.kind = Some("tts".to_owned());
+        }
+        if default_tts {
+            cfg.realtime_defaults = Some(crate::model_manager::config::RealtimeDefaults {
+                stt_model: None,
+                llm_model: None,
+                tts_model: Some("tts-big".to_owned()),
+                embed_model: None,
+            });
+        }
+        cfg
+    }
+
+    /// 0.9.1 C1 case 2: a configured `realtime_defaults.tts_model` that is not loaded and does
+    /// not fit resolves to none: the default id is not stored for the session, and no sentence
+    /// is attempted or counted dropped. The STT and LLM slots are unchanged (no STT model and
+    /// no STT default: the resolver's empty id with `not_resident_no_headroom`, as before C1).
+    #[test]
+    fn c1_a_default_tts_that_does_not_fit_resolves_to_none_available() {
+        let rt = c1_runtime();
+        let mm = rt.block_on(q3_mm(c1_no_room_for_tts(true), &["llm-a"]));
+        let res = resolve_tts_slot(&mm, false, None);
+        assert_tts_none_available(&res);
+        let stt = mm.resolve_realtime_slot(RealtimeSlot::Stt, None);
+        assert_eq!(
+            (stt.model_id.as_str(), stt.source, stt.reason, stt.loading),
+            ("", "substituted", Some("not_resident_no_headroom"), false),
+            "STT keeps its resolution"
+        );
+        let llm = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert_eq!(llm.model_id, "llm-a");
+        // The shared resolver itself is unchanged for TTS too (request_model_load uses it).
+        let raw = mm.resolve_realtime_slot(RealtimeSlot::Tts, None);
+        assert_eq!(
+            (raw.model_id.as_str(), raw.source, raw.reason),
+            ("tts-big", "default", Some("not_resident_no_headroom"))
+        );
+        let state = AppState::new().with_model_manager(mm);
+        assert!(c1_dropped_sentences(&rt, &state, &res.model_id).abs() < f64::EPSILON);
+    }
+
+    /// 0.9.1 C1 case 3: a registered TTS id that has no room now, with no default, resolves to
+    /// none: no sentence is attempted or counted dropped.
+    #[test]
+    fn c1_a_named_tts_without_room_resolves_to_none_available() {
+        let rt = c1_runtime();
+        let mm = rt.block_on(q3_mm(c1_no_room_for_tts(false), &["llm-a"]));
+        let res = resolve_tts_slot(&mm, false, Some("tts-big"));
+        assert_tts_none_available(&res);
+        let state = AppState::new().with_model_manager(mm);
+        assert!(c1_dropped_sentences(&rt, &state, &res.model_id).abs() < f64::EPSILON);
+    }
+
+    /// C1 leaves a usable TTS alone: a loaded one is granted as requested, and a named one that
+    /// fits is granted with a background load (`loading: true`), as before.
+    #[tokio::test]
+    async fn c1_a_tts_that_is_loaded_or_fits_is_still_granted() {
+        let mut cfg = q3_config(&[
+            ("llm-a", 1.0, false),
+            ("tts-a", 1.0, false),
+            ("tts-b", 1.0, false),
+        ]);
+        for id in ["tts-a", "tts-b"] {
+            if let Some(e) = cfg.models.get_mut(id) {
+                e.kind = Some("tts".to_owned());
+            }
+        }
+        let mm = q3_mm(cfg, &["llm-a", "tts-a"]).await;
+        let ready = resolve_tts_slot(&mm, false, Some("tts-a"));
+        assert_eq!(
+            (ready.model_id.as_str(), ready.source),
+            ("tts-a", "requested")
+        );
+        let fits = resolve_tts_slot(&mm, false, Some("tts-b"));
+        assert_eq!(
+            (fits.model_id.as_str(), fits.source, fits.loading),
+            ("tts-b", "requested", true)
+        );
+    }
+
+    /// An empty admin snapshot for a C1b test session.
+    fn c1b_snapshot() -> Arc<RwLock<SessionSnapshot>> {
+        Arc::new(RwLock::new(SessionSnapshot {
+            id: uuid::Uuid::new_v4(),
+            conn_id: 7,
+            connected_at: 0,
+            stt_model: None,
+            llm_model: None,
+            tts_model: None,
+            tts_voice: None,
+            language: None,
+            system_prompt: None,
+            barge_in_phrase: None,
+            embed_model: None,
+            turn_count: 0,
+            history_entries: Vec::new(),
+        }))
+    }
+
+    /// 0.9.1 C1b (C1 case 5): a TTS slot resolved `loading: true` whose load then fails. The
+    /// watcher clears the session's TTS id (and the admin snapshot's) and takes it out of the
+    /// D2 serving set, sends no event before the watch window is up (no second
+    /// `model_selection`), and later sentences are not attempted or counted dropped.
+    #[test]
+    fn c1b_a_tts_load_that_fails_after_resolve_clears_the_session_tts() {
+        const TTS: &str = "tts-fail";
+        let rt = c1_runtime();
+        let mut cfg = q3_config(&[("llm-a", 1.0, false), (TTS, 1.0, false)]);
+        if let Some(e) = cfg.models.get_mut(TTS) {
+            e.kind = Some("tts".to_owned());
+        }
+        let factory = crate::model_manager::lifecycle::MockEngineFactory {
+            fail_message_for: Some((TTS.to_owned(), "mock TTS load failed".to_owned())),
+            ..Default::default()
+        };
+        let mm = rt.block_on(async {
+            let mm = Arc::new(
+                crate::model_manager::ModelManager::new(cfg, Arc::new(factory))
+                    .await
+                    .unwrap(),
+            );
+            mm.load_model("llm-a").await.unwrap();
+            mm
+        });
+        let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
+        let snap = c1b_snapshot();
+        let voice_pin = Arc::new(crate::voice_pin::VoicePinManager::default());
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let tts_id = rt.block_on(async {
+            // As the `config` path does: resolve (spawns the load), store, register, watch.
+            let res = resolve_tts_slot(&mm, false, Some(TTS));
+            assert_eq!((res.model_id.as_str(), res.loading), (TTS, true));
+            {
+                let mut s = session.lock().await;
+                s.tts_model = Some(res.model_id.clone());
+                swap_serving(&mut s, &voice_pin);
+            }
+            if let Ok(mut s) = snap.write() {
+                s.tts_model = Some(res.model_id.clone());
+            }
+            assert_eq!(voice_pin.serving_count(TTS), 1);
+            spawn_model_ready_watcher(
+                Arc::clone(&mm),
+                res.model_id.clone(),
+                out_tx.clone(),
+                shutdown.clone(),
+                Some(TtsLoadFailClear {
+                    session: Arc::clone(&session),
+                    session_snap: Arc::clone(&snap),
+                    voice_pin: Arc::clone(&voice_pin),
+                    conn_id: 7,
+                }),
+            );
+            for _ in 0..100 {
+                if session.lock().await.tts_model.as_deref() == Some("") {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+            session.lock().await.tts_model.clone()
+        });
+        assert_eq!(tts_id.as_deref(), Some(""), "the failed id is cleared");
+        assert!(!mm.is_ready(TTS) && !mm.is_loading(TTS), "the load failed");
+        assert_eq!(snap.read().unwrap().tts_model.as_deref(), Some(""));
+        assert_eq!(voice_pin.serving_count(TTS), 0, "left the serving set");
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no event before the watch window is up"
+        );
+        shutdown.cancel();
+        let state = AppState::new().with_model_manager(Arc::clone(&mm));
+        let id = tts_id.unwrap_or_default();
+        assert!(
+            c1_dropped_sentences(&rt, &state, &id).abs() < f64::EPSILON,
+            "later sentences are not attempted or counted dropped"
+        );
+        assert!(
+            (c1_dropped_sentences(&rt, &state, TTS) - 2.0).abs() < f64::EPSILON,
+            "control: the failed id itself drops every sentence"
+        );
+    }
+
+    /// C1b: the watcher clears only the id it watched — a later `config` that moved the
+    /// session to another TTS model is left alone, and so is its serving-set entry.
+    #[tokio::test]
+    async fn c1b_clear_leaves_a_session_that_moved_on_alone() {
+        let session = Arc::new(tokio::sync::Mutex::new(Session {
+            tts_model: Some("tts-other".to_owned()),
+            ..Session::default()
+        }));
+        let voice_pin = Arc::new(crate::voice_pin::VoicePinManager::default());
+        swap_serving(&mut *session.lock().await, &voice_pin);
+        let clear = TtsLoadFailClear {
+            session: Arc::clone(&session),
+            session_snap: c1b_snapshot(),
+            voice_pin: Arc::clone(&voice_pin),
+            conn_id: 7,
+        };
+        assert!(!clear_failed_tts(&clear, "tts-fail").await);
+        assert_eq!(session.lock().await.tts_model.as_deref(), Some("tts-other"));
+        assert_eq!(voice_pin.serving_count("tts-other"), 1);
+    }
+
+    // ── C1/C1b through the real `config` path (fix round F3) ──────────────
+
+    /// A manager over `cfg` with `factory`, `preload` loaded.
+    async fn c1_mm(
+        cfg: crate::model_manager::Config,
+        factory: crate::model_manager::lifecycle::MockEngineFactory,
+        preload: &[&str],
+    ) -> Arc<crate::model_manager::ModelManager> {
+        let mm = Arc::new(
+            crate::model_manager::ModelManager::new(cfg, Arc::new(factory))
+                .await
+                .unwrap(),
+        );
+        for m in preload {
+            mm.load_model(m).await.unwrap();
+        }
+        mm
+    }
+
+    /// `q3_config` with every id in `tts` marked a TTS model.
+    fn c1_cfg(models: &[(&str, f64, bool)], tts: &[&str]) -> crate::model_manager::Config {
+        let mut cfg = q3_config(models);
+        for id in tts {
+            if let Some(e) = cfg.models.get_mut(*id) {
+                e.kind = Some("tts".to_owned());
+            }
+        }
+        cfg
+    }
+
+    /// A receiver running on `mm` that has been sent one `config` frame.
+    struct C1Run {
+        session: Arc<tokio::sync::Mutex<Session>>,
+        snap: Arc<RwLock<SessionSnapshot>>,
+        voice_pin: Arc<crate::voice_pin::VoicePinManager>,
+        out_rx: mpsc::Receiver<WsMsg>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    fn c1_start_receiver(
+        mm: &Arc<crate::model_manager::ModelManager>,
+        config: &serde_json::Value,
+    ) -> C1Run {
+        let frames = futures_util::stream::iter(vec![Ok::<_, axum::Error>(WsMsg::Text(
+            config.to_string().into(),
+        ))])
+        .chain(futures_util::stream::pending());
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let (audio_tx, _audio_rx) = mpsc::channel(1);
+        let (inject_tx, _inject_rx) = mpsc::channel(1);
+        let (reload_tx, _reload_rx) = mpsc::channel(1);
+        let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
+        let snap = c1b_snapshot();
+        let voice_pin = Arc::new(crate::voice_pin::VoicePinManager::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(run_receiver(
+            frames,
+            out_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Notify::new()),
+            Arc::clone(&session),
+            audio_tx,
+            inject_tx,
+            reload_tx,
+            7,
+            Arc::clone(&snap),
+            shutdown.clone(),
+            Some(Arc::clone(mm)),
+            Arc::clone(&voice_pin),
+        ));
+        C1Run {
+            session,
+            snap,
+            voice_pin,
+            out_rx,
+            shutdown,
+        }
+    }
+
+    /// The next JSON event within `ms`, or `None`.
+    async fn c1_next_event(
+        out_rx: &mut mpsc::Receiver<WsMsg>,
+        ms: u64,
+    ) -> Option<serde_json::Value> {
+        loop {
+            match time::timeout(Duration::from_millis(ms), out_rx.recv()).await {
+                Ok(Some(WsMsg::Text(t))) => return serde_json::from_str(&t).ok(),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    /// C1 through `config`: with no TTS on the server, `model_selection` carries
+    /// `tts_model: ""`, `substituted`, `none_available`, and the session stores `""`.
+    #[tokio::test]
+    async fn c1_config_with_no_tts_on_the_server_selects_none_available() {
+        let mm = c1_mm(
+            c1_cfg(&[("llm-a", 1.0, false)], &[]),
+            crate::model_manager::lifecycle::MockEngineFactory::default(),
+            &["llm-a"],
+        )
+        .await;
+        let mut run = c1_start_receiver(&mm, &serde_json::json!({"type":"config"}));
+        let ev = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+        assert_eq!(ev["type"], "model_selection", "{ev}");
+        assert_eq!(ev["tts_model"], serde_json::json!(""), "{ev}");
+        assert_eq!(ev["tts_source"], "substituted", "{ev}");
+        assert_eq!(ev["tts_reason"], "none_available", "{ev}");
+        assert_eq!(run.session.lock().await.tts_model.as_deref(), Some(""));
+        run.shutdown.cancel();
+    }
+
+    /// C1b through `config` (proves the config path hands the TTS watcher its clear context):
+    /// a named TTS that fits but fails to load is cleared from the session, the snapshot and
+    /// the serving set, cleared exactly once (one WARN), and no event beyond `model_loading started` +
+    /// `model_selection` before the watch window is up.
+    #[test]
+    fn c1b_config_path_clears_a_tts_whose_load_fails() {
+        const TTS: &str = "tts-cfgfail";
+        let rt = c1_runtime();
+        let run = rt.block_on(async {
+            let factory = crate::model_manager::lifecycle::MockEngineFactory {
+                fail_message_for: Some((TTS.to_owned(), "mock TTS load failed".to_owned())),
+                ..Default::default()
+            };
+            let mm = c1_mm(
+                c1_cfg(&[("llm-a", 1.0, false), (TTS, 1.0, false)], &[TTS]),
+                factory,
+                &["llm-a"],
+            )
+            .await;
+            let mut run =
+                c1_start_receiver(&mm, &serde_json::json!({"type":"config","tts_model":TTS}));
+            let started = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+            assert_eq!(
+                (
+                    started["type"].as_str(),
+                    started["model_id"].as_str(),
+                    started["stage"].as_str()
+                ),
+                (Some("model_loading"), Some(TTS), Some("started")),
+                "{started}"
+            );
+            let sel = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+            assert_eq!(sel["type"], "model_selection", "{sel}");
+            assert_eq!(
+                (sel["tts_model"].as_str(), sel["tts_source"].as_str()),
+                (Some(TTS), Some("requested")),
+                "{sel}"
+            );
+            for _ in 0..100 {
+                if run.session.lock().await.tts_model.as_deref() == Some("") {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(run.session.lock().await.tts_model.as_deref(), Some(""));
+            assert!(
+                c1_next_event(&mut run.out_rx, 400).await.is_none(),
+                "no further event"
+            );
+            run
+        });
+        assert_eq!(run.snap.read().unwrap().tts_model.as_deref(), Some(""));
+        assert_eq!(run.voice_pin.serving_count(TTS), 0, "left the serving set");
+        run.shutdown.cancel();
+        let clears = TTS_CLEARS
+            .lock()
+            .map_or(0, |m| m.get(TTS).copied().unwrap_or(0));
+        assert_eq!(clears, 1, "cleared exactly once");
+    }
+
+    /// F3(a): a TTS load that takes longer than one poll but succeeds is not mistaken for a
+    /// failure: the session keeps the id and `ready` is sent.
+    #[tokio::test]
+    async fn c1b_a_slow_tts_load_that_succeeds_keeps_the_session_tts() {
+        const TTS: &str = "tts-slow";
+        let factory = crate::model_manager::lifecycle::MockEngineFactory {
+            load_delay: Some(Duration::from_millis(600)),
+            ..Default::default()
+        };
+        let mm = c1_mm(
+            c1_cfg(&[("llm-a", 1.0, false), (TTS, 1.0, false)], &[TTS]),
+            factory,
+            &["llm-a"],
+        )
+        .await;
+        let mut run = c1_start_receiver(&mm, &serde_json::json!({"type":"config","tts_model":TTS}));
+        let started = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+        assert_eq!(started["stage"], "started", "{started}");
+        let sel = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+        assert_eq!(sel["type"], "model_selection", "{sel}");
+        let ready = c1_next_event(&mut run.out_rx, 3000).await.unwrap();
+        assert_eq!(
+            (ready["model_id"].as_str(), ready["stage"].as_str()),
+            (Some(TTS), Some("ready")),
+            "{ready}"
+        );
+        assert_eq!(run.session.lock().await.tts_model.as_deref(), Some(TTS));
+        assert_eq!(run.voice_pin.serving_count(TTS), 1);
+        run.shutdown.cancel();
+    }
+
+    /// F2: a TTS id another party is already loading — the resolver echoes it with
+    /// `loading: false` (its reservation leaves no room for a second copy) — is a loading
+    /// resolution for the session: `requested`, `model_loading started`, and the watcher
+    /// (so a failure would be cleared); `ready` follows when that load lands.
+    #[tokio::test]
+    async fn c1_a_tts_another_party_is_loading_is_a_loading_resolution() {
+        const TTS: &str = "tts-slow";
+        let factory = crate::model_manager::lifecycle::MockEngineFactory {
+            load_delay: Some(Duration::from_millis(800)),
+            ..Default::default()
+        };
+        let mm = c1_mm(
+            // Room (10 GB) for one copy of the 6 GB TTS, not for the second the
+            // resolver's dry-run counts while the first is still loading.
+            c1_cfg(&[(TTS, 6.0, false)], &[TTS]),
+            factory,
+            &[],
+        )
+        .await;
+        let other = Arc::clone(&mm);
+        let load = tokio::spawn(async move { other.load_model(TTS).await });
+        for _ in 0..100 {
+            if mm.is_loading(TTS) {
+                break;
+            }
+            time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(mm.is_loading(TTS), "the other party's load is running");
+        let raw = mm.resolve_realtime_slot(RealtimeSlot::Tts, Some(TTS));
+        assert_eq!(
+            (raw.model_id.as_str(), raw.loading),
+            (TTS, false),
+            "the scenario"
+        );
+        let res = resolve_tts_slot(&mm, false, Some(TTS));
+        assert_eq!(
+            (res.model_id.as_str(), res.source, res.reason, res.loading),
+            (TTS, "requested", None, true)
+        );
+        let mut run = c1_start_receiver(&mm, &serde_json::json!({"type":"config","tts_model":TTS}));
+        let started = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+        assert_eq!(
+            (started["model_id"].as_str(), started["stage"].as_str()),
+            (Some(TTS), Some("started")),
+            "{started}"
+        );
+        let sel = c1_next_event(&mut run.out_rx, 2000).await.unwrap();
+        assert_eq!(
+            (sel["tts_model"].as_str(), sel["tts_source"].as_str()),
+            (Some(TTS), Some("requested")),
+            "{sel}"
+        );
+        assert!(sel.get("tts_reason").is_none(), "{sel}");
+        let ready = c1_next_event(&mut run.out_rx, 3000).await.unwrap();
+        assert_eq!(ready["stage"], "ready", "{ready}");
+        load.await.unwrap().unwrap();
+        assert_eq!(run.session.lock().await.tts_model.as_deref(), Some(TTS));
+        run.shutdown.cancel();
+    }
+
+    /// N1: a C1b clear that runs after the session's teardown changes nothing —
+    /// the session's STT/LLM ids are not registered again.
+    #[tokio::test]
+    async fn c1b_a_clear_after_teardown_does_not_re_register_the_session() {
+        let session = Arc::new(tokio::sync::Mutex::new(Session {
+            stt_model: Some("stt-a".to_owned()),
+            llm_model: Some("llm-a".to_owned()),
+            tts_model: Some("tts-late".to_owned()),
+            ..Session::default()
+        }));
+        let voice_pin = Arc::new(crate::voice_pin::VoicePinManager::default());
+        swap_serving(&mut *session.lock().await, &voice_pin);
+        assert_eq!(voice_pin.serving_count("llm-a"), 1);
+        close_serving(&mut *session.lock().await, &voice_pin);
+        let clear = TtsLoadFailClear {
+            session: Arc::clone(&session),
+            session_snap: c1b_snapshot(),
+            voice_pin: Arc::clone(&voice_pin),
+            conn_id: 7,
+        };
+        assert!(
+            !clear_failed_tts(&clear, "tts-late").await,
+            "no clear after teardown"
+        );
+        for id in ["stt-a", "llm-a", "tts-late"] {
+            assert_eq!(voice_pin.serving_count(id), 0, "{id}");
+        }
+    }
+
+    /// N2: an id in both the old and the new set keeps its count through a swap.
+    #[test]
+    fn swap_serving_keeps_an_id_that_stays() {
+        let mut s = Session {
+            llm_model: Some("llm-a".to_owned()),
+            ..Session::default()
+        };
+        let voice_pin = crate::voice_pin::VoicePinManager::default();
+        swap_serving(&mut s, &voice_pin);
+        s.tts_model = Some("tts-a".to_owned());
+        swap_serving(&mut s, &voice_pin);
+        assert_eq!(voice_pin.serving_count("llm-a"), 1);
+        assert_eq!(voice_pin.serving_count("tts-a"), 1);
+    }
+
+    #[test]
+    fn serving_ids_skip_empty_ids() {
+        let s = Session {
+            stt_model: Some("stt".to_owned()),
+            llm_model: Some(String::new()),
+            tts_model: Some(String::new()),
+            ..Session::default()
+        };
+        assert_eq!(serving_ids(&s), vec!["stt".to_owned()]);
+    }
+
+    #[test]
+    fn a_set_with_an_empty_id_is_not_pinned() {
+        assert!(pinnable_voice_flow("stt", "llm", "tts"));
+        assert!(!pinnable_voice_flow("stt", "llm", ""));
+        assert!(!pinnable_voice_flow("", "llm", "tts"));
+        assert!(!pinnable_voice_flow("stt", "", "tts"));
+    }
+
+    fn q3_config(models: &[(&str, f64, bool)]) -> crate::model_manager::Config {
+        let mut cfg = admission_test_config(std::collections::HashMap::new());
+        cfg.total_vram_gb = 10.0;
+        for (id, gb, pinned) in models {
+            cfg.models.insert(
+                (*id).to_owned(),
+                crate::model_manager::config::ModelEntry {
+                    vram_gb: *gb,
+                    kind: None,
+                    policy: crate::model_manager::config::ModelPolicy {
+                        pinned: *pinned,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        cfg
+    }
+
+    fn with_default_llm(
+        mut cfg: crate::model_manager::Config,
+        id: &str,
+    ) -> crate::model_manager::Config {
+        cfg.realtime_defaults = Some(crate::model_manager::config::RealtimeDefaults {
+            stt_model: None,
+            llm_model: Some(id.to_owned()),
+            tts_model: None,
+            embed_model: None,
+        });
+        cfg
+    }
+
+    async fn q3_mm(
+        cfg: crate::model_manager::Config,
+        preload: &[&str],
+    ) -> Arc<crate::model_manager::ModelManager> {
+        use crate::model_manager::ModelManager;
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let mm = Arc::new(
+            ModelManager::new(cfg, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        for m in preload {
+            mm.load_model(m).await.unwrap();
+        }
+        mm
+    }
+
+    /// 0.9.0 answered `ready`: the resolver falls back to the slot default, which is the
+    /// requested model, and reports it with `loading: false` because it does not fit.
+    #[tokio::test]
+    async fn a_default_llm_that_does_not_fit_is_not_reported_ready() {
+        let cfg = with_default_llm(
+            q3_config(&[("stt-pin", 6.0, true), ("llm-b", 6.0, false)]),
+            "llm-b",
+        );
+        let mm = q3_mm(cfg, &["stt-pin"]).await;
+        assert_eq!(
+            request_model_load_reply(&mm, "llm-b"),
+            LoadReply::Failed("not_resident_no_headroom")
+        );
+    }
+
+    /// 0.9.0 answered `ready` for an id the server does not know, when no default and no
+    /// loaded model exist for the slot.
+    #[tokio::test]
+    async fn an_unknown_model_is_not_reported_ready() {
+        let mm = q3_mm(q3_config(&[("llm-a", 2.0, false)]), &[]).await;
+        assert_eq!(
+            request_model_load_reply(&mm, "llm-typo"),
+            LoadReply::Failed("unknown_model")
+        );
+    }
+
+    /// With a model of the slot loaded, the resolver would substitute it and the reply would
+    /// carry `would_evict_protected`; an unknown id is named as such instead.
+    #[tokio::test]
+    async fn an_unknown_model_is_named_even_with_a_loaded_llm() {
+        let mm = q3_mm(q3_config(&[("llm-a", 2.0, false)]), &["llm-a"]).await;
+        assert_eq!(
+            request_model_load_reply(&mm, "llm-typo"),
+            LoadReply::Failed("unknown_model")
+        );
+    }
+
+    /// With a default and nothing loaded, the resolver would start loading the default; an
+    /// unknown id is refused before that, so nothing is loaded on its behalf.
+    #[tokio::test]
+    async fn an_unknown_model_starts_no_load_of_the_default() {
+        let cfg = with_default_llm(q3_config(&[("llm-a", 2.0, false)]), "llm-a");
+        let mm = q3_mm(cfg, &[]).await;
+        assert_eq!(
+            request_model_load_reply(&mm, "llm-typo"),
+            LoadReply::Failed("unknown_model")
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!mm.is_ready("llm-a") && !mm.is_loading("llm-a"));
+    }
+
+    #[tokio::test]
+    async fn a_loaded_model_is_reported_ready() {
+        let mm = q3_mm(q3_config(&[("llm-a", 2.0, false)]), &["llm-a"]).await;
+        assert_eq!(request_model_load_reply(&mm, "llm-a"), LoadReply::Ready);
     }
 }

@@ -84,7 +84,8 @@ fn handle_device_query_flags() -> bool {
 /// Marker that `scripts/fill-config-defaults.py` looks for in a binary before
 /// running it: only a build that has `--print-default-config` contains it. (The
 /// flag's own text is not reliable for this: the optimiser splits short string
-/// comparisons.) An older server ignores unknown flags and would start for real.
+/// comparisons.) A server older than 0.9.1 ignores unknown flags and would start for real;
+/// since 0.9.1 an unknown flag exits 64 (see `rustedvino::cli`).
 #[used]
 static TEMPLATE_FLAGS_MARKER: [u8; 31] = *b"RUSTEDVINO-TEMPLATE-FLAGS-V1-OK";
 
@@ -104,6 +105,25 @@ fn print_template(template: anyhow::Result<serde_json::Value>) {
 /// [`PROCESS_EXIT_TIMEOUT`]. `async_main` is unchanged behaviourally; only
 /// what happens *after* it returns is different.
 fn main() -> std::process::ExitCode {
+    // FM-1: classify every argument first. `--help` prints the usage; an argument this binary
+    // does not know (a typo, `/?`, `--config x.json`) prints it with the usage and exits 64
+    // instead of starting the server with whatever config the search finds. After this every
+    // argument is a known, valid-UTF-8 flag, so the `std::env::args()` calls below cannot panic.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match rustedvino::cli::classify_args(&args) {
+        rustedvino::cli::CliAction::Proceed => {}
+        rustedvino::cli::CliAction::Help => {
+            print!("{}", rustedvino::cli::usage());
+            return std::process::ExitCode::SUCCESS;
+        }
+        rustedvino::cli::CliAction::Unknown(arg) => {
+            eprint!(
+                "rustedvino: unknown argument {arg:?}\n\n{}",
+                rustedvino::cli::usage()
+            );
+            return std::process::ExitCode::from(rustedvino::cli::EXIT_USAGE);
+        }
+    }
     // `--version` / `-V`: answer before anything else (no config, no signal
     // thread, no runtime) so it works on a fresh unpacked bundle.
     if std::env::args()
@@ -256,6 +276,7 @@ async fn async_main() -> anyhow::Result<()> {
     // this crate (e.g. RustedVINO Bear Edition) so both get identical
     // startup validation and shutdown behaviour.
     let setup = rustedvino::startup::bootstrap(log_buffer).await?;
+    let realtime_sessions = std::sync::Arc::clone(&setup.state.realtime_sessions);
     let app = rustedvino::create_router_with_auth(
         setup.state,
         &setup.cors_origins,
@@ -266,5 +287,12 @@ async fn async_main() -> anyhow::Result<()> {
     // Bind address/port come from config (`bind_addr`/`port`; default
     // loopback:11437 — secure by default, T4.2). stormVINO owns 11435;
     // cutover day: RustedVINO takes 11435 (Part 9).
-    rustedvino::startup::serve(app, setup.addr, setup.socket, &setup.model_manager).await
+    rustedvino::startup::serve(
+        app,
+        setup.addr,
+        setup.socket,
+        &setup.model_manager,
+        realtime_sessions,
+    )
+    .await
 }

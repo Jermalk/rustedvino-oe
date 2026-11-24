@@ -316,7 +316,31 @@ pub fn note_release_event() {
 #[derive(Debug, Clone, Copy)]
 pub struct MeasureWindow {
     generation: u64,
-    quiet_at_start: bool,
+    /// Time from the last release to [`open`](Self::open); `None` when nothing was released yet.
+    since_release: Option<Duration>,
+}
+
+/// Why a [`MeasureWindow`] is not clean ([`MeasureWindow::taint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTaint {
+    /// The window opened within [`QUIET_AFTER_RELEASE`] of an eviction or failed load.
+    QuietPeriod {
+        /// Time from that release to the window's opening.
+        since_release: Duration,
+    },
+    /// Another load, eviction or failed load happened while the window was open.
+    LifecycleEvent,
+}
+
+impl WindowTaint {
+    /// A stable short code for logs.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::QuietPeriod { .. } => "within_quiet_period_after_release",
+            Self::LifecycleEvent => "lifecycle_event_during_window",
+        }
+    }
 }
 
 impl MeasureWindow {
@@ -324,10 +348,25 @@ impl MeasureWindow {
     #[must_use]
     pub fn open() -> Self {
         let last = LAST_RELEASE_MS.load(Ordering::Relaxed);
-        let quiet_ms = u64::try_from(QUIET_AFTER_RELEASE.as_millis()).unwrap_or(u64::MAX);
         Self {
             generation: GENERATION.load(Ordering::Relaxed),
-            quiet_at_start: last == 0 || now_ms().saturating_sub(last) > quiet_ms,
+            since_release: (last != 0)
+                .then(|| Duration::from_millis(now_ms().saturating_sub(last))),
+        }
+    }
+
+    /// Why the window is not clean, or `None` when nothing else could have changed the process
+    /// total since [`open`](Self::open): no release shortly before, and no lifecycle event since.
+    #[must_use]
+    pub fn taint(&self) -> Option<WindowTaint> {
+        match self.since_release {
+            Some(since_release) if since_release <= QUIET_AFTER_RELEASE => {
+                Some(WindowTaint::QuietPeriod { since_release })
+            }
+            _ if GENERATION.load(Ordering::Relaxed) != self.generation => {
+                Some(WindowTaint::LifecycleEvent)
+            }
+            _ => None,
         }
     }
 
@@ -336,7 +375,7 @@ impl MeasureWindow {
     /// before.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.quiet_at_start && GENERATION.load(Ordering::Relaxed) == self.generation
+        self.taint().is_none()
     }
 }
 
@@ -404,6 +443,23 @@ mod tests {
         assert!(!w.is_clean());
         note_release_event();
         assert!(!MeasureWindow::open().is_clean(), "within the quiet period");
+    }
+
+    /// The taint names its cause: a window opened right after a release reports the quiet
+    /// period with the time since that release (the reason the load log gives).
+    #[test]
+    fn taint_reports_the_quiet_period() {
+        note_release_event();
+        match MeasureWindow::open().taint() {
+            Some(WindowTaint::QuietPeriod { since_release }) => {
+                assert!(since_release <= QUIET_AFTER_RELEASE);
+            }
+            other => panic!("expected the quiet period, got {other:?}"),
+        }
+        assert_eq!(
+            WindowTaint::LifecycleEvent.reason(),
+            "lifecycle_event_during_window"
+        );
     }
 
     #[test]

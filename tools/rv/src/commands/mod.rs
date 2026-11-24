@@ -7,9 +7,12 @@ pub mod check;
 pub mod config;
 pub mod lifecycle;
 pub mod logs;
+pub mod metrics;
 pub mod models;
 pub mod ops;
+pub mod outcome;
 pub mod prompt;
+mod refusal;
 pub mod service;
 pub mod status;
 
@@ -67,6 +70,102 @@ pub fn print_busy_hint(ctx: &Ctx, r: &Reply, verb: &str) {
             ))
         );
     }
+}
+
+/// One model's admin entry, looked up in `GET /v1/admin/models` (there is no single-model GET).
+pub(crate) enum EntryLookup {
+    /// The entry.
+    Found(serde_json::Value),
+    /// The list came back and the model is not in it.
+    NotRegistered,
+    /// The list is not available (no response, 401, ...): the reply says why.
+    Unavailable(Reply),
+}
+
+/// Looks `model` up in the registry.
+pub(crate) fn lookup_entry(ctx: &Ctx, model: &str) -> EntryLookup {
+    let r = ctx.api.get("/v1/admin/models");
+    let Some(models) = r
+        .json()
+        .filter(|_| r.code == Some(200))
+        .and_then(|b| b.get("models"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return EntryLookup::Unavailable(r);
+    };
+    models
+        .iter()
+        .find(|m| m.get("id").and_then(serde_json::Value::as_str) == Some(model))
+        .cloned()
+        .map_or(EntryLookup::NotRegistered, EntryLookup::Found)
+}
+
+/// The entry of `model`, or `None` quietly when the list or the model is not there.
+pub(crate) fn admin_entry_quiet(ctx: &Ctx, model: &str) -> Option<serde_json::Value> {
+    match lookup_entry(ctx, model) {
+        EntryLookup::Found(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// The entry of `model`, or `Err(1)` after printing why there is none (`not registered`, or the
+/// failed list request). `not_registered` is set when the list answered without the model.
+pub(crate) fn admin_entry(ctx: &Ctx, model: &str) -> Result<serde_json::Value, (i32, bool)> {
+    match lookup_entry(ctx, model) {
+        EntryLookup::Found(e) => Ok(e),
+        EntryLookup::NotRegistered => {
+            eprintln!(
+                "{}",
+                ctx.style
+                    .red(&format!("error: model '{model}' is not registered"))
+            );
+            Err((1, true))
+        }
+        EntryLookup::Unavailable(r) => {
+            print_error(ctx, &r);
+            Err((1, false))
+        }
+    }
+}
+
+/// How a verb words a text model whose entry has no `sampling` field (a server < 0.9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OldServerNote {
+    /// `add` / `patch`: sampling flags would be dropped — the warning (brief item 6).
+    Warning,
+    /// `check` / `status <id>`: nothing was sent — a dim neutral line (review F3).
+    Neutral,
+}
+
+/// The neutral line `rv check` / `rv status <id>` print for a server without the field.
+pub(crate) const NOT_REPORTED: &str = "sampling profile: not reported by this server (< 0.9.1)";
+
+/// Prints a registered model's sampling profile as the server reports it (V5c): the profile for a
+/// text model, the old-server note when its entry has no `sampling` field, nothing for other
+/// kinds (P9/F2). Returns what it found.
+pub(crate) fn print_entry_profile<'a>(
+    ctx: &Ctx,
+    model: &str,
+    entry: &'a serde_json::Value,
+    old: OldServerNote,
+) -> crate::sampling::EntryProfile<'a> {
+    use crate::sampling::{EntryProfile, OLD_SERVER_WARNING, Origin, entry_profile, print, render};
+    let found = entry_profile(entry);
+    match (&found, old) {
+        (EntryProfile::Profile(s), _) => print(ctx.style, &render(model, s, Origin::Server)),
+        (EntryProfile::OldServer, OldServerNote::Warning) => {
+            eprintln!(
+                "{} {}",
+                ctx.style.warn(),
+                ctx.style.yellow(OLD_SERVER_WARNING)
+            );
+        }
+        (EntryProfile::OldServer, OldServerNote::Neutral) => {
+            println!("{}", ctx.style.dim(NOT_REPORTED));
+        }
+        (EntryProfile::NotApplicable, _) => {}
+    }
+    found
 }
 
 /// Prints `error (CODE): detail` to stderr, in red.

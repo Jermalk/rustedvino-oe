@@ -20,8 +20,7 @@
 //   The model manager owns all engine handles now.
 // ============================================================
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -118,6 +117,13 @@ pub struct AppState {
     /// this process is not supervised. Admits only the watchdog read (`crate::WATCHDOG_PATH`),
     /// fixed at boot like [`admin_locked`](Self::admin_locked).
     pub watchdog_token: Option<Arc<str>>,
+
+    /// How long a realtime session may go without a committed utterance (or an
+    /// `inject_history`/`reload_history` batch) before the server closes it
+    /// (1000 `idle_timeout`). Always
+    /// [`REALTIME_IDLE_TIMEOUT`](crate::realtime_types::REALTIME_IDLE_TIMEOUT)
+    /// in production; a field (not a config key) only so tests can shorten it.
+    pub realtime_idle_timeout: std::time::Duration,
 }
 
 impl Default for AppState {
@@ -126,7 +132,7 @@ impl Default for AppState {
             model_manager: None,
             metrics_handle: None,
             voice_pin: Arc::new(VoicePinManager::default()),
-            realtime_sessions: Arc::new(RwLock::new(HashMap::new())),
+            realtime_sessions: Arc::default(),
             device_budgets: Arc::new(DeviceBudgets::default()),
             log_buffer: LogRingBuffer::default(),
             auth: Arc::new(ArcSwap::new(Arc::new(AuthConfig {
@@ -135,6 +141,7 @@ impl Default for AppState {
             }))),
             admin_locked: false,
             watchdog_token: None,
+            realtime_idle_timeout: crate::realtime_types::REALTIME_IDLE_TIMEOUT,
         }
     }
 }

@@ -51,6 +51,14 @@ fn gb_to_bytes(gb: f64) -> f64 {
     if bytes > 0.0 { bytes } else { 0.0 }
 }
 const PROCESS_GPU_MEMORY_BYTES: &str = "rustedvino_process_gpu_memory_bytes";
+
+/// Process and host memory (C26, pull-at-scrape, Linux only): the figures the server already reads
+/// for admission, exported so an operator can watch RSS and free RAM without a second agent on the
+/// box. Absent (never 0) where the OS cannot measure them, like [`PROCESS_GPU_MEMORY_BYTES`].
+const PROCESS_RESIDENT_MEMORY_BYTES: &str = "rustedvino_process_resident_memory_bytes";
+const PROCESS_RSS_ANON_BYTES: &str = "rustedvino_process_rss_anon_bytes";
+const HOST_MEMORY_AVAILABLE_BYTES: &str = "rustedvino_host_memory_available_bytes";
+const HOST_MEMORY_TOTAL_BYTES: &str = "rustedvino_host_memory_total_bytes";
 const MODEL_GPU_MEMORY_ESTIMATE_BYTES: &str = "rustedvino_model_gpu_memory_estimate_bytes";
 
 /// `OpenVINO` compile-cache disk usage (the project's internal engineering log)
@@ -150,6 +158,16 @@ const REQUESTS_TOTAL: &str = "rustedvino_requests_total";
 const TOKENS_PER_SECOND: &str = "rustedvino_tokens_per_second";
 const TTFT_SECONDS: &str = "rustedvino_ttft_seconds";
 const REQUEST_DURATION_SECONDS: &str = "rustedvino_request_duration_seconds";
+// 0.9.1 V1-usage: per-request prompt work, reasoning share, prefill speed.
+const PROMPT_TOKENS_TOTAL: &str = "rustedvino_prompt_tokens_total";
+const REASONING_TOKENS_TOTAL: &str = "rustedvino_reasoning_tokens_total";
+const PREFILL_TOKENS_PER_SECOND: &str = "rustedvino_prefill_tokens_per_second";
+
+/// Shortest prompt (in tokens) that records a `rustedvino_prefill_tokens_per_second` sample. A
+/// short prompt's first token is dominated by fixed per-request cost (template, scheduling, one
+/// decode step), so its rate says nothing about prefill. A hard constant on purpose, not a config
+/// key. The prompt and reasoning counters count every finished request regardless.
+pub const PREFILL_MIN_PROMPT_TOKENS: usize = 256;
 
 /// STT/TTS real-time factor (processing time ÷ audio duration, dimensionless).
 /// Emitted by both offline endpoints (`/v1/audio/transcriptions`,
@@ -187,6 +205,13 @@ const RT_LLM_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0];
 /// approach or exceed it.
 const RTF_BUCKETS: &[f64] = &[0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 5.0];
 
+/// Histogram buckets for effective prefill speed (prompt tokens per second). Spans an NPU or CPU
+/// prefill (tens of tok/s) through a dGPU prefill with prefix-cache hits (thousands), roughly
+/// evenly on a log scale so the p50 lands within a factor of ~1.5 anywhere in 10–5,000 tok/s.
+const PREFILL_TPS_BUCKETS: &[f64] = &[
+    10.0, 25.0, 50.0, 100.0, 200.0, 350.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0,
+];
+
 /// Install the global Prometheus recorder and register metric descriptions.
 ///
 /// Returns a [`PrometheusHandle`] whose `render()` produces the text
@@ -218,6 +243,11 @@ pub fn install() -> anyhow::Result<PrometheusHandle> {
         .map_err(|e| anyhow::anyhow!("failed to set realtime LLM buckets: {e}"))?
         .set_buckets_for_metric(Matcher::Full(RTF_RATIO.to_owned()), RTF_BUCKETS)
         .map_err(|e| anyhow::anyhow!("failed to set RTF buckets: {e}"))?
+        .set_buckets_for_metric(
+            Matcher::Full(PREFILL_TOKENS_PER_SECOND.to_owned()),
+            PREFILL_TPS_BUCKETS,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to set prefill buckets: {e}"))?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("failed to install Prometheus recorder: {e}"))?;
     register_metrics();
@@ -231,6 +261,34 @@ fn register_metrics() {
     register_key_usage_metrics();
     register_eviction_metrics();
     register_ov_cache_metrics();
+    register_memory_metrics();
+}
+
+/// Process and host memory gauges — see [`PROCESS_RESIDENT_MEMORY_BYTES`].
+fn register_memory_metrics() {
+    describe_gauge!(
+        PROCESS_RESIDENT_MEMORY_BYTES,
+        Unit::Bytes,
+        "Resident memory of this server process (VmRSS of /proc/self/status: anonymous plus \
+         file-backed pages such as mapped model files), read at scrape time (Linux only)"
+    );
+    describe_gauge!(
+        PROCESS_RSS_ANON_BYTES,
+        Unit::Bytes,
+        "Anonymous resident memory of this server process (RssAnon of /proc/self/status), read at \
+         scrape time (Linux only) — the figure the system-RAM admission measures loads with"
+    );
+    describe_gauge!(
+        HOST_MEMORY_AVAILABLE_BYTES,
+        Unit::Bytes,
+        "Host memory available for new allocations without swapping (MemAvailable of \
+         /proc/meminfo), read at scrape time (Linux only) — the live figure the RAM floor checks"
+    );
+    describe_gauge!(
+        HOST_MEMORY_TOTAL_BYTES,
+        Unit::Bytes,
+        "Total host memory (MemTotal of /proc/meminfo), read at scrape time (Linux only)"
+    );
 }
 
 /// OV compile-cache disk usage — see [`OV_CACHE_BYTES`]'s doc comment.
@@ -291,8 +349,7 @@ fn register_key_usage_metrics() {
         KEY_USAGE_TOTAL,
         Unit::Count,
         "Requests attributed to a specific Bearer key, labeled only by its last 6 characters \
-         (never the full key — see require_bearer_auth's key_suffix helper, the only thing \
-         that ever turns a full key into this fragment). Cumulative since server start, not a \
+         (the full key never appears in any metric). Cumulative since server start, not a \
          rolling window — pair with rustedvino_key_last_seen_timestamp_seconds to tell \
          \"high total, quiet lately\" from \"active right now.\" Only successfully-authenticated \
          requests count: a key under 12 characters is skipped entirely (its last 6 chars would \
@@ -449,6 +506,21 @@ fn register_hot_path_metrics() {
         Unit::Seconds,
         "Time from request arrival (handler entry) to its first generated token. Carries a `modality` label (text vs multimodal)"
     );
+    describe_counter!(
+        PROMPT_TOKENS_TOTAL,
+        Unit::Count,
+        "Prompt (input) tokens of finished generation requests, as the engine counted them (the same figure as usage.prompt_tokens). Carries a `modality` label (text vs multimodal)"
+    );
+    describe_counter!(
+        REASONING_TOKENS_TOTAL,
+        Unit::Count,
+        "Reasoning tokens of finished generation requests (the same figure as usage.completion_tokens_details.reasoning_tokens): tokens inside the reasoning block, markers included. Exact on text CB models; approximate on VLM/NPU (a tokenizer recount of the reasoning text). Carries a `modality` label"
+    );
+    describe_histogram!(
+        PREFILL_TOKENS_PER_SECOND,
+        Unit::CountPerSecond,
+        "Prompt tokens per second, effective prefill (prefix-cache hits included): prompt tokens divided by the time from the engine starting this request to its first generated token, excluding queue and admission time. Recorded only for prompts of at least 256 tokens. Under continuous batching the interval also holds other requests' steps. Carries a `modality` label"
+    );
     describe_histogram!(
         REQUEST_DURATION_SECONDS,
         Unit::Seconds,
@@ -529,6 +601,13 @@ struct PerRequestMetrics {
     ttft_seconds: Histogram,
     /// `rustedvino_request_duration_seconds` — recorded once per request (finish).
     request_duration: Histogram,
+    /// `rustedvino_prompt_tokens_total` — the engine's prompt count, once per finished request.
+    prompt_tokens: Counter,
+    /// `rustedvino_reasoning_tokens_total` — the usage reasoning figure, once per finished request.
+    reasoning_tokens: Counter,
+    /// `rustedvino_prefill_tokens_per_second` — once per request whose prompt clears
+    /// [`PREFILL_MIN_PROMPT_TOKENS`].
+    prefill_tps: Histogram,
 }
 
 /// Cached metric handles for the per-token hot path, owned by the engine
@@ -586,6 +665,9 @@ impl HotMetrics {
                 requests_total: counter!(REQUESTS_TOTAL, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
                 ttft_seconds: histogram!(TTFT_SECONDS, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
                 request_duration: histogram!(REQUEST_DURATION_SECONDS, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
+                prompt_tokens: counter!(PROMPT_TOKENS_TOTAL, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
+                reasoning_tokens: counter!(REASONING_TOKENS_TOTAL, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
+                prefill_tps: histogram!(PREFILL_TOKENS_PER_SECOND, "model" => model.clone(), "device" => dev.clone(), "kind" => kind_label, "modality" => m),
             }
         };
         let mut per_request: [Option<PerRequestMetrics>; Modality::COUNT] = [None, None];
@@ -658,11 +740,82 @@ impl HotMetrics {
         }
     }
 
+    /// Count a finished generation request's prompt and reasoning tokens (0.9.1 V1-usage): the
+    /// same figures its `usage` block reports. Called once per request, at its end.
+    pub fn record_request_tokens(
+        &self,
+        modality: Modality,
+        prompt_tokens: usize,
+        reasoning_tokens: usize,
+    ) {
+        if let Some(pr) = &self.per_request[modality as usize] {
+            pr.prompt_tokens
+                .increment(u64::try_from(prompt_tokens).unwrap_or(u64::MAX));
+            pr.reasoning_tokens
+                .increment(u64::try_from(reasoning_tokens).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Record a request's effective prefill speed: `prompt_tokens` over `prefill` (the engine's
+    /// start of this request to its first generated token). A no-op below
+    /// [`PREFILL_MIN_PROMPT_TOKENS`] or for a zero interval — see [`prefill_rate`].
+    pub fn record_prefill(
+        &self,
+        modality: Modality,
+        prompt_tokens: usize,
+        prefill: std::time::Duration,
+    ) {
+        if let (Some(pr), Some(rate)) = (
+            &self.per_request[modality as usize],
+            prefill_rate(prompt_tokens, prefill),
+        ) {
+            pr.prefill_tps.record(rate);
+        }
+    }
+
     /// Record a request's real-time factor (processing time ÷ audio duration).
     /// STT/TTS engines only.
     pub fn record_rtf(&self, ratio: f64) {
         self.rtf.record(ratio);
     }
+}
+
+/// A request's effective-prefill interval (0.9.1 V1-usage, P2): from the engine's start of the
+/// request (`engine_started_at`, after the admission wait and the command queue) to its first
+/// token or text chunk (`first_token_at`; `None` when none came → no interval). `requested_at` is
+/// the handler entry that TTFT counts from; it is taken only as a floor, so the interval never
+/// reaches back into the queue even if the engine start were read before it.
+#[must_use]
+pub fn prefill_interval(
+    requested_at: std::time::Instant,
+    engine_started_at: std::time::Instant,
+    first_token_at: Option<std::time::Instant>,
+) -> Option<std::time::Duration> {
+    first_token_at.map(|t| t.saturating_duration_since(engine_started_at.max(requested_at)))
+}
+
+/// The effective prefill rate a request records, in prompt tokens per second: `None` when the
+/// prompt is shorter than [`PREFILL_MIN_PROMPT_TOKENS`] (no sample) or the interval is zero.
+#[must_use]
+pub fn prefill_rate(prompt_tokens: usize, prefill: std::time::Duration) -> Option<f64> {
+    let secs = prefill.as_secs_f64();
+    if prompt_tokens < PREFILL_MIN_PROMPT_TOKENS || secs <= 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)] // prompt counts are far below f64's exact range
+    Some(prompt_tokens as f64 / secs)
+}
+
+/// Test helper (cb/vlm/npu engine tests, 0.9.1 V1-usage): the value of the first `metric` sample
+/// line in a Prometheus render whose labels contain `label`; `None` when the series is absent.
+#[cfg(test)]
+pub(crate) fn test_sample(rendered: &str, metric: &str, label: &str) -> Option<f64> {
+    rendered
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .find(|l| l.starts_with(metric) && l[metric.len()..].starts_with('{') && l.contains(label))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
 }
 
 /// Set the state gauges from a live [`MetricsSnapshot`].
@@ -751,6 +904,57 @@ pub fn record_state(snap: &MetricsSnapshot) {
     for (domain, total_gb, used_gb) in &snap.domain_vram {
         gauge!(VRAM_TOTAL_BYTES, "domain" => domain.clone()).set(gb_to_bytes(*total_gb));
         gauge!(VRAM_USED_BYTES, "domain" => domain.clone()).set(gb_to_bytes(*used_gb));
+    }
+    record_memory(&MemoryReadings::read());
+}
+
+/// One scrape's process and host memory readings in bytes (C26). `None` = the OS could not
+/// measure it; its gauge is then not written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryReadings {
+    /// `VmRSS` of `/proc/self/status`.
+    process_resident: Option<u64>,
+    /// `RssAnon` of `/proc/self/status`.
+    process_rss_anon: Option<u64>,
+    /// `MemAvailable` of `/proc/meminfo`.
+    host_available: Option<u64>,
+    /// `MemTotal` of `/proc/meminfo`.
+    host_total: Option<u64>,
+}
+
+impl MemoryReadings {
+    /// Read all four figures live (two small `/proc` reads on Linux; all `None` elsewhere).
+    fn read() -> Self {
+        let (host_total, host_available) = crate::os_memory::host_memory_bytes();
+        let (process_resident, process_rss_anon) = crate::os_memory::process_memory_bytes();
+        Self {
+            process_resident,
+            process_rss_anon,
+            host_available,
+            host_total,
+        }
+    }
+}
+
+/// Write the process and host memory gauges, skipping each figure that is `None` so an
+/// unmeasurable value is absent from the exposition instead of a misleading 0.
+///
+/// Limit: a gauge that had a value keeps it if a later read fails (only possible if `/proc`
+/// becomes unreadable mid-run). `metrics-exporter-prometheus` 0.16 cannot remove one series; its
+/// only removal is a global idle timeout per metric kind, which would also drop the gauges that are
+/// set rarely on purpose (`rustedvino_ov_cache_bytes`, the per-key last-seen gauge).
+// Byte counts of a host's RAM are far under f64's exact-integer ceiling (2^53).
+#[allow(clippy::cast_precision_loss)]
+fn record_memory(r: &MemoryReadings) {
+    for (name, value) in [
+        (PROCESS_RESIDENT_MEMORY_BYTES, r.process_resident),
+        (PROCESS_RSS_ANON_BYTES, r.process_rss_anon),
+        (HOST_MEMORY_AVAILABLE_BYTES, r.host_available),
+        (HOST_MEMORY_TOTAL_BYTES, r.host_total),
+    ] {
+        if let Some(bytes) = value {
+            gauge!(name).set(bytes as f64);
+        }
     }
 }
 
@@ -1356,5 +1560,242 @@ mod tests {
         let rendered = handle.render();
         assert!(rendered.contains("key_suffix=\"aaaaaa\""));
         assert!(rendered.contains("key_suffix=\"bbbbbb\""));
+    }
+
+    /// The value of the unlabelled series `metric` in a render, or `None` when it is absent.
+    fn bare_series(rendered: &str, metric: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(metric)?.strip_prefix(' '))
+            .and_then(|v| v.parse().ok())
+    }
+
+    const MEMORY_GAUGES: [&str; 4] = [
+        PROCESS_RESIDENT_MEMORY_BYTES,
+        PROCESS_RSS_ANON_BYTES,
+        HOST_MEMORY_AVAILABLE_BYTES,
+        HOST_MEMORY_TOTAL_BYTES,
+    ];
+
+    /// C26: each memory gauge renders its reading in bytes, with HELP and TYPE gauge lines.
+    #[test]
+    fn memory_gauges_render_their_readings_in_bytes() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_metrics();
+            record_memory(&MemoryReadings {
+                process_resident: Some(2_000_000_000),
+                process_rss_anon: Some(1_500_000_000),
+                host_available: Some(20_000_000_000),
+                host_total: Some(32_000_000_000),
+            });
+        });
+        let r = handle.render();
+        let expect = [2e9, 1.5e9, 2e10, 3.2e10];
+        for (name, want) in MEMORY_GAUGES.iter().zip(expect) {
+            let got = bare_series(&r, name).unwrap_or_else(|| panic!("no `{name}` in:\n{r}"));
+            assert!((got - want).abs() < 1.0, "{name}: {got} != {want}");
+            assert!(
+                r.contains(&format!("# TYPE {name} gauge")),
+                "TYPE line for {name}:\n{r}"
+            );
+            assert!(
+                r.contains(&format!("# HELP {name} ")),
+                "HELP line for {name}:\n{r}"
+            );
+        }
+    }
+
+    /// C26: a figure the OS cannot measure is absent from the exposition, never 0 — each gauge
+    /// on its own, the others still written.
+    #[test]
+    fn memory_gauge_is_absent_when_its_reader_returns_none() {
+        let full = MemoryReadings {
+            process_resident: Some(1),
+            process_rss_anon: Some(2),
+            host_available: Some(3),
+            host_total: Some(4),
+        };
+        let blanks: [fn(&mut MemoryReadings); 4] = [
+            |r| r.process_resident = None,
+            |r| r.process_rss_anon = None,
+            |r| r.host_available = None,
+            |r| r.host_total = None,
+        ];
+        for (i, blank) in blanks.iter().enumerate() {
+            let mut readings = full;
+            blank(&mut readings);
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || record_memory(&readings));
+            let r = handle.render();
+            for (j, name) in MEMORY_GAUGES.iter().enumerate() {
+                assert_eq!(
+                    bare_series(&r, name).is_some(),
+                    i != j,
+                    "`{name}` presence with reading {i} blanked:\n{r}"
+                );
+            }
+        }
+        // Nothing measurable (a non-Linux host): none of the four series.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || record_memory(&MemoryReadings::default()));
+        let r = handle.render();
+        assert!(
+            MEMORY_GAUGES.iter().all(|n| !r.contains(n)),
+            "all absent:\n{r}"
+        );
+    }
+
+    /// C26: on Linux a scrape (`record_state`) carries all four gauges with plausible values.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_gauges_appear_on_linux_with_plausible_values() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || record_state(&snap_with(false, 0, 0)));
+        let r = handle.render();
+        let v = |name: &str| bare_series(&r, name).unwrap_or_else(|| panic!("no `{name}`:\n{r}"));
+        let (rss, anon) = (v(PROCESS_RESIDENT_MEMORY_BYTES), v(PROCESS_RSS_ANON_BYTES));
+        let (avail, total) = (v(HOST_MEMORY_AVAILABLE_BYTES), v(HOST_MEMORY_TOTAL_BYTES));
+        assert!(anon > 0.0 && rss > 0.0, "RSS {rss}, RssAnon {anon}");
+        assert!(rss < total && anon < total, "process within host RAM");
+        assert!(
+            avail > 0.0 && avail <= total,
+            "MemAvailable {avail} vs MemTotal {total}"
+        );
+        assert!(
+            total.fract() == 0.0 && (total % 1024.0) == 0.0,
+            "whole kB in bytes: {total}"
+        );
+    }
+
+    // ---- 0.9.1 V1-usage: prompt / reasoning / prefill series ----
+
+    /// `/metrics` renders the three series with their HELP lines (the prefill HELP names the
+    /// "effective prefill" caveat and the floor constant's value; the reasoning HELP says
+    /// approximate on VLM/NPU), as a histogram with the chosen buckets, labelled like TTFT.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn v1_usage_series_render_with_help_and_buckets() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(PREFILL_TOKENS_PER_SECOND.to_owned()),
+                PREFILL_TPS_BUCKETS,
+            )
+            .unwrap()
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_metrics();
+            let m = HotMetrics::new(ModelKind::Vision, "vl", "GPU.1");
+            m.record_request_tokens(Modality::Multimodal, 1_000, 40);
+            m.record_prefill(
+                Modality::Multimodal,
+                1_000,
+                std::time::Duration::from_millis(500),
+            );
+        });
+        let r = handle.render();
+        let help = |name: &str| {
+            r.lines()
+                .find(|l| l.starts_with(&format!("# HELP {name} ")))
+                .unwrap_or_else(|| panic!("no HELP for {name}:\n{r}"))
+                .to_owned()
+        };
+        assert!(help(PROMPT_TOKENS_TOTAL).contains("usage.prompt_tokens"));
+        assert!(help(REASONING_TOKENS_TOTAL).contains("approximate on VLM/NPU"));
+        let prefill = help(PREFILL_TOKENS_PER_SECOND);
+        assert!(
+            prefill.contains("effective prefill (prefix-cache hits included)"),
+            "{prefill}"
+        );
+        assert!(
+            prefill.contains(&format!("at least {PREFILL_MIN_PROMPT_TOKENS} tokens")),
+            "HELP and the constant must agree: {prefill}"
+        );
+        assert!(r.contains(&format!("# TYPE {PREFILL_TOKENS_PER_SECOND} histogram")));
+        let labels = r#"model="vl",device="GPU.1",kind="vision",modality="multimodal""#;
+        assert!(
+            r.contains(&format!("{PROMPT_TOKENS_TOTAL}{{{labels}}} 1000")),
+            "{r}"
+        );
+        assert!(
+            r.contains(&format!("{REASONING_TOKENS_TOTAL}{{{labels}}} 40")),
+            "{r}"
+        );
+        assert!(
+            r.contains(&format!(
+                r#"{PREFILL_TOKENS_PER_SECOND}_bucket{{{labels},le="2000"}} 1"#
+            )),
+            "2,000 tok/s lands in the 2000 bucket: {r}"
+        );
+        assert!(
+            r.contains(&format!(
+                r#"{PREFILL_TOKENS_PER_SECOND}_bucket{{{labels},le="1500"}} 0"#
+            )),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn prefill_rate_floor_and_buckets() {
+        let d = std::time::Duration::from_secs(1);
+        assert_eq!(prefill_rate(PREFILL_MIN_PROMPT_TOKENS - 1, d), None);
+        assert_eq!(prefill_rate(PREFILL_MIN_PROMPT_TOKENS, d), Some(256.0));
+        assert_eq!(prefill_rate(1_000, std::time::Duration::ZERO), None);
+        assert!(PREFILL_TPS_BUCKETS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(PREFILL_TPS_BUCKETS.first(), Some(&10.0));
+        assert_eq!(PREFILL_TPS_BUCKETS.last(), Some(&5000.0));
+    }
+
+    /// metrics-09: the key-usage HELP text names no internal function.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn key_usage_help_names_no_internal_function() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_metrics();
+            record_key_usage("abcdef");
+        });
+        let r = handle.render();
+        let help = r
+            .lines()
+            .find(|l| l.starts_with(&format!("# HELP {KEY_USAGE_TOTAL} ")))
+            .unwrap();
+        assert!(
+            !help.contains("require_bearer_auth") && !help.contains("helper"),
+            "{help}"
+        );
+        assert!(help.contains("last 6 characters"), "{help}");
+    }
+
+    /// R-3: the interval starts at the engine start, not the handler entry (queue excluded), and
+    /// there is none without a first token.
+    #[test]
+    fn prefill_interval_excludes_the_queue() {
+        use std::time::{Duration, Instant};
+        let requested = Instant::now();
+        let engine = requested + Duration::from_secs(5);
+        let first = engine + Duration::from_millis(400);
+        assert_eq!(
+            prefill_interval(requested, engine, Some(first)),
+            Some(Duration::from_millis(400))
+        );
+        assert_eq!(prefill_interval(requested, engine, None), None);
+        // An engine start read before the handler entry is floored at the entry.
+        assert_eq!(
+            prefill_interval(engine, requested, Some(first)),
+            Some(Duration::from_millis(400))
+        );
+        // A first token before the start saturates to zero (then `prefill_rate` records nothing).
+        assert_eq!(
+            prefill_interval(requested, first, Some(engine)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(prefill_rate(1_000, Duration::ZERO), None);
     }
 }

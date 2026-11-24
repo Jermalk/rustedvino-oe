@@ -36,27 +36,28 @@ use axum::{
 };
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::ReceiverStream;
 
 use std::sync::Arc;
 
 use super::error::{
-    JsonBody, device_admission_error_response, inference_error_from_text, model_error_response,
-    openai_error, openai_error_with_param, sse_inference_error_event, sse_json_event,
-    unsupported_param,
+    JsonBody, device_admission_error_response, inference_error_from_text, openai_error,
+    openai_error_with_param, sse_inference_error_event, sse_json_event, unsupported_param,
 };
 use crate::{
     app_state::AppState,
     cb_engine::{EngineHandle, SubmitResult},
-    image_util::DecodedImage,
     model_manager::{
-        EngineHandleKind, GateClamp, GateDetail, ModelError, ModelManager, OnDemandLoad,
-        ReasoningParser, template::GenerationDefaults,
+        EngineHandleKind, GateClamp, GateDetail, ModelError, ModelManager, ReasoningParser,
+        engine::ModelKind,
+        on_demand::WaitPlace,
+        sampling::{SamplingProfile, dec},
+        template::GenerationDefaults,
     },
     ov_cb::{FinishReason, GenParams},
     prompt_builder::{
         HarmonyFilter, ModelFamily, ThinkFilter, ThinkPiece, ToolCall, extract_reasoning_gpt_oss,
-        extract_thinking, parse_tool_calls, prompt_ends_in_thinking, template_prefills_thinking,
+        extract_thinking, parse_tool_calls_with_tools, prompt_ends_in_thinking,
+        template_prefills_thinking,
     },
     streaming::{StreamEvent, TokenReceiver, stream_channel},
 };
@@ -487,8 +488,15 @@ pub(crate) async fn gate_vlm_admission(
 /// exact gate only (the legacy pool figure is an estimate, not a capacity). `admitted` is the
 /// prompt size [`gate_vlm_admission`] returned; `0` means unknown and leaves the request alone.
 ///
+/// `requested == 0` is an unbounded budget (`max_tokens_cap: 0` and no `max_tokens`; an explicit
+/// `max_tokens: 0` is refused earlier). With the pool known it resolves to the room the pool has
+/// left after the prompt (P-02), so the engine gets a real bound and the watchdog allowance
+/// ([`crate::vlm_engine::generation_allowance`]) a decode term; it is not logged or counted as a
+/// clamp. With the pool unknown (legacy gate, unknown prompt size, no pool figure) it stays `0`.
+///
 /// # Errors
-/// A 400 when the prompt leaves less than [`VLM_MIN_ANSWER_TOKENS`] tokens of room.
+/// A 400 when the prompt leaves less than [`VLM_MIN_ANSWER_TOKENS`] tokens of room (also for an
+/// unbounded budget).
 pub(crate) fn clamp_vlm_max_tokens(
     model_id: &str,
     (exact_gate, pool_capacity_tokens): (bool, usize),
@@ -500,7 +508,15 @@ pub(crate) fn clamp_vlm_max_tokens(
     }
     let spare = (pool_capacity_tokens * VLM_POOL_ROOM_PERCENT / 100).max(VLM_POOL_ROOM_TOKENS);
     let room = pool_capacity_tokens.saturating_sub(admitted + spare);
-    if requested <= room {
+    if requested == 0 && room >= VLM_MIN_ANSWER_TOKENS {
+        tracing::debug!(
+            model_id,
+            budget = room,
+            "unbounded max_tokens resolved to the KV pool room"
+        );
+        return Ok(room);
+    }
+    if requested != 0 && requested <= room {
         return Ok(requested);
     }
     if room < VLM_MIN_ANSWER_TOKENS {
@@ -622,9 +638,9 @@ pub struct ChatRequest {
     /// extension, the same convention other `OpenAI`-compatible servers use,
     /// e.g. Ollama/`llama.cpp`). Scales a token's logit by this factor every
     /// time it has already appeared; `> 1.0` discourages repeats, `1.0` = off.
-    /// Absent → the server applies [`DEFAULT_REPETITION_PENALTY`] as a safety
-    /// net (see [`resolve_repetition_penalty`]) — send `1.0` explicitly to
-    /// opt out.
+    /// Absent → the model profile's penalty: the operator's `sampling`, else the
+    /// model file's value in `(1.0, 2.0]`, else the server's 1.1 safety net (see
+    /// [`resolve_repetition_penalty`]) — send `1.0` explicitly to opt out.
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
 
@@ -682,12 +698,33 @@ pub struct ChatRequest {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
 
-    /// vLLM-style template arguments (SF-5 D-04). Only `enable_thinking` is read: it applies
-    /// when the top-level [`Self::enable_thinking`] is absent (the top-level field wins when both
-    /// are set). Other keys are accepted and ignored; a non-boolean `enable_thinking` is a 400
-    /// `invalid_chat_template_kwargs`, a non-object value the generic body-parse 400.
+    /// vLLM-style template arguments (SF-5 D-04; 0.9.1). Only an allowlist is read:
+    /// `enable_thinking` and `preserve_thinking` (booleans) and `reasoning_effort` (see
+    /// [`Self::reasoning_effort`]); a top-level field of the same name wins. They reach the
+    /// template as server-built values, never as the client's JSON. Other keys are accepted and
+    /// ignored (logged); a wrong type is a 400 naming the key (`invalid_chat_template_kwargs` /
+    /// `invalid_reasoning_effort`), a non-object value the generic body-parse 400.
     #[serde(default)]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// `OpenAI` `reasoning_effort` (0.9.1): `none` / `minimal` = thinking off, `low` / `medium` /
+    /// `high` (also `xhigh`, `max`) = thinking on with a 1,024 / 4,096 / 16,384-token strict
+    /// budget. Raw JSON so a
+    /// wrong type gets the same named 400 (`invalid_reasoning_effort`) as an unknown word. See
+    /// `crate::thinking_budget` for the precedence.
+    #[serde(default)]
+    pub reasoning_effort: Option<serde_json::Value>,
+
+    /// The strict thinking budget in tokens (0.9.1): an integer `>= 0`, `0` = thinking off. At
+    /// the budget the request ends with `finish_reason: "length"`. Raw JSON for the named 400
+    /// (`invalid_thinking_budget`).
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<serde_json::Value>,
+
+    /// vLLM's name for [`Self::thinking_budget_tokens`]; both set to different values is a 400
+    /// (`conflicting_thinking_budget`).
+    #[serde(default)]
+    pub thinking_token_budget: Option<serde_json::Value>,
 
     // ---- Known-but-unsupported params (rejected with 400, not silently dropped).
     // These are parsed only so the handler can detect their presence and return an
@@ -1021,6 +1058,20 @@ pub(crate) struct Usage {
     pub(crate) prompt_tokens: usize,
     pub(crate) completion_tokens: usize,
     pub(crate) total_tokens: usize,
+    /// `OpenAI` `completion_tokens_details` (0.9.1 V1-usage): always present, so a client can
+    /// tell "no reasoning" (0) from an older server (absent).
+    pub(crate) completion_tokens_details: CompletionTokensDetails,
+}
+
+/// `usage.completion_tokens_details`. Only `reasoning_tokens` is reported (no
+/// `prompt_tokens_details.cached_tokens`: `GenAI` 2026.4.1 gives no per-request hit count,
+/// so a `cached_tokens` figure would be a guess).
+#[derive(Serialize)]
+pub(crate) struct CompletionTokensDetails {
+    /// Tokens of the reasoning block (markers included), counted on the engine thread
+    /// (`crate::reasoning_tokens`): exact on text CB models, a tokenizer recount (approximate) on
+    /// VLM / NPU. Never above `completion_tokens`; 0 when thinking is off or the model has none.
+    pub(crate) reasoning_tokens: usize,
 }
 
 // ---- SSE event construction -----------------------------------------
@@ -1157,6 +1208,7 @@ pub(crate) fn usage_sse_event(
     created: u64,
     prompt_tokens: usize,
     compl_tokens: usize,
+    reasoning_tokens: usize,
 ) -> Event {
     let data = serde_json::json!({
         "id": id,
@@ -1164,11 +1216,7 @@ pub(crate) fn usage_sse_event(
         "created": created,
         "model": model,
         "choices": [],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": compl_tokens,
-            "total_tokens": prompt_tokens + compl_tokens
-        }
+        "usage": usage_for(prompt_tokens, compl_tokens, reasoning_tokens),
     });
     Event::default().data(data.to_string())
 }
@@ -1179,6 +1227,11 @@ pub(crate) fn usage_sse_event(
 /// `finish_reason` chunk → optional usage chunk (when `include_usage`) → `[DONE]`.
 /// `counts` is `(prompt_tokens, completion_tokens)` accumulated via the `scan`
 /// operator in the caller; only used when `include_usage` is `true`.
+///
+/// **Test-only legacy shaper:** no route calls it (the chat stream uses `ScanState::process`).
+/// It is stateless, so it drops `ReasoningTokens` and its usage chunk always reports
+/// `completion_tokens_details.reasoning_tokens: 0` (0.9.1 V1-usage, review R-7) — do not wire it
+/// into a route without threading the reasoning count through.
 #[allow(dead_code)]
 pub fn stream_event_to_sse(
     event: StreamEvent,
@@ -1190,7 +1243,11 @@ pub fn stream_event_to_sse(
     meta: ResponseMeta,
 ) -> Vec<Result<Event, Infallible>> {
     match event {
-        StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => vec![],
+        StreamEvent::PromptTokens(_)
+        | StreamEvent::CompletionTokens(_)
+        | StreamEvent::ReasoningTokens(_) => {
+            vec![]
+        }
         StreamEvent::Token(tok, _) => vec![Ok(token_event(&tok, id, model, created, meta))],
         StreamEvent::Done(reason) => {
             let mut frames = vec![Ok(finish_event(
@@ -1209,6 +1266,7 @@ pub fn stream_event_to_sse(
                     created,
                     pt,
                     ct,
+                    0,
                 )));
             }
             frames.push(Ok(Event::default().data("[DONE]")));
@@ -1459,48 +1517,72 @@ fn parse_tool_choice(
     }
 }
 
-/// The request's effective `enable_thinking`: the top-level field, else
-/// `chat_template_kwargs.enable_thinking` (SF-5 D-04). A non-boolean kwarg is a 400 naming it;
-/// other kwargs are ignored (a warning once per process, then debug).
-fn resolve_enable_thinking(req: &ChatRequest) -> Result<Option<bool>, Box<Response>> {
-    let Some(kwargs) = req.chat_template_kwargs.as_ref() else {
-        return Ok(req.enable_thinking);
-    };
-    let ignored: Vec<&str> = kwargs
-        .keys()
-        .map(String::as_str)
-        .filter(|k| *k != "enable_thinking")
-        .collect();
-    if !ignored.is_empty() {
-        // A client using another switch name (`thinking`, `reasoning_effort`) silently gets the
-        // default: say so once at warn level, where a normal run can see it.
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if WARNED.swap(true, Ordering::Relaxed) {
-            tracing::debug!(
-                ?ignored,
-                "chat_template_kwargs: only enable_thinking is read"
-            );
-        } else {
-            tracing::warn!(
-                ?ignored,
-                "chat_template_kwargs: only enable_thinking is read, these keys are ignored \
-                 (logged once per process)"
-            );
+/// The request's thinking controls (0.9.1, `crate::thinking_budget`): `enable_thinking`,
+/// `reasoning_effort` (top level, else `chat_template_kwargs`), `preserve_thinking` (kwargs), and
+/// the budget (`thinking_budget_tokens` / `thinking_token_budget`). A wrong type or value is a
+/// 400 naming the field; kwargs outside the allowlist are ignored (a warning once per process,
+/// then debug).
+fn resolve_thinking_request(
+    req: &ChatRequest,
+) -> Result<crate::thinking_budget::ThinkingRequest, Box<Response>> {
+    if let Some(kwargs) = req.chat_template_kwargs.as_ref() {
+        let ignored = crate::thinking_budget::ignored_kwargs(kwargs);
+        if !ignored.is_empty() {
+            // A client using another switch name (`thinking`) silently gets the default: say
+            // so once at warn level, where a normal run can see it.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if WARNED.swap(true, Ordering::Relaxed) {
+                tracing::debug!(
+                    ?ignored,
+                    "chat_template_kwargs: only enable_thinking, reasoning_effort and \
+                     preserve_thinking are read"
+                );
+            } else {
+                tracing::warn!(
+                    ?ignored,
+                    "chat_template_kwargs: only enable_thinking, reasoning_effort and \
+                     preserve_thinking are read, these keys are ignored (logged once per process)"
+                );
+            }
         }
     }
-    let from_kwargs = match kwargs.get("enable_thinking") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Bool(b)) => Some(*b),
-        Some(_) => {
-            return Err(Box::new(openai_error(
-                StatusCode::BAD_REQUEST,
-                "chat_template_kwargs.enable_thinking must be a boolean",
-                "invalid_request_error",
-                Some("invalid_chat_template_kwargs"),
-            )));
-        }
-    };
-    Ok(req.enable_thinking.or(from_kwargs))
+    crate::thinking_budget::parse_request(crate::thinking_budget::RawThinkingFields {
+        enable_thinking: req.enable_thinking,
+        reasoning_effort: req.reasoning_effort.as_ref(),
+        thinking_budget_tokens: req.thinking_budget_tokens.as_ref(),
+        thinking_token_budget: req.thinking_token_budget.as_ref(),
+        kwargs: req.chat_template_kwargs.as_ref(),
+    })
+    .map_err(|e| {
+        Box::new(openai_error_with_param(
+            StatusCode::BAD_REQUEST,
+            e.message,
+            "invalid_request_error",
+            Some(e.code),
+            Some(e.param),
+        ))
+    })
+}
+
+/// [`crate::thinking_budget::resolve`] for one request on one model, logged at debug.
+fn thinking_plan(
+    request_id: &str,
+    thinking: &crate::thinking_budget::ThinkingRequest,
+    model_default: Option<u32>,
+    max_new_tokens: usize,
+) -> crate::thinking_budget::ThinkingPlan {
+    let plan = crate::thinking_budget::resolve(thinking, model_default, max_new_tokens);
+    if plan != crate::thinking_budget::ThinkingPlan::default() {
+        tracing::debug!(
+            request_id,
+            enable_thinking = ?plan.template.enable_thinking,
+            reasoning_effort = ?plan.template.reasoning_effort,
+            preserve_thinking = ?plan.template.preserve_thinking,
+            thinking_budget = ?plan.budget,
+            "thinking plan"
+        );
+    }
+    plan
 }
 
 /// Reject a known `OpenAI` chat parameter the engine cannot honor with an
@@ -1662,18 +1744,11 @@ pub(crate) fn validate_message_roles(messages: &[ChatMessage]) -> Option<Respons
     ))
 }
 
-/// Server-side repetition-penalty safety net, applied whenever a request
-/// doesn't specify its own `repetition_penalty` — see
-/// [`resolve_repetition_penalty`]'s doc comment for why this exists.
-///
-/// `1.1` matches the long-standing `llama.cpp`/Ollama community default: mild
-/// enough not to visibly change well-behaved output, but enough to break the
-/// degenerate "same token/word forever" loop a `repetition_penalty` of `1.0`
-/// (`OpenVINO`'s own unset default) does nothing to prevent.
-pub(crate) const DEFAULT_REPETITION_PENALTY: f32 = 1.1;
-
 /// Resolve the `repetition_penalty` to actually send the engine: the
-/// caller's explicit value if given, else [`DEFAULT_REPETITION_PENALTY`].
+/// caller's explicit value if given, else the model profile's (`profile_default`:
+/// the operator's, else the model file's `(1.0, 2.0]`, else
+/// [`crate::model_manager::sampling::DEFAULT_REPETITION_PENALTY`] — 0.9.1 V5b).
+/// The tools pin never touches it.
 ///
 /// Unlike `presence_penalty`/`frequency_penalty` (which pass through `None`
 /// — "leave `OpenVINO`'s own default alone" — when the caller doesn't ask for
@@ -1685,8 +1760,113 @@ pub(crate) const DEFAULT_REPETITION_PENALTY: f32 = 1.1;
 /// `frequency_penalty` were requested that turn, so nothing discouraged the
 /// repeat. A caller can still explicitly opt out by sending
 /// `"repetition_penalty": 1.0`.
-pub(crate) fn resolve_repetition_penalty(requested: Option<f32>) -> Option<f32> {
-    requested.or(Some(DEFAULT_REPETITION_PENALTY))
+pub(crate) fn resolve_repetition_penalty(
+    requested: Option<f32>,
+    profile_default: f32,
+) -> Option<f32> {
+    requested.or(Some(profile_default))
+}
+
+/// Where a request's `temperature`/`top_p`/`top_k` came from, for the per-request
+/// debug line (`sampling_source`, V5c): `client` when it set any of them, `tools_pin`
+/// when tools are active and it set none, else `config` when the operator layer
+/// supplied any of the profile's three, else `model` (file layer or greedy default).
+pub(crate) fn sampling_source(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    tools_active: bool,
+    profile: &SamplingProfile,
+) -> &'static str {
+    if temperature.is_some() || top_p.is_some() || top_k.is_some() {
+        "client"
+    } else if tools_active {
+        "tools_pin"
+    } else if profile.package_from_config() {
+        "config"
+    } else {
+        "model"
+    }
+}
+
+/// The full per-request sampling resolution against a model's profile (V5b),
+/// shared by chat (CB, VLM, NPU), legacy completions and realtime: today's
+/// client rules ([`resolve_sampling_defaults`]) over the profile's package; the
+/// repetition-penalty chain (client → operator → file → 1.1) on every request,
+/// greedy included; presence/frequency client → operator, but the operator's are
+/// withheld on NPU and on a request made greedy by the tools pin or by its own
+/// `temperature: 0` (tool-call JSON and T 0 baselines must not get a
+/// model-card presence penalty). Fills those six fields of `params`; logs
+/// `sampling_source` and `repetition_penalty_src` at debug.
+pub(crate) fn apply_sampling_profile(
+    params: &mut GenParams,
+    client: ClientSampling,
+    tools_active: bool,
+    profile: &SamplingProfile,
+    npu: bool,
+    model: &str,
+) {
+    let (temperature, top_p, top_k) = resolve_sampling_defaults(
+        client.temperature,
+        client.top_p,
+        client.top_k,
+        tools_active,
+        profile.package(),
+    );
+    params.temperature = temperature;
+    params.top_p = clamp_top_p(top_p);
+    params.top_k = top_k;
+    params.repetition_penalty =
+        resolve_repetition_penalty(client.repetition_penalty, profile.repetition_penalty);
+    let source = sampling_source(
+        client.temperature,
+        client.top_p,
+        client.top_k,
+        tools_active,
+        profile,
+    );
+    let request_greedy = source == "tools_pin" || client.temperature.is_some_and(|t| t <= 0.0);
+    let withhold = npu || request_greedy;
+    params.presence_penalty = client
+        .presence_penalty
+        .or_else(|| profile.presence_for(withhold));
+    params.frequency_penalty = client
+        .frequency_penalty
+        .or_else(|| profile.frequency_for(withhold));
+    let repetition_penalty_src = if client.repetition_penalty.is_some() {
+        "client"
+    } else {
+        profile.repetition_penalty_src.label()
+    };
+    tracing::debug!(
+        model,
+        sampling_source = source,
+        temperature = params.temperature.map(dec),
+        top_p = params.top_p.map(dec),
+        top_k = params.top_k.map(|k| k as u64),
+        repetition_penalty = params.repetition_penalty.map(dec),
+        repetition_penalty_src,
+        presence_penalty = params.presence_penalty.map(dec),
+        frequency_penalty = params.frequency_penalty.map(dec),
+        "sampling resolved"
+    );
+}
+
+/// The sampling fields a client sent (all `None` for a realtime turn).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClientSampling {
+    /// The request's `temperature` (`Some(0.0)` = greedy).
+    pub temperature: Option<f32>,
+    /// The request's `top_p`.
+    pub top_p: Option<f32>,
+    /// The request's `top_k` (extension field).
+    pub top_k: Option<usize>,
+    /// The request's `repetition_penalty` (extension field).
+    pub repetition_penalty: Option<f32>,
+    /// The request's `presence_penalty`.
+    pub presence_penalty: Option<f32>,
+    /// The request's `frequency_penalty`.
+    pub frequency_penalty: Option<f32>,
 }
 
 /// Greedy pin used by [`resolve_sampling_defaults`] when tools are active and
@@ -1775,43 +1955,48 @@ pub(crate) fn resolve_sampling_defaults(
 /// `json_schema` is the pre-validated structured-output constraint from
 /// [`json_schema_from_response_format`] (`None` = free-form).
 /// `max_tokens_cap` is the server-wide generation-budget ceiling
-/// (see [`clamp_max_tokens`]). `tools_active` and `model_defaults` feed
-/// [`resolve_sampling_defaults`] — see its doc comment.
+/// (see [`clamp_max_tokens`]). `tools_active`, the model's `profile` and `npu`
+/// feed [`apply_sampling_profile`] — see its doc comment.
 fn gen_params_from_chat(
     req: &ChatRequest,
     json_schema: Option<String>,
     max_tokens_cap: usize,
     tools_active: bool,
-    model_defaults: GenerationDefaults,
+    profile: &SamplingProfile,
+    npu: bool,
 ) -> GenParams {
     // max_tokens takes precedence; fall back to max_completion_tokens (newer SDKs).
     let token_budget = req.max_tokens.or(req.max_completion_tokens);
-    let (temperature, top_p, top_k) = resolve_sampling_defaults(
-        req.temperature,
-        req.top_p,
-        req.top_k,
-        tools_active,
-        model_defaults,
-    );
-    GenParams {
+    let mut params = GenParams {
         max_new_tokens: clamp_max_tokens(token_budget, 0, max_tokens_cap),
-        temperature,
-        top_p: clamp_top_p(top_p),
-        presence_penalty: req.presence_penalty,
-        frequency_penalty: req.frequency_penalty,
-        repetition_penalty: resolve_repetition_penalty(req.repetition_penalty),
         seed: req.seed,
         stop: parse_stop(req.stop.as_ref()),
         json_schema,
-        top_k,
-    }
+        ..GenParams::default()
+    };
+    apply_sampling_profile(
+        &mut params,
+        ClientSampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+        },
+        tools_active,
+        profile,
+        npu,
+        &req.model,
+    );
+    params
 }
 
 // ---- Handler --------------------------------------------------------
 
 /// Build VLM engine inputs from an image-bearing chat request.
 ///
-/// Returns `(vlm_messages, decoded_images)` where:
+/// Returns `(vlm_messages, pending_images)` where:
 /// - `vlm_messages` is the message history as JSON `{role, content}` objects,
 ///   additionally carrying `tool_calls`/`tool_call_id`/`name` when the source
 ///   [`ChatMessage`] has them (same fields [`messages_to_template_values`]
@@ -1822,11 +2007,13 @@ fn gen_params_from_chat(
 ///   Each `image_url` part in the **last** message is replaced in place by the
 ///   universal `OpenVINO` `GenAI` tag `<ov_genai_image_N>`, where `N` is a
 ///   zero-based counter local to that message. The tag's index `N` maps to
-///   `decoded_images[N]`.
-/// - `decoded_images` are the decoded NHWC RGB buffers in the order they appeared
-///   in the last message. Empty when the last message has no images.
+///   `pending_images[N]`.
+/// - `pending_images` are the header-checked, still compressed images
+///   ([`crate::image_util::PendingImage`], 0.9.1 S5c) in the order they appeared in the
+///   last message, decoded later by `decode_pending_for_vlm` once the request holds its
+///   engine slot. Empty when the last message has no images.
 ///
-/// Only the **last** message's images are decoded and tagged. `VLMPipeline`'s
+/// Only the **last** message's images are checked and tagged. `VLMPipeline`'s
 /// `ChatHistory`-based `generate()` overload is documented (`pipeline.hpp`) to
 /// bind every tensor in its `images` argument to the last chat-history message —
 /// it does not resolve tags by position. An `image_url` part in an *earlier*
@@ -1840,13 +2027,17 @@ fn gen_params_from_chat(
 /// reply, which stays in `vlm_messages` untouched.
 ///
 /// # Errors
-/// Returns an error if the last message's `image_url` fails to decode (bad
-/// base64, unsupported format, HTTP URL, etc.).
+/// Returns an error if the last message's `image_url` fails the header pass (bad
+/// base64, unsupported format, HTTP URL, an S5 limit, etc.). A body corrupt past a
+/// valid header is found only by the later decode.
 fn extract_vlm_messages(
     messages: &[ChatMessage],
-) -> anyhow::Result<(Vec<serde_json::Value>, Vec<DecodedImage>)> {
+    limits: crate::image_util::ImageLimits,
+) -> anyhow::Result<(Vec<serde_json::Value>, Vec<crate::image_util::PendingImage>)> {
     use std::fmt::Write as _;
 
+    // 0.9.1 S5: one budget for the request's images (count, total pixels).
+    let mut budget = crate::image_util::ImageBudget::new(limits);
     let mut images = Vec::new();
     let mut vlm_messages = Vec::with_capacity(messages.len());
     let last_idx = messages.len().saturating_sub(1);
@@ -1882,7 +2073,10 @@ fn extract_vlm_messages(
                             if !is_last {
                                 continue;
                             }
-                            images.push(crate::image_util::decode_data_uri(&image_url.url)?);
+                            images.push(crate::image_util::check_data_uri(
+                                &image_url.url,
+                                &mut budget,
+                            )?);
                             if !buf.is_empty() {
                                 buf.push(' ');
                             }
@@ -1915,6 +2109,59 @@ fn extract_vlm_messages(
     Ok((vlm_messages, images))
 }
 
+/// The response for a vision submit that was not accepted (`AtCapacity` → 429,
+/// `Closing` → 503 + `Retry-After`, `EngineDead` → 503). `Submitted` never reaches here; it is
+/// mapped to a 500 rather than a panic.
+fn vlm_submit_refused(refused: &SubmitResult) -> Response {
+    match refused {
+        SubmitResult::AtCapacity => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "server at capacity — all inference slots busy, retry shortly",
+            "rate_limit_error",
+            Some("server_overloaded"),
+        ),
+        SubmitResult::Closing => super::error::model_error_response(ModelError::Evicting),
+        SubmitResult::EngineDead => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "VLM engine unavailable (engine thread exited)",
+            "server_error",
+            Some("engine_unavailable"),
+        ),
+        SubmitResult::Submitted => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error: a submitted request was treated as refused",
+            "server_error",
+            None,
+        ),
+    }
+}
+
+/// The 500 for an image task that panicked or was cancelled on the blocking pool (review F6):
+/// the server's fault, not the image's.
+fn image_task_failed(e: &anyhow::Error) -> Response {
+    tracing::error!(error = %e, "image decode task failed");
+    openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error: the image decode task failed",
+        "server_error",
+        None,
+    )
+}
+
+/// Free the `image_url` payloads (base64 strings) of `messages` once the header pass holds their
+/// bytes (review F10): a request waiting for its slot then holds each image once, compressed.
+fn drop_image_payloads(messages: &mut [ChatMessage]) {
+    for msg in messages {
+        if let Some(MessageContent::Parts(parts)) = &mut msg.content {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    image_url.url = String::new();
+                }
+            }
+        }
+    }
+}
+
 /// Validate messages and render the chat template for the CB (text-only) path.
 ///
 /// Only called after the VLM routing check — image-bearing requests are
@@ -1928,6 +2175,7 @@ fn extract_vlm_messages(
 /// Returns the prompt string, or a boxed `Response` to return early.
 fn prepare_text_prompt(
     req: &ChatRequest,
+    kwargs: &crate::prompt_builder::TemplateKwargs,
     tools: Option<&[serde_json::Value]>,
     steer: Option<&str>,
     template: &str,
@@ -1944,13 +2192,13 @@ fn prepare_text_prompt(
     if let Some(text) = steer {
         template_messages.push(serde_json::json!({ "role": "system", "content": text }));
     }
-    crate::prompt_builder::build_prompt(
+    crate::prompt_builder::build_prompt_with_kwargs(
         &template_messages,
         tools,
         template,
         eos_token,
         bos_token,
-        req.enable_thinking,
+        kwargs,
         None,
     )
     .map_err(|e| {
@@ -1974,19 +2222,96 @@ fn prepare_text_prompt(
 /// Returns `text/event-stream` when `stream: true`, or a single
 /// `chat.completion` JSON object when `stream: false`. Both modes apply to the
 /// VLM path as well as the CB path.
-#[allow(clippy::too_many_lines)]
+///
+/// F1b: an `on_demand` model that is not loaded is loaded; the request waits for it up to
+/// `on_demand_wait_secs`. A non-streaming request waits inside the handler; a streaming one gets
+/// its `200` SSE response first and SSE keep-alives while it waits (the handler runs again
+/// inside that response, after the wait — see [`ChatWait`]).
 pub async fn chat_completions(
     State(state): State<AppState>,
-    JsonBody(mut req): JsonBody<ChatRequest>,
+    JsonBody(req): JsonBody<ChatRequest>,
 ) -> Response {
     // Zero point for the per-request latency metrics (TTFT, duration). Captured
     // at the very top so it includes prompt-build + queue time, matching how a
     // client perceives request latency. `Instant` is monotonic (unlike the
-    // `unix_now()` wall clock used for the OpenAI `created` field).
+    // `unix_now()` wall clock used for the OpenAI `created` field). After an
+    // on-demand wait it is taken again (the wait is not counted).
     let requested_at = std::time::Instant::now();
+    let mut deferred = None;
+    let resp = chat_completions_run(
+        state.clone(),
+        req,
+        requested_at,
+        ChatWait::MayDefer(&mut deferred),
+    )
+    .await;
+    let Some((req, slot)) = deferred else {
+        return resp;
+    };
+    let every = super::on_demand::keep_alive_every(state.model_manager.as_deref());
+    super::on_demand::sse_after_wait(every, async move {
+        chat_completions_run(state, *req, requested_at, ChatWait::Waiting(slot)).await
+    })
+}
 
+/// Chat's answer for a model of a kind it does not serve (`None`: text and vision, served).
+/// An embedding model is pointed at its endpoint with a 400 (R4/G3) rather than a misleading 501;
+/// the other kinds are registry-modelled but `/v1/chat/completions` is not their endpoint (R3
+/// seams). Used for a loaded model and, before any load (F1b), for an
+/// on-demand one.
+fn chat_kind_refusal(model: &str, kind: ModelKind) -> Option<Response> {
+    match kind {
+        ModelKind::TextGen | ModelKind::Vision => None,
+        ModelKind::Embedding => Some(openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("model '{model}' is an embedding model — use POST /v1/embeddings"),
+            "invalid_request_error",
+            Some("unsupported_operation"),
+        )),
+        ModelKind::Stt
+        | ModelKind::Tts
+        | ModelKind::ImageGen
+        | ModelKind::Reranking
+        | ModelKind::Decision => Some(openai_error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "model '{model}' is a {} model — not yet served by this build",
+                kind.label()
+            ),
+            "server_error",
+            Some("not_implemented"),
+        )),
+    }
+}
+
+/// How [`chat_completions_run`] meets an `on_demand` model that is not loaded (F1b).
+enum ChatWait<'a> {
+    /// The first run. A streaming request that is to wait leaves its request and waiter place
+    /// here and returns (its answer is ignored): [`chat_completions`] then starts the SSE
+    /// response and runs the handler again inside it. Anything else waits in place.
+    MayDefer(
+        &'a mut Option<(
+            Box<ChatRequest>,
+            crate::model_manager::on_demand::WaiterSlot,
+        )>,
+    ),
+    /// The run inside that SSE response: it waits holding this place, and never defers again.
+    Waiting(crate::model_manager::on_demand::WaiterSlot),
+}
+
+/// The body of [`chat_completions`].
+#[allow(clippy::too_many_lines)]
+async fn chat_completions_run(
+    state: AppState,
+    mut req: ChatRequest,
+    mut requested_at: std::time::Instant,
+    wait: ChatWait<'_>,
+) -> Response {
     // OpenAI default: stream is false when absent.
     let stream = req.stream.unwrap_or(false);
+    // F1b: the only field changed before the model lookup; a deferred request is handed back
+    // with it restored, so the second run sees the request as the client sent it.
+    let client_enable_thinking = req.enable_thinking;
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
     // Empty `messages` is a 400 on EVERY path. Enforced here (before routing) so
@@ -2002,11 +2327,13 @@ pub async fn chat_completions(
         );
     }
 
-    // SF-5 D-04: `chat_template_kwargs.enable_thinking` (vLLM's form) was silently ignored.
-    match resolve_enable_thinking(&req) {
-        Ok(v) => req.enable_thinking = v,
+    // SF-5 D-04 / 0.9.1: the thinking controls (`enable_thinking`, `reasoning_effort`, the
+    // budget, the allowlisted `chat_template_kwargs`), type-checked before anything else.
+    let thinking = match resolve_thinking_request(&req) {
+        Ok(t) => t,
         Err(resp) => return *resp,
-    }
+    };
+    req.enable_thinking = thinking.enable_thinking;
 
     // Reject known-but-unsupported params up front (n>1, logprobs, top_logprobs,
     // logit_bias) — an explicit 400 rather than a silent accept-and-drop.
@@ -2070,8 +2397,8 @@ pub async fn chat_completions(
         return resp;
     }
 
-    let created = unix_now();
-    let request_id = format!("chatcmpl-rv-{created}-{}", next_response_seq());
+    let mut created = unix_now();
+    let mut request_id = format!("chatcmpl-rv-{created}-{}", next_response_seq());
 
     // Tool-call parsing dialect for this model. The real path overwrites it
     // from the model's detected family; the mock path keeps Default.
@@ -2117,21 +2444,66 @@ pub async fn chat_completions(
         // Resolve the model's chat context. Every error variant maps to a
         // distinct HTTP status with no fallback to a default model (design
         // decision: explicit over implicit).
-        let ctx = match mm.get_chat_context(&req.model) {
-            Ok(c) => c,
-            // Slice 3c: a NotLoaded model declared `load: on_demand` is loaded
-            // lazily on first use — kick off a background load and tell the
-            // client to retry (503 Loading + Retry-After). Eager models keep
-            // failing fast with a bare NotLoaded 503 (no auto-load).
-            Err(ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-                    OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
-                };
+        //
+        // Slice 3c: a NotLoaded model declared `load: on_demand` is loaded lazily on first use.
+        // F1b: the request waits for it up to `on_demand_wait_secs`, else 503 Loading +
+        // Retry-After. Eager models keep failing fast with a bare NotLoaded 503 (no auto-load).
+        let first = mm.get_chat_context_for_request(&req.model).await;
+        // F1b: an on-demand model of a kind chat does not serve is refused
+        // with chat's own answer for that kind before any load or wait, when the kind is certain
+        // (review N-1).
+        if matches!(first, Err(ModelError::NotLoaded | ModelError::Loading))
+            && mm.is_on_demand(&req.model)
+            && let Some(resp) = mm
+                .certain_model_kind(&req.model)
+                .and_then(|kind| chat_kind_refusal(&req.model, kind))
+        {
+            return resp;
+        }
+        let waited = first.is_err();
+        let place = match wait {
+            ChatWait::MayDefer(out) => {
+                if !stream {
+                    WaitPlace::Take
+                } else if let Some(slot) =
+                    super::on_demand::streaming_wait_slot(mm, &req.model, &first)
+                {
+                    req.enable_thinking = client_enable_thinking;
+                    *out = Some((Box::new(req), slot));
+                    // Ignored: `chat_completions` answers with the SSE response.
+                    return Response::default();
+                } else {
+                    // No place before the response started: answer at once, never wait without
+                    // keep-alives (review R-4).
+                    WaitPlace::NoWait
+                }
             }
-            Err(e) => return model_error_response(e),
+            ChatWait::Waiting(slot) => WaitPlace::Held(slot),
         };
+        let ctx = match super::on_demand::resolve_waiting(mm, &req.model, first, place, || {
+            mm.get_chat_context_for_request(&req.model)
+        })
+        .await
+        {
+            Ok(c) => c,
+            Err(u) => return u.into_response(&req.model),
+        };
+        // TTFT and duration measure serving, so they start after an on-demand
+        // wait (the wait itself is in the "on-demand wait: done" log line).
+        if waited {
+            requested_at = std::time::Instant::now();
+            created = unix_now();
+            request_id = format!("chatcmpl-rv-{created}-{}", next_response_seq());
+        }
+
+        // V5: whether the operator's presence/frequency penalties are withheld for the NPU
+        // engine — from the engine handle, once, for every arm below.
+        let npu_engine = ctx.handle.is_npu();
+        // 0.9.1 S1: register on the engine's liveness before anything is submitted: if the
+        // engine stalls while this request waits or runs, its channel gets `generation_stalled`.
+        if let Some(liveness) = ctx.handle.liveness() {
+            liveness.register(&tx, &request_id, &req.model, mm);
+        }
 
         // R1: capability routing. The kind of the Ready model — not a global
         // `has_images` switch — decides the path. A text-gen model rejects image
@@ -2141,9 +2513,43 @@ pub async fn chat_completions(
             EngineHandleKind::Vision(vlm) => {
                 // VLM path (single-stream VLMPipeline). Decode image parts; on
                 // 2026.2 the pipeline serves both image and text-only requests.
-                let (mut vlm_messages, images) = match extract_vlm_messages(&req.messages) {
+                // Decoded on the blocking pool, two at a time server-wide (0.9.1 S5b): a
+                // 64 MP decode is ~1 s of CPU that must not run on a runtime worker.
+                // The messages move to the decode task and come back (no copy of the
+                // base64 payload); later code still reads `req.messages`, but not the image
+                // payloads: those are freed once the header pass holds the bytes (review F10).
+                let mut messages = std::mem::take(&mut req.messages);
+                let limits = mm.image_limits();
+                let extracted = match crate::image_util::decode_off_runtime(move || {
+                    let r = extract_vlm_messages(&messages, limits);
+                    drop_image_payloads(&mut messages);
+                    (messages, r)
+                })
+                .await
+                {
+                    Ok((messages, r)) => {
+                        req.messages = messages;
+                        r
+                    }
+                    Err(e) => return image_task_failed(&e),
+                };
+                // 0.9.1 S5c: only the header pass ran — the images are still compressed. They
+                // are decoded below, after device admission and the engine slot, so a request
+                // that waits holds no decoded pixels; the 400s for limits and formats are
+                // already answered.
+                let (mut vlm_messages, pending_images) = match extracted {
                     Ok(r) => r,
                     Err(e) => {
+                        if let Some(limit) =
+                            e.downcast_ref::<crate::image_util::ImageLimitExceeded>()
+                        {
+                            return openai_error(
+                                StatusCode::BAD_REQUEST,
+                                limit.message.clone(),
+                                "invalid_request_error",
+                                Some(limit.code),
+                            );
+                        }
                         return openai_error(
                             StatusCode::BAD_REQUEST,
                             format!("failed to decode image: {e}"),
@@ -2186,7 +2592,7 @@ pub async fn chat_completions(
                     } else {
                         None
                     },
-                    !images.is_empty(),
+                    !pending_images.is_empty(),
                     (ctx.max_prompt_tokens, ctx.gate_detail.as_ref()),
                 )
                 .await
@@ -2195,7 +2601,7 @@ pub async fn chat_completions(
                     Err(resp) => return *resp,
                 };
                 // F2-S-5 (E-16): an image request passed a limit that counted only its text.
-                if !images.is_empty()
+                if !pending_images.is_empty()
                     && ctx.max_prompt_tokens > 0
                     && let Some(mm) = state.model_manager.as_ref()
                 {
@@ -2246,7 +2652,8 @@ pub async fn chat_completions(
                     json_schema,
                     mm.max_tokens_cap(),
                     tools_active,
-                    ctx.generation_defaults,
+                    &ctx.sampling,
+                    npu_engine,
                 );
                 match clamp_vlm_max_tokens(
                     &req.model,
@@ -2263,18 +2670,90 @@ pub async fn chat_completions(
                     top_p: vlm_gen_params.top_p,
                     top_k: vlm_gen_params.top_k,
                 };
-                // `enable_thinking` reaches a VLM only as a chat-template
-                // variable: unlike the CB path (which renders via
+                // 0.9.1: the thinking plan, against the final (clamped) max_new_tokens.
+                let plan = thinking_plan(
+                    &request_id,
+                    &thinking,
+                    ctx.thinking_budget_tokens,
+                    vlm_gen_params.max_new_tokens,
+                );
+                vlm_gen_params.thinking_budget = plan.budget;
+                // The thinking variables reach a VLM only as chat-template
+                // variables: unlike the CB path (which renders via
                 // `build_prompt`), `VLMPipeline` applies the template
-                // internally. Built server-side and restricted to this one
-                // key on purpose — extra context is merged into minja AFTER
+                // internally. Built server-side and restricted to the
+                // allowlisted keys on purpose — extra context is merged into minja AFTER
                 // `bos_token`/`eos_token`/`pad_token`, so forwarding
                 // client-supplied JSON here would let a request override them.
-                let vlm_extra_context = req
-                    .enable_thinking
-                    .map(|v| serde_json::json!({ "enable_thinking": v }));
-                match vlm
-                    .generate_with_lease(
+                let vlm_extra_context = plan.template.to_extra_context();
+                // Why this is the static template check: see the comment at its use below.
+                let vlm_starts_thinking = template_prefills_thinking(&ctx.template)
+                    && plan.template.enable_thinking != Some(false);
+                // 0.9.1 V1-usage: the engine counts reasoning tokens with the handler's split.
+                vlm_gen_params.reasoning = crate::prompt_builder::ReasoningSplit::new(
+                    ctx.reasoning_parser,
+                    vlm_starts_thinking,
+                );
+                // 0.9.1 S5c: take the engine slot first (the wait, up to the queue timeout),
+                // then decode — off the runtime, two at a time server-wide — and downscale each
+                // image to `max_image_pixels` (C28), then send. A body that is corrupt past a
+                // valid header is found only here: 400, and the slot and leases are released.
+                let slot = match vlm.acquire_slot().await {
+                    Ok(slot) => slot,
+                    // 0.9.1 S1: the engine stalled while this request waited for its slot.
+                    Err(SubmitResult::EngineDead) if vlm.liveness().is_dead() => {
+                        return super::error::inference_error_from_text(
+                            Some(mm),
+                            &req.model,
+                            &crate::stall_watch::stalled_error_text(),
+                        );
+                    }
+                    Err(refused) => return vlm_submit_refused(&refused),
+                };
+                // A text-only request skips the decode altogether (review F4). The full decodes
+                // have their own two slots, apart from header passes and edits (review F3).
+                let images = if pending_images.is_empty() {
+                    Vec::new()
+                } else {
+                    let max_image_pixels = mm.max_image_pixels();
+                    let model = vlm.model_id().to_owned();
+                    let rid = request_id.clone();
+                    let decoded = crate::image_util::decode_for_vlm_off_runtime(move || {
+                        let owner = crate::image_util::ImageOwner {
+                            model: &model,
+                            request_id: &rid,
+                        };
+                        pending_images
+                            .into_iter()
+                            .map(|p| {
+                                crate::image_util::decode_pending_for_vlm(
+                                    p,
+                                    max_image_pixels,
+                                    owner,
+                                )
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    })
+                    .await;
+                    match decoded {
+                        Ok(Ok(images)) => images,
+                        Ok(Err(e)) => {
+                            drop(slot);
+                            return openai_error(
+                                StatusCode::BAD_REQUEST,
+                                format!("failed to decode image: {e}"),
+                                "invalid_request_error",
+                                None,
+                            );
+                        }
+                        Err(e) => {
+                            drop(slot);
+                            return image_task_failed(&e);
+                        }
+                    }
+                };
+                let submitted = slot
+                    .submit(
                         vlm_messages,
                         images,
                         effective_tools,
@@ -2285,28 +2764,9 @@ pub async fn chat_completions(
                         transient_lease,
                         admitted,
                     )
-                    .await
-                {
-                    SubmitResult::Submitted => {}
-                    SubmitResult::AtCapacity => {
-                        return openai_error(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "server at capacity — all inference slots busy, retry shortly",
-                            "rate_limit_error",
-                            Some("server_overloaded"),
-                        );
-                    }
-                    SubmitResult::Closing => {
-                        return super::error::model_error_response(ModelError::Evicting);
-                    }
-                    SubmitResult::EngineDead => {
-                        return openai_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "VLM engine unavailable (engine thread exited)",
-                            "server_error",
-                            Some("engine_unavailable"),
-                        );
-                    }
+                    .await;
+                if !matches!(submitted, SubmitResult::Submitted) {
+                    return vlm_submit_refused(&submitted);
                 }
                 // Report the actual VLM model name, not whatever the client sent.
                 let vlm_model = vlm.model_id().to_owned();
@@ -2333,8 +2793,8 @@ pub async fn chat_completions(
                 // and because tool parsing runs on that placeholder, EVERY
                 // tool call is silently lost. See
                 // the project's internal engineering log.
-                let vlm_starts_thinking =
-                    template_prefills_thinking(&ctx.template) && req.enable_thinking != Some(false);
+                // (`vlm_starts_thinking` is computed above, before the submit, so the engine's
+                // reasoning count uses the same split.)
                 // G2 (VLM): same buffered tool-call branch as the text path —
                 // `<tool_call>` (or the fenced-json fallback) can't be parsed
                 // incrementally, so both stream modes buffer here when tools
@@ -2352,6 +2812,7 @@ pub async fn chat_completions(
                         state.model_manager.as_ref(),
                         ctx.reasoning_parser,
                         vlm_starts_thinking,
+                        req.tools.as_deref(),
                     )
                     .await;
                 }
@@ -2407,9 +2868,26 @@ pub async fn chat_completions(
                         Some("unsupported_content"),
                     );
                 }
+                let mut gen_params = gen_params_from_chat(
+                    &req,
+                    json_schema,
+                    mm.max_tokens_cap(),
+                    tools_active,
+                    &ctx.sampling,
+                    npu_engine,
+                );
+                // 0.9.1: the thinking plan, against the final max_new_tokens.
+                let plan = thinking_plan(
+                    &request_id,
+                    &thinking,
+                    ctx.thinking_budget_tokens,
+                    gen_params.max_new_tokens,
+                );
+                gen_params.thinking_budget = plan.budget;
                 let steer = tool_choice.steer();
                 let prompt = match prepare_text_prompt(
                     &req,
+                    &plan.template,
                     if tools_active {
                         req.tools.as_deref()
                     } else {
@@ -2436,13 +2914,6 @@ pub async fn chat_completions(
                     return *resp;
                 }
 
-                let gen_params = gen_params_from_chat(
-                    &req,
-                    json_schema,
-                    mm.max_tokens_cap(),
-                    tools_active,
-                    ctx.generation_defaults,
-                );
                 let npu_meta = ResponseMeta {
                     family: ctx.family,
                     temperature: gen_params.temperature,
@@ -2452,6 +2923,11 @@ pub async fn chat_completions(
                 // Per-request truth from the rendered prompt: honors
                 // enable_thinking:false, which renders a CLOSED think prefill.
                 let npu_starts_thinking = prompt_ends_in_thinking(&prompt);
+                // 0.9.1 V1-usage: the engine counts reasoning tokens with the handler's split.
+                gen_params.reasoning = crate::prompt_builder::ReasoningSplit::new(
+                    ctx.reasoning_parser,
+                    npu_starts_thinking,
+                );
 
                 // Cross-pipeline device admission (step 2): a second gate in
                 // front of the engine's own per-engine gate below, capping
@@ -2545,34 +3021,14 @@ pub async fn chat_completions(
             // R4/G3: an embedding model is a real, served kind — just not via
             // chat. Point the caller at the right endpoint with a 400 rather than
             // a misleading 501.
-            EngineHandleKind::Embedding(_) => {
-                return openai_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "model '{}' is an embedding model — use POST /v1/embeddings",
-                        req.model
-                    ),
-                    "invalid_request_error",
-                    Some("unsupported_operation"),
-                );
-            }
-            // R3 seams: these kinds are registry-modelled but /v1/chat/completions
-            // is not their endpoint. Return an honest 400 pointing to the right route.
-            EngineHandleKind::Stt(_)
+            // R4/G3 and the R3 seams: kinds chat does not serve (`chat_kind_refusal`).
+            EngineHandleKind::Embedding(_)
+            | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
             | EngineHandleKind::Decision(_) => {
-                return openai_error(
-                    StatusCode::NOT_IMPLEMENTED,
-                    format!(
-                        "model '{}' is a {} model — not yet served by this build",
-                        req.model,
-                        ctx.handle.kind().label()
-                    ),
-                    "server_error",
-                    Some("not_implemented"),
-                );
+                return chat_kind_refusal(&req.model, ctx.handle.kind()).unwrap_or_default();
             }
         };
 
@@ -2586,9 +3042,26 @@ pub async fn chat_completions(
         } else {
             None
         };
+        let mut gen_params = gen_params_from_chat(
+            &req,
+            json_schema,
+            mm.max_tokens_cap(),
+            tools_active,
+            &ctx.sampling,
+            npu_engine,
+        );
+        // 0.9.1: the thinking plan, against the final max_new_tokens.
+        let plan = thinking_plan(
+            &request_id,
+            &thinking,
+            ctx.thinking_budget_tokens,
+            gen_params.max_new_tokens,
+        );
+        gen_params.thinking_budget = plan.budget;
         let steer = tool_choice.steer();
         let prompt = match prepare_text_prompt(
             &req,
+            &plan.template,
             effective_tools,
             steer.as_deref(),
             &ctx.template,
@@ -2604,13 +3077,10 @@ pub async fn chat_completions(
         // template source contains a bare `<think>` in its other branch.
         starts_in_thinking = prompt_ends_in_thinking(&prompt);
 
-        let gen_params = gen_params_from_chat(
-            &req,
-            json_schema,
-            mm.max_tokens_cap(),
-            tools_active,
-            ctx.generation_defaults,
-        );
+        // 0.9.1 V1-usage: the engine counts reasoning tokens with the same split the streaming
+        // filter uses (`ContentFilter::for_request`).
+        gen_params.reasoning =
+            crate::prompt_builder::ReasoningSplit::new(ctx.reasoning_parser, starts_in_thinking);
         effective_temperature = gen_params.temperature;
         effective_top_p = gen_params.top_p;
         effective_top_k = gen_params.top_k;
@@ -2785,6 +3255,7 @@ pub async fn chat_completions(
             state.model_manager.as_ref(),
             reasoning_parser,
             starts_in_thinking,
+            req.tools.as_deref(),
         )
         .await;
     }
@@ -2866,6 +3337,8 @@ struct ScanState {
     prompt_tokens: usize,
     /// Count of non-empty raw `Token` events — proxy for generated tokens.
     completion_tokens: usize,
+    /// The engine's reasoning-token count (`StreamEvent::ReasoningTokens`); 0 until it arrives.
+    reasoning_tokens: usize,
     think: ContentFilter,
     /// Set once a mid-stream `Error` has been emitted (T3.2). The error arm
     /// sends the full terminal sequence itself; this flag suppresses the
@@ -2900,6 +3373,7 @@ impl ScanState {
         Self {
             prompt_tokens: 0,
             completion_tokens: 0,
+            reasoning_tokens: 0,
             think: ContentFilter::for_request(reasoning_parser, starts_in_thinking),
             errored: false,
             mm,
@@ -2927,6 +3401,10 @@ impl ScanState {
             // The engine's exact total replaces the running chunk sum.
             StreamEvent::CompletionTokens(n) => {
                 self.completion_tokens = n;
+                vec![]
+            }
+            StreamEvent::ReasoningTokens(n) => {
+                self.reasoning_tokens = n;
                 vec![]
             }
             StreamEvent::Token(tok, new_tokens) => {
@@ -2987,6 +3465,7 @@ impl ScanState {
                         created,
                         self.prompt_tokens,
                         self.completion_tokens,
+                        self.reasoning_tokens,
                     )));
                 }
                 frames.push(Ok(Event::default().data("[DONE]")));
@@ -3041,7 +3520,9 @@ fn build_chat_sse_stream(
 
     let id_owned = id.to_owned();
     let model_owned = model.to_owned();
-    let token_stream = ReceiverStream::new(rx)
+    // `until_done`: the stream ends at the terminal `Done` (0.9.1 S1 — a stalled engine never
+    // closes its sender).
+    let token_stream = crate::streaming::until_done(rx)
         .scan(
             ScanState::new(
                 mm,
@@ -3079,6 +3560,9 @@ pub(crate) struct Drained {
     /// Count of non-empty deltas — a proxy for generated tokens
     /// (see the project's internal engineering log 2026-05-29).
     pub(crate) completion_tokens: usize,
+    /// The engine's reasoning-token count (`StreamEvent::ReasoningTokens`, 0.9.1 V1-usage); `0`
+    /// when the engine sent none (mock path).
+    pub(crate) reasoning_tokens: usize,
     /// The engine's finish reason (`Stop`/`Length`).
     pub(crate) finish: FinishReason,
 }
@@ -3092,6 +3576,7 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
     let mut content = String::new();
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
+    let mut reasoning_tokens = 0usize;
     // Default to Stop: if the stream closes without an explicit Done (e.g. the
     // engine dropped the sender), report a clean stop rather than hanging.
     let mut finish = FinishReason::Stop;
@@ -3101,6 +3586,7 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
             StreamEvent::PromptTokens(n) => prompt_tokens = n,
             // The engine's exact total replaces the running chunk sum.
             StreamEvent::CompletionTokens(n) => completion_tokens = n,
+            StreamEvent::ReasoningTokens(n) => reasoning_tokens = n,
             StreamEvent::Token(tok, new_tokens) => {
                 // Sum the engine's own reported token count, not 1 per event
                 // — see the identical fix + rationale in ScanState::process.
@@ -3118,6 +3604,7 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
         content,
         prompt_tokens,
         completion_tokens,
+        reasoning_tokens,
         finish,
     })
 }
@@ -3125,11 +3612,22 @@ pub(crate) async fn drain_channel(mut rx: TokenReceiver) -> Result<Drained, Stri
 /// Build a `usage` block. `prompt_tokens` is the engine's exact tokenizer count
 /// (Phase 3.6; `0` when unavailable, e.g. the mock path); `completion_tokens` is
 /// the non-empty-delta count (≈ generated tokens — see the project's internal engineering log 2026-05-29).
-pub(crate) fn usage_for(prompt_tokens: usize, completion_tokens: usize) -> Usage {
+///
+/// `reasoning_tokens` is the engine's count (0.9.1 V1-usage); it is clamped to
+/// `completion_tokens` here as well, so `reasoning_tokens <= completion_tokens` holds on every
+/// path whatever the engine sent.
+pub(crate) fn usage_for(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    reasoning_tokens: usize,
+) -> Usage {
     Usage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
+        completion_tokens_details: CompletionTokensDetails {
+            reasoning_tokens: reasoning_tokens.min(completion_tokens),
+        },
     }
 }
 
@@ -3161,11 +3659,7 @@ async fn collect_completion(
     // so tagless output is reasoning, not answer — parity with streaming.
     // gpt-oss doesn't emit `<think>` at all (harmony channels instead) — routed
     // to `extract_reasoning_gpt_oss` so its analysis/final split actually fires.
-    let (reasoning, answer) = match reasoning_parser {
-        Some(ReasoningParser::GptOss) => extract_reasoning_gpt_oss(&drained.content),
-        Some(_) => extract_thinking(&drained.content, starts_in_thinking),
-        None => (None, drained.content.clone()),
-    };
+    let (reasoning, answer) = split_drained(&drained, reasoning_parser, starts_in_thinking);
 
     let body = ChatCompletion {
         id,
@@ -3182,12 +3676,39 @@ async fn collect_completion(
             },
             finish_reason: drained.finish.as_openai(),
         }],
-        usage: usage_for(drained.prompt_tokens, drained.completion_tokens),
+        usage: usage_for(
+            drained.prompt_tokens,
+            drained.completion_tokens,
+            drained.reasoning_tokens,
+        ),
         model_family: meta.family.label(),
         sampling: meta.sampling(),
     };
 
     Json(body).into_response()
+}
+
+/// The `(reasoning, answer)` split of a drained buffered generation. gap-2: only for a
+/// reasoning model (`reasoning_parser` set); otherwise the content is the answer, untouched.
+/// gpt-oss's harmony channels go through `extract_reasoning_gpt_oss`. 0.9.1: a request the
+/// thinking budget stopped is split by `extract_thinking_at_budget` — never the
+/// "thinking was cut off" placeholder, since `finish_reason: "length"` already says it.
+fn split_drained(
+    drained: &Drained,
+    reasoning_parser: Option<ReasoningParser>,
+    starts_in_thinking: bool,
+) -> (Option<String>, String) {
+    match reasoning_parser {
+        Some(_) if drained.finish == FinishReason::ThinkingBudget => {
+            crate::prompt_builder::extract_thinking_at_budget(
+                &drained.content,
+                crate::prompt_builder::ReasoningSplit::new(reasoning_parser, starts_in_thinking),
+            )
+        }
+        Some(ReasoningParser::GptOss) => extract_reasoning_gpt_oss(&drained.content),
+        Some(_) => extract_thinking(&drained.content, starts_in_thinking),
+        None => (None, drained.content.clone()),
+    }
 }
 
 /// Buffered tool-calling collector for requests that supplied `tools`.
@@ -3213,6 +3734,7 @@ async fn collect_tool_completion(
     mm: Option<&Arc<ModelManager>>,
     reasoning_parser: Option<ReasoningParser>,
     starts_in_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
 ) -> Response {
     let drained = match drain_channel(rx).await {
         Ok(d) => d,
@@ -3228,24 +3750,27 @@ async fn collect_tool_completion(
     // nothing, which is correct (a model that never exited thinking never
     // emitted a post-think tool call). gpt-oss: see collect_completion above —
     // same GptOss/other/None split, same reasoning.
-    let (thinking, answer) = match reasoning_parser {
-        Some(ReasoningParser::GptOss) => extract_reasoning_gpt_oss(&drained.content),
-        Some(_) => extract_thinking(&drained.content, starts_in_thinking),
-        None => (None, drained.content.clone()),
-    };
+    let (thinking, answer) = split_drained(&drained, reasoning_parser, starts_in_thinking);
+    // 0.9.1: a request the thinking budget stopped never reached its answer, so nothing it
+    // emitted is a tool call (a call-shaped line inside the reasoning is the model thinking).
+    let budget_stopped = drained.finish == FinishReason::ThinkingBudget;
     // gpt-oss's tool call lives inside the `commentary` channel, which
     // `HarmonyFilter` routes into `thinking` alongside any genuine analysis
     // reasoning (see extract_reasoning_gpt_oss) — scan there, not `answer`
     // (the `final`-channel text, real regardless of whether a tool call is
     // also present, so left untouched). Every other family's tool-call
     // syntax lives inside the answer itself, scanned as before.
-    let (tool_calls, remaining, thinking) = if meta.family == ModelFamily::GptOss {
+    let (tool_calls, remaining, thinking) = if budget_stopped {
+        (None, answer, thinking)
+    } else if meta.family == ModelFamily::GptOss {
         let (tool_calls, cleaned_thinking) =
-            parse_tool_calls(thinking.as_deref().unwrap_or(""), meta.family);
+            parse_tool_calls_with_tools(thinking.as_deref().unwrap_or(""), meta.family, tools);
         let thinking = (!cleaned_thinking.trim().is_empty()).then_some(cleaned_thinking);
         (tool_calls, answer, thinking)
     } else {
-        let (tool_calls, remaining) = parse_tool_calls(&answer, meta.family);
+        // `tools`: the request's schemas — the Qwen XML dialect types its bare-text
+        // argument values from them (QXL, 0.9.1); every other family ignores them.
+        let (tool_calls, remaining) = parse_tool_calls_with_tools(&answer, meta.family, tools);
         (tool_calls, remaining, thinking)
     };
 
@@ -3272,6 +3797,7 @@ async fn collect_tool_completion(
             include_usage,
             drained.prompt_tokens,
             drained.completion_tokens,
+            drained.reasoning_tokens,
             meta,
         )
     } else {
@@ -3284,6 +3810,7 @@ async fn collect_tool_completion(
             finish_reason,
             drained.prompt_tokens,
             drained.completion_tokens,
+            drained.reasoning_tokens,
             thinking,
             meta,
         )
@@ -3303,6 +3830,7 @@ fn tool_completion_json(
     finish_reason: &'static str,
     prompt_tokens: usize,
     completion_tokens: usize,
+    reasoning_tokens: usize,
     reasoning: Option<String>,
     meta: ResponseMeta,
 ) -> Response {
@@ -3334,7 +3862,7 @@ fn tool_completion_json(
             message,
             finish_reason,
         }],
-        usage: usage_for(prompt_tokens, completion_tokens),
+        usage: usage_for(prompt_tokens, completion_tokens, reasoning_tokens),
         model_family: meta.family.label(),
         sampling: meta.sampling(),
     };
@@ -3356,6 +3884,7 @@ fn tool_completion_sse(
     include_usage: bool,
     prompt_tokens: usize,
     compl_tokens: usize,
+    reasoning_tokens: usize,
     meta: ResponseMeta,
 ) -> Response {
     // Payload chunk: role + reasoning_content + (tool_calls) or (content),
@@ -3422,6 +3951,7 @@ fn tool_completion_sse(
             created,
             prompt_tokens,
             compl_tokens,
+            reasoning_tokens,
         )));
     }
     frames.push(Ok(Event::default().data("[DONE]")));
@@ -3690,6 +4220,79 @@ mod tests {
             clamp_vlm_max_tokens("m", (true, 0), 9_990, 2_000).unwrap(),
             2_000
         );
+    }
+
+    /// P-02: with `max_tokens_cap: 0` and no `max_tokens` the budget is 0 (unbounded); a vision
+    /// request with a known pool gets the pool's room after the prompt instead, so the watchdog
+    /// allowance has a decode term. An explicit `max_tokens` and a non-zero cap are unchanged;
+    /// an unknown pool keeps 0; too little room is the same 400 as an over-room budget.
+    #[test]
+    fn vlm_unbounded_budget_resolves_to_the_pool_room() {
+        use crate::vlm_engine::{
+            WATCHDOG_DECODE_FLOOR_TOK_S, WATCHDOG_PREFILL_FLOOR_TOK_S, generation_allowance,
+        };
+        let budget = |req: serde_json::Value, cap: usize| {
+            gen_params_from_chat(
+                &chat_req(req),
+                None,
+                cap,
+                false,
+                &SamplingProfile::default(),
+                false,
+            )
+            .max_new_tokens
+        };
+        let msgs = serde_json::json!({"model": "m", "messages": []});
+        let with_max = serde_json::json!({"model": "m", "messages": [], "max_tokens": 300});
+        let ctx = (true, 10_000);
+        let admitted = 4_000;
+        let room = 10_000 - 4_000 - 100; // 1 % of the pool spare (100 > 32)
+
+        // cap 0 + no max_tokens: budget 0 -> the room
+        assert_eq!(budget(msgs.clone(), 0), 0);
+        let resolved = clamp_vlm_max_tokens("m", ctx, admitted, budget(msgs.clone(), 0)).unwrap();
+        assert_eq!(resolved, room);
+        // the allowance now includes the decode term for that room
+        let secs = admitted as u64 / WATCHDOG_PREFILL_FLOOR_TOK_S
+            + room as u64 / WATCHDOG_DECODE_FLOOR_TOK_S;
+        assert_eq!(
+            generation_allowance(admitted, resolved),
+            std::time::Duration::from_secs(secs)
+        );
+        assert!(generation_allowance(admitted, resolved) > generation_allowance(admitted, 0));
+
+        // cap 0 + explicit max_tokens: unchanged (fits, and over-room still clamps to room)
+        assert_eq!(
+            clamp_vlm_max_tokens("m", ctx, admitted, budget(with_max.clone(), 0)).unwrap(),
+            300
+        );
+        assert_eq!(
+            clamp_vlm_max_tokens("m", ctx, admitted, 1_000_000).unwrap(),
+            room
+        );
+        // cap > 0 + no max_tokens: the cap, as today
+        assert_eq!(budget(msgs.clone(), 2_000), 2_000);
+        assert_eq!(
+            clamp_vlm_max_tokens("m", ctx, admitted, budget(msgs, 2_000)).unwrap(),
+            2_000
+        );
+        assert_eq!(budget(with_max, 2_000), 300);
+
+        // pool unknown (legacy gate, unknown prompt size, no pool figure): stays 0
+        assert_eq!(
+            clamp_vlm_max_tokens("m", (false, 10_000), admitted, 0).unwrap(),
+            0
+        );
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 0, 0).unwrap(), 0);
+        assert_eq!(
+            clamp_vlm_max_tokens("m", (true, 0), admitted, 0).unwrap(),
+            0
+        );
+
+        // too little room: the over-room 400; exactly the minimum answer passes
+        let resp = *clamp_vlm_max_tokens("m", ctx, 9_990, 0).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(clamp_vlm_max_tokens("m", ctx, 9_884, 0).unwrap(), 16);
     }
 
     /// A grossly oversized prompt must be rejected by the byte-length
@@ -4000,17 +4603,23 @@ mod tests {
     /// including the opt-out `1.0`, always wins.
     #[test]
     fn resolve_repetition_penalty_applies_default_only_when_absent() {
+        use crate::model_manager::sampling::DEFAULT_REPETITION_PENALTY;
         assert_eq!(
-            resolve_repetition_penalty(None),
+            resolve_repetition_penalty(None, DEFAULT_REPETITION_PENALTY),
             Some(DEFAULT_REPETITION_PENALTY)
         );
         assert_eq!(
-            resolve_repetition_penalty(Some(1.0)),
+            resolve_repetition_penalty(None, 1.05),
+            Some(1.05),
+            "absent → the profile's value (e.g. a file 1.05)"
+        );
+        assert_eq!(
+            resolve_repetition_penalty(Some(1.0), 1.05),
             Some(1.0),
             "explicit opt-out wins"
         );
         assert_eq!(
-            resolve_repetition_penalty(Some(1.3)),
+            resolve_repetition_penalty(Some(1.3), DEFAULT_REPETITION_PENALTY),
             Some(1.3),
             "explicit value wins"
         );
@@ -4427,7 +5036,11 @@ mod tests {
     #[test]
     fn chat_template_kwargs_enable_thinking_is_honoured() {
         let m = serde_json::json!([{"role": "user", "content": "hi"}]);
-        let r = |v: serde_json::Value| resolve_enable_thinking(&cr(v)).map_err(|e| e.status());
+        let r = |v: serde_json::Value| {
+            resolve_thinking_request(&cr(v))
+                .map(|t| t.enable_thinking)
+                .map_err(|e| e.status())
+        };
         assert_eq!(
             r(serde_json::json!({"model": "x", "messages": m})),
             Ok(None)
@@ -4461,6 +5074,109 @@ mod tests {
             r(serde_json::json!({"model": "x", "messages": m,
                 "chat_template_kwargs": {"enable_thinking": "false"}})),
             Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    /// The `(code, param, message)` of the 400 `resolve_thinking_request` gives `v`.
+    async fn thinking_refusal(v: serde_json::Value) -> (String, String, String) {
+        let resp = *resolve_thinking_request(&cr(v)).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let e = &body["error"];
+        assert_eq!(e["type"], "invalid_request_error", "{body}");
+        (
+            e["code"].as_str().unwrap().to_owned(),
+            e["param"].as_str().unwrap().to_owned(),
+            e["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// 0.9.1: the new request fields parse, and each wrong value is a 400 naming its field.
+    #[tokio::test]
+    async fn thinking_fields_parse_and_refuse_with_named_400s() {
+        use crate::thinking_budget::ReasoningEffort;
+        let m = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let ok = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"model": "x", "messages": m});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            resolve_thinking_request(&cr(v)).unwrap()
+        };
+        let t = ok(serde_json::json!({"reasoning_effort": "high", "thinking_budget_tokens": 900}));
+        assert_eq!(t.effort, Some(ReasoningEffort::High));
+        assert_eq!(t.budget, Some(900));
+        let t = ok(serde_json::json!({"thinking_token_budget": 64}));
+        assert_eq!(t.budget, Some(64), "the vLLM alias");
+        let t = ok(serde_json::json!({"thinking_budget_tokens": 64, "thinking_token_budget": 64}));
+        assert_eq!(t.budget, Some(64), "both, equal: fine");
+        let t = ok(serde_json::json!({"chat_template_kwargs": {
+            "reasoning_effort": "low", "preserve_thinking": true, "custom": [1]}}));
+        assert_eq!(t.effort, Some(ReasoningEffort::Low));
+        assert_eq!(t.preserve_thinking, Some(true));
+
+        let refused = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"model": "x", "messages": m});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            thinking_refusal(v)
+        };
+        let (code, param, msg) = refused(serde_json::json!({"reasoning_effort": "ultra"})).await;
+        assert_eq!(
+            (code.as_str(), param.as_str()),
+            ("invalid_reasoning_effort", "reasoning_effort")
+        );
+        assert!(
+            msg.contains("none, minimal, low, medium, high, xhigh, max"),
+            "{msg}"
+        );
+        let (code, param, _) = refused(serde_json::json!({"reasoning_effort": 3})).await;
+        assert_eq!(
+            (code.as_str(), param.as_str()),
+            ("invalid_reasoning_effort", "reasoning_effort")
+        );
+        let (code, param, _) =
+            refused(serde_json::json!({"chat_template_kwargs": {"reasoning_effort": "HIGH"}}))
+                .await;
+        assert_eq!(
+            (code.as_str(), param.as_str()),
+            (
+                "invalid_reasoning_effort",
+                "chat_template_kwargs.reasoning_effort"
+            )
+        );
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("512"),
+        ] {
+            let (code, param, _) =
+                refused(serde_json::json!({"thinking_budget_tokens": bad})).await;
+            assert_eq!(
+                (code.as_str(), param.as_str()),
+                ("invalid_thinking_budget", "thinking_budget_tokens")
+            );
+        }
+        let (code, param, _) =
+            refused(serde_json::json!({"thinking_budget_tokens": 10, "thinking_token_budget": 20}))
+                .await;
+        assert_eq!(
+            (code.as_str(), param.as_str()),
+            ("conflicting_thinking_budget", "thinking_token_budget")
+        );
+        let (code, param, _) =
+            refused(serde_json::json!({"chat_template_kwargs": {"preserve_thinking": "yes"}}))
+                .await;
+        assert_eq!(
+            (code.as_str(), param.as_str()),
+            (
+                "invalid_chat_template_kwargs",
+                "chat_template_kwargs.preserve_thinking"
+            )
         );
     }
 
@@ -4540,6 +5256,10 @@ mod tests {
             vram_safety_margin_gb: 0.0,
             npu_footprint_factor: 1.0,
             cpu_image_gen_max_pixels: 1024 * 1024,
+            max_audio_duration_secs: 7_200,
+            max_images_per_request: 16,
+            max_image_pixels_per_request: 64 * 1024 * 1024,
+            max_image_pixels: 4_000_000,
             min_kv_cache_gb: 0.0,
             light_model_max_gb: 2.0,
             light_stt_max_gb: 1.0,
@@ -4566,7 +5286,9 @@ mod tests {
             max_prompt_array: 16, // the production default
             max_embedding_inputs: 256,
             max_embedding_batch_tokens: 32_768,
-            max_tokens_cap: 8192,              // the production default
+            max_tokens_cap: 8192, // the production default
+            stream_first_token_timeout_secs: 600,
+            stream_token_gap_timeout_secs: 120,
             bind_addr: "127.0.0.1".to_owned(), // loopback — irrelevant for unit tests
             port: 11_437,
             allow_insecure_public_bind: false,
@@ -4592,6 +5314,7 @@ mod tests {
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
             load_timeout_secs: 600,
+            on_demand_wait_secs: 0,
         }
     }
 
@@ -4612,6 +5335,27 @@ mod tests {
     /// Deserialize a `ChatRequest` from a JSON literal (all fields default-filled).
     fn chat_req(v: serde_json::Value) -> ChatRequest {
         serde_json::from_value(v).unwrap()
+    }
+
+    /// E3 (F3): a chat request on a vision model with a device-headroom limit, after an idle gap
+    /// (readings 31 s old), takes exactly one fresh reading before deciding, and not on the async
+    /// runtime's thread (a current-thread runtime) nor on the background `vram-probe` thread.
+    /// Reverting the handler to the cached `get_chat_context` fails this.
+    #[tokio::test]
+    async fn chat_on_a_vision_model_reads_an_old_device_reading_first() {
+        use crate::model_manager::tests::{headroom_of, thread_probe_vision_manager};
+        let (mm, probe) = thread_probe_vision_manager(512 << 20).await;
+        headroom_of(&mm).age_readings(std::time::Duration::from_secs(31));
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        let req = chat_req(serde_json::json!({
+            "model": "vlm-a",
+            "messages": [{"role": "user", "content": "describe the weather"}]
+        }));
+        let resp = chat_completions(axum::extract::State(state), JsonBody(req)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sync = probe.synchronous_calls();
+        assert_eq!(sync.len(), 1, "one synchronous probe: {sync:?}");
+        assert_ne!(sync[0].0, std::thread::current().id(), "not on the runtime");
     }
 
     /// 2026.2 migration (PLAN step 6): a VLM now SERVES text-only requests. The
@@ -4715,6 +5459,410 @@ mod tests {
         );
     }
 
+    /// 0.9.1 S5 (I-02) through the handler: one image over `max_images_per_request` (16) is a
+    /// 400 whose `code` names the limit, before the engine sees anything.
+    #[tokio::test]
+    async fn image_request_over_the_image_count_is_a_400_too_many_images() {
+        let state = routed_state(&[("qwen-vlm-8b", 5.5)]).await;
+        let mut content = vec![serde_json::json!({"type": "text", "text": "compare"})];
+        for _ in 0..17 {
+            content.push(
+                serde_json::json!({"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}),
+            );
+        }
+        let req = chat_req(serde_json::json!({
+            "model": "qwen-vlm-8b",
+            "messages": [{"role": "user", "content": content}]
+        }));
+        let resp = chat_completions(axum::extract::State(state), JsonBody(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "too_many_images", "{json}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_images_per_request"),
+            "{json}"
+        );
+    }
+
+    /// A `width x height` PNG as a data URI; `truncate` drops that many bytes from the end (IEND
+    /// and part of IDAT): the header still reads, the body does not decode.
+    fn png_data_uri(width: u32, height: u32, truncate: usize) -> String {
+        use base64ct::{Base64, Encoding};
+        use image::{DynamicImage, ImageFormat, RgbImage};
+        #[allow(clippy::cast_possible_truncation)]
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 13) as u8, ((x + y) * 3) as u8])
+        }));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        buf.truncate(buf.len() - truncate);
+        format!("data:image/png;base64,{}", Base64::encode_string(&buf))
+    }
+
+    fn vlm_image_req(uris: &[String], stream: bool) -> ChatRequest {
+        let mut content = vec![serde_json::json!({"type": "text", "text": "what is this?"})];
+        for u in uris {
+            content.push(serde_json::json!({"type": "image_url", "image_url": {"url": u}}));
+        }
+        chat_req(serde_json::json!({
+            "model": "qwen-vlm-8b",
+            "stream": stream,
+            "messages": [{"role": "user", "content": content}]
+        }))
+    }
+
+    async fn vlm_handle_of(state: &AppState) -> crate::vlm_engine::VlmHandle {
+        let mm = state.model_manager.as_ref().unwrap();
+        match mm
+            .get_chat_context_for_request("qwen-vlm-8b")
+            .await
+            .unwrap()
+            .handle
+        {
+            EngineHandleKind::Vision(v) => v,
+            _ => panic!("qwen-vlm-8b is not a vision model"),
+        }
+    }
+
+    async fn wait_until_parked(vlm: &crate::vlm_engine::VlmHandle, n: usize) {
+        use crate::model_manager::ManagedEngine as _;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while vlm.waiting() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {n} requests parked at the engine slot",
+                vlm.waiting()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 0.9.1 S5c: with every engine slot taken, image requests (streaming and not) park at the
+    /// slot holding only compressed bytes — no full decode has run for them (test hook keyed by
+    /// this test's own image size) — and decode once they get it. The 400s that the header
+    /// decides (count, per-request pixel sum, not an image) still answer at once, before any
+    /// wait; a body corrupt past a valid header answers its 400 only after the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vision_requests_waiting_for_a_slot_hold_no_decoded_pixels() {
+        use crate::image_util::test_hook::full_decodes_of;
+        use crate::model_manager::ManagedEngine as _;
+        let state = routed_state(&[("qwen-vlm-8b", 5.5)]).await;
+        let vlm = vlm_handle_of(&state).await;
+        let held = vlm.hold_all_slots().await.unwrap();
+
+        let (w, h) = (53, 41);
+        let mut waiting = Vec::new();
+        for stream in [false, true, false, true] {
+            let st = state.clone();
+            let req = vlm_image_req(&[png_data_uri(w, h, 0)], stream);
+            waiting.push(tokio::spawn(async move {
+                chat_completions(axum::extract::State(st), JsonBody(req)).await
+            }));
+        }
+        let st = state.clone();
+        let corrupt = vlm_image_req(&[png_data_uri(59, 43, 16)], true);
+        let corrupt = tokio::spawn(async move {
+            chat_completions(axum::extract::State(st), JsonBody(corrupt)).await
+        });
+        wait_until_parked(&vlm, 5).await;
+        assert_eq!(
+            full_decodes_of(w, h),
+            0,
+            "a waiting request decoded its image"
+        );
+        assert_eq!(
+            full_decodes_of(59, 43),
+            0,
+            "a waiting request decoded its image"
+        );
+
+        // Header-decided 400s, slot still held: no wait.
+        let tiny = png_data_uri(2, 2, 0);
+        let over_count = vlm_image_req(&vec![tiny; 17], false);
+        let over_pixels = {
+            use base64ct::{Base64, Encoding};
+            let png = crate::image_util::test_hook::png_declaring(8200, 8200);
+            vlm_image_req(
+                &[format!(
+                    "data:image/png;base64,{}",
+                    Base64::encode_string(&png)
+                )],
+                true,
+            )
+        };
+        let not_image = vlm_image_req(
+            &["data:image/png;base64,aGVsbG8gd29ybGQ=".to_owned()],
+            false,
+        );
+        for (req, code) in [
+            (over_count, Some("too_many_images")),
+            (over_pixels, Some("image_too_large")),
+            (not_image, None),
+        ] {
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                chat_completions(axum::extract::State(state.clone()), JsonBody(req)),
+            )
+            .await
+            // Err = timed out: a header-decided 400 waited for the slot.
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"].as_str(), code, "{json}");
+        }
+        assert!(
+            !corrupt.is_finished(),
+            "the corrupt body must wait like the rest"
+        );
+
+        drop(held);
+        for t in waiting {
+            assert_eq!(t.await.unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(
+            full_decodes_of(w, h),
+            4,
+            "each request decoded after the wait"
+        );
+        let resp = corrupt.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to decode image"),
+            "{json}"
+        );
+        // The corrupt request released its slot: the engine is idle again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while vlm.active() > 0 {
+            assert!(std::time::Instant::now() < deadline, "slot not released");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 0.9.1 C28 through the chat path, non-streaming and streaming: an image over
+    /// `max_image_pixels` reaches the engine downscaled (the mock engine reports what it
+    /// received), one under it unchanged.
+    #[tokio::test]
+    async fn vision_chat_downscales_images_over_max_image_pixels() {
+        let state = routed_state(&[("qwen-vlm-8b", 5.5)]).await;
+        // 2100 x 2000 (2100 x 2001 streaming, so the two runs are told apart) = 4.2 MP > the
+        // 4 MP default; 300 x 200 is under it.
+        for (stream, h) in [(false, 2000), (true, 2001)] {
+            let req = vlm_image_req(
+                &[png_data_uri(2100, h, 0), png_data_uri(300, 200, 0)],
+                stream,
+            );
+            let resp = chat_completions(axum::extract::State(state.clone()), JsonBody(req)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Read the whole answer: the stream ends after the engine has run.
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!body.is_empty());
+            let want = crate::image_util::downscaled_dims(2100, h, 4_000_000).unwrap();
+            let seen = crate::vlm_engine::mock_seen_image_dims();
+            assert!(
+                seen.iter().any(|d| d == &[want, (300, 200)]),
+                "stream {stream}: engine saw {seen:?}, want [{want:?}, (300, 200)]"
+            );
+        }
+    }
+
+    /// Review N3: `drop_image_payloads` empties every `image_url` (any message), and keeps the
+    /// text parts and plain-text messages as they were.
+    #[test]
+    fn drop_image_payloads_empties_image_urls_only() {
+        let mut msgs = vec![
+            user_parts(vec![
+                ContentPart::Text { text: "a".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrlData {
+                        url: "data:image/png;base64,AAAA".into(),
+                    },
+                },
+            ]),
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("ok".into())),
+                ..Default::default()
+            },
+            user_parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrlData {
+                    url: "data:image/png;base64,BBBB".into(),
+                },
+            }]),
+        ];
+        drop_image_payloads(&mut msgs);
+        let mut images = 0;
+        for m in &msgs {
+            if let Some(MessageContent::Parts(parts)) = &m.content {
+                for p in parts {
+                    match p {
+                        ContentPart::ImageUrl { image_url } => {
+                            assert!(image_url.url.is_empty());
+                            images += 1;
+                        }
+                        ContentPart::Text { text } => assert_eq!(text, "a"),
+                    }
+                }
+            }
+        }
+        assert_eq!(images, 2);
+        assert!(matches!(&msgs[1].content, Some(MessageContent::Text(t)) if t == "ok"));
+    }
+
+    /// Review N3 / F4: a text-only request to a vision model takes no full-decode slot — with
+    /// both held it is still served at once.
+    #[tokio::test]
+    async fn a_text_only_vision_request_takes_no_decode_slot() {
+        let state = routed_state(&[("qwen-vlm-8b", 5.5)]).await;
+        let held = crate::image_util::hold_vlm_decode_slots().await.unwrap();
+        let req = chat_req(serde_json::json!({
+            "model": "qwen-vlm-8b",
+            "messages": [{"role": "user", "content": "describe the weather"}]
+        }));
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            chat_completions(axum::extract::State(state), JsonBody(req)),
+        )
+        .await
+        // Err = timed out: the text-only request waited for a decode slot.
+        .unwrap();
+        drop(held);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A routed state whose mock vision engines wait `vlm_queue_timeout` for a slot, with a
+    /// device admission budget of 1 on the test device (`CPU`), so a test can see the device
+    /// lease taken and given back.
+    async fn routed_state_with_budget(vlm_queue_timeout: std::time::Duration) -> AppState {
+        let mut cfg = routing_config(&[("qwen-vlm-8b", 5.5)]);
+        cfg.device_budgets = std::collections::HashMap::from([("CPU".to_owned(), 1)]);
+        let budgets = Arc::new(crate::admission::DeviceBudgets::from_config(&cfg));
+        let factory = MockEngineFactory {
+            vlm_queue_timeout: Some(vlm_queue_timeout),
+            ..Default::default()
+        };
+        let mm = ModelManager::new(cfg, Arc::new(factory)).await.unwrap();
+        mm.load_model("qwen-vlm-8b").await.unwrap();
+        AppState::new()
+            .with_model_manager(Arc::new(mm))
+            .with_device_budgets(budgets)
+    }
+
+    /// Review F5c: a vision request with an image that cannot get an engine slot within the
+    /// queue timeout is the existing `429 server_overloaded`, its image never decoded, and it
+    /// gives the device lease back.
+    #[tokio::test]
+    async fn vision_request_that_times_out_at_the_slot_is_a_429() {
+        use crate::image_util::test_hook::full_decodes_of;
+        let state = routed_state_with_budget(std::time::Duration::from_millis(100)).await;
+        let vlm = vlm_handle_of(&state).await;
+        let held = vlm.hold_all_slots().await.unwrap();
+        let req = vlm_image_req(&[png_data_uri(71, 53, 0)], true);
+        let resp = chat_completions(axum::extract::State(state.clone()), JsonBody(req)).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "server_overloaded", "{json}");
+        assert_eq!(
+            full_decodes_of(71, 53),
+            0,
+            "a refused request decoded its image"
+        );
+        assert_eq!(
+            state.device_budgets.available("CPU"),
+            Some(1),
+            "device lease leaked"
+        );
+        drop(held);
+    }
+
+    /// Review F5b: a client that goes away while its vision request is parked at the engine
+    /// slot, or while its images decode, releases the device lease and the slot at once (the
+    /// handler future is dropped); a decode already running finishes on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_goes_away_releases_the_slot_and_the_device_lease() {
+        use crate::model_manager::ManagedEngine as _;
+        async fn until(what: &str, f: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !f() {
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        let state = routed_state_with_budget(std::time::Duration::from_secs(30)).await;
+        let vlm = vlm_handle_of(&state).await;
+
+        // 1. Parked at the slot.
+        let held = vlm.hold_all_slots().await.unwrap();
+        let st = state.clone();
+        let req = vlm_image_req(&[png_data_uri(73, 59, 0)], true);
+        let task =
+            tokio::spawn(
+                async move { chat_completions(axum::extract::State(st), JsonBody(req)).await },
+            );
+        wait_until_parked(&vlm, 1).await;
+        assert_eq!(
+            state.device_budgets.available("CPU"),
+            Some(0),
+            "lease held while parked"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(vlm.waiting(), 0);
+        assert_eq!(
+            state.device_budgets.available("CPU"),
+            Some(1),
+            "device lease leaked"
+        );
+        drop(held);
+
+        // 2. While decoding: the decode of this size is held at a gate.
+        let gate = crate::image_util::test_hook::gate_decodes_of(79, 61);
+        let st = state.clone();
+        let req = vlm_image_req(&[png_data_uri(79, 61, 0)], false);
+        let task =
+            tokio::spawn(
+                async move { chat_completions(axum::extract::State(st), JsonBody(req)).await },
+            );
+        until("decode started", || gate.entered() == 1).await;
+        assert_eq!(vlm.active(), 1, "the slot is held while decoding");
+        assert_eq!(state.device_budgets.available("CPU"), Some(0));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(vlm.active(), 0, "slot released on disconnect");
+        assert_eq!(
+            state.device_budgets.available("CPU"),
+            Some(1),
+            "device lease leaked"
+        );
+        gate.open();
+
+        // The engine still serves.
+        let req = vlm_image_req(&[png_data_uri(3, 3, 0)], false);
+        let resp = chat_completions(axum::extract::State(state.clone()), JsonBody(req)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// End-to-end: a VLM request with `tools` active gets its `tools` array
     /// all the way to the engine (the mock VLM echoes a `<tool_call>` block
     /// only when it receives a non-empty `tools`) and the response comes back
@@ -4750,6 +5898,76 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// QXL R4: on the vision path too, the request's `tools` reach the Qwen XML
+    /// parser. The model's chat template contains `<function=` (so the load
+    /// detects `QwenCoder`), and the mock VLM answers with a Qwen XML call
+    /// carrying `True` / `None` and a numeric-looking string parameter: the
+    /// arguments come back typed from the schema, in both stream modes.
+    #[tokio::test]
+    async fn vlm_request_with_tools_types_qwen_xml_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("qwen-xml.jinja");
+        std::fs::write(
+            &template,
+            "{% for m in messages %}{{ m.content }}{% endfor %}<function=example>",
+        )
+        .unwrap();
+        let mut cfg = routing_config(&[("qwen-vlm-8b", 5.5)]);
+        cfg.models
+            .get_mut("qwen-vlm-8b")
+            .unwrap()
+            .policy
+            .chat_template = Some(template);
+        let mm = ModelManager::new(cfg, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("qwen-vlm-8b").await.unwrap();
+        let state = AppState::new().with_model_manager(Arc::new(mm));
+        for stream in [false, true] {
+            let req = chat_req(serde_json::json!({
+                "model": "qwen-vlm-8b",
+                "stream": stream,
+                "messages": [{"role": "user",
+                    "content": crate::vlm_engine::MOCK_VLM_QWEN_XML_TOOL}],
+                "tools": [{"type": "function", "function": {
+                    "name": "get_forecast",
+                    "parameters": {"type": "object", "properties": {
+                        "city": {"type": "string"},
+                        "metric": {"type": "boolean"},
+                        "note": {"type": ["string", "null"]},
+                        "zip": {"type": "string"}
+                    }}
+                }}]
+            }));
+            let resp = chat_completions(axum::extract::State(state.clone()), JsonBody(req)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "stream={stream}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let tc = if stream {
+                let chunk = body
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter(|d| d.contains(r#""tool_calls""#))
+                    .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                    .next()
+                    .unwrap_or_else(|| panic!("no tool_calls chunk: {body}"));
+                chunk["choices"][0]["delta"]["tool_calls"][0].clone()
+            } else {
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(json["model_family"], "qwen_coder", "{body}");
+                json["choices"][0]["message"]["tool_calls"][0].clone()
+            };
+            assert_eq!(tc["function"]["name"], "get_forecast", "stream={stream}");
+            assert_eq!(
+                tc["function"]["arguments"],
+                r#"{"city":"Hanoi","metric":true,"note":null,"zip":"10000"}"#,
+                "stream={stream}"
+            );
+        }
     }
 
     /// Same request shape but WITHOUT `tools` — the mock must not emit a
@@ -4838,7 +6056,7 @@ mod tests {
             created: 0,
             model: "test-model",
             choices: vec![],
-            usage: usage_for(0, 0),
+            usage: usage_for(0, 0, 0),
             model_family: meta.family.label(),
             sampling: meta.sampling(),
         };
@@ -5479,6 +6697,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5498,6 +6717,89 @@ mod tests {
         assert_eq!(tc["type"], "function");
         assert_eq!(tc["function"]["name"], "get_weather");
         assert_eq!(tc["function"]["arguments"], r#"{"city":"Paris"}"#);
+    }
+
+    /// QXL (0.9.1): the request's `tools` reach the Qwen XML parser, so a
+    /// Python-literal `True`/`None` arrives as JSON `true`/`null` and a
+    /// numeric-looking string parameter stays a string — in both stream modes
+    /// (the tool path is buffered either way). Live case of 2026-11-20.
+    #[tokio::test]
+    async fn collect_tool_completion_qwen_xml_types_arguments_from_tools() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {
+            "name": "get_forecast",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"},
+                "metric": {"type": "boolean"},
+                "days": {"type": "integer"},
+                "note": {"type": ["string", "null"]},
+                "zip": {"type": "string"}
+            }}
+        }})];
+        let qwen_meta = ResponseMeta {
+            family: ModelFamily::QwenCoder,
+            ..test_meta()
+        };
+        for stream in [false, true] {
+            let (tx, rx) = stream_channel();
+            tokio::spawn(async move {
+                tx.send(StreamEvent::Token(
+                    concat!(
+                        "<tool_call>\n<function=get_forecast>\n",
+                        "<parameter=city>\nHanoi\n</parameter>\n",
+                        "<parameter=metric>\nTrue\n</parameter>\n",
+                        "<parameter=days>\n3\n</parameter>\n",
+                        "<parameter=note>\nNone\n</parameter>\n",
+                        "<parameter=zip>\n10000\n</parameter>\n",
+                        "</function>\n</tool_call>"
+                    )
+                    .into(),
+                    1,
+                ))
+                .await
+                .unwrap();
+                tx.send(StreamEvent::Done(FinishReason::Stop))
+                    .await
+                    .unwrap();
+            });
+            let resp = collect_tool_completion(
+                rx,
+                "id-q",
+                "m",
+                1,
+                qwen_meta,
+                stream,
+                false,
+                None,
+                None,
+                false,
+                Some(&tools),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let tc = if stream {
+                let chunk = body
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter(|d| d.contains(r#""tool_calls""#))
+                    .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                    .next()
+                    .unwrap();
+                chunk["choices"][0]["delta"]["tool_calls"][0].clone()
+            } else {
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                json["choices"][0]["message"]["tool_calls"][0].clone()
+            };
+            assert_eq!(tc["function"]["name"], "get_forecast", "stream={stream}");
+            assert_eq!(
+                tc["function"]["arguments"],
+                r#"{"city":"Hanoi","metric":true,"days":3,"note":null,"zip":"10000"}"#,
+                "stream={stream}"
+            );
+        }
     }
 
     /// gpt-oss's harmony tool-call shape, exercised end to end: raw engine
@@ -5538,6 +6840,7 @@ mod tests {
             None,
             Some(ReasoningParser::GptOss),
             false,
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5583,6 +6886,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5629,6 +6933,7 @@ mod tests {
             None,
             Some(ReasoningParser::Qwen3),
             false,
+            None,
         )
         .await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -5677,6 +6982,7 @@ mod tests {
             None,
             Some(ReasoningParser::Qwen3),
             false,
+            None,
         )
         .await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -6117,7 +7423,11 @@ mod tests {
             ContentPart::Text { text: "bar".into() },
         ];
         let cb = extract_text_content(&MessageContent::Parts(parts.clone()));
-        let (vlm, images) = extract_vlm_messages(&[user_parts(parts)]).unwrap();
+        let (vlm, images) = extract_vlm_messages(
+            &[user_parts(parts)],
+            crate::image_util::ImageLimits::default(),
+        )
+        .unwrap();
         assert_eq!(cb, "foobar");
         assert!(images.is_empty());
         assert_eq!(
@@ -6146,7 +7456,8 @@ mod tests {
             ..Default::default()
         }];
 
-        let (vlm_messages, _images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, _images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
 
         assert_eq!(
             vlm_messages[0]["tool_calls"],
@@ -6167,7 +7478,8 @@ mod tests {
             ..Default::default()
         }];
 
-        let (vlm_messages, _images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, _images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
 
         assert_eq!(vlm_messages[0]["tool_call_id"], "call_1");
         assert_eq!(vlm_messages[0]["name"], "lookup_record");
@@ -6180,7 +7492,8 @@ mod tests {
     fn extract_vlm_messages_omits_tool_fields_when_absent() {
         let msgs = vec![user_parts(vec![ContentPart::Text { text: "hi".into() }])];
 
-        let (vlm_messages, _images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, _images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         let obj = vlm_messages[0].as_object().unwrap();
 
         assert!(!obj.contains_key("tool_calls"));
@@ -6204,7 +7517,8 @@ mod tests {
             })]),
             ..Default::default()
         }];
-        let (vlm_messages, _images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, _images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
 
         let gate_text = vlm_gate_text(&vlm_messages);
 
@@ -6221,7 +7535,8 @@ mod tests {
         let msgs = vec![user_parts(vec![ContentPart::Text {
             text: "hello world".into(),
         }])];
-        let (vlm_messages, _images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, _images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
 
         assert_eq!(vlm_gate_text(&vlm_messages), "hello world");
     }
@@ -6265,7 +7580,8 @@ mod tests {
             },
         ])];
 
-        let (vlm_messages, images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         assert_eq!(images.len(), 2, "both images decoded");
         let content = vlm_messages[0]["content"].as_str().unwrap();
         assert_eq!(
@@ -6288,7 +7604,8 @@ mod tests {
             },
         ])];
 
-        let (vlm_messages, images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(
             vlm_messages[0]["content"].as_str().unwrap(),
@@ -6322,7 +7639,8 @@ mod tests {
             }]),
         ];
 
-        let (vlm_messages, images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         assert_eq!(images.len(), 1, "only the last message's image is decoded");
         assert_eq!(
             vlm_messages[0]["content"].as_str().unwrap(),
@@ -6365,7 +7683,8 @@ mod tests {
             },
         ];
 
-        let (vlm_messages, images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         assert!(
             images.is_empty(),
             "no image in the last (text-only) message"
@@ -6392,7 +7711,8 @@ mod tests {
             user_parts(vec![ContentPart::Text { text: "two".into() }]),
         ];
 
-        let (vlm_messages, images) = extract_vlm_messages(&msgs).unwrap();
+        let (vlm_messages, images) =
+            extract_vlm_messages(&msgs, crate::image_util::ImageLimits::default()).unwrap();
         assert!(images.is_empty(), "no images decoded");
         assert_eq!(vlm_messages[0]["content"].as_str().unwrap(), "hi");
         assert_eq!(vlm_messages[1]["content"].as_str().unwrap(), "two");
@@ -6419,7 +7739,8 @@ mod tests {
         assert_eq!(vals[0]["role"], "system");
         assert_eq!(vals[1]["role"], "user");
         assert_eq!(vals[2]["role"], "function");
-        let (vlm, _images) = extract_vlm_messages(&messages).unwrap();
+        let (vlm, _images) =
+            extract_vlm_messages(&messages, crate::image_util::ImageLimits::default()).unwrap();
         assert_eq!(vlm[0]["role"], "system");
         assert_eq!(vlm[1]["role"], "user");
         assert_eq!(vlm[2]["role"], "function");
@@ -6447,5 +7768,1608 @@ mod tests {
         .unwrap();
         let vals = messages_to_template_values(&messages);
         assert_eq!(vals[0]["content"], "what is this?");
+    }
+
+    // ---- 0.9.1 V5: the per-model sampling profile, end to end on the mock -----------------
+
+    /// A Ready text model `m1` in a real temp `models_dir` (its `generation_config.json` is
+    /// `gen_config` when given), its stanza `stanza`, a durable config file (PATCH/reload),
+    /// and the recorder of every `GenParams` its mock engine received.
+    struct V5 {
+        state: AppState,
+        mm: Arc<ModelManager>,
+        recorded: Arc<std::sync::Mutex<Vec<GenParams>>>,
+        dir: tempfile::TempDir,
+    }
+
+    impl V5 {
+        async fn new(stanza: serde_json::Value, gen_config: Option<&str>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let models = dir.path().join("models");
+            std::fs::create_dir_all(models.join("m1")).unwrap();
+            if let Some(g) = gen_config {
+                std::fs::write(models.join("m1").join("generation_config.json"), g).unwrap();
+            }
+            let cfg = serde_json::json!({
+                "models_dir": models, "device": "CPU", "total_vram_gb": 0.0,
+                "models": { "m1": stanza }
+            });
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, cfg.to_string()).unwrap();
+            let config = crate::model_manager::Config::load(&path).unwrap();
+            let factory = Arc::new(MockEngineFactory::default());
+            let recorded = Arc::clone(&factory.recorded_params);
+            let mm = Arc::new(
+                ModelManager::new(config, factory)
+                    .await
+                    .unwrap()
+                    .with_config_path(path),
+            );
+            mm.load_model("m1").await.unwrap();
+            let state = AppState::new().with_model_manager(Arc::clone(&mm));
+            Self {
+                state,
+                mm,
+                recorded,
+                dir,
+            }
+        }
+
+        /// Send one chat request (`extra` merged into a minimal body) and return the
+        /// `GenParams` the engine got for it.
+        async fn chat(&self, extra: serde_json::Value) -> GenParams {
+            let mut body = serde_json::json!({
+                "model": "m1", "messages": [{"role": "user", "content": "hi"}]
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let before = self.recorded.lock().unwrap().len();
+            let _ = chat_completions(
+                axum::extract::State(self.state.clone()),
+                JsonBody(chat_req(body)),
+            )
+            .await;
+            let rec = self.recorded.lock().unwrap();
+            assert_eq!(rec.len(), before + 1, "the engine got exactly one request");
+            rec[before].clone()
+        }
+    }
+
+    const QWEN3_FILE: &str = r#"{"do_sample": true, "temperature": 0.6, "top_p": 0.95,
+        "top_k": 20, "repetition_penalty": 1.05}"#;
+
+    fn sampling_of(p: &GenParams) -> (Option<f32>, Option<f32>, Option<usize>, Option<f32>) {
+        (p.temperature, p.top_p, p.top_k, p.repetition_penalty)
+    }
+
+    /// No operator layer: the file package applies, and the file penalty (1.05, read
+    /// outside the `do_sample` gate) replaces the 1.1 net; tools pin greedy above it, penalty kept.
+    #[tokio::test]
+    async fn v5_file_layer_applies_and_tools_pin_greedy() {
+        let v = V5::new(serde_json::json!({"vram_gb": 0.0}), Some(QWEN3_FILE)).await;
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(
+            sampling_of(&p),
+            (Some(0.6), Some(0.95), Some(20), Some(1.05))
+        );
+        assert_eq!(p.presence_penalty, None);
+        let tools = serde_json::json!({"tools": [{"type": "function",
+            "function": {"name": "f", "parameters": {"type": "object"}}}]});
+        let p = v.chat(tools).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.05)));
+    }
+
+    /// The client rows against an operator profile: T>0 keeps its own and fills the unset
+    /// `top_p`/`top_k` from the profile; T 0 is greedy (D-11); only `top_k` passes through;
+    /// a client penalty and presence win.
+    #[tokio::test]
+    async fn v5_client_rules_run_against_the_profile() {
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "sampling": {"temperature": 0.15, "top_p": 0.8,
+                "repetition_penalty": 1.2, "presence_penalty": 1.5}}),
+            Some(QWEN3_FILE),
+        )
+        .await;
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(
+            sampling_of(&p),
+            (Some(0.15), Some(0.8), Some(20), Some(1.2))
+        );
+        assert_eq!(p.presence_penalty, Some(1.5));
+        let p = v.chat(serde_json::json!({"temperature": 0.9})).await;
+        assert_eq!(sampling_of(&p), (Some(0.9), Some(0.8), Some(20), Some(1.2)));
+        let p = v.chat(serde_json::json!({"temperature": 0.0})).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.2)));
+        // F1: a client T 0 drops the operator presence; the penalty chain stays.
+        assert_eq!(
+            p.presence_penalty, None,
+            "operator presence withheld on client T 0"
+        );
+        let p = v.chat(serde_json::json!({"top_k": 5})).await;
+        assert_eq!(sampling_of(&p), (None, None, Some(5), Some(1.2)));
+        // Tools active, client sends none: the greedy pin wins over the operator's T 0.15.
+        let tools = serde_json::json!({"tools": [{"type": "function",
+            "function": {"name": "f", "parameters": {"type": "object"}}}]});
+        let p = v.chat(tools.clone()).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.2)));
+        assert_eq!(
+            p.presence_penalty, None,
+            "operator presence withheld under the tools pin"
+        );
+        // The client's own presence under the pin still passes.
+        let mut with_presence = tools;
+        with_presence["presence_penalty"] = serde_json::json!(0.7);
+        with_presence["frequency_penalty"] = serde_json::json!(0.3);
+        let p = v.chat(with_presence).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.2)));
+        assert_eq!(
+            (p.presence_penalty, p.frequency_penalty),
+            (Some(0.7), Some(0.3))
+        );
+        // A client T > 0 or a client top_k (not greedy by request) keeps the operator presence.
+        let p = v.chat(serde_json::json!({"top_k": 5})).await;
+        assert_eq!(p.presence_penalty, Some(1.5));
+        let p = v
+            .chat(serde_json::json!({"repetition_penalty": 1.0, "presence_penalty": 0.0}))
+            .await;
+        assert_eq!(p.repetition_penalty, Some(1.0));
+        assert_eq!(p.presence_penalty, Some(0.0));
+    }
+
+    /// F1: the repetition chain is unchanged on greedy requests — the file's 1.05 reaches a
+    /// client-T-0 request and a tools-pinned one, with no operator layer.
+    #[tokio::test]
+    async fn v5_repetition_chain_holds_on_greedy_requests() {
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "sampling": {"temperature": 0.7,
+                "frequency_penalty": 0.4}}),
+            Some(QWEN3_FILE),
+        )
+        .await;
+        let p = v.chat(serde_json::json!({"temperature": 0})).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.05)));
+        assert_eq!(p.frequency_penalty, None);
+        let tools = serde_json::json!({"tools": [{"type": "function",
+            "function": {"name": "f", "parameters": {"type": "object"}}}]});
+        let p = v.chat(tools).await;
+        assert_eq!(sampling_of(&p), (Some(0.0), None, None, Some(1.05)));
+        assert_eq!(p.frequency_penalty, None);
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(p.frequency_penalty, Some(0.4), "the profile path keeps it");
+    }
+
+    /// No file, no operator: greedy + the server's 1.1 (unchanged from 0.9.0).
+    #[tokio::test]
+    async fn v5_no_layers_is_greedy_with_the_server_penalty() {
+        let v = V5::new(serde_json::json!({"vram_gb": 0.0}), None).await;
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(sampling_of(&p), (None, None, None, Some(1.1)));
+    }
+
+    /// A PATCH of `sampling` on a Ready model reaches the very next request; a PATCH with
+    /// `null` clears it (back to the file layer) and the file on disk then loads with none.
+    #[tokio::test]
+    async fn v5_patch_reaches_the_next_request_and_null_clears() {
+        let v = V5::new(serde_json::json!({"vram_gb": 0.0}), None).await;
+        let patch: crate::model_manager::config::ModelEntryPatch = serde_json::from_value(
+            serde_json::json!({"sampling": {"temperature": 0.15, "top_p": 0.95}}),
+        )
+        .unwrap();
+        let report = v.mm.patch_model("m1", &patch).unwrap();
+        assert_eq!(report.applied_live, vec!["sampling"]);
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(sampling_of(&p), (Some(0.15), Some(0.95), None, Some(1.1)));
+        // Persisted as typed (no f32 widening into the operator's file).
+        let text = std::fs::read_to_string(v.dir.path().join("config.json")).unwrap();
+        assert!(text.contains(r#""temperature": 0.15"#), "{text}");
+
+        let clear: crate::model_manager::config::ModelEntryPatch =
+            serde_json::from_value(serde_json::json!({"sampling": null})).unwrap();
+        assert!(!clear.is_empty(), "a null-only body is a real PATCH");
+        v.mm.patch_model("m1", &clear).unwrap();
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(sampling_of(&p), (None, None, None, Some(1.1)));
+        let reread = crate::model_manager::Config::load(&v.dir.path().join("config.json")).unwrap();
+        assert_eq!(reread.models["m1"].policy.sampling, None);
+    }
+
+    /// The `do_sample` rule on PATCH: operator `top_p` without a temperature on a model whose
+    /// file has no `do_sample` is a 400-class error and changes nothing.
+    #[tokio::test]
+    async fn v5_patch_rejects_top_p_without_temperature_on_a_greedy_file() {
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0}),
+            Some(r#"{"temperature": 0.7}"#),
+        )
+        .await;
+        let patch: crate::model_manager::config::ModelEntryPatch =
+            serde_json::from_value(serde_json::json!({"sampling": {"top_p": 0.9}})).unwrap();
+        let err = v.mm.patch_model("m1", &patch).unwrap_err().to_string();
+        assert!(err.contains("do_sample"), "{err}");
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(sampling_of(&p), (None, None, None, Some(1.1)));
+        // With a do_sample file the same PATCH is accepted (profile T from the file).
+        let v = V5::new(serde_json::json!({"vram_gb": 0.0}), Some(QWEN3_FILE)).await;
+        v.mm.patch_model("m1", &patch).unwrap();
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(
+            sampling_of(&p),
+            (Some(0.6), Some(0.9), Some(20), Some(1.05))
+        );
+    }
+
+    /// `reload-config` applies an edited `sampling` to a Ready model (reported in
+    /// `applied_live`, not in `models_not_applied`); other changed keys still are not applied.
+    #[tokio::test]
+    async fn v5_reload_applies_sampling_to_a_ready_model() {
+        let v = V5::new(serde_json::json!({"vram_gb": 0.0}), None).await;
+        let models = v.dir.path().join("models");
+        let cfg = serde_json::json!({
+            "models_dir": models, "device": "CPU", "total_vram_gb": 0.0,
+            "models": { "m1": {"vram_gb": 0.0, "pinned": true,
+                "sampling": {"temperature": 0.3, "frequency_penalty": 0.5}} }
+        });
+        std::fs::write(v.dir.path().join("config.json"), cfg.to_string()).unwrap();
+        let report = v.mm.reload_config().unwrap();
+        assert_eq!(report.applied_live.len(), 1);
+        assert_eq!(report.applied_live[0].model, "m1");
+        assert_eq!(report.applied_live[0].fields, vec!["sampling"]);
+        assert_eq!(report.models_not_applied.len(), 1);
+        assert_eq!(report.models_not_applied[0].fields, vec!["pinned"]);
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(sampling_of(&p), (Some(0.3), None, None, Some(1.1)));
+        assert_eq!(p.frequency_penalty, Some(0.5));
+        // A second reload with no edit applies nothing.
+        assert!(v.mm.reload_config().unwrap().applied_live.is_empty());
+    }
+
+    /// Legacy `/v1/completions` uses the same profile.
+    #[tokio::test]
+    async fn v5_completions_use_the_profile() {
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "sampling": {"temperature": 0.4}}),
+            Some(QWEN3_FILE),
+        )
+        .await;
+        let req: crate::handlers::completions::CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m1", "prompt": "hi"})).unwrap();
+        let _ = crate::handlers::completions::completions(
+            axum::extract::State(v.state.clone()),
+            JsonBody(req),
+        )
+        .await;
+        let rec = v.recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            sampling_of(&rec[0]),
+            (Some(0.4), Some(0.95), Some(20), Some(1.05))
+        );
+    }
+
+    // ---- 0.9.1 V1-usage (review R-2): handler → `GenParams.reasoning` wiring ----------------
+
+    /// A chat template whose generation prompt prefills an open `<think>` unless
+    /// `enable_thinking` is false (then a closed one), Qwen3-style. Written to its own temp dir
+    /// (returned so it lives as long as the test) and named by absolute path in the stanza.
+    fn thinking_template() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("think.jinja");
+        std::fs::write(
+            &path,
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+             {% endfor %}<|im_start|>assistant\n\
+             {% if enable_thinking is defined and enable_thinking == false %}\
+             <think>\n\n</think>\n\n{% else %}<think>\n{% endif %}",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// Text CB: the split the engine gets is the parser plus "the rendered prompt ends in an open
+    /// `<think>`" — true with thinking on, false with `enable_thinking: false`.
+    #[tokio::test]
+    async fn v1_chat_hands_the_engine_its_reasoning_split() {
+        use crate::prompt_builder::ReasoningSplit;
+        let (_tdir, template) = thinking_template();
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "reasoning_parser": "qwen3",
+                "chat_template": template}),
+            None,
+        )
+        .await;
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(
+            p.reasoning,
+            ReasoningSplit::new(Some(ReasoningParser::Qwen3), true),
+            "prefilled <think>: the count starts at the first token"
+        );
+        let p = v.chat(serde_json::json!({"enable_thinking": false})).await;
+        assert_eq!(
+            p.reasoning,
+            ReasoningSplit::new(Some(ReasoningParser::Qwen3), false),
+            "closed prefill: no reasoning expected"
+        );
+        let p = v
+            .chat(serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}))
+            .await;
+        assert_eq!(
+            p.reasoning,
+            ReasoningSplit::new(Some(ReasoningParser::Qwen3), false)
+        );
+    }
+
+    /// gpt-oss: the harmony parser reaches the engine (its count uses the channel split).
+    #[tokio::test]
+    async fn v1_chat_hands_a_gpt_oss_model_the_harmony_split() {
+        use crate::prompt_builder::ReasoningSplit;
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "reasoning_parser": "gpt_oss"}),
+            None,
+        )
+        .await;
+        let p = v.chat(serde_json::json!({})).await;
+        assert_eq!(
+            p.reasoning,
+            ReasoningSplit::new(Some(ReasoningParser::GptOss), false)
+        );
+    }
+
+    // ---- 0.9.1 thinking control: handler → template variables + `GenParams.thinking_budget` --
+
+    /// A chat template whose generation prompt opens `<think>` only when `cond` (a Jinja
+    /// expression) holds, else a closed block — so `GenParams.reasoning.starts_in_thinking`
+    /// shows what the template saw.
+    fn template_opening_think_when(cond: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cond.jinja");
+        std::fs::write(
+            &path,
+            format!(
+                "{{% for m in messages %}}<|im_start|>{{{{ m.role }}}}\n{{{{ m.content }}}}\
+                 <|im_end|>\n{{% endfor %}}<|im_start|>assistant\n\
+                 {{% if {cond} %}}<think>\n{{% else %}}<think>\n\n</think>\n\n{{% endif %}}"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn v_with_template(template: &std::path::Path, extra_stanza: serde_json::Value) -> V5 {
+        let mut stanza = serde_json::json!({"vram_gb": 0.0, "reasoning_parser": "qwen3",
+            "chat_template": template});
+        for (k, v) in extra_stanza.as_object().unwrap() {
+            stanza[k] = v.clone();
+        }
+        V5::new(stanza, None).await
+    }
+
+    /// `reasoning_effort` (top level or kwargs) and the budget field: the switch reaches the
+    /// template, the preset or explicit budget reaches the engine, clamped below `max_tokens`.
+    #[tokio::test]
+    async fn thinking_effort_and_budget_reach_the_template_and_the_engine() {
+        let (_tdir, template) = thinking_template();
+        let v = v_with_template(&template, serde_json::json!({})).await;
+        let opened = |p: &GenParams| p.reasoning.starts_in_thinking;
+        let p = v.chat(serde_json::json!({"max_tokens": 8192})).await;
+        assert_eq!(p.thinking_budget, None, "nothing asked: no budget");
+        assert!(opened(&p));
+        for (effort, budget) in [("low", 1_024), ("medium", 4_096), ("high", 7_680)] {
+            let p = v
+                .chat(serde_json::json!({"max_tokens": 8192, "reasoning_effort": effort}))
+                .await;
+            assert_eq!(p.thinking_budget, Some(budget), "{effort}");
+            assert!(opened(&p), "{effort}");
+        }
+        for effort in ["none", "minimal"] {
+            let p = v
+                .chat(serde_json::json!({"max_tokens": 8192, "reasoning_effort": effort}))
+                .await;
+            assert_eq!(p.thinking_budget, None, "{effort}");
+            assert!(!opened(&p), "{effort}: thinking off reaches the template");
+        }
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192,
+                "chat_template_kwargs": {"reasoning_effort": "low"}}))
+            .await;
+        assert_eq!(p.thinking_budget, Some(1_024), "kwargs form");
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192, "thinking_budget_tokens": 0}))
+            .await;
+        assert_eq!(p.thinking_budget, None);
+        assert!(!opened(&p), "budget 0 = off");
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 1000, "thinking_token_budget": 4096}))
+            .await;
+        assert_eq!(
+            p.thinking_budget,
+            Some(500),
+            "clamped to max_tokens - min(512, half)"
+        );
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 2000, "thinking_token_budget": 4096}))
+            .await;
+        assert_eq!(
+            p.thinking_budget,
+            Some(1_488),
+            "clamped to max_tokens - 512"
+        );
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 400, "reasoning_effort": "max"}))
+            .await;
+        assert_eq!(
+            p.thinking_budget,
+            Some(200),
+            "a short request keeps half for thinking"
+        );
+        assert!(opened(&p));
+        let p = v
+            .chat(
+                serde_json::json!({"max_tokens": 8192, "thinking_budget_tokens": 100,
+                "enable_thinking": false}),
+            )
+            .await;
+        assert_eq!(
+            p.thinking_budget, None,
+            "an explicit off wins over a budget"
+        );
+        assert!(!opened(&p));
+        let p = v
+            .chat(
+                serde_json::json!({"max_tokens": 8192, "thinking_budget_tokens": 100,
+                "reasoning_effort": "none"}),
+            )
+            .await;
+        assert_eq!(p.thinking_budget, None);
+        assert!(!opened(&p), "effort none is an explicit off too");
+    }
+
+    /// The per-model default applies when the request says nothing, and the request overrides it.
+    #[tokio::test]
+    async fn thinking_model_default_budget_applies_and_is_overridden() {
+        let (_tdir, template) = thinking_template();
+        let v = v_with_template(
+            &template,
+            serde_json::json!({"thinking_budget_tokens": 2048}),
+        )
+        .await;
+        let p = v.chat(serde_json::json!({"max_tokens": 8192})).await;
+        assert_eq!(p.thinking_budget, Some(2_048));
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192, "reasoning_effort": "low"}))
+            .await;
+        assert_eq!(
+            p.thinking_budget,
+            Some(1_024),
+            "the effort beats the model default"
+        );
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192, "enable_thinking": false}))
+            .await;
+        assert_eq!(p.thinking_budget, None, "thinking off arms nothing");
+        let v = v_with_template(&template, serde_json::json!({"thinking_budget_tokens": 0})).await;
+        let p = v.chat(serde_json::json!({"max_tokens": 8192})).await;
+        assert_eq!(p.thinking_budget, None);
+        assert!(
+            !p.reasoning.starts_in_thinking,
+            "a model default of 0 = off"
+        );
+    }
+
+    /// A routed state with one model `id` (its kind from the mock factory's name rule) carrying a
+    /// qwen3 reasoning parser and the model default `default_budget`.
+    async fn thinking_state(id: &str, default_budget: Option<u32>) -> AppState {
+        let mut config = routing_config(&[(id, 1.0)]);
+        if let Some(e) = config.models.get_mut(id) {
+            e.policy.reasoning_parser = Some(ReasoningParser::Qwen3);
+            e.policy.thinking_budget_tokens = default_budget;
+        }
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model(id).await.unwrap();
+        AppState::new().with_model_manager(Arc::new(mm))
+    }
+
+    async fn chat_on(state: &AppState, id: &str, extra: serde_json::Value) {
+        let mut body = serde_json::json!({
+            "model": id, "messages": [{"role": "user", "content": "hi"}]
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let resp = chat_completions(
+            axum::extract::State(state.clone()),
+            JsonBody(chat_req(body)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The VLM arm: the plan reaches the engine (`thinking_budget`, the split) and the template
+    /// as the server-built extra context.
+    #[tokio::test]
+    async fn thinking_plan_reaches_the_vlm_engine_and_its_template_context() {
+        let id = "c14a-vlm-think";
+        let state = thinking_state(id, Some(2048)).await;
+        chat_on(
+            &state,
+            id,
+            serde_json::json!({"max_tokens": 8192, "reasoning_effort": "none"}),
+        )
+        .await;
+        chat_on(
+            &state,
+            id,
+            serde_json::json!({"max_tokens": 8192, "reasoning_effort": "low"}),
+        )
+        .await;
+        chat_on(&state, id, serde_json::json!({"max_tokens": 8192})).await;
+        let seen = crate::vlm_engine::mock_seen_params(id);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        let (_, p, ctx) = &seen[0];
+        assert_eq!(p.thinking_budget, None);
+        assert!(!p.reasoning.starts_in_thinking);
+        assert_eq!(
+            ctx.as_ref(),
+            Some(&serde_json::json!({"enable_thinking": false, "reasoning_effort": "none"}))
+        );
+        let (_, p, ctx) = &seen[1];
+        assert_eq!(p.thinking_budget, Some(1_024));
+        assert_eq!(
+            ctx.as_ref(),
+            Some(&serde_json::json!({"enable_thinking": true, "reasoning_effort": "low"}))
+        );
+        let (_, p, ctx) = &seen[2];
+        assert_eq!(p.thinking_budget, Some(2_048), "the model default");
+        assert_eq!(ctx, &None, "nothing asked: no template variables");
+    }
+
+    /// The NPU arm: the plan is resolved against the final `max_new_tokens` and reaches the
+    /// engine.
+    #[tokio::test]
+    async fn thinking_plan_reaches_the_npu_engine() {
+        let id = "c14a-npu-think";
+        let state = thinking_state(id, None).await;
+        chat_on(
+            &state,
+            id,
+            serde_json::json!({"max_tokens": 8192, "reasoning_effort": "none"}),
+        )
+        .await;
+        chat_on(
+            &state,
+            id,
+            serde_json::json!({"max_tokens": 8192, "reasoning_effort": "low"}),
+        )
+        .await;
+        chat_on(
+            &state,
+            id,
+            serde_json::json!({"max_tokens": 600, "thinking_budget_tokens": 4096}),
+        )
+        .await;
+        let seen = crate::npu_engine::mock_seen_params(id);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[0].thinking_budget, None);
+        assert_eq!(seen[1].thinking_budget, Some(1_024));
+        assert_eq!(seen[2].thinking_budget, Some(300), "600 - min(512, 300)");
+    }
+
+    /// `/v1/completions` has no thinking control: the model default does not arm a budget there
+    /// (the prompt is the client's own text), and the chat fields are not read.
+    #[tokio::test]
+    async fn thinking_budget_does_not_apply_to_legacy_completions() {
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "thinking_budget_tokens": 64}),
+            None,
+        )
+        .await;
+        let req: crate::handlers::completions::CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m1", "prompt": "<think>",
+                "max_tokens": 4096, "reasoning_effort": "low", "thinking_budget_tokens": 8}))
+            .unwrap();
+        let _ = crate::handlers::completions::completions(
+            axum::extract::State(v.state.clone()),
+            JsonBody(req),
+        )
+        .await;
+        let rec = v.recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].thinking_budget, None);
+    }
+
+    /// gpt-oss-style templates read `reasoning_effort`: the client's word reaches the template
+    /// when thinking is on, `"none"` when it is off; `preserve_thinking` reaches it too; a
+    /// non-allowlisted kwarg never does.
+    #[tokio::test]
+    async fn thinking_template_sees_only_the_allowlisted_server_built_variables() {
+        let (_t1, effort) = template_opening_think_when(
+            "reasoning_effort is defined and reasoning_effort == \"high\"",
+        );
+        let v = v_with_template(&effort, serde_json::json!({})).await;
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192, "reasoning_effort": "high"}))
+            .await;
+        assert!(
+            p.reasoning.starts_in_thinking,
+            "the effort word passed through"
+        );
+        assert_eq!(
+            p.thinking_budget,
+            Some(7_680),
+            "and the budget is still strict"
+        );
+        let p = v.chat(serde_json::json!({"max_tokens": 8192})).await;
+        assert!(!p.reasoning.starts_in_thinking);
+
+        let (_t2, none) = template_opening_think_when(
+            "reasoning_effort is defined and reasoning_effort == \"none\"",
+        );
+        let v = v_with_template(&none, serde_json::json!({})).await;
+        let p = v
+            .chat(serde_json::json!({"max_tokens": 8192, "reasoning_effort": "minimal"}))
+            .await;
+        assert!(
+            p.reasoning.starts_in_thinking,
+            "off reaches gpt-oss as \"none\""
+        );
+
+        let (_t3, preserve) = template_opening_think_when("preserve_thinking is defined");
+        let v = v_with_template(&preserve, serde_json::json!({})).await;
+        let p = v
+            .chat(serde_json::json!({"chat_template_kwargs": {"preserve_thinking": true}}))
+            .await;
+        assert!(p.reasoning.starts_in_thinking);
+
+        let (_t4, custom) =
+            template_opening_think_when("custom is defined or bos_token == \"EVIL\"");
+        let v = v_with_template(&custom, serde_json::json!({})).await;
+        let p = v
+            .chat(serde_json::json!({"chat_template_kwargs": {"custom": 1, "bos_token": "EVIL"}}))
+            .await;
+        assert!(
+            !p.reasoning.starts_in_thinking,
+            "raw kwargs never reach the template"
+        );
+    }
+
+    /// `/v1/completions` (P3): no parser; the raw rule starts in thinking only when the client's
+    /// own prompt ends in an open `<think>`.
+    #[tokio::test]
+    async fn v1_completions_hand_the_engine_the_raw_think_split() {
+        use crate::prompt_builder::ReasoningSplit;
+        let v = V5::new(
+            serde_json::json!({"vram_gb": 0.0, "reasoning_parser": "qwen3"}),
+            None,
+        )
+        .await;
+        for (prompt, starts) in [("hi", false), ("<|im_start|>assistant\n<think>\n", true)] {
+            let req: crate::handlers::completions::CompletionRequest =
+                serde_json::from_value(serde_json::json!({"model": "m1", "prompt": prompt}))
+                    .unwrap();
+            let before = v.recorded.lock().unwrap().len();
+            let _ = crate::handlers::completions::completions(
+                axum::extract::State(v.state.clone()),
+                JsonBody(req),
+            )
+            .await;
+            let rec = v.recorded.lock().unwrap();
+            assert_eq!(rec.len(), before + 1);
+            assert_eq!(
+                rec[before].reasoning,
+                ReasoningSplit::new(None, starts),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    // ---- 0.9.1 S1: the engine stall watchdog through the handlers ----------------------------
+    //
+    // Fake engines only (`stall_watch::mock` markers on the CB, VLM and NPU mocks). The manager
+    // is built and its models loaded on real time; then tokio time is paused, so the deadlines
+    // (10 s here) pass as soon as everything waits. Every case here expects a stall or none at
+    // all — a "slow but alive" engine cannot be timed against paused time from an OS thread, so
+    // that case lives in `stall_watch::tests` (paused time, the engine driven from the test).
+    // Each case gets its own manager: a stall marks the engine dead.
+
+    use crate::stall_watch::mock::{OK, STALL_AFTER_3, STALL_FIRST};
+
+    /// The deadlines of these tests, seconds (both).
+    const S1_DEADLINE: u64 = 10;
+
+    /// A manager with `models` (`(id, device)`) loaded, deadlines `first` / `gap` seconds; then
+    /// tokio time is paused.
+    async fn s1_state(
+        models: &[(&str, &str)],
+        first: u64,
+        gap: u64,
+    ) -> (AppState, Arc<ModelManager>) {
+        let ids: Vec<(&str, f64)> = models.iter().map(|(id, _)| (*id, 1.0)).collect();
+        let mut cfg = routing_config(&ids);
+        cfg.stream_first_token_timeout_secs = first;
+        cfg.stream_token_gap_timeout_secs = gap;
+        for (id, device) in models {
+            cfg.models.get_mut(*id).unwrap().policy.device = Some((*device).to_owned());
+        }
+        let mm = Arc::new(
+            ModelManager::new(cfg, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        for (id, _) in models {
+            mm.load_model(id).await.unwrap();
+        }
+        tokio::time::pause();
+        (AppState::new().with_model_manager(Arc::clone(&mm)), mm)
+    }
+
+    fn s1_req(model: &str, text: &str, stream: bool) -> ChatRequest {
+        chat_req(serde_json::json!({
+            "model": model, "stream": stream,
+            "messages": [{"role": "user", "content": text}]
+        }))
+    }
+
+    /// Run one chat request to the end of its body. No tokio timeout (see `stall_watch::mock::RealTimeBound`): while
+    /// the request waits on a mock engine thread, the only timers are the watcher's own.
+    async fn s1_chat(
+        state: &AppState,
+        req: ChatRequest,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let _bound = crate::stall_watch::mock::RealTimeBound::start("s1_chat");
+        let resp = chat_completions(axum::extract::State(state.clone()), JsonBody(req)).await;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Wait until `id`'s engine is busy with at least `progress` progress signals (review N5).
+    /// The loop yields without ever letting the runtime go idle, so other tasks (the request on
+    /// its way to the engine) run but paused time cannot auto-advance to a deadline while the
+    /// mock engine's OS thread is still on its way into the call; real time bounds it.
+    async fn s1_wait_engine(mm: &ModelManager, id: &str, progress: u64) {
+        let liveness = mm.liveness_for_test(id).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (seen, busy) = liveness.signals_for_test();
+            if busy && seen >= progress {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "{id}: engine never busy with {progress} progress signals"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn s1_model_info(mm: &ModelManager, id: &str) -> crate::model_manager::ModelInfo {
+        mm.list_models().into_iter().find(|i| i.id == id).unwrap()
+    }
+
+    /// Assert the request ended as a stall: 504 + `Retry-After: 30` + `generation_stalled`
+    /// (non-streaming), or one SSE error frame with that code then `[DONE]` (streaming).
+    fn assert_stalled(
+        stream: bool,
+        (status, headers, body): &(StatusCode, axum::http::HeaderMap, String),
+        what: &str,
+    ) {
+        if stream {
+            assert_eq!(*status, StatusCode::OK, "{what}: SSE committed 200 first");
+            assert_eq!(
+                body.matches("\"code\":\"generation_stalled\"").count(),
+                1,
+                "{what}: {body}"
+            );
+            assert!(body.contains("\"type\":\"server_error\""), "{what}: {body}");
+            assert!(
+                body.trim_end().ends_with("data: [DONE]"),
+                "{what}: the stream ends: {body}"
+            );
+        } else {
+            assert_eq!(*status, StatusCode::GATEWAY_TIMEOUT, "{what}: {body}");
+            assert_eq!(headers.get("retry-after").unwrap(), "30", "{what}");
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["error"]["code"], "generation_stalled", "{what}");
+            assert_eq!(v["error"]["type"], "server_error", "{what}");
+            assert!(
+                !body.contains("retry shortly"),
+                "{what}: no promise (F7): {body}"
+            );
+        }
+    }
+
+    /// Assert a request was refused because the model's engine stalled: 503 naming the stall.
+    fn assert_refused_as_stalled((status, _, body): &(StatusCode, axum::http::HeaderMap, String)) {
+        assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains("model_unavailable") && body.contains("stalled"),
+            "{body}"
+        );
+    }
+
+    /// The matrix: text CB, VLM and NPU mock engines; an engine that makes no progress at all and
+    /// one that stops after 3 tokens; streaming and not. Each ends as a stall, not before the
+    /// deadline; the CPU/NPU model is then booked as stalled (listed, refused with 503
+    /// `model_unavailable` naming the stall), and the tokens before the stall reached the
+    /// streaming client.
+    #[tokio::test]
+    async fn s1_every_engine_and_mode_ends_a_stalled_generation() {
+        for (model, device) in [("s1-cb", "CPU"), ("s1-vlm", "CPU"), ("s1-npu", "NPU")] {
+            for marker in [STALL_FIRST, STALL_AFTER_3] {
+                for stream in [false, true] {
+                    let what = format!("{model} {marker} stream={stream}");
+                    let (state, mm) = s1_state(&[(model, device)], S1_DEADLINE, S1_DEADLINE).await;
+                    let t0 = tokio::time::Instant::now();
+                    let st = state.clone();
+                    let req = s1_req(model, marker, stream);
+                    let out = tokio::spawn(async move { s1_chat(&st, req).await });
+                    // Paused time: returns once the request waits on its engine; then hold the
+                    // clock until the mock is in its call with every token sent (review N5).
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    s1_wait_engine(&mm, model, if marker == STALL_AFTER_3 { 3 } else { 0 }).await;
+                    let out = out.await.unwrap();
+                    let took = t0.elapsed();
+                    assert_stalled(stream, &out, &what);
+                    assert!(
+                        took >= std::time::Duration::from_secs(S1_DEADLINE),
+                        "{what}: not before the deadline: {took:?}"
+                    );
+                    // No upper bound here: before the mock's OS thread begins its call, paused
+                    // time may jump over other timers (SSE keep-alive). "At most one tick late"
+                    // is `stall_watch::tests`' job.
+                    if stream && marker == STALL_AFTER_3 {
+                        assert!(
+                            out.2.contains("tok2"),
+                            "{what}: tokens before the stall: {}",
+                            out.2
+                        );
+                    }
+                    assert!(s1_model_info(&mm, model).generation_stalled, "{what}");
+                    assert!(!mm.is_gpu_poisoned(), "{what}: not a GPU model");
+                    assert_refused_as_stalled(&s1_chat(&state, s1_req(model, OK, false)).await);
+                    tokio::time::resume(); // the next case builds its manager on real time
+                }
+            }
+        }
+    }
+
+    /// GPU vs CPU: a stalled GPU model sets the GPU-poisoned flag (the serving-model path) and
+    /// answers 503 `gpu_poisoned` afterwards; the CPU model next to it, and another GPU model, keep
+    /// serving (the stalled request's slot and device lease were released), not booked as stalled.
+    #[tokio::test]
+    async fn s1_a_gpu_stall_poisons_the_gpu_and_the_cpu_model_keeps_serving() {
+        let (state, mm) = s1_state(
+            &[("s1-gpu", "GPU"), ("s1-gpu2", "GPU"), ("s1-cpu", "CPU")],
+            S1_DEADLINE,
+            S1_DEADLINE,
+        )
+        .await;
+        let out = s1_chat(&state, s1_req("s1-gpu", STALL_FIRST, false)).await;
+        assert_stalled(false, &out, "gpu");
+        assert!(mm.is_gpu_poisoned(), "GPU stall -> the GPU-poisoned flag");
+        let (status, _, body) = s1_chat(&state, s1_req("s1-gpu", OK, false)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("gpu_poisoned"), "{body}");
+        let (status, _, body) = s1_chat(&state, s1_req("s1-cpu", OK, false)).await;
+        assert_eq!(status, StatusCode::OK, "the CPU model still serves: {body}");
+        assert!(!s1_model_info(&mm, "s1-cpu").generation_stalled);
+        // Owner ruling (a): unsupervised, only the stalled GPU model is refused — another model on
+        // the poisoned GPU is still served (the admin listing shows it `unavailable`).
+        let (status, _, body) = s1_chat(&state, s1_req("s1-gpu2", OK, false)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the other GPU model still serves: {body}"
+        );
+        assert!(!s1_model_info(&mm, "s1-gpu2").generation_stalled);
+    }
+
+    /// `0` turns the watchdog off: a hung engine is not ended (the request is still pending an
+    /// hour later), and nothing is marked.
+    #[tokio::test]
+    async fn s1_zero_disables_the_watchdog() {
+        let (state, mm) = s1_state(&[("s1-cpu", "CPU")], 0, 0).await;
+        let st = state.clone();
+        let pending =
+            tokio::spawn(async move { s1_chat(&st, s1_req("s1-cpu", STALL_FIRST, false)).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The mock engine thread is in its call before paused time moves on (review N5).
+        s1_wait_engine(&mm, "s1-cpu", 0).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        assert!(
+            !pending.is_finished(),
+            "no deadline: still waiting an hour later"
+        );
+        assert!(!s1_model_info(&mm, "s1-cpu").generation_stalled);
+        pending.abort(); // the mock's call returns once nobody reads its channel
+    }
+
+    /// A request queued behind the stalled one on a single-stream engine (VLM) is not started
+    /// by the engine: the engine's verdict ends it too, with the same `generation_stalled`.
+    #[tokio::test]
+    async fn s1_a_queued_request_behind_a_stall_is_released() {
+        let (state, _mm) = s1_state(&[("s1-vlm", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+        let st = state.clone();
+        let first =
+            tokio::spawn(async move { s1_chat(&st, s1_req("s1-vlm", STALL_FIRST, false)).await });
+        // Paused time: this sleep returns once the first request waits on its engine.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let queued = s1_chat(&state, s1_req("s1-vlm", OK, false)).await;
+        assert_stalled(false, &first.await.unwrap(), "running");
+        assert_stalled(false, &queued, "queued");
+    }
+
+    /// Review F1: the client of the stalled request leaves before any deadline. The engine is
+    /// still watched: with nobody connected it is declared dead at the deadline, and the next
+    /// request is refused instead of queueing behind the stuck call forever. (A request that
+    /// queues before the verdict ends with `generation_stalled`: the queued-request test.)
+    #[tokio::test]
+    async fn s1_a_client_that_leaves_does_not_end_the_watching() {
+        let key = "client-gone";
+        let (state, mm) = s1_state(&[("s1-cb", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+        let st = state.clone();
+        let stuck = crate::stall_watch::mock::stuck(key);
+        let first = tokio::spawn(async move { s1_chat(&st, s1_req("s1-cb", &stuck, true)).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The mock engine thread is in its call before paused time moves on (review N5).
+        s1_wait_engine(&mm, "s1-cb", 0).await;
+        first.abort(); // the client disconnects
+        let _ = first.await;
+        // Nobody is connected now. The engine is still watched: past the deadline it is dead.
+        tokio::time::sleep(std::time::Duration::from_secs(3 * S1_DEADLINE)).await;
+        assert!(
+            s1_model_info(&mm, "s1-cb").generation_stalled,
+            "the verdict needs no client"
+        );
+        assert_refused_as_stalled(&s1_chat(&state, s1_req("s1-cb", OK, false)).await);
+        crate::stall_watch::mock::release(key);
+    }
+
+    /// A request that arrives while the engine is stuck, before the verdict, and waits for the
+    /// engine thread's tokenizer reply (the L0 prompt gate) is released by the verdict too: the
+    /// gate fails open and the request ends with `generation_stalled`, not a hang.
+    #[tokio::test]
+    async fn s1_a_request_waiting_on_the_tokenizer_is_released() {
+        let key = "tokenizer-wait";
+        let (state, mm) = s1_state(&[("s1-cb", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+        mm.set_max_prompt_tokens_for_test("s1-cb", 100_000);
+        let st = state.clone();
+        let stuck = crate::stall_watch::mock::stuck(key);
+        let first = tokio::spawn(async move { s1_chat(&st, s1_req("s1-cb", &stuck, false)).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The mock engine thread is in its call before paused time moves on (review N5).
+        s1_wait_engine(&mm, "s1-cb", 0).await;
+        let second = s1_chat(&state, s1_req("s1-cb", OK, false)).await;
+        assert_stalled(false, &second, "the request parked on the tokenizer reply");
+        assert_stalled(false, &first.await.unwrap(), "the stuck one");
+        crate::stall_watch::mock::release(key);
+    }
+
+    /// Review F3 / owner (b): a call that STAYS stuck (its channel closing does not end it) keeps
+    /// the model's memory booked. A plain unload goes straight to the held join (the busy rule
+    /// does not apply to a dead engine) and reports the stall; the record stays `Evicting`,
+    /// listed as stalled, the booking held, a reload and requests refused. When the call
+    /// finally returns, the join releases the memory, and unload + load works.
+    #[tokio::test]
+    async fn s1_a_stuck_call_keeps_its_booking_until_its_thread_exits() {
+        let key = "booking";
+        let (state, mm) = s1_state(&[("s1-cpu", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+        mm.set_forced_join_deadline_for_test(std::time::Duration::from_millis(300));
+        let booked = mm.metrics_snapshot().used_vram_gb;
+        assert!(booked > 0.0);
+        let stuck = crate::stall_watch::mock::stuck(key);
+        assert_stalled(
+            false,
+            &s1_chat(&state, s1_req("s1-cpu", &stuck, false)).await,
+            "stall",
+        );
+
+        let err = mm.evict_model("s1-cpu").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::GenerationStalled(id)) if id == "s1-cpu"
+            ),
+            "{err}"
+        );
+        let info = s1_model_info(&mm, "s1-cpu");
+        assert_eq!(info.state, crate::model_manager::ModelState::Evicting);
+        assert!(info.generation_stalled, "still listed as stalled");
+        assert!(
+            (mm.metrics_snapshot().used_vram_gb - booked).abs() < 1e-9,
+            "the stuck thread's memory stays booked"
+        );
+        let err = mm.load_model("s1-cpu").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::GenerationStalled(_))
+            ),
+            "a reload is refused while the old thread is alive: {err}"
+        );
+        assert!(err.to_string().contains("restart"), "{err}");
+        assert_refused_as_stalled(&s1_chat(&state, s1_req("s1-cpu", OK, false)).await);
+        // Review N2: the admin routes answer the same 503 `model_unavailable`, not a 500.
+        let uri: axum::http::Uri = "/v1/admin/models/s1-cpu".parse().unwrap();
+        let unload = crate::handlers::admin::admin_unload_model(
+            State(state.clone()),
+            axum::extract::Path("s1-cpu".to_owned()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Query::try_from_uri(&uri),
+        )
+        .await;
+        let load = crate::handlers::admin::admin_load_model(
+            State(state.clone()),
+            axum::extract::Path("s1-cpu".to_owned()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        for (what, resp) in [("unload", unload), ("load", load)] {
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin {what}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("model_unavailable"), "admin {what}: {body}");
+        }
+
+        // The call returns late: the thread exits, the join releases the memory.
+        crate::stall_watch::mock::release(key);
+        let mut released = false;
+        for _ in 0..400 {
+            if s1_model_info(&mm, "s1-cpu").state == crate::model_manager::ModelState::NotLoaded {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(released, "the record is reconciled once the thread exits");
+        assert!(mm.metrics_snapshot().used_vram_gb < booked);
+        assert!(!s1_model_info(&mm, "s1-cpu").generation_stalled);
+        mm.load_model("s1-cpu").await.unwrap();
+        let (status, _, body) = s1_chat(&state, s1_req("s1-cpu", OK, false)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The buffered tool-call path: a healthy engine with `tools` is served, and a stall there
+    /// is the JSON 504 also for `stream: true` — that path sends nothing before the generation
+    /// has been drained, so no SSE status is committed yet.
+    #[tokio::test]
+    async fn s1_the_buffered_tool_path() {
+        let tool_req = |model: &str, text: &str, stream: bool| {
+            chat_req(serde_json::json!({
+                "model": model, "stream": stream,
+                "messages": [{"role": "user", "content": text}],
+                "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+            }))
+        };
+        let (state, mm) = s1_state(&[("s1-cb", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+        let (status, _, body) = s1_chat(&state, tool_req("s1-cb", OK, false)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("tok1"), "{body}");
+        let out = s1_chat(&state, tool_req("s1-cb", STALL_FIRST, true)).await;
+        assert_stalled(false, &out, "tools + stream");
+        assert!(s1_model_info(&mm, "s1-cb").generation_stalled);
+    }
+
+    /// Legacy `/v1/completions` (CB): the same 504 / SSE frame, streaming and not.
+    #[tokio::test]
+    async fn s1_completions_end_a_stalled_generation() {
+        for stream in [false, true] {
+            let (state, mm) = s1_state(&[("s1-cb", "CPU")], S1_DEADLINE, S1_DEADLINE).await;
+            let req: super::super::completions::CompletionRequest = serde_json::from_value(
+                serde_json::json!({"model": "s1-cb", "prompt": STALL_AFTER_3, "stream": stream}),
+            )
+            .unwrap();
+            let fut = async {
+                let resp = super::super::completions::completions(
+                    axum::extract::State(state.clone()),
+                    JsonBody(req),
+                )
+                .await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, String::from_utf8_lossy(&body).into_owned())
+            };
+            let bound = crate::stall_watch::mock::RealTimeBound::start("completions");
+            let out = fut.await;
+            drop(bound);
+            assert_stalled(stream, &out, &format!("completions stream={stream}"));
+            assert!(s1_model_info(&mm, "s1-cb").generation_stalled);
+            tokio::time::resume();
+        }
+    }
+
+    // ---- 0.9.1 V1-usage: usage.completion_tokens_details.reasoning_tokens ----
+
+    use crate::prompt_builder::ReasoningSplit;
+    use crate::reasoning_tokens::{DeltaTally, recount_reasoning};
+
+    /// The event sequence the text CB engine sends for `deltas` under `split`: one `Token` per
+    /// delta, the exact `ReasoningTokens` from its per-delta tally, then `Done`.
+    fn cb_events(deltas: &[(&str, usize)], split: ReasoningSplit) -> Vec<StreamEvent> {
+        let mut tally = DeltaTally::default();
+        let mut events = vec![StreamEvent::PromptTokens(40)];
+        for (d, n) in deltas {
+            tally.push(d, *n);
+            events.push(StreamEvent::Token((*d).to_owned(), *n));
+        }
+        events.push(StreamEvent::ReasoningTokens(tally.resolve(split).tokens));
+        events.push(StreamEvent::Done(FinishReason::Stop));
+        events
+    }
+
+    /// The event sequence a VLM / NPU engine sends: text chunks (`Token(_, 1)`), the exact total
+    /// (`CompletionTokens`), the tokenizer recount (`ReasoningTokens`, here a 1-token-per-4-bytes
+    /// fake tokenizer), then `Done`.
+    fn chunk_events(chunks: &[&str], total: usize, split: ReasoningSplit) -> Vec<StreamEvent> {
+        let mut events = vec![StreamEvent::PromptTokens(40)];
+        let mut text = String::new();
+        for c in chunks {
+            text.push_str(c);
+            events.push(StreamEvent::Token((*c).to_owned(), 1));
+        }
+        let recount = recount_reasoning("m", &text, split, total, |s: &str| Ok(s.len() / 4));
+        events.push(StreamEvent::CompletionTokens(total));
+        events.push(StreamEvent::ReasoningTokens(recount.tokens));
+        events.push(StreamEvent::Done(FinishReason::Stop));
+        events
+    }
+
+    fn channel_of(events: Vec<StreamEvent>) -> TokenReceiver {
+        let (tx, rx) = stream_channel();
+        for e in events {
+            tx.try_send(e).unwrap();
+        }
+        rx
+    }
+
+    async fn body_of(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The `usage` object of a buffered JSON body, or of the SSE usage chunk.
+    fn usage_in(body: &str) -> serde_json::Value {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            return v["usage"].clone();
+        }
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .find_map(|v| v.get("usage").filter(|u| !u.is_null()).cloned())
+            .unwrap_or_else(|| panic!("no usage in body: {body}"))
+    }
+
+    fn reasoning_and_completion(usage: &serde_json::Value) -> (u64, u64) {
+        let r = usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("reasoning_tokens must be present: {usage}"));
+        let c = usage["completion_tokens"].as_u64().unwrap();
+        assert!(r <= c, "reasoning_tokens {r} > completion_tokens {c}");
+        (r, c)
+    }
+
+    /// Every chat path that reports usage, fed the same events: buffered, streamed with
+    /// `include_usage`, and the buffered tool path in both stream modes.
+    async fn usage_on_every_chat_path(
+        events: &[StreamEvent],
+        parser: Option<ReasoningParser>,
+        starts: bool,
+    ) -> Vec<(u64, u64)> {
+        let clone = |e: &StreamEvent| match e {
+            StreamEvent::PromptTokens(n) => StreamEvent::PromptTokens(*n),
+            StreamEvent::Token(t, n) => StreamEvent::Token(t.clone(), *n),
+            StreamEvent::CompletionTokens(n) => StreamEvent::CompletionTokens(*n),
+            StreamEvent::ReasoningTokens(n) => StreamEvent::ReasoningTokens(*n),
+            StreamEvent::Done(r) => StreamEvent::Done(*r),
+            StreamEvent::Error(e) => StreamEvent::Error(e.clone()),
+        };
+        let fresh = || channel_of(events.iter().map(clone).collect());
+        let mut out = Vec::new();
+        let resp =
+            collect_completion(fresh(), "id", "m", 0, None, parser, starts, test_meta()).await;
+        out.push(reasoning_and_completion(&usage_in(&body_of(resp).await)));
+        let resp = build_chat_sse_stream(
+            fresh(),
+            "id",
+            "m",
+            0,
+            true,
+            None,
+            starts,
+            parser,
+            crate::admission::WorkLease::default(),
+            None,
+            test_meta(),
+        );
+        out.push(reasoning_and_completion(&usage_in(&body_of(resp).await)));
+        for stream in [false, true] {
+            let resp = collect_tool_completion(
+                fresh(),
+                "id",
+                "m",
+                0,
+                test_meta(),
+                stream,
+                true,
+                None,
+                parser,
+                starts,
+                None,
+            )
+            .await;
+            out.push(reasoning_and_completion(&usage_in(&body_of(resp).await)));
+        }
+        out
+    }
+
+    const THINK_DELTAS: &[(&str, usize)] = &[
+        ("<think>", 1),
+        ("weigh", 1),
+        (" options", 1),
+        ("</think>", 1),
+        ("Pick B", 2),
+    ];
+
+    /// Text CB: the parser's split, counted exactly per delta, reaches every path.
+    #[tokio::test]
+    async fn usage_reports_exact_reasoning_tokens_on_every_text_path() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::Qwen3), false);
+        let got = usage_on_every_chat_path(
+            &cb_events(THINK_DELTAS, split),
+            Some(ReasoningParser::Qwen3),
+            false,
+        )
+        .await;
+        assert_eq!(
+            got,
+            vec![(4, 6); 4],
+            "streamed, buffered and both tool paths agree"
+        );
+    }
+
+    /// Raw `<think>` with no reasoning parser: the tokens inside the block still count (the
+    /// stream splits them out; buffered keeps them in `content`, the count is the same).
+    #[tokio::test]
+    async fn usage_counts_a_raw_think_block_without_a_parser() {
+        let got = usage_on_every_chat_path(
+            &cb_events(THINK_DELTAS, ReasoningSplit::default()),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(got, vec![(4, 6); 4]);
+    }
+
+    /// Thinking off (a closed prefill, so the output has no markup): 0, still present.
+    #[tokio::test]
+    async fn usage_thinking_off_reports_zero_reasoning_tokens() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::Qwen3), false);
+        let got = usage_on_every_chat_path(
+            &cb_events(&[("Pick", 1), (" B", 1)], split),
+            Some(ReasoningParser::Qwen3),
+            false,
+        )
+        .await;
+        assert_eq!(got, vec![(0, 2); 4]);
+    }
+
+    /// VLM / NPU shape: multi-token chunks, the exact total, the tokenizer recount.
+    #[tokio::test]
+    async fn usage_reports_the_recount_on_chunked_engines() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::Qwen3), true);
+        // Prefilled `<think>`: "look closely</think>" = 20 bytes → 5 by the fake tokenizer.
+        let events = chunk_events(&["look ", "closely</think>", "A cat."], 9, split);
+        let got = usage_on_every_chat_path(&events, Some(ReasoningParser::Qwen3), true).await;
+        assert_eq!(got, vec![(5, 9); 4]);
+    }
+
+    /// An engine figure above `completion_tokens` is clamped in the usage block; an engine that
+    /// sends none (the mock path) reports 0, never an absent field.
+    #[tokio::test]
+    async fn usage_reasoning_is_clamped_and_always_present() {
+        let events = vec![
+            StreamEvent::Token("a".into(), 1),
+            StreamEvent::Token("b".into(), 1),
+            StreamEvent::ReasoningTokens(7),
+            StreamEvent::Done(FinishReason::Stop),
+        ];
+        let got = usage_on_every_chat_path(&events, None, false).await;
+        assert_eq!(got, vec![(2, 2); 4]);
+        let events = vec![
+            StreamEvent::Token("a".into(), 1),
+            StreamEvent::Done(FinishReason::Stop),
+        ];
+        let got = usage_on_every_chat_path(&events, None, false).await;
+        assert_eq!(got, vec![(0, 1); 4]);
+    }
+
+    // ---- 0.9.1 strict thinking budget: the response on every chat path ---------------------
+
+    /// The bodies of every chat path (buffered, streamed, tool buffered + tool streamed) for
+    /// `events` ending in `Done(ThinkingBudget)`.
+    async fn budget_bodies(
+        events: &[StreamEvent],
+        parser: Option<ReasoningParser>,
+        starts: bool,
+        family: ModelFamily,
+    ) -> Vec<String> {
+        let clone = |e: &StreamEvent| match e {
+            StreamEvent::PromptTokens(n) => StreamEvent::PromptTokens(*n),
+            StreamEvent::Token(t, n) => StreamEvent::Token(t.clone(), *n),
+            StreamEvent::CompletionTokens(n) => StreamEvent::CompletionTokens(*n),
+            StreamEvent::ReasoningTokens(n) => StreamEvent::ReasoningTokens(*n),
+            StreamEvent::Done(r) => StreamEvent::Done(*r),
+            StreamEvent::Error(e) => StreamEvent::Error(e.clone()),
+        };
+        let fresh = || channel_of(events.iter().map(clone).collect());
+        let meta = || ResponseMeta {
+            family,
+            ..test_meta()
+        };
+        let mut out = Vec::new();
+        out.push(
+            body_of(collect_completion(fresh(), "id", "m", 0, None, parser, starts, meta()).await)
+                .await,
+        );
+        out.push(
+            body_of(build_chat_sse_stream(
+                fresh(),
+                "id",
+                "m",
+                0,
+                true,
+                None,
+                starts,
+                parser,
+                crate::admission::WorkLease::default(),
+                None,
+                meta(),
+            ))
+            .await,
+        );
+        for stream in [false, true] {
+            out.push(
+                body_of(
+                    collect_tool_completion(
+                        fresh(),
+                        "id",
+                        "m",
+                        0,
+                        meta(),
+                        stream,
+                        true,
+                        None,
+                        parser,
+                        starts,
+                        None,
+                    )
+                    .await,
+                )
+                .await,
+            );
+        }
+        out
+    }
+
+    /// Every `finish_reason` a body carries (JSON or SSE chunks), nulls skipped.
+    fn finish_reasons(body: &str) -> Vec<String> {
+        let docs: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(body)
+            .map_or_else(
+                |_| {
+                    body.lines()
+                        .filter_map(|l| l.strip_prefix("data: "))
+                        .filter_map(|d| serde_json::from_str(d).ok())
+                        .collect()
+                },
+                |v| vec![v],
+            );
+        docs.iter()
+            .filter_map(|v| v["choices"][0]["finish_reason"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn with_budget_done(mut events: Vec<StreamEvent>) -> Vec<StreamEvent> {
+        if let Some(StreamEvent::Done(r)) = events.last_mut() {
+            *r = FinishReason::ThinkingBudget;
+        }
+        events
+    }
+
+    /// A budget stop: `finish_reason: "length"` on every path, `reasoning_tokens` reported,
+    /// never the cut-off placeholder, and a tool call inside the reasoning is NOT parsed.
+    #[tokio::test]
+    async fn budget_stop_is_length_with_no_placeholder_and_no_tool_parse_on_every_path() {
+        let deltas: &[(&str, usize)] = &[
+            ("<think>", 1),
+            ("maybe call ", 2),
+            (
+                "<tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>",
+                9,
+            ),
+        ];
+        let split = ReasoningSplit::new(Some(ReasoningParser::Qwen3), false);
+        let events = with_budget_done(cb_events(deltas, split));
+        let bodies = budget_bodies(
+            &events,
+            Some(ReasoningParser::Qwen3),
+            false,
+            ModelFamily::Default,
+        )
+        .await;
+        assert_eq!(bodies.len(), 4);
+        for body in &bodies {
+            assert_eq!(finish_reasons(body), vec!["length"], "{body}");
+            assert!(!body.contains("cut off"), "no placeholder: {body}");
+            assert!(!body.contains("\"tool_calls\":["), "no tool parse: {body}");
+            assert_eq!(
+                reasoning_and_completion(&usage_in(body)),
+                (12, 12),
+                "{body}"
+            );
+        }
+        // Buffered: the reasoning is in `reasoning_content`, the answer is empty.
+        let json: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let msg = &json["choices"][0]["message"];
+        assert_eq!(msg["content"], "");
+        assert!(
+            msg["reasoning_content"]
+                .as_str()
+                .unwrap()
+                .starts_with("maybe call"),
+            "{msg}"
+        );
+        // Control: the same text with a natural stop parses as a call-free text (the call is
+        // inside an unclosed block) — and a natural stop after `</think>` still parses calls.
+        let natural: &[(&str, usize)] = &[
+            ("<think>", 1),
+            ("ok", 1),
+            ("</think>", 1),
+            (
+                "<tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>",
+                9,
+            ),
+        ];
+        let events = cb_events(natural, split);
+        let bodies = budget_bodies(
+            &events,
+            Some(ReasoningParser::Qwen3),
+            false,
+            ModelFamily::Default,
+        )
+        .await;
+        assert_eq!(finish_reasons(&bodies[2]), vec!["tool_calls"]);
+    }
+
+    /// The prompt opened the block (`starts_in_thinking`): tagless output is all reasoning.
+    #[tokio::test]
+    async fn budget_stop_with_a_prefilled_block_has_no_placeholder() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::Qwen3), true);
+        let events = with_budget_done(cb_events(&[("plan", 1), (" more", 1)], split));
+        let bodies = budget_bodies(
+            &events,
+            Some(ReasoningParser::Qwen3),
+            true,
+            ModelFamily::Default,
+        )
+        .await;
+        for body in &bodies {
+            assert_eq!(finish_reasons(body), vec!["length"], "{body}");
+            assert!(!body.contains("cut off"), "{body}");
+            assert_eq!(reasoning_and_completion(&usage_in(body)), (2, 2), "{body}");
+        }
+        let json: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(
+            json["choices"][0]["message"]["reasoning_content"],
+            "plan more"
+        );
+        assert_eq!(json["choices"][0]["message"]["content"], "");
+    }
+
+    const OSS_CALL: &[(&str, usize)] = &[
+        ("analysis", 1),
+        ("We need the weather.", 5),
+        (
+            "assistantcommentary to=functions.get_weather json{\"location\":\"SF\"}",
+            9,
+        ),
+    ];
+
+    /// The events a CB request with `budget` would produce for `deltas` ending in `natural`: the
+    /// real tracker decides, the finish is mapped the way the engine maps it.
+    fn budgeted_cb_events(
+        deltas: &[(&str, usize)],
+        split: ReasoningSplit,
+        budget: u32,
+        natural: FinishReason,
+    ) -> Vec<StreamEvent> {
+        let mut t = crate::thinking_budget::tracker_for(split, Some(budget)).unwrap();
+        let mut kept = Vec::new();
+        let mut stopped = false;
+        for d in deltas {
+            kept.push(*d);
+            if t.push(d.0, d.1) == crate::thinking_budget::BudgetStep::Stop {
+                stopped = true;
+                break;
+            }
+        }
+        let mut events = cb_events(&kept, split);
+        if let Some(StreamEvent::Done(r)) = events.last_mut() {
+            *r = if stopped {
+                FinishReason::ThinkingBudget
+            } else {
+                natural.with_budget(false, t.inside())
+            };
+        }
+        events
+    }
+
+    /// gpt-oss budgets the analysis channel only: an analysis then a commentary tool call under
+    /// a budget smaller than the whole output finishes normally, and the call is parsed — also
+    /// when the generation hit `max_tokens` inside the call (a plain `length`).
+    #[tokio::test]
+    async fn budget_on_gpt_oss_leaves_a_commentary_tool_call_alone() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::GptOss), false);
+        for (natural, expect) in [
+            (FinishReason::Stop, "tool_calls"),
+            (FinishReason::Length, "tool_calls"),
+        ] {
+            let events = budgeted_cb_events(OSS_CALL, split, 7, natural);
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Done(r)) if *r == natural),
+                "{events:?}"
+            );
+            let bodies = budget_bodies(
+                &events,
+                Some(ReasoningParser::GptOss),
+                false,
+                ModelFamily::GptOss,
+            )
+            .await;
+            for body in &bodies[2..] {
+                assert_eq!(finish_reasons(body), vec![expect], "{body}");
+                assert!(body.contains("get_weather"), "{body}");
+            }
+        }
+    }
+
+    /// gpt-oss: an analysis that runs past the budget still stops (before any call).
+    #[tokio::test]
+    async fn budget_on_gpt_oss_still_stops_a_long_analysis() {
+        let split = ReasoningSplit::new(Some(ReasoningParser::GptOss), false);
+        let events = budgeted_cb_events(OSS_CALL, split, 3, FinishReason::Stop);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done(FinishReason::ThinkingBudget))
+        ));
+        let bodies = budget_bodies(
+            &events,
+            Some(ReasoningParser::GptOss),
+            false,
+            ModelFamily::GptOss,
+        )
+        .await;
+        for body in &bodies {
+            assert_eq!(finish_reasons(body), vec!["length"], "{body}");
+            assert!(!body.contains("\"tool_calls\":["), "{body}");
+            assert!(!body.contains("cut off"), "{body}");
+        }
     }
 }

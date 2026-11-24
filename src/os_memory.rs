@@ -165,6 +165,58 @@ pub fn parse_status_rss_anon_kb(contents: &str) -> Option<u64> {
     parse_meminfo_field_kb(contents, "RssAnon:")
 }
 
+/// This process's `(VmRSS, RssAnon)` in bytes from one read of `/proc/self/status` (the
+/// `/metrics` gauges read both per scrape). Each `None` when its line is missing; both `None` off
+/// Linux or when the file is unreadable.
+#[must_use]
+pub fn process_memory_bytes() -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(contents) = std::fs::read_to_string("/proc/self/status") else {
+            return (None, None);
+        };
+        let kb_to_bytes = |kb: u64| kb.saturating_mul(1024);
+        (
+            parse_status_vm_rss_kb(&contents).map(kb_to_bytes),
+            parse_status_rss_anon_kb(&contents).map(kb_to_bytes),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
+/// Parses the `VmRSS:` line (kB) out of `/proc/<pid>/status` contents.
+#[cfg(any(target_os = "linux", test))]
+#[must_use]
+pub fn parse_status_vm_rss_kb(contents: &str) -> Option<u64> {
+    parse_meminfo_field_kb(contents, "VmRSS:")
+}
+
+/// Host memory in bytes from one read of `/proc/meminfo`: `(MemTotal, MemAvailable)`, each `None`
+/// when its line is missing or unparsable, both `None` off Linux or when the file is unreadable.
+/// The `/metrics` gauges' source (exact bytes, unlike the GiB readers above, which feed the
+/// accounting and the admission floor).
+#[must_use]
+pub fn host_memory_bytes() -> (Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(contents) = std::fs::read_to_string("/proc/meminfo") else {
+            return (None, None);
+        };
+        let kb_to_bytes = |kb: u64| kb.saturating_mul(1024);
+        (
+            parse_meminfo_total_kb(&contents).map(kb_to_bytes),
+            parse_meminfo_available_kb(&contents).map(kb_to_bytes),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None)
+    }
+}
+
 /// Returns `true` when a load needing `need_gb` may proceed without pushing live
 /// free RAM below `floor_gb` — i.e. `avail_gb - need_gb >= floor_gb`. The pure
 /// arithmetic core of the M1 system-RAM admission gate, split out for testing.
@@ -491,6 +543,40 @@ mod tests {
         let sample = "VmRSS:\t   18296 kB\nRssAnon:\t    1332 kB\nRssFile:\t   16964 kB\n";
         assert_eq!(parse_status_rss_anon_kb(sample), Some(1332));
         assert_eq!(parse_status_rss_anon_kb("VmRSS:\t 1 kB\n"), None);
+    }
+
+    /// C26: `VmRSS` parses out of a real `/proc/self/status` excerpt (the line `VmHWM` precedes it
+    /// and must not be taken), and is `None` when absent or garbled.
+    #[test]
+    fn parses_status_vm_rss_line() {
+        let sample = "VmPeak:\t  400000 kB\nVmHWM:\t   20000 kB\nVmRSS:\t   18296 kB\n\
+                      RssAnon:\t    1332 kB\nRssFile:\t   16964 kB\n";
+        assert_eq!(parse_status_vm_rss_kb(sample), Some(18296));
+        assert_eq!(parse_status_vm_rss_kb("RssAnon:\t 1 kB\n"), None);
+        assert_eq!(parse_status_vm_rss_kb("VmRSS:\t lots kB\n"), None);
+    }
+
+    /// C26: on Linux the live readers return plausible figures: resident ≥ anonymous > 0 (one
+    /// snapshot), and 0 < available ≤ total.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_and_host_memory_readers_are_plausible() {
+        // One snapshot of /proc/self/status: VmRSS = RssAnon + RssFile + RssShmem there, so the
+        // order holds with no race against the parallel tests.
+        let (rss, anon) = process_memory_bytes();
+        let (rss, anon) = (
+            rss.expect("VmRSS readable on Linux"),
+            anon.expect("RssAnon readable"),
+        );
+        assert!(anon > 0 && rss >= anon, "VmRSS {rss} vs RssAnon {anon}");
+        let (total, avail) = host_memory_bytes();
+        let total = total.expect("MemTotal readable on Linux");
+        let avail = avail.expect("MemAvailable readable on Linux");
+        assert!(total > 256 * 1024 * 1024, "MemTotal {total}");
+        assert!(
+            avail > 0 && avail <= total,
+            "MemAvailable {avail} vs MemTotal {total}"
+        );
     }
 
     #[test]

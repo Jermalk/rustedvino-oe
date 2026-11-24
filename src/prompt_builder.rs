@@ -417,6 +417,78 @@ pub fn build_prompt<M: Serialize>(
     // (replacing "You are ChatGPT…"). Other templates ignore it.
     model_identity: Option<&str>,
 ) -> anyhow::Result<String> {
+    build_prompt_with_kwargs(
+        messages,
+        tools,
+        template,
+        eos_token,
+        bos_token,
+        &TemplateKwargs::from_enable_thinking(enable_thinking),
+        model_identity,
+    )
+}
+
+/// The thinking variables a request hands the chat template (0.9.1): built server-side from the
+/// request's resolved thinking controls (`crate::thinking_budget::resolve`), never from raw
+/// client JSON. `None` on a field = the variable is left undefined (the template's own default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TemplateKwargs {
+    /// `enable_thinking` (Qwen3-style switch).
+    pub enable_thinking: Option<bool>,
+    /// `reasoning_effort` (gpt-oss's native control): `"none"` when thinking is off, the
+    /// request's effort word when thinking is on at that effort.
+    pub reasoning_effort: Option<&'static str>,
+    /// `preserve_thinking` (templates that can keep earlier turns' reasoning).
+    pub preserve_thinking: Option<bool>,
+}
+
+impl TemplateKwargs {
+    /// Only `enable_thinking`, with the derived `reasoning_effort: "none"` when it is `false`
+    /// (gpt-oss: an empty analysis channel) — what [`build_prompt`] has always passed.
+    #[must_use]
+    pub fn from_enable_thinking(enable_thinking: Option<bool>) -> Self {
+        Self {
+            enable_thinking,
+            reasoning_effort: (enable_thinking == Some(false)).then_some("none"),
+            preserve_thinking: None,
+        }
+    }
+
+    /// The same variables as a JSON object for `VLMPipeline`'s template (which renders inside
+    /// `OpenVINO GenAI`), holding only the keys that are set; `None` when none is.
+    #[must_use]
+    pub fn to_extra_context(self) -> Option<serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        if let Some(v) = self.enable_thinking {
+            map.insert("enable_thinking".to_owned(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = self.reasoning_effort {
+            map.insert(
+                "reasoning_effort".to_owned(),
+                serde_json::Value::String(v.to_owned()),
+            );
+        }
+        if let Some(v) = self.preserve_thinking {
+            map.insert("preserve_thinking".to_owned(), serde_json::Value::Bool(v));
+        }
+        (!map.is_empty()).then_some(serde_json::Value::Object(map))
+    }
+}
+
+/// [`build_prompt`] with every allowlisted thinking variable ([`TemplateKwargs`]) instead of
+/// `enable_thinking` alone.
+///
+/// # Errors
+/// As [`build_prompt`].
+pub fn build_prompt_with_kwargs<M: Serialize>(
+    messages: &[M],
+    tools: Option<&[serde_json::Value]>,
+    template: &str,
+    eos_token: &str,
+    bos_token: &str,
+    kwargs: &TemplateKwargs,
+    model_identity: Option<&str>,
+) -> anyhow::Result<String> {
     let mut env = Environment::new();
     env.set_auto_escape_callback(|_| AutoEscape::None);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -476,15 +548,20 @@ pub fn build_prompt<M: Serialize>(
     // enabled). Pass `false` explicitly to trigger the Qwen3 template's
     // `<think>\n\n</think>` closed-block prefill, which suppresses thinking.
     // `true` is passed as defined-true (model decides, same as default for most templates).
-    let thinking_val = enable_thinking.map_or(JinjaValue::UNDEFINED, JinjaValue::from);
+    let thinking_val = kwargs
+        .enable_thinking
+        .map_or(JinjaValue::UNDEFINED, JinjaValue::from);
     // `reasoning_effort`: gpt-oss uses this instead of `enable_thinking`. When
-    // thinking is suppressed (`enable_thinking=false`), pass `"none"` so the
-    // template pre-fills an empty analysis channel and the model skips reasoning.
-    // For all other cases pass UNDEFINED so the template uses its own default.
-    let reasoning_effort_val = match enable_thinking {
-        Some(false) => JinjaValue::from("none"),
-        _ => JinjaValue::UNDEFINED,
-    };
+    // thinking is suppressed, `"none"` makes the template pre-fill an empty
+    // analysis channel and the model skips reasoning; a request's own effort word
+    // reaches it when thinking is on at that effort (0.9.1). Otherwise UNDEFINED,
+    // so the template uses its own default.
+    let reasoning_effort_val = kwargs
+        .reasoning_effort
+        .map_or(JinjaValue::UNDEFINED, JinjaValue::from);
+    let preserve_thinking_val = kwargs
+        .preserve_thinking
+        .map_or(JinjaValue::UNDEFINED, JinjaValue::from);
     let model_identity_val = model_identity.map_or(JinjaValue::UNDEFINED, JinjaValue::from);
     let ctx = context! {
         messages => JinjaValue::from_serialize(messages),
@@ -494,6 +571,7 @@ pub fn build_prompt<M: Serialize>(
         bos_token => bos_token,
         enable_thinking => thinking_val,
         reasoning_effort => reasoning_effort_val,
+        preserve_thinking => preserve_thinking_val,
         model_identity => model_identity_val,
     };
     tmpl.render(ctx)
@@ -511,13 +589,30 @@ pub fn build_prompt<M: Serialize>(
 ///
 /// Call [`extract_thinking`] first to remove `<think>` blocks; this function
 /// does not look inside them.
+///
+/// Same as [`parse_tool_calls_with_tools`] with no tool schemas.
 #[must_use]
 pub fn parse_tool_calls(text: &str, family: ModelFamily) -> (Option<Vec<ToolCall>>, String) {
+    parse_tool_calls_with_tools(text, family, None)
+}
+
+/// [`parse_tool_calls`] with the request's `OpenAI` tool schemas (`tools`).
+///
+/// Only the Qwen XML dialect (`ModelFamily::QwenCoder`) reads `tools`: its
+/// parameter values are bare text, so each one is typed from the called
+/// function's declared JSON-schema `type` (see `qwen_xml_value`). Every other
+/// family's output is identical to [`parse_tool_calls`].
+#[must_use]
+pub fn parse_tool_calls_with_tools(
+    text: &str,
+    family: ModelFamily,
+    tools: Option<&[serde_json::Value]>,
+) -> (Option<Vec<ToolCall>>, String) {
     match family {
         ModelFamily::Default => parse_default(text),
         ModelFamily::Lfm2 => parse_lfm2(text),
         ModelFamily::Mistral => parse_mistral(text),
-        ModelFamily::QwenCoder => parse_qwen_coder_xml(text),
+        ModelFamily::QwenCoder => parse_qwen_coder_xml(text, tools),
         ModelFamily::GptOss => parse_gpt_oss_tool_calls(text),
     }
 }
@@ -1275,10 +1370,15 @@ fn parse_mistral(text: &str) -> (Option<Vec<ToolCall>>, String) {
 
 /// Qwen3-Coder XML dialect: `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`
 ///
-/// Arguments are extracted as key/value pairs; each value is attempted as JSON
-/// first (numbers, booleans, nested objects) and falls back to a plain string.
+/// Arguments are extracted as key/value pairs. Each (trimmed) value is bare
+/// text, typed by [`qwen_xml_value`] from the called function's declared
+/// parameter schema in `tools` — the model writes Python literals
+/// (`True`/`False`/`None`) there, and a string parameter must stay a string.
 /// Multiple sequential `<tool_call>` blocks are each parsed as a separate call.
-fn parse_qwen_coder_xml(text: &str) -> (Option<Vec<ToolCall>>, String) {
+fn parse_qwen_coder_xml(
+    text: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> (Option<Vec<ToolCall>>, String) {
     let (Some(outer_re), Some(fn_re), Some(param_re)) =
         (tool_call_re(), qwen_coder_fn_re(), qwen_coder_param_re())
     else {
@@ -1295,15 +1395,17 @@ fn parse_qwen_coder_xml(text: &str) -> (Option<Vec<ToolCall>>, String) {
             );
             continue;
         };
-        let name = &fn_cap[1];
+        // Trimmed for the schema lookup and the emitted name alike (QXL R6).
+        let name = fn_cap[1].trim();
+        let properties = tool_properties(tools, name);
         let mut args = serde_json::Map::new();
         for param_cap in param_re.captures_iter(block) {
             let key = param_cap[1].trim().to_owned();
             let raw_val = param_cap[2].trim();
-            // Try to parse as JSON scalar/object; fall back to bare string.
-            let json_val = serde_json::from_str::<serde_json::Value>(raw_val)
-                .unwrap_or_else(|_| serde_json::Value::String(raw_val.to_owned()));
-            args.insert(key, json_val);
+            let declared = properties
+                .and_then(|p| p.get(&key))
+                .and_then(declared_types);
+            args.insert(key, qwen_xml_value(raw_val, declared.as_deref()));
         }
         let arguments = serde_json::to_string(&serde_json::Value::Object(args))
             .unwrap_or_else(|_| "{}".to_owned());
@@ -1322,6 +1424,184 @@ fn parse_qwen_coder_xml(text: &str) -> (Option<Vec<ToolCall>>, String) {
     }
     let remaining = outer_re.replace_all(text, "").trim().to_owned();
     (Some(calls), remaining)
+}
+
+/// The `parameters.properties` object of the first tool in `tools` whose
+/// function is called `name` (`{"type":"function","function":{"name",
+/// "parameters"}}`, or the same object without the `function` wrapper).
+fn tool_properties<'a>(
+    tools: Option<&'a [serde_json::Value]>,
+    name: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    tools?
+        .iter()
+        .map(|t| t.get("function").unwrap_or(t))
+        .find(|f| f.get("name").and_then(serde_json::Value::as_str) == Some(name))?
+        .get("parameters")?
+        .get("properties")?
+        .as_object()
+}
+
+/// The JSON-schema type names one parameter declares: `type` as a string or an
+/// array of strings; with no `type`, an `enum` whose members are all strings
+/// counts as `string`; else the union of the same for its `anyOf` / `oneOf`
+/// members. `OpenAPI`'s `"nullable": true` adds `null`. `None` (no schema) when
+/// nothing declares a type, or when any union member declares none (a `$ref`,
+/// a mixed `enum`, …) — then the value is typed as if no schema existed.
+fn declared_types(prop: &serde_json::Value) -> Option<Vec<&str>> {
+    fn type_names<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) -> bool {
+        match v.get("type") {
+            Some(serde_json::Value::String(s)) => out.push(s),
+            Some(serde_json::Value::Array(a)) => {
+                out.extend(a.iter().filter_map(serde_json::Value::as_str));
+            }
+            _ => match v.get("enum").and_then(serde_json::Value::as_array) {
+                Some(e) if !e.is_empty() && e.iter().all(serde_json::Value::is_string) => {
+                    out.push("string");
+                }
+                _ => return false,
+            },
+        }
+        true
+    }
+    let mut out = Vec::new();
+    if !type_names(prop, &mut out) {
+        let members = prop
+            .get("anyOf")
+            .or_else(|| prop.get("oneOf"))?
+            .as_array()?;
+        for m in members {
+            if !type_names(m, &mut out) {
+                return None;
+            }
+        }
+    }
+    if prop.get("nullable") == Some(&serde_json::Value::Bool(true)) {
+        out.push("null");
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `true` when every quoted string body in the Python-ish container `src` uses
+/// only the backslash escapes `unescape_py` decodes faithfully (`\\`, `\'`,
+/// `\"`, `\n`, `\r`, `\t`). Any other escape (`\b`, a `\u` + hex escape, …) would be
+/// silently mangled by [`pythonish_to_json`] (the backslash dropped), so the
+/// Qwen XML path then keeps the raw text instead (QXL R2). LFM2 does not use
+/// this check.
+fn qwen_container_escapes_ok(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote != b'\'' && quote != b'"' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != quote {
+            if bytes[j] == b'\\' {
+                match bytes.get(j + 1) {
+                    Some(b'\\' | b'\'' | b'"' | b'n' | b'r' | b't') => j += 1,
+                    _ => return false,
+                }
+            }
+            j += 1;
+        }
+        i = j + 1;
+    }
+    true
+}
+
+/// Type one Qwen XML `<parameter=…>` value (already trimmed) as JSON.
+///
+/// With the parameter's declared JSON-schema types (`declared`), first match wins:
+/// 1. `boolean` declared: `True`/`true` → `true`, `False`/`false` → `false`;
+/// 2. *null rule:* `None`/`null` → `null` when `null` is declared **or**
+///    `string` is not (so `{"type":"integer"}` and `{"type":"boolean"}` alike
+///    give `null`; only a string-typed, non-nullable parameter keeps `"None"`);
+/// 3. `integer`/`number`/`object`/`array` declared: the value parsed as JSON,
+///    or as a Python-literal container (`{'a': True}`, `[1, None]`) when its
+///    strings use only escapes `unescape_py` decodes faithfully. With `string`
+///    also declared, only a value of a declared kind is taken; without it, any
+///    parse is taken (as before this typing existed);
+/// 4. `string` declared: a value that is one whole JSON string literal
+///    (`"Hanoi"`) is decoded (the pre-0.9.1 behaviour); anything else is the
+///    raw text, never converted (`None`, `123`, `true`, `[1, 2]` stay strings);
+/// 5. `integer`/`number`/`object`/`array` declared but nothing parsed: the raw
+///    text (`True` for an `integer` stays `"True"`);
+/// 6. otherwise (only `boolean` and/or `null` declared, nothing matched): as
+///    with no schema.
+///
+/// With no schema, or none of the known type names declared: bare `True` /
+/// `False` / `None` → `true` / `false` / `null`, else JSON, else the raw text.
+fn qwen_xml_value(raw: &str, declared: Option<&[&str]>) -> serde_json::Value {
+    const KNOWN: [&str; 7] = [
+        "string", "boolean", "null", "integer", "number", "object", "array",
+    ];
+    let untyped = || match raw {
+        "True" => serde_json::Value::Bool(true),
+        "False" => serde_json::Value::Bool(false),
+        "None" => serde_json::Value::Null,
+        _ => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+        }
+    };
+    let Some(types) = declared.filter(|t| t.iter().any(|n| KNOWN.contains(n))) else {
+        return untyped();
+    };
+    let has = |name: &str| types.contains(&name);
+    if has("boolean") {
+        match raw {
+            "True" | "true" => return serde_json::Value::Bool(true),
+            "False" | "false" => return serde_json::Value::Bool(false),
+            _ => {}
+        }
+    }
+    if matches!(raw, "None" | "null") && (has("null") || !has("string")) {
+        return serde_json::Value::Null;
+    }
+    let structured = ["integer", "number", "object", "array"]
+        .iter()
+        .any(|t| has(t));
+    if structured {
+        let parsed = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .or_else(|| {
+                if (raw.starts_with('{') || raw.starts_with('[')) && qwen_container_escapes_ok(raw)
+                {
+                    serde_json::from_str(&pythonish_to_json(raw)?).ok()
+                } else {
+                    None
+                }
+            });
+        if let Some(v) = parsed {
+            let kind_declared = match &v {
+                serde_json::Value::Number(n) => {
+                    has("number") || (has("integer") && (n.is_i64() || n.is_u64()))
+                }
+                serde_json::Value::Object(_) => has("object"),
+                serde_json::Value::Array(_) => has("array"),
+                _ => false,
+            };
+            if kind_declared || !has("string") {
+                return v;
+            }
+        }
+    }
+    if has("string") {
+        if raw.len() >= 2
+            && raw.starts_with('"')
+            && raw.ends_with('"')
+            && let Ok(s @ serde_json::Value::String(_)) = serde_json::from_str(raw)
+        {
+            return s;
+        }
+        serde_json::Value::String(raw.to_owned())
+    } else if structured {
+        serde_json::Value::String(raw.to_owned())
+    } else {
+        untyped()
+    }
 }
 
 fn gpt_oss_tool_call_re() -> Option<&'static Regex> {
@@ -1902,6 +2182,164 @@ pub fn extract_reasoning_gpt_oss(text: &str) -> (Option<String>, String) {
     (reasoning, answer.trim().to_owned())
 }
 
+// ---- Reasoning spans (0.9.1 V1-usage) --------------------------------
+
+/// Which reasoning split a request's output gets — the same choice the chat handler makes for its
+/// streaming filter (`ContentFilter::for_request`): gpt-oss harmony channels for
+/// [`ReasoningParser::GptOss`](crate::model_manager::ReasoningParser::GptOss), `<think>…</think>`
+/// for every other parser **and for no parser at all** (a model that never emits `<think>` simply
+/// has no reasoning span). Carried to the engines in
+/// [`GenParams::reasoning`](crate::ov_cb::GenParams::reasoning) so they can count
+/// `usage.completion_tokens_details.reasoning_tokens` next to the tokens they generate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReasoningSplit {
+    /// The model's reasoning parser tag (`None`: raw `<think>` rule).
+    pub parser: Option<crate::model_manager::ReasoningParser>,
+    /// The rendered prompt ends in an open `<think>`: the output starts inside reasoning.
+    pub starts_in_thinking: bool,
+}
+
+impl ReasoningSplit {
+    /// The split for a request served with `parser`, whose output starts inside a `<think>`
+    /// block when `starts_in_thinking`.
+    #[must_use]
+    pub fn new(
+        parser: Option<crate::model_manager::ReasoningParser>,
+        starts_in_thinking: bool,
+    ) -> Self {
+        Self {
+            parser,
+            starts_in_thinking,
+        }
+    }
+
+    /// The byte ranges of `text` (a request's whole raw output) that are reasoning, **markers
+    /// included** (`<think>`, `</think>`; for gpt-oss the leading channel word and the
+    /// `assistantfinal` transition). The non-marker bytes inside these ranges are exactly the
+    /// bytes [`ThinkFilter`] / [`HarmonyFilter`] route to `reasoning_content` when fed the same
+    /// text, so the count and the streamed `reasoning_content` cannot drift apart.
+    #[must_use]
+    pub fn reasoning_spans(self, text: &str) -> Vec<std::ops::Range<usize>> {
+        if matches!(
+            self.parser,
+            Some(crate::model_manager::ReasoningParser::GptOss)
+        ) {
+            harmony_reasoning_span(text).into_iter().collect()
+        } else {
+            think_reasoning_spans(text, self.starts_in_thinking)
+        }
+    }
+}
+
+/// [`ThinkFilter`]'s routing as byte ranges: from an opening `<think>` (or byte 0 when the
+/// output starts in thinking) through the end of the next `</think>`, or to the end of the text
+/// when the block never closes.
+fn think_reasoning_spans(text: &str, starts_in_thinking: bool) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    let mut start = 0;
+    let mut in_think = starts_in_thinking;
+    loop {
+        if in_think {
+            if let Some(i) = text[pos..].find(CLOSE_TAG) {
+                let end = pos + i + CLOSE_TAG.len();
+                spans.push(start..end);
+                pos = end;
+                in_think = false;
+            } else {
+                if start < text.len() {
+                    spans.push(start..text.len());
+                }
+                return spans;
+            }
+        } else if let Some(i) = text[pos..].find(OPEN_TAG) {
+            start = pos + i;
+            pos = start + OPEN_TAG.len();
+            in_think = true;
+        } else {
+            return spans;
+        }
+    }
+}
+
+/// [`HarmonyFilter`]'s routing as one byte range: an output that opens on a reasoning channel
+/// word (`analysis` / `commentary`) is reasoning up to the end of its first `assistantfinal`
+/// transition (a mid-stream `assistantanalysis` / `assistantcommentary` stays in reasoning), or
+/// to the end of the text. An output that opens on `final`, or on no channel word, has none.
+fn harmony_reasoning_span(text: &str) -> Option<std::ops::Range<usize>> {
+    let lead = match_leading_channel_word(text)?;
+    if harmony_mode_for(lead) != HarmonyMode::Reasoning {
+        return None;
+    }
+    // ASCII lowercasing keeps byte offsets, so an index in `lower` is an index in `text`.
+    let lower = text.to_ascii_lowercase();
+    let marker = "assistantfinal";
+    let end = lower[lead.len()..]
+        .find(marker)
+        .map_or(text.len(), |i| lead.len() + i + marker.len());
+    Some(0..end)
+}
+
+// ---- Thinking budget support (0.9.1) --------------------------------
+
+/// The `<think>` opening marker (for `crate::thinking_budget`'s running detector).
+pub(crate) const THINK_OPEN_TAG: &str = OPEN_TAG;
+/// The `</think>` closing marker (for `crate::thinking_budget`'s running detector).
+pub(crate) const THINK_CLOSE_TAG: &str = CLOSE_TAG;
+/// The harmony reasoning → answer transition [`harmony_reasoning_span`] ends at, lower case.
+pub(crate) const HARMONY_FINAL_MARKER: &str = "assistantfinal";
+/// Bytes of output after which the leading gpt-oss channel word is decided: one past the longest
+/// channel name, so the word-boundary character is seen too.
+pub(crate) const HARMONY_LEAD_DECISION_BYTES: usize = MAX_CHANNEL_NAME_LEN + 1;
+
+/// When `text` (the start of a gpt-oss output) opens on a reasoning channel word (`analysis` /
+/// `commentary`), the byte length of that word — the same lead [`harmony_reasoning_span`] uses;
+/// `None` when it opens on `final` or on no channel word.
+pub(crate) fn harmony_reasoning_lead_len(text: &str) -> Option<usize> {
+    let lead = match_leading_channel_word(text)?;
+    (harmony_mode_for(lead) == HarmonyMode::Reasoning).then_some(lead.len())
+}
+
+/// `true` when some gpt-oss channel name and `text` are prefixes of one another: more output
+/// could still make `text` open on a channel word.
+pub(crate) fn harmony_lead_still_open(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    GPT_OSS_CHANNEL_NAMES
+        .iter()
+        .any(|name| name.starts_with(lower.as_str()) || lower.starts_with(name))
+}
+
+/// The `(reasoning, answer)` split of an output the thinking budget stopped (0.9.1): the
+/// reasoning spans of `split` (markers removed, trimmed) and whatever answer text lies outside
+/// them — normally none. Unlike [`extract_thinking`], an unclosed block never yields the
+/// "thinking was cut off" placeholder: the stop was the server's, and the response says so with
+/// `finish_reason: "length"`.
+#[must_use]
+pub fn extract_thinking_at_budget(text: &str, split: ReasoningSplit) -> (Option<String>, String) {
+    let spans = split.reasoning_spans(text);
+    let mut reasoning = String::new();
+    let mut answer = String::new();
+    let mut pos = 0;
+    for span in &spans {
+        answer.push_str(&text[pos..span.start]);
+        reasoning.push_str(&text[span.clone()]);
+        pos = span.end;
+    }
+    answer.push_str(&text[pos..]);
+    if split.parser == Some(crate::model_manager::ReasoningParser::GptOss) {
+        // The harmony span holds the lead channel word and the `assistantfinal` glue: strip
+        // them the way the buffered harmony filter does.
+        let (r, a) = extract_reasoning_gpt_oss(&reasoning);
+        let reasoning = r.unwrap_or_default();
+        let answer = format!("{a}{answer}");
+        let reasoning = (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_owned());
+        return (reasoning, answer.trim().to_owned());
+    }
+    let reasoning = reasoning.replace(OPEN_TAG, "").replace(CLOSE_TAG, "");
+    let reasoning = (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_owned());
+    (reasoning, answer.trim().to_owned())
+}
+
 // ============================================================
 // Unit tests
 // ============================================================
@@ -2383,6 +2821,350 @@ mod tests {
         let (calls, remaining) = parse_tool_calls(text, ModelFamily::QwenCoder);
         assert!(calls.is_some());
         assert_eq!(remaining, "Let me check.");
+    }
+
+    // ---- QwenCoder XML: schema-typed parameter values (QXL, 0.9.1) ----
+
+    /// One `<tool_call>` block in the shape Qwen3.5/3.6/Coder emit.
+    fn qxl_call(name: &str, params: &[(&str, &str)]) -> String {
+        let mut s = format!("<tool_call>\n<function={name}>\n");
+        for (k, v) in params {
+            for part in ["<parameter=", k, ">\n", v, "\n</parameter>\n"] {
+                s.push_str(part);
+            }
+        }
+        s.push_str("</function>\n</tool_call>");
+        s
+    }
+
+    /// The live test's schema (2026-11-20, a B70 box): `get_forecast` with a
+    /// string, a boolean, an integer and a `string|null` parameter, plus a
+    /// `configure` tool with object/array/anyOf parameters.
+    fn qxl_tools() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"type": "function", "function": {
+                "name": "get_forecast",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                    "metric": {"type": "boolean"},
+                    "days": {"type": "integer"},
+                    "note": {"type": ["string", "null"]}
+                }}
+            }}),
+            serde_json::json!({"type": "function", "function": {
+                "name": "configure",
+                "parameters": {"type": "object", "properties": {
+                    "opts": {"type": "object"},
+                    "items": {"type": "array"},
+                    "label": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "count": {"type": ["string", "integer"]},
+                    "free": {"description": "no type declared"},
+                    "ratio": {"type": "number"},
+                    "tag": {"type": "string", "nullable": true},
+                    "mode": {"enum": ["a", "b"]},
+                    "mixed": {"enum": ["a", 1]}
+                }}
+            }}),
+        ]
+    }
+
+    /// Parse `text` as `QwenCoder` with `tools`, returning each call's
+    /// arguments as a JSON value.
+    fn qxl_args(text: &str, tools: Option<&[serde_json::Value]>) -> Vec<serde_json::Value> {
+        let (calls, _) = parse_tool_calls_with_tools(text, ModelFamily::QwenCoder, tools);
+        calls
+            .expect("tool call expected")
+            .iter()
+            .map(|c| serde_json::from_str(&c.function.arguments).expect("arguments are JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn qwen_xml_live_case_typed_from_schema() {
+        let tools = qxl_tools();
+        let text = qxl_call(
+            "get_forecast",
+            &[
+                ("city", "Hanoi"),
+                ("metric", "True"),
+                ("days", "3"),
+                ("note", "None"),
+            ],
+        );
+        let (calls, _) = parse_tool_calls_with_tools(&text, ModelFamily::QwenCoder, Some(&tools));
+        let calls = calls.expect("one call");
+        // Exact bytes the client receives (serde_json has preserve_order).
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"city":"Hanoi","metric":true,"days":3,"note":null}"#
+        );
+    }
+
+    #[test]
+    fn qwen_xml_boolean_false_and_json_spellings() {
+        let tools = qxl_tools();
+        for (raw, want) in [("False", false), ("false", false), ("true", true)] {
+            let args = qxl_args(&qxl_call("get_forecast", &[("metric", raw)]), Some(&tools));
+            assert_eq!(args[0]["metric"], serde_json::Value::Bool(want), "{raw}");
+        }
+        let args = qxl_args(&qxl_call("get_forecast", &[("note", "null")]), Some(&tools));
+        assert_eq!(args[0]["note"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn qwen_xml_string_param_never_converted() {
+        let tools = qxl_tools();
+        for raw in [
+            "None",
+            "123",
+            "true",
+            "False",
+            "null",
+            "[1, 2]",
+            "\"unterminated",
+            "\"a\" and \"b\"",
+        ] {
+            let args = qxl_args(&qxl_call("get_forecast", &[("city", raw)]), Some(&tools));
+            assert_eq!(args[0]["city"], serde_json::json!(raw), "{raw}");
+        }
+        // R3: one whole JSON string literal is decoded, as before 0.9.1.
+        // `|` stands for a backslash: `"a\"b` + `\u` + `00e9"` (a JSON escape).
+        let escaped = r#""a|"b|u00e9""#.replace('|', "\\");
+        for (raw, want) in [("\"Hanoi\"", "Hanoi"), (escaped.as_str(), "a\"bé")] {
+            let args = qxl_args(&qxl_call("get_forecast", &[("city", raw)]), Some(&tools));
+            assert_eq!(args[0]["city"], serde_json::json!(want), "{raw}");
+        }
+        // `string|null`: a non-null value stays a string, even numeric-looking.
+        let args = qxl_args(&qxl_call("get_forecast", &[("note", "123")]), Some(&tools));
+        assert_eq!(args[0]["note"], serde_json::json!("123"));
+    }
+
+    #[test]
+    fn qwen_xml_no_schema_maps_bare_python_literals() {
+        let text = qxl_call(
+            "anything",
+            &[
+                ("a", "True"),
+                ("b", "False"),
+                ("c", "None"),
+                ("d", "7"),
+                ("e", "word"),
+            ],
+        );
+        let want = serde_json::json!({"a": true, "b": false, "c": null, "d": 7, "e": "word"});
+        // No tools at all, and the legacy entry point (also no tools).
+        assert_eq!(qxl_args(&text, None)[0], want);
+        let (calls, _) = parse_tool_calls(&text, ModelFamily::QwenCoder);
+        let legacy: serde_json::Value =
+            serde_json::from_str(&calls.expect("call").remove(0).function.arguments).expect("JSON");
+        assert_eq!(legacy, want);
+        // A parameter with no `type` in an otherwise-declared function.
+        let tools = qxl_tools();
+        let args = qxl_args(&qxl_call("configure", &[("free", "None")]), Some(&tools));
+        assert_eq!(args[0]["free"], serde_json::Value::Null);
+        // A parameter the function does not declare.
+        let args = qxl_args(
+            &qxl_call("get_forecast", &[("extra", "True")]),
+            Some(&tools),
+        );
+        assert_eq!(args[0]["extra"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn qwen_xml_unknown_function_uses_no_schema_path() {
+        let tools = qxl_tools();
+        let args = qxl_args(
+            &qxl_call("not_declared", &[("city", "None"), ("n", "123")]),
+            Some(&tools),
+        );
+        assert_eq!(args[0], serde_json::json!({"city": null, "n": 123}));
+    }
+
+    #[test]
+    fn qwen_xml_python_literal_containers() {
+        let tools = qxl_tools();
+        let text = qxl_call(
+            "configure",
+            &[
+                ("opts", "{'a': True, 'b': None, 'c': 'it\\'s'}"),
+                ("items", "[1, None, 'x']"),
+            ],
+        );
+        let args = qxl_args(&text, Some(&tools));
+        assert_eq!(
+            args[0]["opts"],
+            serde_json::json!({"a": true, "b": null, "c": "it's"})
+        );
+        assert_eq!(args[0]["items"], serde_json::json!([1, null, "x"]));
+        // JSON containers still parse as before; an unparseable one stays raw.
+        let args = qxl_args(
+            &qxl_call(
+                "configure",
+                &[("opts", "{\"k\": [true]}"), ("items", "[oops")],
+            ),
+            Some(&tools),
+        );
+        assert_eq!(args[0]["opts"], serde_json::json!({"k": [true]}));
+        assert_eq!(args[0]["items"], serde_json::json!("[oops"));
+    }
+
+    #[test]
+    fn qwen_xml_union_types() {
+        let tools = qxl_tools();
+        // anyOf string|null, as Pydantic writes Optional[str].
+        let args = qxl_args(&qxl_call("configure", &[("label", "None")]), Some(&tools));
+        assert_eq!(args[0]["label"], serde_json::Value::Null);
+        let args = qxl_args(&qxl_call("configure", &[("label", "42")]), Some(&tools));
+        assert_eq!(args[0]["label"], serde_json::json!("42"));
+        // string|integer: an integer is taken, anything else stays a string.
+        let args = qxl_args(&qxl_call("configure", &[("count", "5")]), Some(&tools));
+        assert_eq!(args[0]["count"], serde_json::json!(5));
+        let args = qxl_args(&qxl_call("configure", &[("count", "5.5")]), Some(&tools));
+        assert_eq!(args[0]["count"], serde_json::json!("5.5"));
+        let args = qxl_args(&qxl_call("configure", &[("count", "True")]), Some(&tools));
+        assert_eq!(args[0]["count"], serde_json::json!("True"));
+        // integer only: an unparseable value falls back to the raw string, as before.
+        let args = qxl_args(
+            &qxl_call("get_forecast", &[("days", "True"), ("metric", "1")]),
+            Some(&tools),
+        );
+        assert_eq!(args[0]["days"], serde_json::json!("True"));
+        // boolean only, unmatched: no-schema path (JSON parse), as before.
+        assert_eq!(args[0]["metric"], serde_json::json!(1));
+    }
+
+    /// R1: the null rule — `None`/`null` is `null` unless the parameter is a
+    /// non-nullable string; `OpenAPI` `nullable: true` counts as `null`.
+    #[test]
+    fn qwen_xml_none_null_rule() {
+        let tools = qxl_tools();
+        for (func, key) in [
+            ("get_forecast", "days"),
+            ("configure", "ratio"),
+            ("configure", "opts"),
+            ("configure", "items"),
+            ("get_forecast", "metric"),
+            ("configure", "tag"),
+        ] {
+            for raw in ["None", "null"] {
+                let args = qxl_args(&qxl_call(func, &[(key, raw)]), Some(&tools));
+                assert_eq!(args[0][key], serde_json::Value::Null, "{key}={raw}");
+            }
+        }
+        let args = qxl_args(&qxl_call("get_forecast", &[("city", "None")]), Some(&tools));
+        assert_eq!(args[0]["city"], serde_json::json!("None"));
+        let args = qxl_args(&qxl_call("configure", &[("tag", "x")]), Some(&tools));
+        assert_eq!(args[0]["tag"], serde_json::json!("x"));
+    }
+
+    /// R2: a Python-ish container whose strings carry an escape the
+    /// pythonish rewrite cannot keep (`\b`, a `\u` + hex escape) stays the raw
+    /// text. In the literals below `|` stands for a backslash.
+    #[test]
+    fn qwen_xml_container_unsafe_escapes_stay_raw() {
+        let tools = qxl_tools();
+        for raw in [
+            r#"{"re": "|bword|b", "ok": None}"#,
+            r"{'name': 'caf|u00e9', 'ok': True}",
+            r"['a|x41', None]",
+        ] {
+            let raw = raw.replace('|', "\\");
+            assert!(
+                !raw.contains('é'),
+                "the escape must reach the parser undecoded"
+            );
+            let key = if raw.starts_with('[') {
+                "items"
+            } else {
+                "opts"
+            };
+            let args = qxl_args(&qxl_call("configure", &[(key, &raw)]), Some(&tools));
+            assert_eq!(args[0][key], serde_json::json!(raw), "{raw}");
+        }
+        // Plain JSON with those escapes still parses (no pythonish step).
+        let json_raw = r#"{"re": "|bw", "n": "caf|u00e9"}"#.replace('|', "\\");
+        let args = qxl_args(&qxl_call("configure", &[("opts", &json_raw)]), Some(&tools));
+        assert_eq!(
+            args[0]["opts"],
+            serde_json::json!({"re": "\u{8}w", "n": "café"})
+        );
+    }
+
+    /// R5: an all-string `enum` without `type` is a string; a mixed one is no
+    /// schema.
+    #[test]
+    fn qwen_xml_string_enum_is_string() {
+        let tools = qxl_tools();
+        let args = qxl_args(
+            &qxl_call("configure", &[("mode", "123"), ("mixed", "123")]),
+            Some(&tools),
+        );
+        assert_eq!(args[0]["mode"], serde_json::json!("123"));
+        assert_eq!(args[0]["mixed"], serde_json::json!(123));
+    }
+
+    /// R6: the function name is trimmed for the schema lookup and the output.
+    #[test]
+    fn qwen_xml_function_name_trimmed() {
+        let tools = qxl_tools();
+        let text = "<tool_call>\n<function= get_forecast >\n<parameter=metric>\nTrue\n</parameter>\n<parameter=city>\n123\n</parameter>\n</function>\n</tool_call>";
+        let (calls, _) = parse_tool_calls_with_tools(text, ModelFamily::QwenCoder, Some(&tools));
+        let calls = calls.expect("call");
+        assert_eq!(calls[0].function.name, "get_forecast");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"metric":true,"city":"123"}"#
+        );
+    }
+
+    #[test]
+    fn qwen_xml_two_calls_each_typed_by_own_schema() {
+        let tools = qxl_tools();
+        let text = format!(
+            "{}\n{}",
+            qxl_call("get_forecast", &[("city", "123"), ("metric", "False")]),
+            qxl_call("configure", &[("items", "[True]"), ("count", "7")]),
+        );
+        let args = qxl_args(&text, Some(&tools));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], serde_json::json!({"city": "123", "metric": false}));
+        assert_eq!(args[1], serde_json::json!({"items": [true], "count": 7}));
+    }
+
+    #[test]
+    fn qwen_xml_tools_do_not_change_other_families() {
+        let tools = qxl_tools();
+        let samples = [
+            (
+                ModelFamily::Default,
+                "<tool_call>{\"name\": \"get_forecast\", \"arguments\": {\"city\": 123}}</tool_call>",
+            ),
+            (ModelFamily::Lfm2, "[get_forecast(city=123, metric=True)]"),
+            (ModelFamily::Mistral, "get_forecast{\"city\": 123}"),
+            (
+                ModelFamily::GptOss,
+                "to=functions.get_forecast json{\"city\": 123}",
+            ),
+        ];
+        for (family, text) in samples {
+            let plain = parse_tool_calls(text, family);
+            let typed = parse_tool_calls_with_tools(text, family, Some(&tools));
+            assert!(plain.0.is_some(), "{family:?} sample must parse");
+            let plain_args: Vec<_> = plain
+                .0
+                .iter()
+                .flatten()
+                .map(|c| (c.id.clone(), c.function.arguments.clone()))
+                .collect();
+            let typed_args: Vec<_> = typed
+                .0
+                .iter()
+                .flatten()
+                .map(|c| (c.id.clone(), c.function.arguments.clone()))
+                .collect();
+            assert_eq!(plain_args, typed_args, "{family:?}");
+            assert_eq!(plain.1, typed.1, "{family:?}");
+        }
     }
 
     // ---- templates/lfm2.jinja (the shipped override) ----
@@ -3433,5 +4215,205 @@ mod tests {
     fn harmony_filter_flush_empty_is_empty() {
         let mut f = HarmonyFilter::new();
         assert!(f.flush().is_empty());
+    }
+
+    // ---- ReasoningSplit::reasoning_spans (0.9.1 V1-usage) ----
+
+    /// The spans with their markers removed are exactly what the streaming filter routes to
+    /// `reasoning_content` for the same text, so the token count follows the streamed split.
+    fn assert_spans_match_filter(text: &str, split: ReasoningSplit) {
+        let spans = split.reasoning_spans(text);
+        let gpt_oss = matches!(
+            split.parser,
+            Some(crate::model_manager::ReasoningParser::GptOss)
+        );
+        let from_spans: String = spans
+            .iter()
+            .map(|r| {
+                let mut s = text[r.clone()].to_owned();
+                if gpt_oss {
+                    for name in GPT_OSS_CHANNEL_NAMES {
+                        if s.to_ascii_lowercase().starts_with(name) {
+                            s = s[name.len()..].to_owned();
+                            break;
+                        }
+                    }
+                    if s.to_ascii_lowercase().ends_with("assistantfinal") {
+                        s.truncate(s.len() - "assistantfinal".len());
+                    }
+                    for name in GPT_OSS_CHANNEL_NAMES {
+                        let marker = format!("assistant{name}");
+                        while let Some(i) = s.to_ascii_lowercase().find(&marker) {
+                            s.replace_range(i..i + marker.len(), "");
+                        }
+                    }
+                } else {
+                    s = s.replace(OPEN_TAG, "").replace(CLOSE_TAG, "");
+                }
+                s
+            })
+            .collect();
+        // Feed the filter byte-chunked (3-byte pieces on char boundaries) like a token stream.
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + 3).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            pieces.push(&text[start..end]);
+            start = end;
+        }
+        let mut from_filter = String::new();
+        let mut push = |ps: Vec<ThinkPiece>| {
+            for p in ps {
+                if let ThinkPiece::Reasoning(r) = p {
+                    from_filter.push_str(&r);
+                }
+            }
+        };
+        if gpt_oss {
+            let mut f = HarmonyFilter::new();
+            for p in &pieces {
+                push(f.process(p));
+            }
+            push(f.flush());
+        } else {
+            let mut f = ThinkFilter::starting_in_thinking(split.starts_in_thinking);
+            for p in &pieces {
+                push(f.process(p));
+            }
+            push(f.flush());
+        }
+        assert_eq!(from_spans, from_filter, "text {text:?} split {split:?}");
+    }
+
+    #[test]
+    fn reasoning_spans_follow_the_streaming_filters() {
+        use crate::model_manager::ReasoningParser;
+        let qwen = |s| ReasoningSplit::new(Some(ReasoningParser::Qwen3), s);
+        let none = ReasoningSplit::default();
+        let oss = ReasoningSplit::new(Some(ReasoningParser::GptOss), false);
+        for text in [
+            "<think>a b</think>answer",
+            "pre <think>x</think> mid <think>y</think> end",
+            "<think>never closed",
+            "no markup at all",
+            "",
+            "ünïcödé <think>żółw</think>ok",
+        ] {
+            assert_spans_match_filter(text, qwen(false));
+            assert_spans_match_filter(text, none);
+        }
+        for text in [
+            "prefilled</think>answer",
+            "all reasoning",
+            "r</think>a<think>b</think>c",
+        ] {
+            assert_spans_match_filter(text, qwen(true));
+        }
+        for text in [
+            "analysisThe user asks.assistantfinal4",
+            "analysisStep assistantcommentary more assistantfinalDone",
+            "finalJust the answer",
+            "Hello there, no channel",
+            "analysisCut off mid-thought",
+        ] {
+            assert_spans_match_filter(text, oss);
+        }
+    }
+
+    #[test]
+    fn reasoning_spans_include_the_markers() {
+        let split = ReasoningSplit::new(Some(crate::model_manager::ReasoningParser::Qwen3), false);
+        let text = "x<think>r</think>y";
+        assert_eq!(split.reasoning_spans(text), vec![1..17]);
+        let oss = ReasoningSplit::new(Some(crate::model_manager::ReasoningParser::GptOss), false);
+        let text = "analysisR.assistantfinalA";
+        assert_eq!(oss.reasoning_spans(text), vec![0..24]);
+    }
+
+    // ---- 0.9.1 thinking control: template kwargs + budget-stop split ----
+
+    /// A template that prints each allowlisted thinking variable and a non-allowlisted one.
+    const KWARGS_PROBE: &str = "et={{ enable_thinking if enable_thinking is defined else 'U' }};\
+         re={{ reasoning_effort if reasoning_effort is defined else 'U' }};\
+         pt={{ preserve_thinking if preserve_thinking is defined else 'U' }};\
+         x={{ thinking if thinking is defined else 'U' }};bos={{ bos_token }}";
+
+    fn render(kwargs: &TemplateKwargs) -> String {
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        build_prompt_with_kwargs(&msgs, None, KWARGS_PROBE, "</s>", "<s>", kwargs, None).unwrap()
+    }
+
+    #[test]
+    fn allowlisted_kwargs_reach_the_template_and_nothing_else() {
+        assert_eq!(
+            render(&TemplateKwargs::default()),
+            "et=U;re=U;pt=U;x=U;bos=<s>"
+        );
+        let all = TemplateKwargs {
+            enable_thinking: Some(true),
+            reasoning_effort: Some("high"),
+            preserve_thinking: Some(false),
+        };
+        assert_eq!(render(&all), "et=true;re=high;pt=false;x=U;bos=<s>");
+        // The old entry point keeps its behaviour: off → reasoning_effort "none".
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let old =
+            build_prompt(&msgs, None, KWARGS_PROBE, "</s>", "<s>", Some(false), None).unwrap();
+        assert_eq!(old, "et=false;re=none;pt=U;x=U;bos=<s>");
+    }
+
+    #[test]
+    fn vlm_extra_context_holds_only_the_set_keys() {
+        assert_eq!(TemplateKwargs::default().to_extra_context(), None);
+        assert_eq!(
+            TemplateKwargs::from_enable_thinking(Some(false)).to_extra_context(),
+            Some(serde_json::json!({"enable_thinking": false, "reasoning_effort": "none"}))
+        );
+        let all = TemplateKwargs {
+            enable_thinking: Some(true),
+            reasoning_effort: Some("low"),
+            preserve_thinking: Some(true),
+        };
+        let v = all.to_extra_context().unwrap();
+        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["enable_thinking", "preserve_thinking", "reasoning_effort"]
+        );
+    }
+
+    #[test]
+    fn budget_stop_split_never_yields_the_placeholder() {
+        let qwen = |s| ReasoningSplit::new(Some(crate::model_manager::ReasoningParser::Qwen3), s);
+        let (r, a) = extract_thinking_at_budget("<think>long thought", qwen(false));
+        assert_eq!((r.as_deref(), a.as_str()), (Some("long thought"), ""));
+        let (r, a) = extract_thinking_at_budget("still thinking", qwen(true));
+        assert_eq!((r.as_deref(), a.as_str()), (Some("still thinking"), ""));
+        // Text before the block is the answer that exists.
+        let (r, a) = extract_thinking_at_budget("Sure. <think>hmm", qwen(false));
+        assert_eq!((r.as_deref(), a.as_str()), (Some("hmm"), "Sure."));
+        // A tool call written inside the reasoning stays reasoning.
+        let (r, a) = extract_thinking_at_budget(
+            "<think>maybe <tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
+            qwen(false),
+        );
+        assert!(r.unwrap().contains("<tool_call>"));
+        assert_eq!(a, "");
+        let oss = ReasoningSplit::new(Some(crate::model_manager::ReasoningParser::GptOss), false);
+        let (r, a) = extract_thinking_at_budget("analysisThe user asks about", oss);
+        assert_eq!(
+            (r.as_deref(), a.as_str()),
+            (Some("The user asks about"), "")
+        );
+        for (_, a) in [
+            extract_thinking_at_budget("<think>x", qwen(false)),
+            extract_thinking_at_budget("x", qwen(true)),
+        ] {
+            assert!(!a.contains("cut off"));
+        }
     }
 }

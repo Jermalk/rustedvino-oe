@@ -87,7 +87,7 @@ impl Inputs {
 
 /// Drops a UTF-8 byte-order mark: Windows PowerShell 5.1 writes one with
 /// `Set-Content -Encoding UTF8`, and `serde_json` rejects it.
-fn strip_bom(s: &str) -> &str {
+pub(crate) fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 

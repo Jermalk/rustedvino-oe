@@ -16,13 +16,13 @@ use axum::{
     Extension, Json,
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
-use crate::model_manager::{EngineHandleKind, LoadOverrides, ModelError};
+use crate::model_manager::{EngineHandleKind, EvictionReport, LoadOverrides, ModelError};
 use crate::voice_pin::VoiceFlowPin;
 
 /// Approximate server-start Unix timestamp (seconds), captured once on first
@@ -90,11 +90,24 @@ pub struct HealthResponse {
     /// that device are refused (`503 device_stalled`) until it does; loaded models keep serving.
     /// Details (which device, model, how long): `GET /v1/admin/health/watchdog` or `rv status`.
     pub device_stalled: bool,
+    /// m1: how many startup warnings this process has and their codes (distinct),
+    /// never their text — `/health` is unauthenticated. The full messages: `GET
+    /// /v1/admin/models` (`server.startup_warnings`) or `rv status`.
+    pub startup_warnings: HealthStartupWarnings,
+}
+
+/// The `/health` summary of the startup warnings: `{"count": 0, "codes": []}` when none.
+#[derive(Serialize)]
+pub struct HealthStartupWarnings {
+    /// Number of startup warnings.
+    pub count: usize,
+    /// Their distinct codes (e.g. `preload_skipped`), in first-seen order.
+    pub codes: Vec<&'static str>,
 }
 
 /// GET /health — liveness probe.
 ///
-/// Returns `{"status":"ok","version":"<semver>","git_hash":"<12-char hex or \"unknown\">","gpu_poisoned":false,"device_stalled":false}`.
+/// Returns `{"status":"ok","version":"<semver>","git_hash":"<12-char hex or \"unknown\">","gpu_poisoned":false,"device_stalled":false,"startup_warnings":{"count":0,"codes":[]}}`.
 /// Never returns an error — if the server is alive enough to route here, it's healthy;
 /// `gpu_poisoned: true` is the one signal that it is alive but cannot serve GPU models.
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -110,6 +123,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             .model_manager
             .as_ref()
             .is_some_and(|mm| !mm.stalled_loads().is_empty()),
+        startup_warnings: {
+            let (count, codes) = crate::startup::startup_warning_codes();
+            HealthStartupWarnings { count, codes }
+        },
     })
 }
 
@@ -475,7 +492,9 @@ const STATE_GPU_POISONED: &str = "unavailable (gpu_poisoned)";
 struct AdminModelEntry {
     id: String,
     /// `"not_loaded"` | `"loading"` | `"ready"` | `"evicting"`, or
-    /// `"unavailable (gpu_poisoned)"` for a GPU-placed model while the GPU context is poisoned.
+    /// `"unavailable (gpu_poisoned)"` for a GPU-placed model while the GPU context is poisoned, or
+    /// `"stalled"` for a load past its deadline (step 6b) or a CPU/NPU model whose engine stalled
+    /// (0.9.1 S1: refused until a restart; also while an unload waits for its stuck thread).
     state: &'static str,
     /// From `model_kinds` config; `"text_gen"` when not specified.
     kind: &'static str,
@@ -503,6 +522,16 @@ struct AdminModelEntry {
     /// See `default_temperature`.
     #[serde(skip_serializing_if = "Option::is_none")]
     default_top_k: Option<usize>,
+    /// The model's effective sampling profile (0.9.1 V5c), with a source per value:
+    /// `{mode, temperature: {value, source}, top_p, top_k, repetition_penalty,
+    /// presence_penalty, frequency_penalty, tools: "greedy"}` (+ `ignored_on_device` on
+    /// NPU, `note` for an exporter-stub `generation_config.json`). Present for every
+    /// text-generating model in every state; omitted for other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampling: Option<serde_json::Value>,
+    /// The configured default thinking budget in tokens (`thinking_budget_tokens` in
+    /// config.json, 0.9.1); `null` when unset. Always present, every kind.
+    thinking_budget_tokens: Option<u32>,
     /// The L0 prompt-length gate ceiling in tokens — the number a `400
     /// context_length_exceeded` on this model would cite. `0` before the
     /// model's first successful load, once evicted, for media/embedding
@@ -538,6 +567,10 @@ struct AdminModelEntry {
     /// once evicted, or for an engine kind whose live occupancy can't be
     /// read (see `kv_pressure_flagged`'s doc comment — same caveat applies).
     kv_cache_usage_pct: f64,
+    /// Whether `kv_cache_usage_pct` is a live reading for this model (`rustedvino_kv_cache_usage_
+    /// supported`). `false` while not loaded and for an engine kind whose occupancy cannot be read
+    /// (the VLM engine): its `0.0` is then not "empty" (C21/P1).
+    kv_cache_usage_supported: bool,
     /// Whether this model's KV occupancy has been continuously at/above the
     /// configured pressure threshold for at least the configured sustained
     /// duration (the project's internal engineering log). Always `false`
@@ -585,6 +618,10 @@ struct AdminModelEntry {
     /// when that load's measurement window was not clean, and for a whole-GiB pool (F3-N-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     vram_measured_mib: Option<u64>,
+    /// C25: the part of the booked KV pool that became resident during the last load, MiB; absent
+    /// when not measured that way (see `ModelInfo::kv_pool_resident_mib`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pool_resident_mib: Option<u64>,
     /// F2-S-5 (E-16): `true` once a vision request with images was admitted since the last load
     /// without its image tokens counted — the context limit then saw only the text.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -683,7 +720,8 @@ impl ServerInfo {
 
 /// GET /v1/admin/models — list every registered model with its current state.
 ///
-/// Unlike `GET /v1/models` (OpenAI-compatible, Ready-only), this returns the
+/// Unlike `GET /v1/models` (OpenAI-compatible: Ready models plus `on_demand` ones not loaded
+/// yet), this returns the
 /// full registry: models that are `not_loaded`, `loading`, `ready`, or
 /// `evicting`. Useful for clients that want to know what can be loaded.
 ///
@@ -723,7 +761,7 @@ pub async fn admin_list_models(
             id: info.id,
             state: if mm.gpu_unavailable(&info.device) {
                 STATE_GPU_POISONED
-            } else if info.stalled_secs.is_some() {
+            } else if info.stalled_secs.is_some() || info.generation_stalled {
                 "stalled"
             } else {
                 match info.state {
@@ -739,12 +777,15 @@ pub async fn admin_list_models(
             default_temperature: info.generation_defaults.temperature,
             default_top_p: info.generation_defaults.top_p,
             default_top_k: info.generation_defaults.top_k,
+            sampling: info.sampling.map(|(p, npu)| p.admin_json(npu)),
+            thinking_budget_tokens: info.thinking_budget_tokens,
             max_prompt_tokens: info.max_prompt_tokens,
             cache_size_gb: info.kv_cache_gb,
             kv_requested_gb: info.kv_requested_gb,
             clamped_by: info.kv_clamped_by.map(crate::model_manager::KvClamp::label),
             native_context_limit: info.native_context_limit,
             kv_cache_usage_pct: info.kv_cache_usage_pct,
+            kv_cache_usage_supported: info.kv_cache_usage_supported,
             kv_pressure_flagged: info.kv_pressure_flagged,
             gpu_memory_estimate_gb: info.gpu_memory_estimate_gb,
             kv_cache_precision: info
@@ -765,6 +806,7 @@ pub async fn admin_list_models(
             kv_pool_blocks: info.kv_pool_blocks,
             kv_headroom_cap_tokens: info.kv_headroom_cap_tokens,
             vram_measured_mib: info.vram_measured_mib,
+            kv_pool_resident_mib: info.kv_pool_resident_mib,
             kv_admission_low_confidence: info.uncounted_image_admissions > 0,
             uncounted_image_admissions: info.uncounted_image_admissions,
         })
@@ -1008,13 +1050,63 @@ pub struct ModelObject {
     /// they need to budget context without requiring `GET
     /// /v1/admin/models`
     /// (the project's internal engineering log).
+    /// Also omitted for a model that is not loaded yet (`state` `"not_loaded"` / `"loading"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
-    /// Present only as `"unavailable (gpu_poisoned)"`: the model is listed but cannot
-    /// serve until the server restarts (E-12). Omitted for a healthy model, so the
-    /// response is unchanged in normal operation.
+    /// Omitted for a loaded, healthy model, so a Ready model's entry is unchanged. Otherwise:
+    /// - `"not_loaded"` / `"loading"` *(since 0.9.1, F1a)*: an `on_demand` model that is not
+    ///   loaded yet; a request to it starts (or waits on) its load;
+    /// - `"unavailable (gpu_poisoned)"`: a GPU-placed model that cannot serve, or load, until
+    ///   the server restarts (E-12).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<&'static str>,
+}
+
+/// `state` of a `/v1/models` entry for an `on_demand` model that is not loaded.
+const STATE_NOT_LOADED: &str = "not_loaded";
+/// `state` of a `/v1/models` entry for an `on_demand` model whose load is running.
+const STATE_LOADING: &str = "loading";
+
+/// The public `GET /v1/models` entry for one model, or `None` when the model is not listed
+/// (F1a). Shared by the list and the retrieve route so the two cannot drift apart.
+///
+/// Listed: a `Ready` model (no `state`, or the poisoned one), and an `on_demand` model that is
+/// `NotLoaded` or `Loading` (`"not_loaded"` / `"loading"`, or the poisoned state when its GPU
+/// context is poisoned, since it could not load). An eager model that is not Ready, and any
+/// `Evicting` model, stay hidden: listed = usable. A stalled load reads `"loading"` here (the
+/// admin list says `stalled`). The policy is read through [`ModelManager::is_on_demand`], the
+/// same predicate that decides whether a request starts a load. `max_model_len` only for a Ready
+/// model: before the first load the ceiling is unknown.
+///
+/// [`ModelManager::is_on_demand`]: crate::model_manager::ModelManager::is_on_demand
+fn v1_entry(
+    mm: &crate::model_manager::ModelManager,
+    info: crate::model_manager::ModelInfo,
+) -> Option<ModelObject> {
+    use crate::model_manager::ModelState;
+    let poisoned = mm.gpu_unavailable(&info.device);
+    let state = match info.state {
+        ModelState::Ready => poisoned.then_some(STATE_GPU_POISONED),
+        ModelState::NotLoaded | ModelState::Loading if mm.is_on_demand(&info.id) => {
+            Some(if poisoned {
+                STATE_GPU_POISONED
+            } else if info.state == ModelState::NotLoaded {
+                STATE_NOT_LOADED
+            } else {
+                STATE_LOADING
+            })
+        }
+        ModelState::NotLoaded | ModelState::Loading | ModelState::Evicting => return None,
+    };
+    let ready = info.state == ModelState::Ready;
+    Some(ModelObject {
+        state,
+        id: info.id,
+        object: "model",
+        created: server_created_ts(),
+        owned_by: "rustedvino",
+        max_model_len: (ready && info.max_prompt_tokens > 0).then_some(info.max_prompt_tokens),
+    })
 }
 
 /// Top-level /v1/models response envelope.
@@ -1026,9 +1118,10 @@ pub struct ModelsResponse {
 
 /// GET /v1/models — OpenAI-compatible model discovery.
 ///
-/// Returns only models in the `Ready` state (i.e. loaded and accepting requests).
-/// Models that are registered but not loaded are invisible to `OpenAI` clients;
-/// the admin routes control loading.
+/// Lists the models a client can use: every `Ready` model, and *(since 0.9.1, F1a)* every
+/// `on_demand` model that is not loaded or loading, with a `state` field and no
+/// `max_model_len` (see [`v1_entry`]). An eager model that is not loaded stays invisible to
+/// `OpenAI` clients; the admin routes control loading.
 ///
 /// When `model_manager` is absent (mock mode), returns an empty list.
 pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> {
@@ -1038,13 +1131,11 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
         .map(|mm| {
             // A stalled load that has returned shows up here as Ready (step 6b).
             mm.reap_stalled_loads();
+            // `list_models` returns a snapshot (the models lock is released) before
+            // `v1_entry` reads the policy overlay.
             mm.list_models()
                 .into_iter()
-                .filter(|info| info.state == crate::model_manager::ModelState::Ready)
-                .map(|info| {
-                    let unavailable = mm.gpu_unavailable(&info.device);
-                    model_object(info, unavailable)
-                })
+                .filter_map(|info| v1_entry(mm, info))
                 .collect()
         })
         .unwrap_or_default();
@@ -1055,42 +1146,32 @@ pub async fn models_list(State(state): State<AppState>) -> Json<ModelsResponse> 
     })
 }
 
-/// Build the public `ModelObject` for one model; shared by the list and the retrieve route
-/// so the two cannot drift apart.
-fn model_object(info: crate::model_manager::ModelInfo, unavailable: bool) -> ModelObject {
-    ModelObject {
-        state: unavailable.then_some(STATE_GPU_POISONED),
-        id: info.id,
-        object: "model",
-        created: server_created_ts(),
-        owned_by: "rustedvino",
-        max_model_len: (info.max_prompt_tokens > 0).then_some(info.max_prompt_tokens),
-    }
-}
-
 /// GET /v1/models/{id} — `OpenAI`'s retrieve-model route (D-12).
 ///
-/// Same visibility rule as the list: only `Ready` models exist for `OpenAI` clients, so a
-/// registered-but-not-loaded model answers 404 `model_not_found` like an unknown id. Without
-/// a model manager (mock mode) every id is unknown.
+/// Same visibility rule as the list ([`v1_entry`]): a `Ready` model, or an `on_demand` model
+/// that is not loaded or loading, answers its entry. Any other registered model (an eager one
+/// that is not loaded, or one being evicted) answers 404 `model_not_found` like an unknown id,
+/// with the not-loaded sentence as its message (F1a). Without a model manager (mock mode) every
+/// id is unknown.
 pub async fn model_retrieve(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let found = state.model_manager.as_ref().and_then(|mm| {
-        mm.list_models()
-            .into_iter()
-            .find(|info| info.id == id && info.state == crate::model_manager::ModelState::Ready)
-    });
-    match found {
-        Some(info) => {
-            let unavailable = state
-                .model_manager
-                .as_ref()
-                .is_some_and(|mm| mm.gpu_unavailable(&info.device));
-            Json(model_object(info, unavailable)).into_response()
-        }
-        None => super::error::model_error_response(crate::model_manager::ModelError::NotFound(id)),
+    let Some(mm) = state.model_manager.as_ref() else {
+        return super::error::model_error_response(crate::model_manager::ModelError::NotFound(id));
+    };
+    mm.reap_stalled_loads();
+    let Some(info) = mm.list_models().into_iter().find(|info| info.id == id) else {
+        return super::error::model_error_response(crate::model_manager::ModelError::NotFound(id));
+    };
+    match v1_entry(mm, info) {
+        Some(obj) => Json(obj).into_response(),
+        None => super::error::openai_error(
+            StatusCode::NOT_FOUND,
+            super::error::not_loaded_message(Some(&id)),
+            "invalid_request_error",
+            Some("model_not_found"),
+        ),
     }
 }
 
@@ -1173,6 +1254,9 @@ impl LoadRequest {
             kv_cache_gb: self.kv_cache_gb,
             max_concurrent_streams: self.max_concurrent_streams,
             force: self.force,
+            // Internal only (C27 respawn restore); never from a request body.
+            no_evict: false,
+            resize_rollback: false,
         })
     }
 }
@@ -1199,6 +1283,7 @@ impl LoadRequest {
 pub async fn admin_load_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // Parse + validate the optional overrides body first, so a malformed
@@ -1207,15 +1292,13 @@ pub async fn admin_load_model(
     let overrides = if body.is_empty() {
         LoadOverrides::default()
     } else {
-        match serde_json::from_slice::<LoadRequest>(&body) {
+        // Bad JSON (an unknown field included) is the 400 `invalid_body` envelope (P-C).
+        match super::error::admin_json_from_bytes::<LoadRequest>(&body) {
             Ok(req) => match req.into_overrides() {
                 Ok(ov) => ov,
                 Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
             },
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}"))
-                    .into_response();
-            }
+            Err(resp) => return *resp,
         }
     };
 
@@ -1227,15 +1310,17 @@ pub async fn admin_load_model(
             .into_response();
     };
 
-    match mm.load_model_with_overrides(&model_id, overrides).await {
-        Ok(()) => {
+    let forced = overrides.force;
+    match mm.load_model_reported(&model_id, overrides).await {
+        Ok(victims) => {
             let note = kv_pool_note(mm, &model_id);
             let sep = if note.is_empty() { "" } else { ". " };
-            (
-                StatusCode::OK,
+            eviction_success(
+                &headers,
+                &victims,
+                forced,
                 format!("model '{model_id}' loaded{sep}{note}"),
             )
-                .into_response()
         }
         Err(e) => {
             // Downcast to ModelError for fine-grained HTTP status mapping.
@@ -1256,7 +1341,8 @@ pub async fn admin_load_model(
                     }
                     ModelError::NotFound(_)
                     | ModelError::FilesMissing(_)
-                    | ModelError::FilesIncomplete(..) => {
+                    | ModelError::FilesIncomplete(..)
+                    | ModelError::TemplateUnreadable { .. } => {
                         return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response();
                     }
                     ModelError::Loading | ModelError::Evicting => {
@@ -1276,6 +1362,12 @@ pub async fn admin_load_model(
                         // worker already on its way to a restart says so; otherwise the operator
                         // must restart (gracefully: SIGTERM drains and frees VRAM, T6.1).
                         return gpu_poisoned_admin(&e);
+                    }
+                    // 0.9.1 S1: a stalled engine's model — the inference routes' 503 `model_unavailable`.
+                    ModelError::GenerationStalled(id) => {
+                        return super::error::model_error_response(ModelError::GenerationStalled(
+                            id.clone(),
+                        ));
                     }
                     // WrongKind never originates from load_model; fall through to 500.
                     ModelError::NotLoaded | ModelError::WrongKind(_) => {} // fall through to 500
@@ -1370,13 +1462,13 @@ fn resize_message(
 pub async fn admin_resize_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let request: ResizeRequest = match serde_json::from_slice(&body) {
+    // Bad JSON (an unknown field included) is the 400 `invalid_body` envelope (P-C).
+    let request: ResizeRequest = match super::error::admin_json_from_bytes(&body) {
         Ok(req) => req,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response();
-        }
+        Err(resp) => return *resp,
     };
     if !request.kv_cache_gb.is_finite() || request.kv_cache_gb <= 0.0 {
         return (
@@ -1398,7 +1490,7 @@ pub async fn admin_resize_model(
     };
 
     match mm
-        .resize_model_kv_cache_with(&model_id, request.kv_cache_gb, request.force)
+        .resize_model_kv_cache_reported(&model_id, request.kv_cache_gb, request.force)
         .await
     {
         // `achieved` is the pool the allocator actually handed out, which can be
@@ -1407,13 +1499,13 @@ pub async fn admin_resize_model(
         // `min_kv_cache_gb`. Report the achieved figure, and say so explicitly
         // when it differs — echoing the request turned a clamped pool into a
         // silent full-size "success".
-        Ok(achieved) => {
+        Ok((achieved, reports)) => {
             let info = mm.list_models().into_iter().find(|m| m.id == model_id);
             let (clamped_by, blocks) = info
                 .as_ref()
                 .map_or((None, None), |m| (m.kv_clamped_by, m.kv_pool_blocks));
             let msg = resize_message(&model_id, achieved, request.kv_cache_gb, blocks, clamped_by);
-            (StatusCode::OK, msg).into_response()
+            eviction_success(&headers, &reports, request.force, msg)
         }
         Err(e) => {
             // Cooldown rejection is a plain anyhow error, not a ModelError
@@ -1458,11 +1550,20 @@ pub async fn admin_resize_model(
                     ModelError::GpuPoisoned => {
                         return gpu_poisoned_admin(&e);
                     }
+                    // 0.9.1 S1: a stalled engine's model — the inference routes' 503 `model_unavailable`.
+                    ModelError::GenerationStalled(id) => {
+                        return super::error::model_error_response(ModelError::GenerationStalled(
+                            id.clone(),
+                        ));
+                    }
                     // FilesMissing/FilesIncomplete/WrongKind never originate
                     // from resize_model_kv_cache — completeness is only
                     // checked before a load, and resize never changes kind.
+                    // TemplateUnreadable does (C8: checked before evicting) and
+                    // keeps the 500 below, as before the variant existed.
                     ModelError::FilesMissing(_)
                     | ModelError::FilesIncomplete(..)
+                    | ModelError::TemplateUnreadable { .. }
                     | ModelError::WrongKind(_) => {}
                 }
             }
@@ -1496,6 +1597,7 @@ pub async fn admin_resize_model(
 pub async fn admin_unload_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    headers: HeaderMap,
     query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let force = match force_from_query(query) {
@@ -1510,13 +1612,13 @@ pub async fn admin_unload_model(
             .into_response();
     };
 
-    let evicted = if force {
-        mm.evict_model_forced(&model_id).await
-    } else {
-        mm.evict_model(&model_id).await
-    };
-    match evicted {
-        Ok(()) => (StatusCode::OK, format!("model '{model_id}' evicted")).into_response(),
+    match mm.evict_model_reported(&model_id, force).await {
+        Ok(report) => eviction_success(
+            &headers,
+            &[report],
+            force,
+            format!("model '{model_id}' evicted"),
+        ),
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
@@ -1553,11 +1655,18 @@ pub async fn admin_unload_model(
                     ModelError::InsufficientMemory(_) => {
                         return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
                     }
+                    // 0.9.1 S1: a stalled engine's model — the inference routes' 503 `model_unavailable`.
+                    ModelError::GenerationStalled(id) => {
+                        return super::error::model_error_response(ModelError::GenerationStalled(
+                            id.clone(),
+                        ));
+                    }
                     // WrongKind/FilesMissing/FilesIncomplete never originate
                     // from evict_model — completeness is only checked before a load.
                     ModelError::WrongKind(_)
                     | ModelError::FilesMissing(_)
-                    | ModelError::FilesIncomplete(..) => {}
+                    | ModelError::FilesIncomplete(..)
+                    | ModelError::TemplateUnreadable { .. } => {}
                 }
             }
             tracing::error!(model_id, error = %e, "admin_unload_model failed");
@@ -1585,6 +1694,7 @@ pub async fn admin_unload_model(
 pub async fn admin_deregister_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
+    headers: HeaderMap,
     query: Result<axum::extract::Query<ForceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let force = match force_from_query(query) {
@@ -1599,8 +1709,13 @@ pub async fn admin_deregister_model(
             .into_response();
     };
 
-    match mm.deregister_model_with(&model_id, force).await {
-        Ok(()) => (StatusCode::OK, format!("model '{model_id}' deregistered")).into_response(),
+    match mm.deregister_model_reported(&model_id, force).await {
+        Ok(report) => eviction_success(
+            &headers,
+            report.as_slice(),
+            force,
+            format!("model '{model_id}' deregistered"),
+        ),
         Err(e) => {
             if let Some(model_err) = e.downcast_ref::<ModelError>() {
                 match model_err {
@@ -1635,13 +1750,20 @@ pub async fn admin_deregister_model(
                     ModelError::GpuPoisoned => {
                         return gpu_poisoned_admin(&e);
                     }
+                    // 0.9.1 S1: a stalled engine's model — the inference routes' 503 `model_unavailable`.
+                    ModelError::GenerationStalled(id) => {
+                        return super::error::model_error_response(ModelError::GenerationStalled(
+                            id.clone(),
+                        ));
+                    }
                     // deregister_model only ever evicts a Ready model — NotLoaded,
                     // WrongKind, FilesMissing, and FilesIncomplete never originate
                     // from that path.
                     ModelError::NotLoaded
                     | ModelError::WrongKind(_)
                     | ModelError::FilesMissing(_)
-                    | ModelError::FilesIncomplete(..) => {}
+                    | ModelError::FilesIncomplete(..)
+                    | ModelError::TemplateUnreadable { .. } => {}
                 }
             }
             tracing::error!(model_id, error = %e, "admin_deregister_model failed");
@@ -1695,16 +1817,31 @@ struct PatchModelResponse {
 /// - 200 OK — JSON [`PatchModelResponse`]
 /// - 400 Bad Request — `kind` supplied (immutable), empty body, invalid
 ///   `vram_gb`/`device`/policy field, or a policy field fails validation
+/// - 400 `invalid_body` (envelope, P-C) — malformed JSON, a wrong type
 /// - 404 Not Found — model ID is not registered
 /// - 409 Conflict — model is `Loading`/`Evicting`, or `device`/
 ///   `tier_preference` supplied while `Ready`
+/// - 415 — no `Content-Type: application/json` (axum's answer)
+/// - 422 — an unknown field, at any depth (axum's plain-text answer, kept)
 /// - 503 Service Unavailable — model manager not initialised, or the server
 ///   was started without a durable config file
 pub async fn admin_patch_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
-    Json(patch): Json<crate::model_manager::config::ModelEntryPatch>,
+    body: Result<
+        Json<crate::model_manager::config::ModelEntryPatch>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
+    // P-C: malformed JSON, a wrong type or a missing field is the 400 `invalid_body` envelope;
+    // an unknown field (at any depth) keeps its 422 exactly as before, and a missing
+    // `Content-Type` its 415.
+    let patch = match body {
+        Ok(Json(patch)) => patch,
+        Err(r) => {
+            return super::error::admin_json_rejection(r, super::error::UnknownField::Keep422);
+        }
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1713,7 +1850,25 @@ pub async fn admin_patch_model(
             .into_response();
     };
 
-    match mm.patch_model(&model_id, &patch) {
+    // `patch_model` is synchronous and does blocking file I/O (config.json, and a placement
+    // PATCH re-reads the model directory) under a std mutex: run it on the blocking pool.
+    let result = {
+        let (mm, id) = (std::sync::Arc::clone(mm), model_id.clone());
+        match tokio::task::spawn_blocking(move || mm.patch_model(&id, &patch)).await {
+            Ok(result) => result,
+            // A panicked or cancelled task is a server fault, not the caller's bad input: 500,
+            // as the reload handler does.
+            Err(e) => {
+                tracing::error!(model_id, error = %e, "admin_patch_model task failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("PATCH task failed: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    match result {
         Ok(report) => (
             StatusCode::OK,
             Json(PatchModelResponse {
@@ -1760,7 +1915,9 @@ pub async fn admin_patch_model(
                     | ModelError::NotLoaded
                     | ModelError::WrongKind(_)
                     | ModelError::FilesMissing(_)
-                    | ModelError::FilesIncomplete(..) => {} // never originate from patch_model
+                    | ModelError::FilesIncomplete(..)
+                    | ModelError::GenerationStalled(_)
+                    | ModelError::TemplateUnreadable { .. } => {} // never originate from patch_model
                 }
             }
             let msg = format!("{e:#}");
@@ -1846,6 +2003,73 @@ struct AdmissionCheckResponse {
     headroom_not_previewed: Option<String>,
 }
 
+/// Whether the client asked for the JSON outcome of an eviction route (V1-rv P1): an `Accept`
+/// media range equal to `application/json` (any case, in any of several `Accept` headers; other
+/// parameters such as `charset` ignored) whose `q` is not `0` (RFC 9110: `q=0` means "not
+/// acceptable"). `*/*` and no header keep the plain-text body.
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|range| {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or("").trim();
+            let refused = parts.any(|p| {
+                p.trim()
+                    .split_once('=')
+                    .filter(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+                    .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+                    .is_some_and(|q| q <= 0.0)
+            });
+            media.eq_ignore_ascii_case("application/json") && !refused
+        })
+}
+
+/// The 200 of an unload, deregister, resize or load: the plain-text `message` as before, or, when
+/// the client asked for JSON ([`wants_json`]), [`eviction_outcome`] carrying it.
+fn eviction_success(
+    headers: &HeaderMap,
+    reports: &[EvictionReport],
+    forced: bool,
+    message: String,
+) -> Response {
+    if wants_json(headers) {
+        eviction_outcome(reports, forced, &message)
+    } else {
+        (StatusCode::OK, message).into_response()
+    }
+}
+
+/// The JSON outcome of an unload, deregister, resize or load (V1-rv P1; `message` 0.9.1):
+/// `{evicted, forced, drained_s, aborted, teardown_ms, message}`. `evicted` lists every model the
+/// call evicted, in order (`[]` when it evicted nothing); the three figures are summed over them
+/// (the evictions run one after another). `drained_s` is `0` exactly when nothing was running.
+/// `message` is the plain-text body the route answers without the header, verbatim.
+fn eviction_outcome(reports: &[EvictionReport], forced: bool, message: &str) -> Response {
+    let evicted: Vec<&str> = reports.iter().map(|r| r.model_id.as_str()).collect();
+    let drained: Duration = reports.iter().map(|r| r.drained).sum();
+    let aborted: usize = reports.iter().map(|r| r.aborted).sum();
+    let teardown_ms = reports
+        .iter()
+        .fold(0u64, |acc, r| acc.saturating_add(r.teardown_ms));
+    // Milliseconds are enough: the drain polls every 50 ms.
+    let drained_s = (drained.as_secs_f64() * 1000.0).round() / 1000.0;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "evicted": evicted,
+            "forced": forced,
+            "drained_s": drained_s,
+            "aborted": aborted,
+            "teardown_ms": teardown_ms,
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
 /// Query string of `POST /v1/admin/models/{id}/check`, `DELETE /v1/admin/models/{id}` and
 /// `DELETE /v1/admin/models/{id}/register`.
 #[derive(serde::Deserialize, Default)]
@@ -1912,6 +2136,8 @@ pub async fn admin_check_model(
             .into_response();
     };
 
+    // The dry-run must see the device memory of now, as the load it previews will (S2).
+    mm.refresh_all_device_probes().await;
     match mm.check_admission_with(&model_id, force) {
         Ok(check) => (
             StatusCode::OK,
@@ -2009,8 +2235,10 @@ pub async fn admin_realtime_session_by_id(
 
 /// `DELETE /v1/admin/realtime/sessions/{id}` — force-close a live session.
 ///
-/// Fires the session's `CancellationToken`, which causes the pipeline loop to
-/// exit on its next iteration. The WebSocket closes cleanly (no SIGKILL).
+/// Fires the session's `kill` token, which cancels the turn in progress and
+/// makes the pipeline loop exit. The session then sends the WebSocket close
+/// frame 4000 `closed_by_admin`, waits up to 2 s for the client's close reply,
+/// and drops the connection (0.9.1 C5).
 pub async fn admin_kill_realtime_session(
     Path(id): Path<uuid::Uuid>,
     State(state): State<AppState>,
@@ -2063,6 +2291,10 @@ pub struct AddModelRequest {
     /// image-gen provenance, …) — see the struct doc comment above.
     #[serde(flatten)]
     pub policy: crate::model_manager::config::ModelPolicy,
+    /// Top-level fields no other member claimed (docs-drift L2): still ignored, as before, but
+    /// logged as a WARN naming them, so a typo (`pinnned`) does not vanish silently.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// `POST /v1/admin/models/add` — register a new model at runtime and load it immediately.
@@ -2081,8 +2313,16 @@ pub struct AddModelRequest {
 /// long HTTP timeout.
 pub async fn admin_add_model(
     State(state): State<AppState>,
-    Json(req): Json<AddModelRequest>,
+    body: Result<Json<AddModelRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // P-C: bad JSON (a nested unknown key in `sampling`/`speculative` included) is the 400
+    // `invalid_body` envelope; a missing `Content-Type` keeps axum's 415.
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(r) => {
+            return super::error::admin_json_rejection(r, super::error::UnknownField::InvalidBody);
+        }
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2091,6 +2331,14 @@ pub async fn admin_add_model(
             .into_response();
     };
 
+    if !req.unknown.is_empty() {
+        let keys: Vec<&str> = req.unknown.keys().map(String::as_str).collect();
+        tracing::warn!(
+            model = %req.model_id,
+            keys = %keys.join(", "),
+            "models/add: unknown field(s) ignored — check for typos"
+        );
+    }
     match mm
         .add_model(req.model_id.clone(), req.vram_gb, req.kind, req.policy)
         .await
@@ -2197,6 +2445,15 @@ struct ConfigReloadResponse {
     /// Empty on the common path, so the response shape is unchanged for anyone
     /// who never edits a global.
     globals_not_applied: Vec<String>,
+    /// Loaded models (`left_untouched`) whose stanza in the file changed, with the changed keys:
+    /// `[{"model": "...", "fields": ["chat_template"]}]` (C8). **Not applied** — to apply: unload
+    /// the model, reload the config again, then load it. Empty on the common path.
+    models_not_applied: Vec<crate::model_manager::ModelChangesNotApplied>,
+    /// Loaded (`Ready`) models whose `sampling` or `thinking_budget_tokens` changed in the file:
+    /// **applied** to the next request (both are hot), `[{"model": "...", "fields":
+    /// ["sampling", "thinking_budget_tokens"]}]` (the ones that changed), and not repeated in
+    /// `models_not_applied`. Always present; empty on the common path.
+    applied_live: Vec<crate::model_manager::ModelChangesNotApplied>,
 }
 
 #[allow(clippy::doc_markdown)]
@@ -2236,7 +2493,15 @@ pub async fn admin_reload_config(State(state): State<AppState>) -> Response {
             .into_response();
     };
 
-    match mm.reload_config() {
+    // Synchronous, with blocking file I/O (config.json and, for the V5 `sampling` rule and new
+    // entries, model directories) under a std mutex: run it on the blocking pool.
+    let result = {
+        let mm = std::sync::Arc::clone(mm);
+        tokio::task::spawn_blocking(move || mm.reload_config())
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("config reload task failed: {e}")))
+    };
+    match result {
         Ok(report) => (
             StatusCode::OK,
             Json(ConfigReloadResponse {
@@ -2246,6 +2511,8 @@ pub async fn admin_reload_config(State(state): State<AppState>) -> Response {
                 left_untouched: report.left_untouched,
                 unchanged: report.unchanged,
                 globals_not_applied: report.globals_not_applied,
+                models_not_applied: report.models_not_applied,
+                applied_live: report.applied_live,
             }),
         )
             .into_response(),
@@ -2321,8 +2588,15 @@ struct SetPreloadResponse {
 ///   was started without a durable config file
 pub async fn admin_set_preload(
     State(state): State<AppState>,
-    Json(req): Json<SetPreloadRequest>,
+    body: Result<Json<SetPreloadRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // P-C: bad JSON is the 400 `invalid_body` envelope; a missing `Content-Type` keeps 415.
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(r) => {
+            return super::error::admin_json_rejection(r, super::error::UnknownField::InvalidBody);
+        }
+    };
     let Some(mm) = state.model_manager.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2391,6 +2665,7 @@ pub async fn admin_set_preload(
 /// Response body for `POST /v1/admin/keys/reload`. Counts only — never key
 /// values.
 #[derive(Serialize)]
+#[allow(clippy::struct_excessive_bools)] // independent report flags, one per wire field
 struct KeysReloadResponse {
     /// `true` when `api_keys` differed from the file and was hot-swapped in
     /// — no server restart.
@@ -2402,6 +2677,9 @@ struct KeysReloadResponse {
     /// non-empty admin scope was live — that specific downgrade was refused,
     /// not applied (`admin_keys_updated` is `false` in this case).
     admin_downgrade_refused: bool,
+    /// `true` when no `api_keys` remain and the server binds a network address: inference is
+    /// open to anyone who can reach the port (0.9.1 S3).
+    inference_open_on_network: bool,
     /// Live inference-key count after this reload.
     api_key_count: usize,
     /// Live admin-key count after this reload.
@@ -2443,6 +2721,7 @@ pub async fn admin_reload_keys(State(state): State<AppState>) -> Response {
                 keys_updated: report.keys_updated,
                 admin_keys_updated: report.admin_keys_updated,
                 admin_downgrade_refused: report.admin_downgrade_refused,
+                inference_open_on_network: report.inference_open_on_network,
                 api_key_count: report.api_key_count,
                 admin_key_count: report.admin_key_count,
             }),
@@ -2632,6 +2911,32 @@ mod tests {
     use super::*;
     use crate::model_manager::KvClamp;
 
+    /// docs-drift L2: the catch-all collects exactly the fields nothing else claims. Every policy
+    /// field (the whole `--print-default-model` stanza, so a new field is covered too) still
+    /// reaches `policy`, none of them lands in `unknown`, and a typo does.
+    #[test]
+    fn add_request_collects_only_unknown_fields() {
+        let mut body = crate::model_manager::Config::default_model_template().unwrap();
+        let map = body.as_object_mut().unwrap();
+        map.insert("model_id".to_owned(), serde_json::json!("m"));
+        map.insert("vram_gb".to_owned(), serde_json::json!(1.5));
+        map.insert("pinned".to_owned(), serde_json::json!(true));
+        map.insert("pinnned".to_owned(), serde_json::json!(true));
+        map.insert("bogus".to_owned(), serde_json::json!({"x": 1}));
+        let req: AddModelRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            req.unknown.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["bogus", "pinnned"]
+        );
+        assert!(req.policy.pinned, "a known field still reaches the policy");
+        assert!((req.vram_gb - 1.5).abs() < 1e-9);
+
+        let plain: AddModelRequest =
+            serde_json::from_str(r#"{"model_id": "m", "vram_gb": 0.0, "kind": "embedding"}"#)
+                .unwrap();
+        assert!(plain.unknown.is_empty());
+    }
+
     /// D-04 S9 review #13b: the watchdog's stalled entry carries `recovery`, `null` while the
     /// load is inside its deadline; `rv status` reads exactly these keys.
     #[test]
@@ -2763,6 +3068,10 @@ mod tests {
             git_hash: "abc123def456",
             gpu_poisoned: false,
             device_stalled: false,
+            startup_warnings: HealthStartupWarnings {
+                count: 2,
+                codes: vec!["preload_skipped"],
+            },
         };
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["status"], "ok");
@@ -2770,10 +3079,15 @@ mod tests {
         assert_eq!(json["git_hash"], "abc123def456");
         assert_eq!(json["gpu_poisoned"], false);
         assert_eq!(json["device_stalled"], false);
+        // m1: count + codes only, no message text (`/health` is unauthenticated).
+        assert_eq!(
+            json["startup_warnings"],
+            serde_json::json!({"count": 2, "codes": ["preload_skipped"]})
+        );
         assert_eq!(
             json.as_object().unwrap().len(),
-            5,
-            "HealthResponse must have exactly 5 fields"
+            6,
+            "HealthResponse must have exactly 6 fields"
         );
     }
 
@@ -2793,12 +3107,15 @@ mod tests {
             default_temperature: None,
             default_top_p: None,
             default_top_k: None,
+            sampling: None,
+            thinking_budget_tokens: None,
             max_prompt_tokens: 37_137,
             cache_size_gb: 3.0,
             kv_requested_gb: None,
             clamped_by: None,
             native_context_limit: Some(40_960),
             kv_cache_usage_pct: 0.0,
+            kv_cache_usage_supported: false,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
             kv_cache_precision: None,
@@ -2811,6 +3128,7 @@ mod tests {
             kv_pool_blocks: None,
             kv_headroom_cap_tokens: None,
             vram_measured_mib: None,
+            kv_pool_resident_mib: None,
             kv_admission_low_confidence: false,
             uncounted_image_admissions: 0,
         };
@@ -2818,6 +3136,8 @@ mod tests {
         assert_eq!(json["max_prompt_tokens"], 37_137);
         assert!((json["cache_size_gb"].as_f64().unwrap() - 3.0).abs() < f64::EPSILON);
         assert_eq!(json["native_context_limit"], 40_960);
+        // C21/P1: the flag that says whether `kv_cache_usage_pct` is a live reading, always sent.
+        assert_eq!(json["kv_cache_usage_supported"], false);
     }
 
     /// The KV decision fields: present when known, omitted (never `null`) when not, and the pool
@@ -2833,12 +3153,15 @@ mod tests {
             default_temperature: None,
             default_top_p: None,
             default_top_k: None,
+            sampling: None,
+            thinking_budget_tokens: None,
             max_prompt_tokens: 86_381,
             cache_size_gb: 3.9999,
             kv_requested_gb: None,
             clamped_by: None,
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
+            kv_cache_usage_supported: false,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
             kv_cache_precision: Some("u4"),
@@ -2851,6 +3174,7 @@ mod tests {
             kv_pool_blocks: Some(5_683),
             kv_headroom_cap_tokens: None,
             vram_measured_mib: None,
+            kv_pool_resident_mib: None,
             kv_admission_low_confidence: false,
             uncounted_image_admissions: 0,
         };
@@ -2904,12 +3228,15 @@ mod tests {
             default_temperature: None,
             default_top_p: None,
             default_top_k: None,
+            sampling: None,
+            thinking_budget_tokens: None,
             max_prompt_tokens: 0,
             cache_size_gb: 0.0,
             kv_requested_gb: None,
             clamped_by: None,
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
+            kv_cache_usage_supported: false,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
             kv_cache_precision: None,
@@ -2922,6 +3249,7 @@ mod tests {
             kv_pool_blocks: None,
             kv_headroom_cap_tokens: None,
             vram_measured_mib: None,
+            kv_pool_resident_mib: None,
             kv_admission_low_confidence: false,
             uncounted_image_admissions: 0,
         };
@@ -3089,10 +3417,13 @@ mod tests {
             id: id.to_owned(),
             state,
             stalled_secs: None,
+            generation_stalled: false,
             kind,
             vram_gb: 0.0,
             device: "CPU".to_owned(),
             generation_defaults: crate::model_manager::template::GenerationDefaults::default(),
+            sampling: None,
+            thinking_budget_tokens: None,
             max_prompt_tokens: 0,
             kv_cache_gb: 0.0,
             kv_requested_gb: None,
@@ -3101,10 +3432,12 @@ mod tests {
             kv_resolution: None,
             kv_headroom_cap_tokens: None,
             vram_measured_mib: None,
+            kv_pool_resident_mib: None,
             kv_gate_mode: "",
             kv_gate_clamped_by: None,
             native_context_limit: None,
             kv_cache_usage_pct: 0.0,
+            kv_cache_usage_supported: false,
             kv_pressure_flagged: false,
             gpu_memory_estimate_gb: None,
             uncounted_image_admissions: 0,
@@ -3506,6 +3839,182 @@ mod tests {
         assert!(mm.metrics_snapshot().gpu_poisoned);
     }
 
+    /// F1a: a router over a mock manager with a loaded eager model (`ready-m`), two `on_demand`
+    /// models (`od-cold` not loaded, `od-warm` forced to `Loading`) and an eager model that is
+    /// not loaded (`eager-cold`), all GPU-placed.
+    async fn on_demand_listing_router() -> (
+        axum::Router,
+        std::sync::Arc<crate::model_manager::ModelManager>,
+    ) {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-admin-f1a-listing", "device": "GPU.1", "total_vram_gb": 22.5,
+            "models": {
+                "ready-m": {"vram_gb": 2.0},
+                "od-cold": {"vram_gb": 1.0, "load": "on_demand"},
+                "od-warm": {"vram_gb": 1.0, "load": "on_demand"},
+                "eager-cold": {"vram_gb": 1.0}
+            }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        mm.load_model("ready-m").await.unwrap();
+        mm.set_max_prompt_tokens_for_test("ready-m", 4096);
+        mm.set_state_for_test("od-warm", crate::model_manager::ModelState::Loading);
+        // A non-zero ceiling on a model that is not Ready must still not be shown.
+        mm.set_max_prompt_tokens_for_test("od-warm", 4096);
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        (app, mm)
+    }
+
+    /// F1a: `/v1/models` lists Ready models unchanged (no `state`, with
+    /// `max_model_len`), `on_demand` models that are not loaded / loading with `state`
+    /// `"not_loaded"` / `"loading"` and no `max_model_len`, and hides an eager model that is not
+    /// loaded. `GET /v1/models/{id}` answers the same entry for each listed id and 404
+    /// `model_not_found` for the hidden one.
+    #[tokio::test]
+    async fn v1_models_lists_on_demand_models_with_their_state() {
+        let (app, _mm) = on_demand_listing_router().await;
+        let (status, v1) = send(&app, "GET", "/v1/models", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let data = v1["data"].as_array().unwrap();
+        let entry = |id: &str| data.iter().find(|m| m["id"] == id).cloned();
+
+        let ready = entry("ready-m").unwrap();
+        assert!(ready.get("state").is_none(), "{ready}");
+        assert_eq!(ready["max_model_len"], 4096);
+        let cold = entry("od-cold").unwrap();
+        assert_eq!(cold["state"], "not_loaded");
+        assert!(cold.get("max_model_len").is_none(), "{cold}");
+        assert_eq!(cold["object"], "model");
+        let warm = entry("od-warm").unwrap();
+        assert_eq!(warm["state"], "loading");
+        assert!(warm.get("max_model_len").is_none(), "{warm}");
+        assert!(
+            entry("eager-cold").is_none(),
+            "eager not-loaded stays hidden: {v1}"
+        );
+        assert_eq!(data.len(), 3, "{v1}");
+
+        for id in ["ready-m", "od-cold", "od-warm"] {
+            let (status, one) = send(&app, "GET", &format!("/v1/models/{id}"), "").await;
+            assert_eq!(status, StatusCode::OK, "{id}: {one}");
+            assert_eq!(Some(one), entry(id), "retrieve == list entry for {id}");
+        }
+        let (status, hidden) = send(&app, "GET", "/v1/models/eager-cold", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(hidden["error"]["code"], "model_not_found");
+        assert_eq!(
+            hidden["error"]["message"],
+            "model 'eager-cold' is registered but not loaded; an administrator can load it, or \
+             set it to load on demand"
+        );
+        let (status, unknown) = send(&app, "GET", "/v1/models/nope", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["error"]["code"], "model_not_found");
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not found among the registered models"),
+            "{unknown}"
+        );
+    }
+
+    /// F1a: an `Evicting` model is hidden even when `on_demand` (only not-loaded and loading
+    /// are listed), and once the GPU context is poisoned an `on_demand` GPU model that is not
+    /// loaded reads `"unavailable (gpu_poisoned)"` like a Ready one: it could not load.
+    #[tokio::test]
+    async fn v1_models_on_demand_evicting_hidden_and_poison_takes_precedence() {
+        let (app, mm) = on_demand_listing_router().await;
+        mm.set_state_for_test("od-warm", crate::model_manager::ModelState::Evicting);
+        let (_, v1) = send(&app, "GET", "/v1/models", "").await;
+        let ids: Vec<&str> = v1["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.contains(&"od-warm"), "evicting hidden: {v1}");
+        let (status, _) = send(&app, "GET", "/v1/models/od-warm", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        mm.poison_for_test();
+        let (_, v1) = send(&app, "GET", "/v1/models", "").await;
+        let state = |id: &str| {
+            v1["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .map(|m| m["state"].clone())
+        };
+        assert_eq!(state("ready-m"), Some("unavailable (gpu_poisoned)".into()));
+        assert_eq!(state("od-cold"), Some("unavailable (gpu_poisoned)".into()));
+        let (_, one) = send(&app, "GET", "/v1/models/od-cold", "").await;
+        assert_eq!(one["state"], "unavailable (gpu_poisoned)");
+        assert!(one.get("max_model_len").is_none(), "{one}");
+    }
+
+    /// F1a: the listing reads the policy overlay-first, like `request_on_demand_load`: an eager
+    /// model `PATCH`ed to `load: on_demand` appears with `state: "not_loaded"`.
+    #[tokio::test]
+    async fn v1_models_follows_a_patched_load_policy() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        // PATCH persists, so this manager needs a durable config file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "models_dir": dir.path().join("models"), "device": "CPU", "total_vram_gb": 0.0,
+                "models": { "eager-cold": {"vram_gb": 0.0} }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                crate::model_manager::Config::load(&path).unwrap(),
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap()
+            .with_config_path(path.clone()),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        let (status, _) = send(&app, "GET", "/v1/models/eager-cold", "").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "eager: hidden before the patch"
+        );
+        assert!(!mm.is_on_demand("eager-cold"));
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            "/v1/admin/models/eager-cold",
+            r#"{"load": "on_demand"}"#,
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+        assert!(mm.is_on_demand("eager-cold"));
+        let (status, one) = send(&app, "GET", "/v1/models/eager-cold", "").await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["state"], "not_loaded");
+    }
+
     /// `add` validates a per-model `kv_cache_precision` (it used to refuse the key), and a tiny
     /// pool request is not printed as 0.00.
     #[tokio::test]
@@ -3691,6 +4200,249 @@ mod tests {
         (status, json)
     }
 
+    /// 0.9.1 V5c: every text model's admin entry carries the `sampling` profile with a source
+    /// per value — before its first load too (the file layer is read at registration) — while
+    /// `default_*` keeps its old "omitted before the first load" meaning; a non-text kind has
+    /// no `sampling`.
+    #[tokio::test]
+    async fn admin_models_carry_the_sampling_profile() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(models.join("m-text")).unwrap();
+        std::fs::write(
+            models.join("m-text").join("generation_config.json"),
+            r#"{"do_sample": true, "temperature": 0.6, "top_k": 20, "repetition_penalty": 1.05}"#,
+        )
+        .unwrap();
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": models, "device": "CPU", "total_vram_gb": 0.0,
+            "models": {
+                "m-text": {"vram_gb": 0.0, "sampling": {"top_p": 0.8, "presence_penalty": 1.5}},
+                "embed-x": {"vram_gb": 0.0}
+            }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        let entry = |v: &serde_json::Value, id: &str| {
+            v["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        let text = entry(&admin, "m-text");
+        assert_eq!(text["state"], "not_loaded");
+        assert!(text.get("default_temperature").is_none(), "{text}");
+        let s = &text["sampling"];
+        assert_eq!(s["mode"], "sample");
+        assert_eq!(s["temperature"]["source"], "generation_config.json");
+        assert_eq!(s["top_p"]["source"], "config");
+        assert_eq!(s["top_k"]["value"], 20);
+        assert_eq!(s["repetition_penalty"]["source"], "generation_config.json");
+        assert_eq!(s["presence_penalty"]["source"], "config");
+        assert_eq!(
+            s["frequency_penalty"],
+            serde_json::json!({"value": null, "source": "none"})
+        );
+        assert_eq!(s["tools"], "greedy");
+        assert!(entry(&admin, "embed-x").get("sampling").is_none());
+
+        mm.load_model("m-text").await.unwrap();
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        let text = entry(&admin, "m-text");
+        assert!((text["default_temperature"].as_f64().unwrap() - 0.6).abs() < 1e-6);
+        assert_eq!(text["sampling"]["top_p"]["source"], "config");
+    }
+
+    /// 0.9.1: every admin model entry carries `thinking_budget_tokens` (`null` when unset); a
+    /// PATCH sets it hot on a `Ready` model (the next chat context reads it), `null` clears it,
+    /// and the value is persisted; a negative or non-integer value is refused.
+    #[tokio::test]
+    async fn thinking_budget_tokens_admin_field_and_patch() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(models.join("m-text")).unwrap();
+        std::fs::create_dir_all(models.join("m-set")).unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "models_dir": models, "device": "CPU", "total_vram_gb": 0.0,
+                "models": {
+                    "m-text": {"vram_gb": 0.0, "thinking_budget_tokens": null},
+                    "m-set": {"vram_gb": 0.0, "thinking_budget_tokens": 3000}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = crate::model_manager::Config::load(&path).unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap()
+            .with_config_path(path.clone()),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        let field = |v: &serde_json::Value, id: &str| {
+            v["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .get("thinking_budget_tokens")
+                .cloned()
+        };
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        assert_eq!(field(&admin, "m-text"), Some(serde_json::Value::Null));
+        assert_eq!(field(&admin, "m-set"), Some(serde_json::json!(3000)));
+
+        mm.load_model("m-text").await.unwrap();
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            "/v1/admin/models/m-text",
+            r#"{"thinking_budget_tokens": 2048}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.to_string().contains("thinking_budget_tokens"),
+            "{body}"
+        );
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        assert_eq!(field(&admin, "m-text"), Some(serde_json::json!(2048)));
+        let ctx = mm.get_chat_context_for_request("m-text").await.unwrap();
+        assert_eq!(
+            ctx.thinking_budget_tokens,
+            Some(2048),
+            "hot on the Ready model"
+        );
+        drop(ctx);
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["models"]["m-text"]["thinking_budget_tokens"],
+            serde_json::json!(2048)
+        );
+
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            "/v1/admin/models/m-text",
+            r#"{"thinking_budget_tokens": null}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, admin) = send(&app, "GET", "/v1/admin/models", "").await;
+        assert_eq!(field(&admin, "m-text"), Some(serde_json::Value::Null));
+        let ctx = mm.get_chat_context_for_request("m-text").await.unwrap();
+        assert_eq!(ctx.thinking_budget_tokens, None);
+        drop(ctx);
+
+        for bad in [
+            r#"{"thinking_budget_tokens": -1}"#,
+            r#"{"thinking_budget_tokens": 1.5}"#,
+        ] {
+            // A wrong type: the 400 `invalid_body` envelope since P-C (422 before).
+            let (status, body) = send(&app, "PATCH", "/v1/admin/models/m-text", bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            assert_eq!(body["error"]["code"], "invalid_body", "{bad}: {body}");
+        }
+    }
+
+    /// Review F3: the status a typo'd key inside `sampling` really gets over HTTP, through PATCH
+    /// and through the add body's flattened policy (axum's `Json` extractor answers a serde data
+    /// error itself), and that nothing is changed.
+    #[tokio::test]
+    async fn sampling_typo_status_over_http() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(models.join("m-text")).unwrap();
+        std::fs::create_dir_all(models.join("m-new")).unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "models_dir": models, "device": "CPU", "total_vram_gb": 0.0,
+                "models": { "m-text": {"vram_gb": 0.0} }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = crate::model_manager::Config::load(&path).unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap()
+            .with_config_path(path.clone()),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            "/v1/admin/models/m-text",
+            r#"{"sampling": {"temprature": 1}}"#,
+        )
+        .await;
+        // PATCH: an unknown field at any depth keeps its 422 (plain text) after P-C.
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.is_string(), "plain text as before: {body}");
+        assert!(body.to_string().contains("temprature"), "{body}");
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/admin/models/add",
+            r#"{"model_id": "m-new", "vram_gb": 0.0, "sampling": {"temprature": 1}}"#,
+        )
+        .await;
+        // models/add: the 400 `invalid_body` envelope since P-C (422 before), naming the typo.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_body", "{body}");
+        assert!(body.to_string().contains("temprature"), "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(mm.model_state("m-new").is_none());
+        // A value out of range is the handler's own 400.
+        let (status, _) = send(
+            &app,
+            "PATCH",
+            "/v1/admin/models/m-text",
+            r#"{"sampling": {"temperature": 3}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// Release the simulated request after a short delay, so a forced eviction has something to
     /// drain.
     fn release_later(permit: tokio::sync::OwnedSemaphorePermit) {
@@ -3698,6 +4450,63 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             drop(permit);
         });
+    }
+
+    /// C8: the admin load of a model whose `chat_template` override cannot be read answers 404
+    /// with a body naming the model and the path; after a reload that edits a loaded model's
+    /// `chat_template`, the reload response lists it in `models_not_applied`.
+    #[tokio::test]
+    async fn chat_template_load_error_and_reload_notice_reach_the_admin_responses() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let write = |tpl: &str| {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "models_dir": "/tmp/test-admin-tpl-models", "device": "CPU",
+                    "total_vram_gb": 22.5,
+                    "models": {
+                        "tpl-bad": {"vram_gb": 1.0, "chat_template": "/nonexistent/c8/admin.jinja"},
+                        "tpl-ok": {"vram_gb": 1.0, "chat_template": tpl}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        std::fs::write(dir.path().join("a.jinja"), "A").unwrap();
+        std::fs::write(dir.path().join("b.jinja"), "B").unwrap();
+        write("a.jinja");
+        let cfg = crate::model_manager::Config::load(&path).unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap()
+            .with_config_path(path.clone()),
+        );
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        let (status, body) = send(&app, "POST", "/v1/admin/models/tpl-bad/load", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let text = body.as_str().unwrap_or_default();
+        assert!(text.contains("'tpl-bad'"), "{text}");
+        assert!(text.contains("/nonexistent/c8/admin.jinja"), "{text}");
+
+        let (status, body) = send(&app, "POST", "/v1/admin/models/tpl-ok/load", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        write("b.jinja");
+        let (status, json) = send(&app, "POST", "/v1/admin/config/reload", "").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["models_not_applied"],
+            serde_json::json!([{"model": "tpl-ok", "fields": ["chat_template"]}]),
+            "{json}"
+        );
     }
 
     /// Unload: a busy model is refused with the JSON 409 `model_busy` unless `?force=true`,
@@ -3720,6 +4529,301 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(mm.list_models().iter().any(|m| m.id == "busy-a"
             && m.state == crate::model_manager::ModelState::NotLoaded));
+    }
+
+    /// `send` with an optional `Accept` header, returning the raw body and its content type.
+    async fn send_accept(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+        accept: Option<&str>,
+    ) -> (StatusCode, String, Vec<u8>) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        let req = req.body(axum::body::Body::from(body.to_owned())).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, ctype, bytes.to_vec())
+    }
+
+    fn outcome(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(bytes)))
+    }
+
+    #[test]
+    fn json_is_wanted_only_for_an_explicit_application_json() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(axum::http::header::ACCEPT, v.parse().unwrap());
+            m
+        };
+        assert!(!wants_json(&HeaderMap::new()));
+        assert!(!wants_json(&h("*/*")));
+        assert!(!wants_json(&h("text/plain")));
+        assert!(!wants_json(&h("application/jsonx")));
+        assert!(wants_json(&h("application/json")));
+        assert!(wants_json(&h("text/plain, Application/JSON;q=0.9")));
+        assert!(wants_json(&h("application/json; charset=utf-8")));
+        // axios' default: names application/json, so it gets the JSON (INTERFACE.md says so).
+        assert!(wants_json(&h("application/json, text/plain, */*")));
+        assert!(!wants_json(&h("application/json;q=0")));
+        assert!(!wants_json(&h("application/json; q=0.0, text/plain")));
+        // Two Accept headers: either may name it.
+        let mut two = HeaderMap::new();
+        two.append(axum::http::header::ACCEPT, "text/plain".parse().unwrap());
+        two.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        assert!(wants_json(&two));
+        let mut neither = HeaderMap::new();
+        neither.append(axum::http::header::ACCEPT, "text/plain".parse().unwrap());
+        neither.append(axum::http::header::ACCEPT, "*/*".parse().unwrap());
+        assert!(!wants_json(&neither));
+    }
+
+    /// V1-rv P1: without `Accept: application/json` every route answers the plain text byte for
+    /// byte as before (no header, or `*/*` as curl sends); with it, the JSON outcome.
+    #[tokio::test]
+    async fn eviction_routes_answer_plain_text_unless_json_is_asked_for() {
+        let (app, permit, _mm) = busy_router().await;
+        drop(permit);
+        for accept in [None, Some("*/*")] {
+            let (status, ctype, body) = send_accept(
+                &app,
+                "DELETE",
+                "/v1/admin/models/busy-a?force=true",
+                "",
+                accept,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"model 'busy-a' evicted", "{accept:?}");
+            assert!(ctype.starts_with("text/plain"), "{ctype}");
+            let (status, _, body) =
+                send_accept(&app, "POST", "/v1/admin/models/busy-a/load", "", accept).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body.starts_with(b"model 'busy-a' loaded"),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let (status, _, body) = send_accept(
+            &app,
+            "POST",
+            "/v1/admin/models/busy-a/resize",
+            r#"{"kv_cache_gb": 2.0}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.starts_with(b"model 'busy-a' resized to "),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, _, body) =
+            send_accept(&app, "DELETE", "/v1/admin/models/busy-a/register", "", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"model 'busy-a' deregistered");
+    }
+
+    /// V1-rv P1: the JSON outcome of an unload — nothing running, a request that finished
+    /// during the drain, and one aborted at the (shortened) drain deadline.
+    #[tokio::test]
+    async fn unload_json_reports_nothing_running_drained_and_aborted() {
+        let json = Some("application/json");
+        let (app, permit, mm) = busy_router().await;
+        drop(permit);
+        let (status, ctype, body) =
+            send_accept(&app, "DELETE", "/v1/admin/models/busy-a", "", json).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ctype.starts_with("application/json"), "{ctype}");
+        let v = outcome(&body);
+        assert_eq!(v["evicted"], serde_json::json!(["busy-a"]));
+        assert_eq!(v["forced"], false);
+        assert_eq!(v["drained_s"], 0.0);
+        assert_eq!(v["aborted"], 0);
+        assert!(v["teardown_ms"].is_u64(), "{v}");
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "evicted",
+                "forced",
+                "drained_s",
+                "aborted",
+                "teardown_ms",
+                "message"
+            ],
+            "the field set is fixed (`message` since 0.9.1)"
+        );
+        assert_eq!(v["message"], "model 'busy-a' evicted");
+
+        // Drained: the request finishes ~150 ms into the drain.
+        mm.load_model("busy-a").await.unwrap();
+        let permit = match mm.get_chat_context("busy-a").unwrap().handle {
+            EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+            other => panic!("busy-a must be a TextGen mock, got {other:?}"),
+        };
+        release_later(permit);
+        let (status, _, body) = send_accept(
+            &app,
+            "DELETE",
+            "/v1/admin/models/busy-a?force=true",
+            "",
+            json,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v = outcome(&body);
+        assert_eq!(v["forced"], true);
+        assert!(v["drained_s"].as_f64().unwrap() > 0.0, "{v}");
+        assert_eq!(v["aborted"], 0, "{v}");
+
+        // Aborted: still running at the drain deadline.
+        mm.load_model("busy-a").await.unwrap();
+        mm.set_evict_drain_deadline_for_test(Duration::from_millis(200));
+        let permit = match mm.get_chat_context("busy-a").unwrap().handle {
+            EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+            other => panic!("busy-a must be a TextGen mock, got {other:?}"),
+        };
+        let (status, _, body) = send_accept(
+            &app,
+            "DELETE",
+            "/v1/admin/models/busy-a?force=true",
+            "",
+            json,
+        )
+        .await;
+        drop(permit);
+        assert_eq!(status, StatusCode::OK);
+        let v = outcome(&body);
+        assert_eq!(v["evicted"], serde_json::json!(["busy-a"]));
+        assert_eq!(v["aborted"], 1, "{v}");
+        assert!(v["drained_s"].as_f64().unwrap() >= 0.15, "{v}");
+    }
+
+    /// V1-rv P1: deregister and resize answer the same JSON; a deregistration of a model that
+    /// is not loaded evicted nothing.
+    #[tokio::test]
+    async fn deregister_and_resize_answer_the_json_outcome() {
+        let json = Some("application/json");
+        let (app, permit, _mm) = busy_router().await;
+        release_later(permit);
+        let (status, _, body) = send_accept(
+            &app,
+            "POST",
+            "/v1/admin/models/busy-a/resize",
+            r#"{"kv_cache_gb": 2.0, "force": true}"#,
+            json,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v = outcome(&body);
+        assert_eq!(v["evicted"], serde_json::json!(["busy-a"]));
+        assert_eq!(v["forced"], true);
+        assert!(v["drained_s"].as_f64().unwrap() > 0.0, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("model 'busy-a' resized to "),
+            "the plain-text sentence, achieved pool included: {v}"
+        );
+
+        let (status, _, body) =
+            send_accept(&app, "DELETE", "/v1/admin/models/busy-a", "", json).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body2) =
+            send_accept(&app, "DELETE", "/v1/admin/models/busy-a/register", "", json).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body2)
+        );
+        assert_eq!(outcome(&body)["evicted"], serde_json::json!(["busy-a"]));
+        let v = outcome(&body2);
+        assert_eq!(v["evicted"], serde_json::json!([]));
+        assert_eq!(v["drained_s"], 0.0);
+        assert_eq!(v["aborted"], 0);
+        assert_eq!(v["teardown_ms"], 0);
+        assert_eq!(v["message"], "model 'busy-a' deregistered");
+    }
+
+    /// V1-rv P1: a forced load's JSON names the victim it evicted for room.
+    #[tokio::test]
+    async fn forced_load_json_names_its_victims() {
+        use crate::model_manager::lifecycle::MockEngineFactory;
+        let cfg: crate::model_manager::Config = serde_json::from_value(serde_json::json!({
+            "models_dir": "/tmp/test-admin-force-models", "device": "CPU", "total_vram_gb": 17.0,
+            "cache_size_gb": 1.0, "eviction_grace_secs": 0.0, "vram_safety_margin_gb": 0.0,
+            "min_kv_cache_gb": 0.0,
+            "models": { "a": {"vram_gb": 5.0}, "b": {"vram_gb": 5.0}, "incoming": {"vram_gb": 8.0} }
+        }))
+        .unwrap();
+        let mm = std::sync::Arc::new(
+            crate::model_manager::ModelManager::new(
+                cfg,
+                std::sync::Arc::new(MockEngineFactory::default()),
+            )
+            .await
+            .unwrap(),
+        );
+        mm.load_model("a").await.unwrap();
+        mm.load_model("b").await.unwrap();
+        let hold = |id: &str| match mm.get_chat_context(id).unwrap().handle {
+            EngineHandleKind::TextGen(h) => h.occupy_slot_for_test().unwrap(),
+            other => panic!("{id} must be a TextGen mock, got {other:?}"),
+        };
+        let (pa, pb) = (hold("a"), hold("b"));
+        let app = crate::create_router(
+            crate::app_state::AppState::new().with_model_manager(std::sync::Arc::clone(&mm)),
+        );
+        release_later(pa);
+        release_later(pb);
+        let (status, _, body) = send_accept(
+            &app,
+            "POST",
+            "/v1/admin/models/incoming/load",
+            r#"{"force": true}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v = outcome(&body);
+        assert_eq!(v["forced"], true);
+        let evicted = v["evicted"].as_array().unwrap();
+        assert_eq!(evicted.len(), 1, "{v}");
+        assert!(["a", "b"].contains(&evicted[0].as_str().unwrap()), "{v}");
+        assert!(v["drained_s"].as_f64().unwrap() > 0.0, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("model 'incoming' loaded"),
+            "{v}"
+        );
+        assert_eq!(v["aborted"], 0, "{v}");
     }
 
     /// Deregister: same contract as unload.

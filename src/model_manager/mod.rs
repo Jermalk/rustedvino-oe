@@ -47,8 +47,10 @@ pub(crate) mod kv_precision;
 pub(crate) mod kv_profile;
 pub(crate) mod kv_ratchet;
 pub(crate) mod lifecycle;
+pub mod on_demand;
 pub(crate) mod placement;
 pub(crate) mod poison_diag;
+pub mod sampling;
 pub mod stub_engines;
 pub(crate) mod template;
 mod vram;
@@ -67,10 +69,20 @@ pub use config::{Config, ReasoningParser, SupervisorConfig};
 pub use engine::{EngineHandleKind, ManagedEngine, ModelKind};
 
 /// True when an `OpenVINO`/`OpenCL` error string indicates the GPU context is
-/// permanently wedged (OOM-class). Both markers below mean the `OpenCL` context
+/// permanently wedged (OOM-class). Each marker below means the `OpenCL` context
 /// cannot recover for this process and every subsequent call will fail:
 ///   `CL_OUT_OF_RESOURCES` (-5)  — allocator failed (VRAM OOM)
 ///   `CL_INVALID_EVENT`    (-58) — context already poisoned; retry also fails
+///   `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST` (-14) — see below
+///
+/// The -14 form (seen live 2026-11-15, an 8 MP image on a vision model on the Arc 140V iGPU,
+/// in the server log): the GPU ran out of memory, the explicit
+/// `CL_OUT_OF_RESOURCES` line went to `OpenVINO`'s own stderr, and the exception that reached us
+/// said only `[GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`
+/// (a kernel the waited-on event depended on had failed). Unclassified, the request was an opaque
+/// 500, the later unload tore the engine down on the dead context, the destructor threw
+/// (`clFinish` -5), `std::terminate` aborted the process and the driver kept the memory. Matched
+/// by its symbolic name only, like the other markers.
 ///
 /// A third form of the same failure (seen live 2026-10-08, kernel `xe ... VM worker error: -12`
 /// = ENOMEM at the same second): when the driver cannot allocate during generation, oneDNN's
@@ -86,6 +98,7 @@ pub use engine::{EngineHandleKind, ManagedEngine, ModelKind};
 pub(crate) fn is_gpu_poison_error(msg: &str) -> bool {
     msg.contains("CL_OUT_OF_RESOURCES")
         || msg.contains("CL_INVALID_EVENT")
+        || msg.contains("CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST")
         || (msg.contains("intel_gpu") && msg.contains("could not execute a primitive"))
 }
 
@@ -131,6 +144,11 @@ fn genai_memory_budget_refusal(model_id: &str) -> ModelError {
 /// ceiling with zero contention — the same class of static-formula miss the
 /// VLM wedge below was built for, just on the plain CB path, where it
 /// previously had no self-heal at all.
+///
+/// A third field, `generated_tokens=G` (after `active_requests=`), says how many tokens the
+/// request had generated when the pool ran out. `G >= 1` means the pool filled from the answer,
+/// not the prompt: not a sizing miss, so no recovery and no ratchet (E2). A
+/// message without the field reads as "unknown" and keeps the solo recovery.
 pub(crate) const POOL_EXHAUSTED_MARKER: &str = "KV cache pool exhausted for this request";
 
 /// True when `msg` reports the CB scheduler's `GenerationStatus::IGNORED` —
@@ -173,6 +191,14 @@ pub(crate) fn kv_wedge_observed_prompt_tokens(msg: &str) -> Option<usize> {
 /// to be wrong in.
 pub(crate) fn pool_exhausted_active_requests(msg: &str) -> Option<usize> {
     extract_marker_field(msg, "active_requests=")
+}
+
+/// Extract the `generated_tokens=N` value `cb_engine.rs` embeds in a [`POOL_EXHAUSTED_MARKER`]
+/// message: how many tokens the request had generated when the pool ran out. `None` when the
+/// field is absent or malformed — the count is unknown, and callers keep the behaviour from
+/// before the field existed (E2).
+pub(crate) fn pool_exhausted_generated_tokens(msg: &str) -> Option<usize> {
+    extract_marker_field(msg, "generated_tokens=")
 }
 
 /// Substring marker for the VLM-path KV-admission wedge
@@ -251,6 +277,62 @@ const LOAD_EVICT_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 /// request's actual remaining generation time rather than rounding up to a
 /// coarse poll step.
 const EVICT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The drain of a normal eviction (see `evict_model_inner`): wait, bounded by `deadline`, for the
+/// engine's running requests to finish, then abort what is left. Returns how long it waited
+/// (exactly zero when nothing was running) and how many requests were still running when the
+/// deadline passed — the same number `rustedvino_eviction_aborted_requests_total` gains
+/// (on every engine kind).
+async fn drain_then_abort(
+    handle: &EngineHandleKind,
+    model_id: &str,
+    deadline: Instant,
+    drain: Duration,
+) -> (Duration, usize) {
+    let kind = handle.kind();
+    let mut drained = Duration::ZERO;
+    let drain_started = Instant::now();
+    if handle.as_managed().active() > 0 {
+        while handle.as_managed().active() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(EVICT_DRAIN_POLL_INTERVAL).await;
+        }
+        drained = drain_started.elapsed();
+    }
+    // One reading for the log, the counter and the caller's report, so the three agree.
+    let active = handle.as_managed().active();
+    if active > 0 {
+        tracing::warn!(
+            model_id,
+            kind = kind.label(),
+            active,
+            deadline_s = drain.as_secs(),
+            "eviction drain deadline exceeded — aborting remaining in-flight request(s)"
+        );
+        crate::metrics::record_eviction_aborted_requests(kind.label(), active);
+        handle.request_shutdown();
+    }
+    (drained, active)
+}
+
+/// What one finished eviction did (V1-rv P1): the facts come from the eviction
+/// path itself, per model, not from the server-wide counters. The admin unload, deregister,
+/// resize and load routes report them (`Accept: application/json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictionReport {
+    /// The evicted model.
+    pub model_id: String,
+    /// Time spent waiting for running requests to finish. Exactly zero when nothing was running
+    /// when the drain began (and on the stalled-engine and shutdown paths, which do not drain).
+    pub drained: Duration,
+    /// Requests still running when the drain deadline passed, on every engine kind:
+    /// exactly what `rustedvino_eviction_aborted_requests_total` gains. A continuous-batching text
+    /// engine aborts them (their clients see `model_unloading`); every other engine finishes or
+    /// fails them while the forced eviction waits for its thread. `0` on the stalled-engine and
+    /// shutdown paths, which have no drain deadline and do not move the counter.
+    pub aborted: usize,
+    /// Engine teardown: channel close, engine exit, pipeline destructor, join.
+    pub teardown_ms: u64,
+}
 use lifecycle::{EngineFactory, OvEngineFactory};
 use vram::MemoryTracker;
 
@@ -272,8 +354,9 @@ pub struct AddOutcome {
 /// Reasons a [`ModelManager::get_handle`] or related call can fail.
 ///
 /// The variants are fine-grained so HTTP handlers can map each to the
-/// right status code without string matching.
-#[derive(Debug, PartialEq, Eq)]
+/// right status code without string matching. `Clone` so a failed load's error can be handed
+/// to every request waiting on that load (F1b).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
     /// The model ID is not in the known-model registry (not in `vram_gb`).
     /// → HTTP 404
@@ -294,6 +377,17 @@ pub enum ModelError {
     /// doomed load fails cheaply instead of evicting a healthy model first.
     /// → HTTP 404
     FilesIncomplete(String, Vec<String>),
+    /// The model's configured `chat_template` override cannot be read (C8): the load is refused,
+    /// never served with a different template. Checked with [`Self::FilesMissing`], before any
+    /// VRAM reservation or eviction. → admin HTTP 404 (plain text naming the model and path)
+    TemplateUnreadable {
+        /// The model being loaded.
+        model: String,
+        /// The override's resolved path.
+        path: std::path::PathBuf,
+        /// The I/O error.
+        cause: String,
+    },
     /// The model exists but has not been loaded yet.
     /// → HTTP 503
     NotLoaded,
@@ -357,6 +451,13 @@ pub enum ModelError {
         /// The deadline that expired, seconds.
         secs: u64,
     },
+    /// This (CPU or NPU) model's engine stalled — no progress within the stall watchdog's
+    /// deadline (0.9.1 S1) — and is marked dead: its thread is presumed stuck in a call that does
+    /// not return. Requests, loads and unloads are refused while that thread is alive (its memory
+    /// stays booked); a restart clears it. Carries the model id. (A GPU model that stalls
+    /// answers [`Self::GpuPoisoned`] to requests instead.)
+    /// → HTTP 503 `model_unavailable`, no `Retry-After`
+    GenerationStalled(String),
     /// A load on this device has not returned for longer than its deadline (step 6b); new loads
     /// there are refused until it does. Requests to models already Ready are still served.
     /// → HTTP 503 `device_stalled` + `Retry-After`
@@ -383,6 +484,14 @@ impl std::fmt::Display for ModelError {
                 "model '{id}' is missing required files: {} — re-run the model conversion/export for this model",
                 missing.join(", ")
             ),
+            Self::TemplateUnreadable { model, path, cause } => write!(
+                f,
+                "model '{model}': its chat_template override {} cannot be read ({cause}); the load \
+                 is refused rather than serving a different template. Fix the file or the model's \
+                 `chat_template` setting (a relative path resolves against the config file's \
+                 directory)",
+                path.display()
+            ),
             Self::NotLoaded => write!(f, "model is not loaded"),
             Self::Loading => write!(f, "model is currently loading"),
             Self::Evicting => write!(f, "model is being evicted"),
@@ -391,6 +500,14 @@ impl std::fmt::Display for ModelError {
                 "GPU context poisoned (out of resources) — process restart required"
             ),
             Self::ShuttingDown => write!(f, "the server is stopping — no new model loads"),
+            Self::GenerationStalled(id) => write!(
+                f,
+                "model '{id}' stopped making progress: its engine stalled inside a call and is \
+                 marked dead; its memory stays booked until that call returns. Restart the \
+                 server (under `--supervise` the generation watchdog restarts the worker for a \
+                 CPU text or vision model, not for an NPU model); an unload + load works only if \
+                 the call has returned since"
+            ),
             Self::WrongKind(msg) | Self::InsufficientMemory(msg) => write!(f, "{msg}"),
             Self::EvictionIncomplete(id) => write!(
                 f,
@@ -511,6 +628,12 @@ struct ModelRecord {
     /// its device takes no new loads, and [`ModelManager::reap_stalled_loads`] commits or
     /// discards the result when it arrives. State stays `Loading`.
     load_stalled: bool,
+    /// 0.9.1 S1: `Some(the stalled engine's liveness)` while the record is `Evicting` because its
+    /// engine stalled, and the eviction is waiting for that engine's stuck thread to exit. Its
+    /// memory stays booked; status, loads and requests answer [`ModelError::GenerationStalled`]
+    /// until the thread exits (the eviction's join then reconciles the record to `NotLoaded`,
+    /// which clears this).
+    stuck_engine: Option<crate::stall_watch::EngineLiveness>,
     /// The typed submit handle — `Some` only when `state == Ready`.
     /// R1: [`EngineHandleKind::TextGen`] or [`EngineHandleKind::Vision`]; the
     /// enum is the seam that lets later phases store embedding / media handles
@@ -581,6 +704,11 @@ struct ModelRecord {
     /// `TextGen`. Stable for the process lifetime — used in `ModelInfo` so the
     /// admin listing shows kind for models that have never been loaded.
     configured_kind: ModelKind,
+    /// F1b (review N-1): `configured_kind` when it is certain — an explicit `kind` in the config
+    /// or a marker file found at registration — and `None` for the `TextGen` fallback of a
+    /// directory with no markers (files missing or incomplete at boot). Only a certain kind (or
+    /// `last_kind`) refuses a request before a load (`refuse_kind_before_load`).
+    certain_kind: Option<ModelKind>,
     /// The kind this model was last loaded as — `None` until its first
     /// successful load, then retained across eviction. Drives `model_loaded`
     /// in `metrics_snapshot`: an evicted model keeps reporting `model_loaded 0`
@@ -599,6 +727,15 @@ struct ModelRecord {
     /// first measured load or where the OS can't measure. An estimate: a
     /// concurrent load of another model lands in the same window.
     gpu_load_delta_bytes: Option<i64>,
+    /// C25: the same load split by a reading taken after engine construction and before the KV
+    /// warm-up ([`split_load_memory`]); the default (both `None`) when that reading was not taken
+    /// or not trusted, and the old formula then applies. Reset per load.
+    load_split: LoadMemorySplit,
+    /// C7 B.3: the part of this load's KV pool taken to be resident, GiB ([`resident_pool_gb`]):
+    /// what evicting the model is credited beyond its weights on the live system-RAM gate
+    /// ([`ram_credit_gb`]). Set at every commit of a load (`0.0` for a late commit, which has no
+    /// measurement or warm-up record); read only while the model is Ready.
+    kv_pool_resident_gb: f64,
     /// D-07: weight footprint (GB) learned from a measured load on the shared-memory
     /// `system` domain when it came out clearly above what admission charged: measured
     /// change in device memory minus the KV pool reserved by that load. `None` until such
@@ -658,6 +795,15 @@ struct ModelRecord {
     /// (`Default::default()`, all fields `None`) until then and for
     /// media/embedding models.
     generation_defaults: template::GenerationDefaults,
+    /// V5: the operator's `sampling` layer (`ModelPolicy::sampling`), kept in step with
+    /// the entry by registration, PATCH and config reload (hot: read per request).
+    sampling: Option<config::SamplingConfig>,
+    /// 0.9.1: the model's default thinking budget (`ModelPolicy::thinking_budget_tokens`), kept
+    /// in step with the entry by registration, PATCH and config reload (hot, like `sampling`).
+    thinking_budget_tokens: Option<u32>,
+    /// V5: the file layer (`generation_config.json`), read at registration so the
+    /// profile shows before the first load, and re-read at each load commit.
+    file_sampling: sampling::FileSampling,
     /// The model's native (trained/converted) context ceiling —
     /// `max_position_embeddings`, `rope_scaling`-adjusted — from
     /// [`template::read_native_context_limit`]. A hardware-independent model
@@ -673,14 +819,7 @@ struct ModelRecord {
     native_context_limit: Option<usize>,
 }
 
-/// True when `id` is a single path component: non-empty, not `.` or `..`, no separators, no NUL.
-fn is_plain_model_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && !id.contains(['/', '\\', '\0'])
-        && std::path::Path::new(id).components().count() == 1
-}
+use config::is_plain_model_id;
 
 /// True when a model's measured device memory is far enough above what admission charges for it to
 /// be worth a warning. Overshoots within 5 % or 0.75 GB (whichever is larger) are the noise of
@@ -717,13 +856,38 @@ fn cpu_rss_measurable() -> bool {
 }
 
 /// What evicting a model is credited to give back to the live system-RAM gate, GiB. Off `CPU`
-/// its weights: a KV pool is reserved in the tracker but allocated lazily. On `CPU`
+/// its weights plus the part of its KV pool known to be resident (`resident_pool_gb`, C7 B.3,
+/// [`resident_pool_gb`]): a pool is reserved in the tracker but allocated by the plugin only at the
+/// first generation, which the KV warm-up runs at load; an un-warmed pool is credited nothing, as
+/// before. On `CPU`
 /// (`cpu_resident_gb` is `Some`) the larger of its tracker allocation and what it was measured to
 /// hold: the eviction frees the resident memory and also ends the not-yet-resident rest that
 /// [`ModelManager::cpu_outstanding_gb`] subtracts for it, and the two together are exactly that.
 /// Every credit site goes through here, so the dry-run, the stop rule and the release wait agree.
-fn ram_credit_gb(weight_gb: f64, allocated_gb: f64, cpu_resident_gb: Option<f64>) -> f64 {
-    cpu_resident_gb.map_or(weight_gb, |resident| allocated_gb.max(resident))
+fn ram_credit_gb(
+    weight_gb: f64,
+    allocated_gb: f64,
+    cpu_resident_gb: Option<f64>,
+    resident_pool_gb: f64,
+) -> f64 {
+    cpu_resident_gb.map_or(weight_gb + resident_pool_gb.max(0.0), |resident| {
+        allocated_gb.max(resident)
+    })
+}
+
+/// C7 B.3: the part of a just-loaded model's KV pool (`booked_gb`, GiB) taken to be resident,
+/// in this order: (a) measured, the pool growth across the warm-up of a split load
+/// (`load_split.pool_resident_bytes`, C25), capped at the pool; (b) else the booked pool when the
+/// KV warm-up ran and succeeded (`GenAI` 2026.4.1 allocates the whole `cache_size` pool at the
+/// first scheduler step, which the warm-up is); (c) else `0.0`: warm-up off or failed, a
+/// draft-attached text engine (not warmed), CPU/NPU, an unmeasured late commit.
+fn resident_pool_gb(measured_bytes: Option<u64>, warm_up: Option<bool>, booked_gb: f64) -> f64 {
+    let booked = booked_gb.max(0.0);
+    if let Some(bytes) = measured_bytes {
+        #[allow(clippy::cast_precision_loss)] // memory sizes are far below 2^52 bytes
+        return (bytes as f64 / GIB_F64).min(booked);
+    }
+    if warm_up == Some(true) { booked } else { 0.0 }
 }
 
 /// What a closed [`SoloWindow`] measured, bytes: the change in anonymous memory, but only when
@@ -755,6 +919,55 @@ struct SoloWindow {
 }
 
 impl ModelRecord {
+    /// V5b: this model's effective sampling profile (operator over file over the server
+    /// default). Cheap (no I/O): both layers live on the record.
+    fn sampling_profile(&self) -> sampling::SamplingProfile {
+        sampling::SamplingProfile::resolve(self.sampling.as_ref(), &self.file_sampling)
+    }
+
+    /// V5a's `do_sample` rule re-checked against the file layer just read at load: a model
+    /// file re-exported since the operator set `top_p`/`top_k` without a temperature leaves the
+    /// engine sampling at its own T 1.0. `Some(error)` when it no longer holds.
+    fn sampling_rule_error(&self, model_id: &str) -> Option<anyhow::Error> {
+        let entry = config::ModelEntry {
+            policy: config::ModelPolicy {
+                sampling: self.sampling,
+                ..config::ModelPolicy::default()
+            },
+            ..config::ModelEntry::default()
+        };
+        config::check_sampling_do_sample(
+            model_id,
+            &entry,
+            self.file_sampling.samples_with_temperature(),
+        )
+        .err()
+    }
+
+    /// WARN when [`sampling_rule_error`](Self::sampling_rule_error) finds the rule broken (the
+    /// model still loads; boot and reload WARN the same way).
+    fn warn_if_sampling_rule_broken(&self, model_id: &str) {
+        if let Some(e) = self.sampling_rule_error(model_id) {
+            tracing::warn!(
+                model_id,
+                error = %e,
+                "sampling: top_p/top_k are set without a temperature and the model's \
+                 generation_config.json does not turn sampling on — a request that sends no \
+                 temperature samples at the engine's default temperature 1.0; set \
+                 sampling.temperature, or remove top_p/top_k"
+            );
+        }
+    }
+
+    /// The model runs on the NPU engine ([`EngineHandleKind::is_npu`] once loaded; before
+    /// that, its device is `NPU`/`NPU.n`): presence/frequency penalties from the operator
+    /// layer are not forwarded there.
+    fn is_npu(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map_or_else(|| self.device.starts_with("NPU"), EngineHandleKind::is_npu)
+    }
+
     /// Pick the reasoning parser from the chat template when the policy did not set one (see
     /// [`template::auto_reasoning_parser`]) and say so in the log.
     fn auto_detect_reasoning_parser(&mut self, model_id: &str, family: ModelFamily) {
@@ -815,21 +1028,29 @@ impl ModelRecord {
     /// `after` is the reading taken right after the load, before the models lock: on a discrete
     /// GPU only this card's dedicated memory counts (system-memory regions, the iGPU and the NPU
     /// move for reasons that are not this load); elsewhere the process total.
+    ///
+    /// C25: `r.mid` is the reading taken after engine construction, before the warm-up (`None`
+    /// when the engine does not report one); with the pool this load booked it splits the delta
+    /// into measured weights and the part of the pool that became resident
+    /// ([`split_load_memory`]). Only a clean window (`r.window_clean`) is measured and split.
+    /// Returns the split's outcome (`None` when nothing was measured), for the load log.
     fn note_gpu_load(
         &mut self,
-        before: Option<u64>,
-        after: Option<u64>,
-        window: crate::gpu_memory::MeasureWindow,
-    ) {
+        r: &LoadReadings,
+    ) -> Option<Result<LoadMemorySplit, SplitFallback>> {
         #[allow(clippy::cast_possible_wrap)] // device memory < 2^63 bytes
         {
-            self.gpu_load_delta_bytes = before
-                .zip(after)
+            self.gpu_load_delta_bytes = r
+                .before
+                .zip(r.after)
                 .map(|(b, a)| a as i64 - b as i64)
-                .filter(|&d| d >= 0 && window.is_clean());
+                .filter(|&d| d >= 0 && r.window_clean);
         }
+        let outcome = self.gpu_load_delta_bytes.map(|_| split_load_memory(r));
+        self.load_split = outcome.and_then(Result::ok).unwrap_or_default();
         self.gpu_over_budget_warned
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        outcome
     }
 
     /// Whether loading this model reserves a continuous-batching KV pool —
@@ -846,7 +1067,7 @@ impl ModelRecord {
     /// the moment's free RAM.
     fn needs_kv_pool(&self) -> bool {
         match self.configured_kind {
-            ModelKind::TextGen => self.device != "NPU",
+            ModelKind::TextGen => !is_npu_device(&self.device),
             ModelKind::Vision => true,
             _ => false,
         }
@@ -929,6 +1150,12 @@ pub struct ChatContext {
     /// `generation_config.json` didn't pass [`template::load_generation_defaults`]'s
     /// gate.
     pub generation_defaults: template::GenerationDefaults,
+    /// V5b: the model's effective sampling profile (operator over file over the
+    /// server default); the per-request client rules run against it.
+    pub sampling: sampling::SamplingProfile,
+    /// 0.9.1: the model's configured default thinking budget (`None` = none); the request's own
+    /// controls override it (`crate::thinking_budget::resolve`).
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 // ---- Public info type (for /v1/models) --------------------------------
@@ -1160,6 +1387,297 @@ fn measured_weights_mib(load_delta_bytes: Option<i64>, pool_gb: f64) -> Option<u
     Some(weights >> 20)
 }
 
+/// Weights of a measured load, MiB (`vram_measured_mib`): the directly measured weights when the
+/// load was split ([`split_load_memory`]), else [`measured_weights_mib`] (`delta - pool_gb`).
+/// Present exactly when [`measured_weights_mib`] is (the field's presence is unchanged by C25):
+/// `None` without a clean measurement, or when the delta is smaller than the booked pool.
+fn load_weights_mib(
+    load_delta_bytes: Option<i64>,
+    split: LoadMemorySplit,
+    pool_gb: f64,
+) -> Option<u64> {
+    let old = measured_weights_mib(load_delta_bytes, pool_gb)?;
+    Some(split.weights_bytes.map_or(old, |w| w >> 20))
+}
+
+/// What a loaded model holds with its whole pool, bytes, before runtime growth: the measured load
+/// delta, or, when the split shows the booked pool (`pool_bytes`) was not resident at the end of
+/// the load, the measured weights plus the booked pool (C25: the pool is allocated later, at the
+/// first request, so the delta alone misses it).
+fn load_footprint_bytes(delta: i64, split: LoadMemorySplit, pool_bytes: u64) -> i64 {
+    match split.weights_bytes {
+        Some(w) if !split.pool_seen_resident(pool_bytes) => {
+            i64::try_from(w.saturating_add(pool_bytes)).unwrap_or(i64::MAX)
+        }
+        _ => delta,
+    }
+}
+
+/// 0.9.1 rc.2: log at DEBUG why a load's memory was not measured ([`ModelRecord::note_gpu_load`]
+/// returned `None`). The usual cause is a load starting within
+/// [`crate::gpu_memory::QUIET_AFTER_RELEASE`] of an eviction; before this line the skip was silent.
+fn log_load_not_measured(
+    model_id: &str,
+    r: &LoadReadings,
+    window: crate::gpu_memory::MeasureWindow,
+    window_quiet: bool,
+) {
+    use crate::gpu_memory::WindowTaint;
+    let taint = window.taint();
+    let since_release_s = match taint {
+        Some(WindowTaint::QuietPeriod { since_release }) => Some(since_release.as_secs_f64()),
+        _ => None,
+    };
+    let reason = match (taint, window_quiet, r.before.zip(r.after)) {
+        (Some(t), _, _) => t.reason(),
+        (None, false, _) => "lease_active_during_window",
+        (None, true, None) => "no_reading",
+        (None, true, Some(_)) => "negative_delta",
+    };
+    tracing::debug!(
+        model_id,
+        reason,
+        since_release_s,
+        quiet_after_release_s = crate::gpu_memory::QUIET_AFTER_RELEASE.as_secs(),
+        "load memory not measured: vram_measured_mib and gpu_memory_estimate_gb stay absent until \
+         a measured load (METRICS.md, \"Measured device memory\")"
+    );
+}
+
+/// C25: log which way a load's memory was measured (`outcome` from
+/// [`ModelRecord::note_gpu_load`]; nothing when the load was not measured). INFO for an engine
+/// with a KV pool (vision, text), DEBUG for the other kinds, where the split never applies.
+/// Warns when a vision split saw (almost) no pool appear although the warm-up ran and succeeded:
+/// `GenAI` 2026.4.1 allocates the pool at that first generate, so the pool may have been built at
+/// construction on this box or version, and the weights figure would then include it.
+fn log_load_memory_split(
+    model_id: &str,
+    r: &LoadReadings,
+    outcome: Option<Result<LoadMemorySplit, SplitFallback>>,
+) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    let pool_mib = r.pool_bytes >> 20;
+    let delta_mib = r
+        .before
+        .zip(r.after)
+        .map_or(0, |(b, a)| a.saturating_sub(b) >> 20);
+    let with_pool = r.engine.is_some() && r.pool_bytes > 0;
+    match outcome {
+        Ok(split) => {
+            let weights_mib = split.weights_bytes.unwrap_or(0) >> 20;
+            let pool_resident_mib = split.pool_resident_bytes.unwrap_or(0) >> 20;
+            tracing::info!(
+                model_id,
+                path = "direct",
+                weights_mib,
+                pool_resident_mib,
+                pool_mib,
+                delta_mib,
+                "load memory measured: weights across engine construction, pool across the warm-up"
+            );
+            if vision_pool_absent_after_warm_up(r, split) {
+                tracing::warn!(
+                    model_id,
+                    weights_mib,
+                    pool_resident_mib,
+                    pool_mib,
+                    "the KV warm-up succeeded but the vision pool did not appear during it: the \
+                     pool may have been built at construction (then vram_measured_mib includes \
+                     it); check on hardware"
+                );
+            }
+        }
+        Err(why) if with_pool => tracing::info!(
+            model_id,
+            path = "fallback",
+            reason = why.reason(),
+            pool_mib,
+            delta_mib,
+            "load memory measured: weights = load delta minus the booked pool"
+        ),
+        Err(why) => tracing::debug!(
+            model_id,
+            path = "fallback",
+            reason = why.reason(),
+            delta_mib,
+            "load memory measured (no KV pool)"
+        ),
+    }
+}
+
+/// C25: a vision split in which (almost) none of the pool appeared (under 10 %) although the
+/// KV warm-up ran and succeeded: the case [`log_load_memory_split`] warns about.
+fn vision_pool_absent_after_warm_up(r: &LoadReadings, split: LoadMemorySplit) -> bool {
+    r.engine == Some(PoolEngine::Vision)
+        && r.warm_up == Some(true)
+        && split
+            .pool_resident_bytes
+            .is_some_and(|b| b.saturating_mul(10) < r.pool_bytes)
+}
+
+/// C25: a load's device-memory change split at the reading taken after engine construction and
+/// before the KV warm-up. Both `None` = not split: the old formula (`delta - booked pool`) applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoadMemorySplit {
+    /// Weights (and construction-time buffers) measured directly: `mid - before`, bytes.
+    weights_bytes: Option<u64>,
+    /// The part of the booked pool that became resident during the warm-up: `after - mid`,
+    /// capped at the booked pool, bytes.
+    pool_resident_bytes: Option<u64>,
+}
+
+impl LoadMemorySplit {
+    /// Whether the booked pool (`pool_bytes`) was seen resident: at least 90 % of it appeared
+    /// during the warm-up. `false` when not split.
+    fn pool_seen_resident(self, pool_bytes: u64) -> bool {
+        self.pool_resident_bytes
+            .is_some_and(|r| r.saturating_mul(10) >= pool_bytes.saturating_mul(9))
+    }
+}
+
+/// C25: which engine's KV pool a load split is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolEngine {
+    /// The vision (VLM) engine.
+    Vision,
+    /// The continuous-batching text engine.
+    Text,
+}
+
+/// C25: everything one load's memory measurement needs (the load window's readings and what is
+/// known about the engine and its pool).
+#[derive(Clone, Copy, Debug, Default)]
+struct LoadReadings {
+    /// Device memory before the load (`None` when not measured: not quiet, or unreadable).
+    before: Option<u64>,
+    /// After engine construction, before the KV warm-up (`None` when the engine reported no such
+    /// moment).
+    mid: Option<u64>,
+    /// After the load.
+    after: Option<u64>,
+    /// Nothing else changed device memory during the window ([`crate::gpu_memory::MeasureWindow`]
+    /// and no request lease).
+    window_clean: bool,
+    /// The KV pool the load booked, bytes.
+    pool_bytes: u64,
+    /// The engine whose pool this is; `None` for a kind without a KV pool.
+    engine: Option<PoolEngine>,
+    /// Size of the model's weight files on disk (top-level `*.bin`), bytes: a sanity bound only.
+    weights_on_disk: Option<u64>,
+    /// `Some(succeeded)` when the KV warm-up ran; `None` when it did not.
+    warm_up: Option<bool>,
+}
+
+/// C25: why a load was not split (it is then measured the old way, `delta - booked pool`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitFallback {
+    /// The engine reported no post-construction moment (a draft-attached text engine, CPU/NPU,
+    /// other kinds, a factory without the hook).
+    NoMidReading,
+    /// The `before` or `after` reading is missing.
+    MissingReading,
+    /// The load booked no pool.
+    NoPool,
+    /// The readings are not monotonic (`before <= mid <= after`): noise, mostly on a
+    /// shared-memory box, where the reading is all of the process's GPU-driver memory.
+    NotMonotonic,
+    /// The warm-up grew memory by more than twice the pool plus 1 GiB: noise.
+    AbsurdWarmUpGrowth,
+    /// Text engine: less than 90 % of the pool appeared during the warm-up while construction
+    /// took at least the pool, so the construction figure may hold (part of) the pool.
+    TextPoolNotSeenResident,
+    /// Vision engine: construction took at least the weight files plus 90 % of the pool, so it
+    /// probably built the pool.
+    VisionAboveDiskSize,
+}
+
+impl SplitFallback {
+    /// The `reason` field of the load log.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NoMidReading => "no_mid_reading",
+            Self::MissingReading => "missing_reading",
+            Self::NoPool => "no_pool",
+            Self::NotMonotonic => "not_monotonic",
+            Self::AbsurdWarmUpGrowth => "absurd_warm_up_growth",
+            Self::TextPoolNotSeenResident => "text_pool_not_seen_resident",
+            Self::VisionAboveDiskSize => "vision_above_disk_size",
+        }
+    }
+}
+
+/// C25: split a load's device-memory readings (`before` the load, `mid` after engine construction
+/// and before the KV warm-up, `after` the load) given the pool the load booked: weights =
+/// `mid - before`, resident pool = `after - mid` capped at the pool.
+///
+/// In `GenAI` 2026.4.1 both engines allocate their KV tensors at the first scheduler step
+/// (`Scheduler::schedule` → `allocate_cache_if_needed`, the only call site), i.e. at the warm-up,
+/// not at construction; the B70 showed a vision pool appearing in full at the first request.
+/// The guards below protect against a version or box where that does not hold. Falls back
+/// ([`SplitFallback`]) on a missing reading, no pool, non-monotonic readings, an absurd warm-up
+/// growth, and:
+/// - text engine: unless at least 90 % of the pool appeared during the warm-up, or construction
+///   took less than the pool (then it cannot hold the pool);
+/// - vision engine: when construction took at least the weight files on disk plus 90 % of the
+///   pool. Under that bound "nothing appeared during the warm-up" is accepted: it is the case this
+///   split exists for (warm-up off, failed, or not allocating).
+fn split_load_memory(r: &LoadReadings) -> Result<LoadMemorySplit, SplitFallback> {
+    const GIB: u64 = 1 << 30;
+    let (Some(engine), Some(mid)) = (r.engine, r.mid) else {
+        return Err(SplitFallback::NoMidReading);
+    };
+    let (Some(before), Some(after)) = (r.before, r.after) else {
+        return Err(SplitFallback::MissingReading);
+    };
+    let pool = r.pool_bytes;
+    if pool == 0 {
+        return Err(SplitFallback::NoPool);
+    }
+    if before > mid || mid > after {
+        return Err(SplitFallback::NotMonotonic);
+    }
+    let (weights, growth) = (mid - before, after - mid);
+    if growth > pool.saturating_mul(2).saturating_add(GIB) {
+        return Err(SplitFallback::AbsurdWarmUpGrowth);
+    }
+    let split = LoadMemorySplit {
+        weights_bytes: Some(weights),
+        pool_resident_bytes: Some(growth.min(pool)),
+    };
+    match engine {
+        PoolEngine::Text if !split.pool_seen_resident(pool) && weights >= pool => {
+            Err(SplitFallback::TextPoolNotSeenResident)
+        }
+        PoolEngine::Vision
+            if r.weights_on_disk.is_some_and(|disk| {
+                weights >= disk.saturating_add(pool.saturating_mul(9) / 10)
+            }) =>
+        {
+            Err(SplitFallback::VisionAboveDiskSize)
+        }
+        _ => Ok(split),
+    }
+}
+
+/// C25: the size of a model's weight files, bytes: every top-level `*.bin` in `model_dir` (the
+/// engine's IR weights; tokenizer `.bin` files are small and only loosen the bound). `None` when
+/// the directory cannot be read or holds none. A sanity bound for [`split_load_memory`], never
+/// reported. Symlinks are followed (`fs::metadata`, not `DirEntry::metadata`): an HF-cache-style
+/// directory links its `.bin` files into a blob store.
+fn weights_on_disk_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    let total: u64 = std::fs::read_dir(model_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .filter_map(|e| std::fs::metadata(e.path()).ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .sum();
+    (total > 0).then_some(total)
+}
+
 /// Share of the pool's capacity a single prompt may use: the rest covers block rounding.
 const GATE_POOL_FRACTION_PERCENT: usize = 95;
 
@@ -1206,6 +1724,42 @@ impl GateFiles {
     }
 }
 
+/// What registering a model reads from its directory (blocking file I/O): the kind (the
+/// configured one, else detected from the files), the V5 sampling file layer (text-generating
+/// kinds only) and the native context limit.
+#[derive(Clone, Copy)]
+struct RegistrationFiles {
+    kind: ModelKind,
+    /// `kind` is not the fallback (see [`ModelRecord::kind_known`]).
+    kind_known: bool,
+    file_sampling: sampling::FileSampling,
+    native_context_limit: Option<usize>,
+}
+
+impl RegistrationFiles {
+    /// Read them (call off the async runtime).
+    fn read(
+        factory: &dyn EngineFactory,
+        model_dir: &std::path::Path,
+        entry: &config::ModelEntry,
+    ) -> Self {
+        let explicit = entry.kind.as_deref().and_then(ModelKind::from_label);
+        let kind_known = explicit.is_some() || factory.detect_kind_certain(model_dir).is_some();
+        let kind = explicit.unwrap_or_else(|| factory.detect_kind(model_dir));
+        let file_sampling = if matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+            sampling::load_file_sampling(model_dir)
+        } else {
+            sampling::FileSampling::default()
+        };
+        Self {
+            kind,
+            kind_known,
+            file_sampling,
+            native_context_limit: template::read_native_context_limit(model_dir),
+        }
+    }
+}
+
 /// The per-model files a load commit needs besides the limit's: the chat template (override or
 /// shipped, else the generic fallback), the special tokens and the shipped sampling defaults. Read on
 /// the blocking pool with [`GateFiles`], so the commit does no file I/O on the async runtime.
@@ -1217,6 +1771,8 @@ struct ModelFiles {
     special_tokens: (String, String),
     /// `generation_config.json` sampling defaults (text and vision models only).
     generation_defaults: template::GenerationDefaults,
+    /// V5: the whole file layer (package, `do_sample`, penalty, stub flag).
+    file_sampling: sampling::FileSampling,
 }
 
 impl ModelFiles {
@@ -1227,21 +1783,28 @@ impl ModelFiles {
             template: template::FALLBACK_TEMPLATE.to_owned(),
             special_tokens: (String::new(), String::new()),
             generation_defaults: template::GenerationDefaults::default(),
+            file_sampling: sampling::FileSampling::default(),
         }
     }
 
     /// Read them (blocking file I/O: call from `spawn_blocking`). The template and the sampling
-    /// defaults only for text and vision models (media models ship neither); an unreadable
-    /// template warns and falls back to the generic one.
+    /// defaults only for text and vision models (media models ship neither). `template_override`
+    /// is the configured override's content, already read by the load's pre-flight (an unreadable
+    /// override refused the load there, C8); without one, the model directory's template is read,
+    /// and a model that ships none warns and gets the generic fallback.
     fn read(
         model_id: &str,
         model_dir: &std::path::Path,
         kind: ModelKind,
-        template_override: Option<&std::path::Path>,
+        template_override: Option<&str>,
     ) -> Self {
         let generates = matches!(kind, ModelKind::TextGen | ModelKind::Vision);
-        let template = if generates {
-            template::load_chat_template_with_override(model_dir, template_override)
+        let template = if !generates {
+            template::FALLBACK_TEMPLATE.to_owned()
+        } else if let Some(t) = template_override {
+            t.to_owned()
+        } else {
+            template::load_chat_template_with_override(model_dir, None)
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         model_id,
@@ -1250,17 +1813,17 @@ impl ModelFiles {
                     );
                     template::FALLBACK_TEMPLATE.to_owned()
                 })
+        };
+        let file_sampling = if generates {
+            sampling::load_file_sampling(model_dir)
         } else {
-            template::FALLBACK_TEMPLATE.to_owned()
+            sampling::FileSampling::default()
         };
         Self {
             template,
             special_tokens: template::load_special_tokens(model_dir),
-            generation_defaults: if generates {
-                template::load_generation_defaults(model_dir)
-            } else {
-                template::GenerationDefaults::default()
-            },
+            generation_defaults: file_sampling.package,
+            file_sampling,
         }
     }
 }
@@ -1437,15 +2000,18 @@ pub(crate) fn exact_pool_spec(
     })
 }
 
-/// One warning per process: vision models on a discrete GPU keep the legacy context limit.
+/// One warning per process: a vision model on a GPU without the device-headroom limit (no
+/// probe, a probe that returned nothing, `kv_headroom_mode: "off"`, or a shared-memory GPU, P12)
+/// keeps the legacy context limit.
 fn warn_vision_without_headroom_cap_once(model_id: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             model_id,
-            "vision model on a discrete GPU: the context limit stays on the legacy estimate \
-             (the exact limit needs the device-headroom cap, which this build does not have); \
-             logged once per process for the first such model"
+            "vision model on a GPU: the context limit stays on the legacy estimate (the exact \
+             limit needs the device-headroom cap: the device memory could not be read - no \
+             probe, or the probe returned nothing - or kv_headroom_mode is off; a shared-memory \
+             GPU has no such cap); logged once per process for the first such model"
         );
     }
 }
@@ -1469,6 +2035,29 @@ fn warn_unverified_engine_once(pair: &(String, String)) {
     }
 }
 
+/// Whether `device` is the NPU (the NPU text pipeline has no realtime path).
+fn is_npu_device(device: &str) -> bool {
+    device.starts_with("NPU")
+}
+
+/// One warning per model id when `realtime_defaults.llm_model` names a model on the NPU,
+/// which the realtime LLM slot never uses (0.9.1 Q12).
+fn warn_npu_realtime_default_once(model_id: &str) {
+    static SEEN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(model_id.to_owned());
+    if first {
+        tracing::warn!(
+            model_id,
+            "realtime_defaults.llm_model is placed on the NPU, which realtime turns cannot use - \
+             it is ignored as the realtime LLM default"
+        );
+    }
+}
+
 /// Snapshot of a model's state, returned by [`ModelManager::list_models`].
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
@@ -1476,6 +2065,10 @@ pub struct ModelInfo {
     pub state: ModelState,
     /// `Some(seconds running)` while this model's load is stalled (step 6b; state `Loading`).
     pub stalled_secs: Option<u64>,
+    /// This model's engine stalled and is marked dead (0.9.1 S1): it takes no requests, and while
+    /// an unload waits for the stuck thread (`Evicting`) no load either, until a restart (or the
+    /// stuck call returns and the model is unloaded and loaded again).
+    pub generation_stalled: bool,
     pub kind: ModelKind,
     pub vram_gb: f64,
     /// The `OpenVINO` device this model is (or will be) placed on — e.g.
@@ -1489,6 +2082,13 @@ pub struct ModelInfo {
     /// media/embedding models, or when the file didn't pass the loader's
     /// gate.
     pub generation_defaults: template::GenerationDefaults,
+    /// V5: the effective sampling profile and whether the model sits on an NPU;
+    /// `None` for kinds that do not generate text. Present before the first load
+    /// (the file layer is read at registration).
+    pub sampling: Option<(sampling::SamplingProfile, bool)>,
+    /// 0.9.1: the configured default thinking budget (`ModelPolicy::thinking_budget_tokens`);
+    /// `None` when unset.
+    pub thinking_budget_tokens: Option<u32>,
     /// The L0 prompt-length gate ceiling (`ModelRecord::max_prompt_tokens`) —
     /// the number a `400 context_length_exceeded` would cite. `0` before the
     /// model's first successful load, once evicted, for media/embedding
@@ -1516,11 +2116,16 @@ pub struct ModelInfo {
     /// The device-headroom cap right now (vision model on a discrete GPU), tokens, before the pool
     /// limit is applied: it can be far above `max_prompt_tokens` when the pool binds.
     pub kv_headroom_cap_tokens: Option<usize>,
-    /// Weights as measured at the last load, MiB: the process's device-memory delta over that load
-    /// minus the KV pool it allocated. `None` when the load window was not clean (another load or
-    /// an eviction nearby), for a pool sized in whole GiB (its real size is not known to the byte),
-    /// on a model without a measurement, or while not Ready.
+    /// Weights as measured at the last load, MiB: the device-memory change across engine
+    /// construction (C25), or, when that reading was not taken or not trusted, the change across
+    /// the whole load minus the KV pool it booked. `None` when the load window was not clean
+    /// (another load or an eviction nearby), for a pool sized in whole GiB (its real size is not
+    /// known to the byte), on a model without a measurement, or while not Ready.
     pub vram_measured_mib: Option<u64>,
+    /// C25: how much of the booked KV pool became resident during the last load (its warm-up),
+    /// MiB, capped at the pool. `None` while not Ready, when the load was not measured, or when
+    /// it was measured the old way (no post-construction reading, or one not trusted).
+    pub kv_pool_resident_mib: Option<u64>,
     /// How `max_prompt_tokens` was computed: `exact`, `legacy`, or `""` when there is no gate.
     pub kv_gate_mode: &'static str,
     /// What limits the exact gate; `None` under the legacy estimate.
@@ -1544,6 +2149,11 @@ pub struct ModelInfo {
     /// so an operator not watching Prometheus can see it via
     /// `GET /v1/admin/models` directly.
     pub kv_cache_usage_pct: f64,
+    /// Whether `kv_cache_usage_pct` is a trustworthy live reading for this model, the same flag as
+    /// [`ModelMetrics::kv_cache_usage_supported`] (`rustedvino_kv_cache_usage_supported`):
+    /// `false` while not Ready and for an engine kind whose occupancy cannot be read (the VLM
+    /// engine), where the percentage is a permanent `0.0` (C21/P1).
+    pub kv_cache_usage_supported: bool,
     /// Whether this model is currently flagged for sustained KV pressure —
     /// see [`ModelMetrics::kv_pressure_flagged`] for the exact semantics.
     /// Same reasoning for surfacing it here: a gauge nobody looks at is not
@@ -1686,6 +2296,8 @@ struct EvictionTail {
     deadline: Duration,
     /// The engine's device, for the `ffi_watch` teardown entry (`None` if the record had none).
     device: Option<String>,
+    /// F1b: wakes the requests waiting for an on-demand load once the record is `NotLoaded`.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 /// Join one engine thread taken from `slot`, tracked in `ffi_watch` as a teardown for the whole
@@ -1799,6 +2411,7 @@ impl EvictionTail {
             policy,
             deadline,
             device,
+            wake,
         } = self;
         let hold = policy == JoinPolicy::HoldUntilJoined;
         let started = Instant::now();
@@ -1809,12 +2422,13 @@ impl EvictionTail {
         let (tx, rx) = std::sync::mpsc::channel();
         let helper = {
             let (slot, models, vram) = (Arc::clone(&slot), Arc::clone(&models), Arc::clone(&vram));
+            let wake = Arc::clone(&wake);
             let (model_id, device) = (model_id.clone(), device.clone());
             move || {
                 let clean = join_tracked(&slot, &model_id, device.as_deref());
                 let teardown_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if hold {
-                    ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                    ModelManager::reconcile_evicted(&models, &vram, &model_id, &wake);
                     crate::gpu_memory::note_release_event();
                     tracing::info!(
                         model_id = %model_id,
@@ -1843,7 +2457,7 @@ impl EvictionTail {
                 "could not start the eviction join thread — joining here, without a deadline"
             );
             let clean = join_tracked(&slot, &model_id, device.as_deref());
-            ModelManager::reconcile_evicted(&models, &vram, &model_id);
+            ModelManager::reconcile_evicted(&models, &vram, &model_id, &wake);
             crate::gpu_memory::note_release_event();
             return if clean {
                 TailOutcome::Clean
@@ -1854,7 +2468,7 @@ impl EvictionTail {
         match rx.recv_timeout(deadline) {
             Ok(clean) => {
                 if !hold {
-                    ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                    ModelManager::reconcile_evicted(&models, &vram, &model_id, &wake);
                     crate::gpu_memory::note_release_event();
                 }
                 if clean {
@@ -1878,7 +2492,7 @@ impl EvictionTail {
                     deadline_s = deadline.as_secs(),
                     "engine thread did not exit within join deadline — abandoning join"
                 );
-                ModelManager::reconcile_evicted(&models, &vram, &model_id);
+                ModelManager::reconcile_evicted(&models, &vram, &model_id, &wake);
                 // The kernel releases the engine's device memory seconds later — mark it so
                 // per-model memory measurements don't absorb the drop.
                 crate::gpu_memory::note_release_event();
@@ -1952,22 +2566,276 @@ struct BusyExcluded {
     weight_gb: f64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// C7 F4: a test's `MemAvailable` for [`ModelManager::live_system_avail_gb`] on the `system`
+    /// domain (per thread, so parallel tests do not see each other's); `None` = read the host.
+    static TEST_LIVE_AVAIL_GB: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
 /// D3: would the RELOAD of a resized model be admitted, once the model's own memory is freed by
 /// its eviction? The same two gates `ensure_vram_for` applies, on what a full sweep of the OTHER
 /// evictable residents could add on top: tracked VRAM must cover `total_minimum` (skipped when
 /// the domain is ungated), and on the gated UMA system domain live RAM must clear the floor for
-/// `live_need`. `None` for `live_ram` = the RAM gate does not apply.
-fn resize_reload_admits(
+/// `live_need`. `None` for `live_ram` = the RAM gate does not apply. C7: says which gate refused.
+fn resize_reload_gates(
     vram_capacity_gb: f64,
     total_minimum_gb: f64,
     gating_disabled: bool,
-    live_ram: Option<(f64, f64, f64)>,
-) -> bool {
-    let vram_ok = gating_disabled || vram_capacity_gb >= total_minimum_gb;
-    // (available RAM incl. what the sweep frees, RAM the load needs, OS floor)
-    let ram_ok =
-        live_ram.is_none_or(|(avail, need, floor)| os_memory::ram_floor_admits(avail, need, floor));
-    vram_ok && ram_ok
+    live_ram: Option<&ResizeLiveRam>,
+) -> ReloadGates {
+    ReloadGates {
+        vram_ok: gating_disabled || vram_capacity_gb >= total_minimum_gb,
+        ram_ok: live_ram
+            .is_none_or(|r| os_memory::ram_floor_admits(r.reachable_gb(), r.need, r.floor)),
+    }
+}
+
+/// The verdict of [`resize_reload_gates`], per gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReloadGates {
+    /// The tracked-VRAM gate admits the reload.
+    vram_ok: bool,
+    /// The live system-RAM gate admits it (always `true` off the UMA system domain).
+    ram_ok: bool,
+}
+
+impl ReloadGates {
+    /// Both gates admit.
+    fn admits(self) -> bool {
+        self.vram_ok && self.ram_ok
+    }
+}
+
+/// C7: the live system-RAM figures of a resize preflight, GB.
+#[derive(Debug, Clone, Copy)]
+struct ResizeLiveRam {
+    /// `MemAvailable`-derived availability now.
+    avail: f64,
+    /// Credited for unloading the resized model itself ([`resize_own_ram_credit_gb`]).
+    own_credit: f64,
+    /// Credited for evicting every other evictable resident (their [`ram_credit_gb`]).
+    reclaim: f64,
+    /// What the reload is charged: weights + KV (whole GiB) + margin.
+    need: f64,
+    /// What must stay free for the OS (`system_ram_reservation_gb`).
+    floor: f64,
+    /// `MemTotal` (or the declared budget), the most any eviction can make available
+    /// ([`ModelManager::ram_ceiling_gb`]); `None` = uncapped.
+    ceiling: Option<f64>,
+}
+
+impl ResizeLiveRam {
+    /// Availability once the model and every other evictable resident are unloaded, never more
+    /// than `ceiling` (C7 F2: as the reload's own upfront check, [`os_memory::credited_avail_gb`]).
+    fn reachable_gb(&self) -> f64 {
+        os_memory::credited_avail_gb(self.avail, self.own_credit + self.reclaim, self.ceiling)
+    }
+}
+
+/// C7: what unloading a model for its KV resize is credited to give back to its own reload's
+/// live system-RAM gate, GB. Off `CPU`: the weights plus `min(new KV charge, resident pool)`, the
+/// resident pool by the same rule as an eviction ([`resident_pool_gb`]). The reload's pool takes
+/// the place of the resident one, so a shrink of a resident pool is charged only the margin, never
+/// fresh RAM for its KV; a pool that is not resident earns nothing (its memory is already counted
+/// as available). On `CPU` (`cpu_credit_gb` is `Some`) the eviction credit, unchanged: it already
+/// covers the pool.
+fn resize_own_ram_credit_gb(
+    cpu_credit_gb: Option<f64>,
+    weight_gb: f64,
+    kv_need_gb: f64,
+    resident_pool_gb: f64,
+) -> f64 {
+    cpu_credit_gb.unwrap_or_else(|| weight_gb + kv_need_gb.min(resident_pool_gb).max(0.0))
+}
+
+/// C7: `" (the KV is charged in whole GiB: 3.5 GiB counts as 4.0 GiB)"` when the live-RAM gate
+/// charges more than was asked for, else empty. A charge above the whole-GiB round-up comes from
+/// the `min_kv_cache_gb` floor and is attributed to it. `requested_gb <= 0` (grab-all) says
+/// nothing.
+fn kv_charge_note(requested_gb: f64, charged_gb: f64) -> String {
+    if requested_gb <= 0.0 || charged_gb <= requested_gb + 1e-6 {
+        String::new()
+    } else if charged_gb > requested_gb.ceil() + 1e-6 {
+        format!(
+            " (the KV is charged at least min_kv_cache_gb, in whole GiB: {requested_gb:.1} GiB \
+             counts as {charged_gb:.1} GiB)"
+        )
+    } else {
+        format!(
+            " (the KV is charged in whole GiB: {requested_gb:.1} GiB counts as {charged_gb:.1} GiB)"
+        )
+    }
+}
+
+/// C7: what a resize preflight weighed, for the refusal text.
+#[derive(Debug, Clone, Copy)]
+struct ResizeFigures {
+    /// The KV size asked for, GB.
+    requested_kv: f64,
+    /// The weights the reload is charged, GB.
+    weight: f64,
+    /// The KV the live-RAM gate charges (whole GiB), GB.
+    kv_need: f64,
+    /// `vram_safety_margin_gb`.
+    margin: f64,
+    /// What the tracked-VRAM gate needs: weights + min KV + margin, GB.
+    vram_need: f64,
+    /// Tracked VRAM reachable once the model and every other evictable resident are unloaded.
+    vram_reachable: f64,
+}
+
+/// C7: the text of a refused resize preflight. Names each gate that refused, with its figures
+/// (for the RAM gate: available now, the credits, the need and the OS floor) and the whole-GiB
+/// charge of the KV.
+fn resize_refusal_text(
+    model_id: &str,
+    f: &ResizeFigures,
+    live: Option<&ResizeLiveRam>,
+    gates: ReloadGates,
+) -> String {
+    let mut why = Vec::new();
+    if let Some(r) = live.filter(|_| !gates.ram_ok) {
+        why.push(format!(
+            "the live system-RAM gate: the reload needs ~{need:.1} GB (weights {w:.1} + KV \
+             {kv:.1} + margin {m:.1}){note}, and the system would have ~{reach:.1} GB available \
+             ({avail:.1} GB now + {own:.1} GB credited for unloading {model_id} + {rec:.1} GB for \
+             evicting the other idle models), with {floor:.1} GB kept free for the OS",
+            need = r.need,
+            w = f.weight,
+            kv = f.kv_need,
+            m = f.margin,
+            note = kv_charge_note(f.requested_kv, f.kv_need),
+            reach = r.reachable_gb(),
+            avail = r.avail,
+            own = r.own_credit,
+            rec = r.reclaim,
+            floor = r.floor,
+        ));
+    }
+    if !gates.vram_ok {
+        why.push(format!(
+            "the tracked-VRAM gate: the reload needs {need:.1} GB (weights {w:.1} + min KV + \
+             margin {m:.1}), and {reach:.1} GB of tracked VRAM is reachable",
+            need = f.vram_need,
+            w = f.weight,
+            m = f.margin,
+            reach = f.vram_reachable,
+        ));
+    }
+    format!(
+        "resize of {model_id} to a {req:.1} GB KV cache refused before evicting anything: after \
+         it is unloaded the reload would not be admitted by {} — the model was left as it was",
+        why.join("; and by "),
+        req = f.requested_kv,
+    )
+}
+
+/// C7: the live system-RAM figures of a refused load preview, GB.
+#[derive(Debug, Clone)]
+struct PreviewRam {
+    /// What the gate charges: weights + KV (whole GiB) + margin.
+    need: f64,
+    /// `MemAvailable`-derived availability now.
+    avail: f64,
+    /// Availability once every evictable resident is evicted (credited, capped at `MemTotal`).
+    reachable: f64,
+    /// What must stay free for the OS.
+    floor: f64,
+    /// The weights in `need`.
+    weight: f64,
+    /// The KV in `need`.
+    kv: f64,
+    /// The margin in `need`.
+    margin: f64,
+    /// [`kv_charge_note`] for `kv`.
+    kv_note: String,
+}
+
+/// C7: the text of a load refused by its eviction preview. `vram` = (need, free now, reachable
+/// after a full sweep) when the domain has a tracker budget. A gate that cannot be met even
+/// after a full sweep is named with its figures; when each gate alone could be met (the plan
+/// failed on the two together), neither is named (C7 F5).
+fn preview_refusal_text(
+    model_id: &str,
+    ram: Option<&PreviewRam>,
+    vram: Option<(f64, f64, f64)>,
+    would_evict: &[String],
+) -> String {
+    let ram_short = ram.is_some_and(|r| !os_memory::ram_floor_admits(r.reachable, r.need, r.floor));
+    let vram_short = vram.is_some_and(|(need, _, reachable)| reachable < need);
+    // C7 F5: a gate is named only when it cannot be met even after a full sweep; when neither
+    // is short alone (the plan failed on the two together), neither is named.
+    let blame_ram = ram_short;
+    let blame_tracker = vram_short;
+    let mut why = Vec::new();
+    if let Some(r) = ram.filter(|_| blame_ram) {
+        why.push(format!(
+            "the live system-RAM gate: it needs ~{need:.1} GB (weights {w:.1} + KV {kv:.1} + \
+             margin {m:.1}){note}; {avail:.1} GB system RAM is available now and at most \
+             ~{reach:.1} GB after evicting every evictable model, with {floor:.1} GB kept free \
+             for the OS",
+            need = r.need,
+            w = r.weight,
+            kv = r.kv,
+            m = r.margin,
+            note = r.kv_note,
+            avail = r.avail,
+            reach = r.reachable,
+            floor = r.floor,
+        ));
+    }
+    if let Some((need, free, reach)) = vram.filter(|_| blame_tracker) {
+        why.push(format!(
+            "the tracked-VRAM gate: it needs {need:.1} GB (weights + min KV + margin); {free:.1} \
+             GB is free now and at most {reach:.1} GB after evicting every evictable model"
+        ));
+    }
+    if why.is_empty() {
+        why.push(
+            "the memory gates together (each alone could be met by evicting every evictable \
+             model, but no eviction plan meets both)"
+                .to_owned(),
+        );
+    }
+    format!(
+        "insufficient memory: loading {model_id} is refused by {}; evicting the models it could \
+         evict ({}) would not make enough room — nothing was evicted; free memory or load a \
+         smaller model",
+        why.join("; and by "),
+        if would_evict.is_empty() {
+            "none".to_owned()
+        } else {
+            would_evict.join(", ")
+        },
+    )
+}
+
+/// C7: the reason of a refusal inside the load loop, naming the gate(s) that refused this
+/// iteration. `ram` = (available now, need, OS floor) when the live system-RAM gate refused;
+/// `vram` = (need, free) when the tracker refused. Neither (cannot happen today): the tracker's
+/// wording of 0.9.0 is not repeated, the text says "the memory gates".
+fn gate_refusal_reason(
+    ram: Option<(f64, f64, f64)>,
+    kv_note: &str,
+    vram: Option<(f64, f64)>,
+) -> String {
+    let mut why = Vec::new();
+    if let Some((avail, need, floor)) = ram {
+        why.push(format!(
+            "live system RAM: need ~{need:.1} GB{kv_note}, {avail:.1} GB available, {floor:.1} GB \
+             kept free for the OS"
+        ));
+    }
+    if let Some((need, free)) = vram {
+        why.push(format!(
+            "tracked VRAM: need {need:.1} GB, {free:.1} GB free"
+        ));
+    }
+    if why.is_empty() {
+        why.push("the memory gates".to_owned());
+    }
+    why.join("; ")
 }
 
 /// One evictable resident, as the dry-run sees it.
@@ -1994,6 +2862,10 @@ struct EvictionCandidate {
 /// live RAM after every eviction — needed two. Weights are a floor on what an
 /// eviction really frees, so the plan may over-predict evictions but no longer
 /// promises a load that then evicts more than it said.
+///
+/// C7 B.3: a pool known to be resident (measured, or its KV warm-up succeeded, see
+/// [`resident_pool_gb`]) is credited too: the candidate's `weight_gb` is its [`ram_credit_gb`].
+/// The Windows-trip pools above were never touched; a warmed-up pool is allocated at load.
 fn plan_evictions(
     candidates: &[EvictionCandidate],
     free_gb: f64,
@@ -2070,6 +2942,55 @@ fn resize_reload_refused(model_id: &str, err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// C7 F2: the error of a refused resize reload after the rollback attempt: the reload's memory
+/// refusal (`err`, kind kept, so the HTTP status is unchanged) plus whether the model was reloaded
+/// at its previous pool (`restore_error` = `None`) or stays unloaded (`Some(why)`).
+fn resize_rollback_error(
+    model_id: &str,
+    err: anyhow::Error,
+    previous_kv_gb: f64,
+    restore_error: Option<&str>,
+) -> anyhow::Error {
+    match err.downcast::<ModelError>() {
+        Ok(ModelError::InsufficientMemory(msg)) => {
+            let tail = restore_error.map_or_else(
+                || {
+                    format!(
+                        "the resize was refused and {model_id} was reloaded at its previous \
+                         {previous_kv_gb:.1} GiB KV cache (resize_rolled_back)"
+                    )
+                },
+                |why| {
+                    format!(
+                        "the resize was refused, and reloading {model_id} at its previous \
+                         {previous_kv_gb:.1} GiB KV cache failed too ({why}), so it stays unloaded \
+                         (resize_not_restored); load it again if it is still needed"
+                    )
+                },
+            );
+            ModelError::InsufficientMemory(format!("{msg} — {tail}")).into()
+        }
+        Ok(other) => other.into(),
+        Err(err) => err,
+    }
+}
+
+/// The refusal of a `no_evict` load that does not fit beside the resident models: a C27 respawn
+/// restore (unchanged wording) or, C7 N2, a resize's rollback to its previous pool.
+fn no_evict_refusal(model_id: &str, why: &str, resize_rollback: bool) -> String {
+    if resize_rollback {
+        format!(
+            "resize rollback of {model_id}: its previous KV cache does not fit without evicting a \
+             loaded model ({why}), and a rollback never evicts"
+        )
+    } else {
+        format!(
+            "respawn restore of {model_id} skipped: it does not fit without evicting a loaded \
+             model ({why}), and a restore never evicts"
+        )
+    }
+}
+
 /// F1: the text of a load refused after it had already evicted `evicted` for itself.
 fn refused_after_eviction(model_id: &str, evicted: &[String], reason: &str) -> String {
     format!(
@@ -2117,6 +3038,7 @@ fn eviction_plan_candidates(
     vram: &MemoryTracker,
     candidates: &[(String, f64, bool)],
     cpu_residents: &HashMap<String, f64>,
+    resident_pools: &HashMap<String, f64>,
 ) -> Vec<EvictionCandidate> {
     candidates
         .iter()
@@ -2125,7 +3047,12 @@ fn eviction_plan_candidates(
             EvictionCandidate {
                 id: id.clone(),
                 allocated_gb,
-                weight_gb: ram_credit_gb(*weight_gb, allocated_gb, cpu_residents.get(id).copied()),
+                weight_gb: ram_credit_gb(
+                    *weight_gb,
+                    allocated_gb,
+                    cpu_residents.get(id).copied(),
+                    resident_pools.get(id).copied().unwrap_or(0.0),
+                ),
             }
         })
         .collect()
@@ -2313,7 +3240,8 @@ pub struct RealtimeResolution {
     /// either a real registered model, or (only in the no-default,
     /// nothing-viable edge case) the literal id the client requested.
     pub model_id: String,
-    /// `"requested"` | `"default"` | `"substituted"` — matches D6's
+    /// `"requested"` | `"default"` | `"substituted"` (the realtime handler adds
+    /// `"off"` for a client that turned speech off) — matches D6's
     /// `model_selection` event `source` field verbatim, so callers can pass
     /// it straight through without translation.
     pub source: &'static str,
@@ -2352,6 +3280,61 @@ pub struct LoadOverrides {
     /// Default `false`. The `POST /v1/admin/models/{id}/load` body is the
     /// only caller that sets this.
     pub force: bool,
+    /// C27 respawn restore: never evict anything for this load — if it does not fit beside what
+    /// is resident, refuse it (`InsufficientMemory`). Internal (no config key, no request field);
+    /// only [`ModelManager::restore_after_respawn`] sets it (and the resize rollback, below).
+    pub no_evict: bool,
+    /// C7 N2: this `no_evict` load is a resize's rollback to its previous pool, not a respawn
+    /// restore: only the wording of its refusal differs. Internal; `false` everywhere else.
+    pub resize_rollback: bool,
+}
+
+/// m4: one startup warning naming the `preload` models a respawn skipped (none:
+/// nothing).
+fn push_respawn_preload_skipped(skipped: &[&str]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let names = skipped
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::startup::push_startup_warning(
+        "respawn_preload_skipped",
+        format!(
+            "the respawn after a worker crash did not load preload model(s) {names}: they were not \
+             loaded when the worker crashed (the respawn brings back the crashed worker's set) - \
+             load them with `rv load`, or restart the service for the full preload"
+        ),
+    );
+}
+
+/// What a refused boot preload needed, per gate ([`ModelManager::preload_no_room_reason`]).
+#[derive(Debug, Clone, Copy)]
+struct NoRoomNeed {
+    /// Tracker need: weights + min KV + margin.
+    total_minimum: f64,
+    weight_gb: f64,
+    min_kv: f64,
+    margin: f64,
+    /// Live `MemAvailable` reading (system domain only).
+    live_avail: Option<f64>,
+    /// Live-RAM need: weights + conservative KV + margin.
+    live_need: f64,
+    kv_need: f64,
+    /// What must stay free for the OS.
+    ram_floor: f64,
+}
+
+/// How a load may evict for room: `force` = [`LoadOverrides::force`], `no_evict` =
+/// [`LoadOverrides::no_evict`] (wins: nothing is evicted).
+#[derive(Debug, Clone, Copy)]
+struct EvictRule {
+    force: bool,
+    no_evict: bool,
+    /// [`LoadOverrides::resize_rollback`]: the wording of a `no_evict` refusal.
+    resize_rollback: bool,
 }
 
 /// A model's runtime parameters resolved at load time (co-residency Slice 2).
@@ -2530,7 +3513,7 @@ pub(crate) fn validate_speculative_pairing(
         "speculative decoding supports dense text-generation models only, got {target_kind:?}"
     );
     anyhow::ensure!(
-        target_device != "NPU",
+        !is_npu_device(target_device),
         "speculative decoding is not supported on NPU — the NPU TextGen branch \
          uses the static LLMPipeline, not ContinuousBatchingPipeline, and has no \
          draft support"
@@ -2764,6 +3747,26 @@ pub struct ConfigReloadReport {
     /// deliberately not encoded here: reporting it would promise a taxonomy this
     /// code does not yet enforce.
     pub globals_not_applied: Vec<String>,
+    /// Models in [`left_untouched`](Self::left_untouched) whose file stanza differs from the entry
+    /// they were loaded with, and which fields (C8). Reload stages nothing for a live model, so
+    /// unloading and loading it alone still uses the old entry: the operator unloads it, reloads
+    /// the config again (the model is then `updated`), then loads it. Sorted by model id.
+    pub models_not_applied: Vec<ModelChangesNotApplied>,
+    /// Models in [`left_untouched`](Self::left_untouched) that are `Ready` and whose file
+    /// `sampling` and/or `thinking_budget_tokens` differed: applied now (both hot), with `fields`
+    /// naming them; they are then not in [`models_not_applied`](Self::models_not_applied).
+    /// Sorted by model id.
+    pub applied_live: Vec<ModelChangesNotApplied>,
+}
+
+/// One loaded model's changed config keys: those a reload did not apply
+/// ([`ConfigReloadReport::models_not_applied`]), or applied hot ([`ConfigReloadReport::applied_live`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelChangesNotApplied {
+    /// The model id.
+    pub model: String,
+    /// The changed JSON keys of its stanza, sorted (e.g. `chat_template`).
+    pub fields: Vec<String>,
 }
 
 /// Result of [`ModelManager::patch_model`] — which supplied fields landed
@@ -2818,6 +3821,7 @@ pub struct SetPreloadReport {
 /// [`ConfigReloadReport`] — see `reload_keys_file`'s doc comment for why key
 /// rotation has its own reload path.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent report flags, one per wire field
 pub struct KeysReloadReport {
     /// `true` when `api_keys` on disk differed from the live value and was
     /// swapped in.
@@ -2830,6 +3834,10 @@ pub struct KeysReloadReport {
     /// non-empty admin scope was live — that specific downgrade was refused,
     /// not applied. See `reload_keys_file`'s doc comment.
     pub admin_downgrade_refused: bool,
+    /// `true` when, after this reload, there are no `api_keys` and the server binds a network
+    /// address: inference is open to anyone who can reach the port (0.9.1 S3 review). State,
+    /// not transition — it stays `true` on every reload until a key is added.
+    pub inference_open_on_network: bool,
     /// Live inference-key count *after* this reload (whether or not it
     /// changed) — never the keys themselves.
     pub api_key_count: usize,
@@ -2899,6 +3907,11 @@ pub struct ModelManager {
     /// Set by [`ModelManager::begin_shutdown`]; [`ModelManager::is_shutting_down`] also reads the
     /// process-wide stop request. While set, `begin_load` refuses new loads (D-04 S2).
     shutting_down: AtomicBool,
+    /// C27: set first thing in [`ModelManager::shutdown`]. From then on evictions are this
+    /// worker's own teardown, not unloads, so they write no `model_unloaded` line — otherwise a
+    /// worker that drains before its respawn (a watchdog or hang kill sends SIGTERM first) would
+    /// report every model unloaded and nothing would be restored. Per manager, not per process.
+    unload_notes_frozen: AtomicBool,
     /// CPU over-admission: requests handed out so far ([`ModelManager::get_chat_context`]), so a
     /// solo-request measurement can tell that no other request ran inside its window.
     request_starts: AtomicU64,
@@ -2916,6 +3929,9 @@ pub struct ModelManager {
     /// How long a forced eviction waits for a non-abortable engine thread, in milliseconds.
     /// [`FORCED_EVICT_JOIN_DEADLINE`]; an internal value (tests shorten it), not a setting.
     forced_join_deadline_ms: AtomicU64,
+    /// The drain bound of an admin or recovery eviction, in milliseconds: always
+    /// [`EVICT_DRAIN_DEADLINE`]; an internal value (tests shorten it, V1-rv), not a setting.
+    evict_drain_ms: AtomicU64,
     /// Serialises the `load_model` critical section (T5.2, committee findings
     /// 20/38). Without it, two concurrent loads of different models can both
     /// pick the same LRU victim — the loser's `begin_evict` then races to
@@ -2926,9 +3942,18 @@ pub struct ModelManager {
     /// committed. An async [`tokio::sync::Mutex`] because the section spans
     /// `.await` points (the eviction join, the `spawn_blocking` engine load).
     load_lock: tokio::sync::Mutex<()>,
+    /// F1b: requests waiting for an on-demand load — the waiter count (capped at
+    /// [`on_demand::MAX_ON_DEMAND_WAITERS`]), the load-event notify that wakes them, and the
+    /// last failure of each model's load.
+    on_demand: on_demand::OnDemandWaits,
     /// Root of the per-model learned KV-capacity ceilings (`cache_manifest::ratchet_root`);
     /// `None` when no cache directory can be determined (nothing is learned across restarts).
     ratchet_root: Option<std::path::PathBuf>,
+    /// Unit tests only: the private temporary directory `ratchet_root` points at when the test
+    /// config has no `ov_cache_dir`. One per manager, so tests never share learned ceilings, and
+    /// removed when the manager drops, so a `cargo test` run leaves nothing in the temp dir.
+    #[cfg(test)]
+    test_ratchet_tmp: Option<tempfile::TempDir>,
     /// Device inventory captured at startup — used for device validation and
     /// `ModelRecord` construction when models are added dynamically at runtime.
     inventory: Arc<DeviceInventory>,
@@ -2996,6 +4021,21 @@ pub struct ModelManager {
     /// throttles resize churn on a time basis regardless of what triggered
     /// any particular eviction in between.
     kv_pressure: Mutex<HashMap<String, KvPressureState>>,
+    /// `true` while [`Self::load_preload_models`] runs (the listener is not up yet, so every load
+    /// then is a boot preload). C22 / owner decision D-F1: a boot preload the device-headroom gate
+    /// refuses is refused, never makes room by evicting an earlier preload and never waits for
+    /// the driver to release memory ([`VRAM_RELEASE_WAIT`]); runtime loads are unchanged.
+    preloading: AtomicBool,
+    /// A preload never evicts another preload: a boot preload refused because it
+    /// does not fit beside the models already loaded leaves why here (the gate, its need and the
+    /// shortfall), for [`Self::load_preload_list`]'s `preload_skipped` warning (read and removed
+    /// there).
+    preload_no_room: Mutex<HashMap<String, String>>,
+    /// M2: the `preload` models a respawn's preload phase deferred because their KV
+    /// pool is sized to the room left; [`Self::restore_after_respawn`] loads them last.
+    deferred_preload: Mutex<HashSet<String>>,
+    /// The crashed worker's set this (respawned) worker was built with; `None` = a fresh start.
+    respawn_set: Option<Vec<String>>,
 }
 
 /// One model's live KV-pressure bookkeeping — see [`ModelManager`]'s
@@ -3174,11 +4214,12 @@ fn apply_dgpu_size_ceiling(
 /// Precedence (first match wins):
 ///  1. per-model explicit `device` (C1) — always wins, engine skipped;
 ///  2. empty inventory (GPU-free unit tests) — the auto engine needs a real
-///     inventory, so fall back to embedding auto-place / `config.device`,
-///     exactly the pre-C2 test behaviour;
+///     inventory, so an embedder goes through `resolve_embedding_device` against
+///     that empty inventory (`CPU` on every host since 0.9.1 C2) and anything
+///     else gets `config.device`;
 ///  3. per-model `tier_preference` override → fit-aware engine with that order;
-///  4. embedding with an explicit `config.embedding_device` → that device
-///     (graceful fallback preserved via `resolve_embedding_device`);
+///  4. embedding with an explicit `config.embedding_device` → that device if the
+///     inventory has it (graceful fallback preserved via `resolve_embedding_device`);
 ///  5. else → the kind's size-aware built-in tier preference → fit-aware engine.
 ///
 /// The kind comes from the `model_kinds` config hint (the factory's
@@ -3208,9 +4249,15 @@ fn resolve_model_device(
         // (1) explicit override — validated against the inventory below.
         d
     } else if inventory.devices().is_empty() {
-        // (2) GPU-free tests: no auto engine.
+        // (2) GPU-free tests: no auto engine. The empty inventory knows no device, so an
+        // embedder resolves to `CPU` on every host (0.9.1 C2: it used to ask the real
+        // `OpenVINO`, so the same test placed it differently per box).
         if is_embedding {
-            lifecycle::resolve_embedding_device(config.embedding_device.as_deref(), &config.device)
+            lifecycle::resolve_embedding_device(
+                config.embedding_device.as_deref(),
+                &config.device,
+                |d| inventory.get(d).is_some(),
+            )
         } else {
             config.device.clone()
         }
@@ -3219,8 +4266,13 @@ fn resolve_model_device(
         let tiers = parse_tier_preference(model_id, &p.tier_preference)?;
         placement::place_with_fit(model_id, &tiers, vram_estimate, inventory, fits)?
     } else if is_embedding && config.embedding_device.is_some() {
-        // (4) explicit operator embedding device (keeps graceful fallback).
-        lifecycle::resolve_embedding_device(config.embedding_device.as_deref(), &config.device)
+        // (4) explicit operator embedding device (keeps graceful fallback), checked against the
+        // inventory (the enumeration boot took), not a fresh `OpenVINO` core.
+        lifecycle::resolve_embedding_device(
+            config.embedding_device.as_deref(),
+            &config.device,
+            |d| inventory.get(d).is_some(),
+        )
     } else if config.default_placement == config::DefaultPlacement::Device {
         // (4b) `default_placement: "device"` - the global `device`, no engine. The bundle default
         // (`device: CPU`); an iGPU / NPU is then used only when the operator names it.
@@ -3513,13 +4565,20 @@ impl ModelManager {
     /// `pub(crate) fn new()` overload which accepts a mock factory.
     ///
     /// A `preload` model that fails to load does not fail startup — see
-    /// [`new_with_inventory`](Self::new_with_inventory).
+    /// [`new_for_boot`](Self::new_for_boot).
+    ///
+    /// `respawn_set` is the crashed worker's set a supervised respawn targets (`None` = a fresh
+    /// start, the full `preload`; see [`new_for_boot`](Self::new_for_boot)).
     ///
     /// # Errors
     /// Fails only on a config/registration problem (e.g. a `preload` entry
     /// with no `models` entry, an unresolvable device). See
-    /// [`new_with_inventory`](Self::new_with_inventory).
-    pub async fn new_production(config: Config, inventory: Arc<DeviceInventory>) -> Result<Self> {
+    /// [`new_for_boot`](Self::new_for_boot).
+    pub async fn new_production(
+        config: Config,
+        inventory: Arc<DeviceInventory>,
+        respawn_set: Option<Vec<String>>,
+    ) -> Result<Self> {
         // Parse the explicit kind hints once, warning on (and dropping) any
         // unrecognised label rather than panicking — an unknown hint just falls
         // back to directory detection.
@@ -3548,6 +4607,7 @@ impl ModelManager {
                 .unwrap_or_default()
                 .to_owned(),
             admission_queue_timeout_ms: config.admission_queue_timeout_ms,
+            max_audio_duration_secs: config.max_audio_duration_secs,
             model_kinds: std::sync::RwLock::new(model_kinds),
             concurrent_streams: std::sync::RwLock::new(HashMap::new()),
             prefix_caching_overrides: std::sync::RwLock::new(HashMap::new()),
@@ -3568,8 +4628,7 @@ impl ModelManager {
         };
         let probe = crate::gpu_memory::LinuxFdinfoProbe::new()
             .map(|p| Arc::new(p) as Arc<dyn crate::gpu_memory::VramProbe>);
-        let mm = Self::new_with_inventory(config, Arc::new(factory), inventory).await?;
-        Ok(mm.with_vram_probe(probe))
+        Self::new_for_boot(config, Arc::new(factory), inventory, probe, respawn_set).await
     }
 
     /// Set the config file path used to persist dynamically-added model entries.
@@ -3584,7 +4643,11 @@ impl ModelManager {
     }
 
     /// Attach the physical probe of other processes' device memory (`None` where it cannot be read:
-    /// the vision models of a discrete GPU then keep the legacy context limit).
+    /// the vision models of a discrete GPU then keep the legacy context limit). Test-only, and
+    /// only after construction: the boot path passes the probe to
+    /// [`new_for_boot`](Self::new_for_boot) so `preload` sees it
+    /// (C22: attached here after the preload, every boot preload took the legacy limit).
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_vram_probe(
         mut self,
@@ -3651,6 +4714,23 @@ impl ModelManager {
         model_id: &str,
         entry: &config::ModelEntry,
     ) -> Result<ModelRecord> {
+        let files = RegistrationFiles::read(
+            &*self.factory,
+            &self.config.models_dir.join(model_id),
+            entry,
+        );
+        self.build_not_loaded_record_with(model_id, entry, files)
+    }
+
+    /// [`build_not_loaded_record`](Self::build_not_loaded_record) with the model
+    /// directory's files already read ([`RegistrationFiles`]), so a caller on the async
+    /// runtime (`add_model`) can read them on the blocking pool first.
+    fn build_not_loaded_record_with(
+        &self,
+        model_id: &str,
+        entry: &config::ModelEntry,
+        files: RegistrationFiles,
+    ) -> Result<ModelRecord> {
         // No explicit `kind` in config: fall back to the same file-sniffing
         // `detect_kind` uses at real load time (`OvEngineFactory::load`),
         // instead of blindly assuming `TextGen`. Closes the gap where a VLM
@@ -3661,14 +4741,7 @@ impl ModelManager {
         // construction at load time detected Vision correctly via the same
         // file-sniffing, independently — see
         // the project's internal engineering log.
-        let resolved_kind = entry
-            .kind
-            .as_deref()
-            .and_then(ModelKind::from_label)
-            .unwrap_or_else(|| {
-                self.factory
-                    .detect_kind(&self.config.models_dir.join(model_id))
-            });
+        let resolved_kind = files.kind;
         // Teach the factory this model's kind *before* any load reaches it —
         // including the auto-detected case: harmless (load() would
         // independently re-derive the identical answer from the same files)
@@ -3733,9 +4806,12 @@ impl ModelManager {
             eos_token: Arc::from(""),
             bos_token: Arc::from(""),
             configured_kind: resolved_kind,
+            certain_kind: files.kind_known.then_some(resolved_kind),
             last_kind: None,
             last_load_duration_secs: None,
             gpu_load_delta_bytes: None,
+            kv_pool_resident_gb: 0.0,
+            load_split: LoadMemorySplit::default(),
             learned_weight_gb: None,
             cpu_resident: (None, 0),
             image_family: (resolved_kind == ModelKind::ImageGen).then(|| {
@@ -3745,6 +4821,7 @@ impl ModelManager {
             uncounted_image_admissions: std::sync::atomic::AtomicU64::new(0),
             pending_load: None,
             load_stalled: false,
+            stuck_engine: None,
             pinned: entry.policy.pinned,
             priority: entry.policy.priority,
             evictable: entry.policy.evictable,
@@ -3752,9 +4829,10 @@ impl ModelManager {
             domain,
             reasoning_parser: entry.policy.reasoning_parser,
             generation_defaults: template::GenerationDefaults::default(),
-            native_context_limit: template::read_native_context_limit(
-                &self.config.models_dir.join(model_id),
-            ),
+            sampling: entry.policy.sampling,
+            thinking_budget_tokens: entry.policy.thinking_budget_tokens,
+            file_sampling: files.file_sampling,
+            native_context_limit: files.native_context_limit,
         })
     }
 
@@ -3879,12 +4957,33 @@ impl ModelManager {
              use POST /v1/admin/models/{model_id}/load to load it"
         );
 
-        // The registration ends by persisting to config.json: a file that is already invalid
-        // would fail that write after a full load (and maybe evictions), so refuse first.
-        self.ensure_config_file_valid()?;
+        // On the blocking pool, one section: read the model directory's files (kind, the V5
+        // sampling file layer, the native context limit), check V5a's `do_sample` rule against
+        // them, and check config.json. The registration ends by persisting to config.json: a
+        // file that is already invalid would fail that write after a full load (and maybe
+        // evictions), so refuse first.
+        let files = {
+            let factory = Arc::clone(&self.factory);
+            let config_path = self.config_path.clone();
+            let (id, e, dir) = (model_id.clone(), entry.clone(), model_dir.clone());
+            tokio::task::spawn_blocking(move || -> anyhow::Result<RegistrationFiles> {
+                let files = RegistrationFiles::read(&*factory, &dir, &e);
+                config::check_sampling_do_sample(
+                    &id,
+                    &e,
+                    files.file_sampling.samples_with_temperature(),
+                )?;
+                if let Some(path) = config_path {
+                    Self::check_config_file(&path)?;
+                }
+                Ok(files)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("model registration file check failed: {e}"))??
+        };
 
         // ── Resolve device/domain and build the record ──────────────────────
-        let record = self.build_not_loaded_record(&model_id, &entry)?;
+        let record = self.build_not_loaded_record_with(&model_id, &entry, files)?;
 
         // ── Register in runtime maps ONLY — deliberately NOT persisted to
         // config.json yet. The record must exist in `self.models` before
@@ -4087,6 +5186,17 @@ impl ModelManager {
             .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
         let (merged, outcome) = patch.apply_to(&current);
         config::validate_model_entry(model_id, &merged)?;
+        // V5a: the `do_sample` rule against the file layer the record already holds
+        // (read at registration, refreshed at each load) — no file I/O here. Only when
+        // this PATCH sets `sampling`: a model file re-exported since must not block a
+        // PATCH of an unrelated field (the load already WARNs about it).
+        if patch.sampling.is_some() {
+            let file_do_sample = self
+                .read_models("patch_model")
+                .get(model_id)
+                .is_some_and(|r| r.file_sampling.samples_with_temperature());
+            config::check_sampling_do_sample(model_id, &merged, file_do_sample)?;
+        }
         if let Some(ref dev) = merged.policy.device {
             anyhow::ensure!(!dev.is_empty(), "device must be a non-empty string");
             if !self.inventory.devices().is_empty() {
@@ -4158,6 +5268,15 @@ impl ModelManager {
             // would drop it until the next reload (the policy value is `None`).
             let family = r.family;
             r.auto_detect_reasoning_parser(model_id, family);
+            // V5a: hot — the next request's profile reads it from the record.
+            if r.sampling != merged.policy.sampling {
+                r.sampling = merged.policy.sampling;
+                if r.state == ModelState::Ready {
+                    r.sampling_profile().log(model_id, r.is_npu(), "patch");
+                }
+            }
+            // 0.9.1: hot as well — the next request reads it from the record.
+            r.thinking_budget_tokens = merged.policy.thinking_budget_tokens;
         }
         self.dynamic_entries
             .write()
@@ -4362,9 +5481,14 @@ impl ModelManager {
     /// no config path is set (nothing will be persisted). The file can still change between
     /// this check and the write; the write re-checks.
     fn ensure_config_file_valid(&self) -> anyhow::Result<()> {
-        let Some(ref config_path) = self.config_path else {
-            return Ok(());
-        };
+        self.config_path
+            .as_deref()
+            .map_or(Ok(()), Self::check_config_file)
+    }
+
+    /// [`ensure_config_file_valid`](Self::ensure_config_file_valid) for a given path, without
+    /// `self` (blocking file I/O: `add_model` runs it on the blocking pool).
+    fn check_config_file(config_path: &std::path::Path) -> anyhow::Result<()> {
         let check = || -> anyhow::Result<()> {
             let raw = config::read_json_text(config_path)?;
             Self::validate_config_value(&serde_json::from_str(&raw)?)
@@ -4413,6 +5537,22 @@ impl ModelManager {
     /// # Errors
     /// As [`deregister_model`](Self::deregister_model).
     pub async fn deregister_model_with(&self, model_id: &str, force: bool) -> Result<()> {
+        self.deregister_model_reported(model_id, force)
+            .await
+            .map(drop)
+    }
+
+    /// [`deregister_model_with`](Self::deregister_model_with), returning what the eviction did
+    /// when the model was loaded (`None`: it was not, nothing was evicted) — V1-rv P1.
+    ///
+    /// # Errors
+    /// As [`deregister_model`](Self::deregister_model).
+    pub async fn deregister_model_reported(
+        &self,
+        model_id: &str,
+        force: bool,
+    ) -> Result<Option<EvictionReport>> {
+        let mut report = None;
         let state = self
             .read_models("deregister_model")
             .get(model_id)
@@ -4424,11 +5564,7 @@ impl ModelManager {
                 // Before the eviction: a file that cannot be rewritten would leave the model
                 // unloaded but still in config.json, back on the next restart (S281 defect a).
                 self.ensure_config_file_valid()?;
-                if force {
-                    self.evict_model_forced(model_id).await?;
-                } else {
-                    self.evict_model(model_id).await?;
-                }
+                report = Some(self.evict_model_reported(model_id, force).await?);
             }
             Some(ModelState::NotLoaded) => {}
             None => {
@@ -4466,8 +5602,10 @@ impl ModelManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(model_id);
+        // F1b (review R-3): a request waiting for this model answers the removal's 404.
+        self.note_load_event();
         self.persist_model_removal(model_id)?;
-        Ok(())
+        Ok(report)
     }
 
     /// Re-read `config.json` from disk and register any newly-declared model
@@ -4480,7 +5618,8 @@ impl ModelManager {
     /// anything already live:
     /// - Never touches a `Ready`/`Loading`/`Evicting` model — its engine keeps
     ///   running with whatever settings it loaded under, even if the file
-    ///   changed underneath it. `PATCH /v1/admin/models/{id}` handles most
+    ///   changed underneath it. One exception (0.9.1 V5a): a `Ready` model's
+    ///   `sampling` is hot and is applied (reported in `applied_live`). `PATCH /v1/admin/models/{id}` handles most
     ///   fields live (immediately for non-placement fields, next-load for
     ///   `kv_cache_gb`/etc.); `device`/`tier_preference` still need an evict
     ///   first (409 otherwise) since they'd disagree with the resident engine.
@@ -4583,8 +5722,8 @@ impl ModelManager {
                         .insert(model_id.clone(), entry.clone());
                     report.added.push(model_id.clone());
                 }
-                Some(ModelState::Ready | ModelState::Loading | ModelState::Evicting) => {
-                    report.left_untouched.push(model_id.clone());
+                Some(state @ (ModelState::Ready | ModelState::Loading | ModelState::Evicting)) => {
+                    self.reload_live_entry(model_id, entry, state, &mut report);
                 }
                 Some(ModelState::NotLoaded) => {
                     // The entry every load path actually reads (overlay ∪
@@ -4639,7 +5778,123 @@ impl ModelManager {
             }
         }
 
+        report
+            .models_not_applied
+            .sort_by(|a, b| a.model.cmp(&b.model));
+        report.applied_live.sort_by(|a, b| a.model.cmp(&b.model));
         Ok(report)
+    }
+
+    /// A config reload for a live (`Ready`/`Loading`/`Evicting`) model: nothing is staged, the
+    /// model is `left_untouched`, and its changed keys go to `models_not_applied` (C8) — except
+    /// `sampling` on a `Ready` model, which is hot and is applied now (`applied_live`, V5a).
+    fn reload_live_entry(
+        &self,
+        model_id: &str,
+        entry: &config::ModelEntry,
+        state: ModelState,
+        report: &mut ConfigReloadReport,
+    ) {
+        if state == ModelState::Ready {
+            let mut fields = Vec::new();
+            if self.reload_live_sampling(model_id, entry) {
+                fields.push("sampling".to_owned());
+            }
+            if self.reload_live_thinking_budget(model_id, entry) {
+                fields.push("thinking_budget_tokens".to_owned());
+            }
+            if !fields.is_empty() {
+                report.applied_live.push(ModelChangesNotApplied {
+                    model: model_id.to_owned(),
+                    fields,
+                });
+            }
+        }
+        if let Some(changes) = self.live_model_changes(model_id, entry) {
+            report.models_not_applied.push(changes);
+        }
+        report.left_untouched.push(model_id.to_owned());
+    }
+
+    /// A config reload's hot apply of `sampling` to a `Ready` model (V5a): when the file's
+    /// `sampling` differs from the one the model runs with, the overlay entry and the record
+    /// take the file's, so the next request uses it. `true` when it changed. `Config::load`
+    /// checked the value's ranges; the file-dependent `do_sample` rule is only a WARN there
+    /// (ruling B), so a value that breaks it is applied and the WARN says what happens.
+    fn reload_live_sampling(&self, model_id: &str, entry: &config::ModelEntry) -> bool {
+        let Some(mut current) = self.effective_entry(model_id) else {
+            return false;
+        };
+        if current.policy.sampling == entry.policy.sampling {
+            return false;
+        }
+        current.policy.sampling = entry.policy.sampling;
+        self.dynamic_entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(model_id.to_owned(), current);
+        if let Some(r) = self.write_models("reload_config").get_mut(model_id) {
+            r.sampling = entry.policy.sampling;
+            r.sampling_profile().log(model_id, r.is_npu(), "reload");
+        }
+        tracing::info!(
+            model_id,
+            "config reload: sampling applied to the loaded model"
+        );
+        true
+    }
+
+    /// A config reload's hot apply of `thinking_budget_tokens` to a `Ready` model (0.9.1), the
+    /// same way as [`reload_live_sampling`](Self::reload_live_sampling). `true` when it changed.
+    fn reload_live_thinking_budget(&self, model_id: &str, entry: &config::ModelEntry) -> bool {
+        let Some(mut current) = self.effective_entry(model_id) else {
+            return false;
+        };
+        let new = entry.policy.thinking_budget_tokens;
+        if current.policy.thinking_budget_tokens == new {
+            return false;
+        }
+        current.policy.thinking_budget_tokens = new;
+        self.dynamic_entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(model_id.to_owned(), current);
+        if let Some(r) = self.write_models("reload_config").get_mut(model_id) {
+            r.thinking_budget_tokens = new;
+        }
+        tracing::info!(
+            model_id,
+            thinking_budget_tokens = ?new,
+            "config reload: thinking_budget_tokens applied to the loaded model"
+        );
+        true
+    }
+
+    /// A config reload's notice for a live (`Ready`/`Loading`/`Evicting`) model whose file stanza
+    /// `entry` differs from the entry it runs with (C8): reload stages nothing for a live model (its
+    /// next load still reads the entry it was loaded with), so this names the changed fields and
+    /// logs how to apply them. Entry against entry, not against the record (the record holds
+    /// load-time auto-detections such as `reasoning_parser`). `None` when nothing changed.
+    fn live_model_changes(
+        &self,
+        model_id: &str,
+        entry: &config::ModelEntry,
+    ) -> Option<ModelChangesNotApplied> {
+        let current = self.effective_entry(model_id)?;
+        let fields = config::model_entry_changes(&current, entry);
+        if fields.is_empty() {
+            return None;
+        }
+        tracing::warn!(
+            model_id,
+            ?fields,
+            "config reload: model is loaded, its changed settings were not applied — unload it, \
+             reload the config again, then load it"
+        );
+        Some(ModelChangesNotApplied {
+            model: model_id.to_owned(),
+            fields,
+        })
     }
 
     /// Replace the persisted `preload` array in `config.json` —
@@ -4762,6 +6017,15 @@ impl ModelManager {
         })
     }
 
+    /// `true` when `bind_addr` is not a loopback address — an unparseable value counts as a
+    /// network bind (startup would have refused it, so this is only defensive).
+    fn binds_to_network(&self) -> bool {
+        self.config
+            .bind_addr
+            .parse::<std::net::IpAddr>()
+            .map_or(true, |ip| !ip.is_loopback())
+    }
+
     /// Re-read the keys file from disk and hot-swap `api_keys`/`admin_api_keys`
     /// — independent of [`reload_config`](Self::reload_config) on purpose
     /// (see its doc comment). `POST /v1/admin/keys/reload` is the only
@@ -4841,6 +6105,19 @@ impl ModelManager {
 
         let api_key_count = file_keys.api_keys.len();
         let admin_key_count = new_admin_keys.len();
+        if keys_changed && api_key_count == 0 && self.binds_to_network() {
+            // 0.9.1 S3: applied anyway — refusing would keep a key the operator may be
+            // revoking alive — but say loudly that inference is now open to the network,
+            // and that the next start refuses this keys file without the opt-in.
+            tracing::warn!(
+                bind_addr = %self.config.bind_addr,
+                allow_insecure_public_bind = self.config.allow_insecure_public_bind,
+                "keys reload: the keys file has no api_keys any more and the server binds a \
+                 network address — inference is now open to anyone who can reach the port \
+                 (admin keys protect only /v1/admin/*). Without allow_insecure_public_bind \
+                 the next start refuses this keys file"
+            );
+        }
         if keys_changed || admin_keys_changed {
             auth.store(Arc::new(crate::AuthConfig {
                 api_keys: file_keys.api_keys,
@@ -4858,6 +6135,7 @@ impl ModelManager {
             keys_updated: keys_changed,
             admin_keys_updated: admin_keys_changed,
             admin_downgrade_refused,
+            inference_open_on_network: api_key_count == 0 && self.binds_to_network(),
             api_key_count,
             admin_key_count,
         })
@@ -4922,24 +6200,55 @@ impl ModelManager {
     /// discovered, the inference domain falls back to `config.device` and the
     /// tracker is single-domain — exactly the pre-inventory behaviour, which is
     /// what GPU-free unit tests want. Production resolves a real inventory via
-    /// [`new_with_inventory`](Self::new_with_inventory).
+    /// [`new_for_boot`](Self::new_for_boot).
     ///
     /// # Errors
     /// Fails only on a config/registration problem (e.g. a `preload` entry
     /// with no `models` entry, an unresolvable device or tier). A `preload`
     /// model that fails to *load* (engine/factory failure at runtime — the
     /// 2026-07-14 VRAM-overcommit incident, the project's internal engineering log)
-    /// does **not** fail startup: see [`new_with_inventory`](Self::new_with_inventory).
+    /// does **not** fail startup: see [`new_for_boot`](Self::new_for_boot).
     ///
     /// Test-only: production always has an inventory and uses
-    /// [`new_with_inventory`](Self::new_with_inventory) (via `new_production`).
+    /// [`new_for_boot`](Self::new_for_boot) (via `new_production`).
     #[cfg(test)]
     pub(crate) async fn new(config: Config, factory: Arc<dyn EngineFactory>) -> Result<Self> {
         Self::new_with_inventory(config, factory, Arc::new(DeviceInventory::default())).await
     }
 
+    /// [`new_with_inventory_and_probe`](Self::new_with_inventory_and_probe) with no probe of
+    /// other processes' device memory. Test-only: production always passes the probe it has.
+    ///
+    /// # Errors
+    /// Fails only on a config/registration problem — see [`new`](Self::new).
+    #[cfg(test)]
+    pub(crate) async fn new_with_inventory(
+        config: Config,
+        factory: Arc<dyn EngineFactory>,
+        inventory: Arc<DeviceInventory>,
+    ) -> Result<Self> {
+        Self::new_with_inventory_and_probe(config, factory, inventory, None).await
+    }
+
+    /// [`new_for_boot`](Self::new_for_boot) as a fresh start (no respawn set). Test-only.
+    ///
+    /// # Errors
+    /// Fails only on a config/registration problem — see [`new`](Self::new).
+    #[cfg(test)]
+    pub(crate) async fn new_with_inventory_and_probe(
+        config: Config,
+        factory: Arc<dyn EngineFactory>,
+        inventory: Arc<DeviceInventory>,
+        probe: Option<Arc<dyn crate::gpu_memory::VramProbe>>,
+    ) -> Result<Self> {
+        Self::new_for_boot(config, factory, inventory, probe, None).await
+    }
+
     /// As [`new`](Self::new), but resolves the inference memory domain (and, in
-    /// Phase B-2, per-domain budgets) from a real device `inventory`.
+    /// Phase B-2, per-domain budgets) from a real device `inventory`, with the
+    /// physical `probe` of other processes' device memory (`None` where it cannot
+    /// be read). This is the boot path [`new_production`](Self::new_production)
+    /// takes, `preload` included.
     ///
     /// A `preload` model that fails to load (e.g. a `CL_OUT_OF_RESOURCES`-class
     /// engine failure) degrades gracefully instead of aborting the process —
@@ -4952,13 +6261,20 @@ impl ModelManager {
     /// hit the same preload failure (2026-07-14 incident, see
     /// the project's internal engineering log).
     ///
+    /// `respawn_set` is the crashed worker's set a respawned worker targets (from
+    /// [`restore_models_from_env`](crate::startup::restore_models_from_env)): `None` = a fresh
+    /// start, the full `preload`; `Some(set)` = only the `preload` models in `set` load (see
+    /// [`Self::load_preload_list`]).
+    ///
     /// # Errors
     /// Fails only on a config/registration problem — see [`new`](Self::new).
     #[allow(clippy::too_many_lines)]
-    pub(crate) async fn new_with_inventory(
+    pub(crate) async fn new_for_boot(
         config: Config,
         factory: Arc<dyn EngineFactory>,
         inventory: Arc<DeviceInventory>,
+        probe: Option<Arc<dyn crate::gpu_memory::VramProbe>>,
+        respawn_set: Option<Vec<String>>,
     ) -> Result<Self> {
         // Per-domain budgets are needed *during* registration now (T5/F4): the
         // memory domain + its total drive fit-aware placement. They depend only
@@ -5013,11 +6329,10 @@ impl ModelManager {
             // tier preference for `resolve_model_device` below, and defaulted
             // `configured_kind` to a hardcoded `TextGen` even for a real VLM
             // (see the project's internal engineering log).
-            let kind = entry
-                .kind
-                .as_deref()
-                .and_then(ModelKind::from_label)
-                .unwrap_or_else(|| factory.detect_kind(&model_dir));
+            let explicit_kind = entry.kind.as_deref().and_then(ModelKind::from_label);
+            let kind_known =
+                explicit_kind.is_some() || factory.detect_kind_certain(&model_dir).is_some();
+            let kind = explicit_kind.unwrap_or_else(|| factory.detect_kind(&model_dir));
             // Startup-preloaded models with an explicit `kind` already reach
             // the factory via `new_production`'s bulk `model_kinds` hint
             // population; the auto-detected case doesn't, so teach it here —
@@ -5076,9 +6391,12 @@ impl ModelManager {
                     eos_token: Arc::from(""),
                     bos_token: Arc::from(""),
                     configured_kind: kind,
+                    certain_kind: kind_known.then_some(kind),
                     last_kind: None,
                     last_load_duration_secs: None,
                     gpu_load_delta_bytes: None,
+                    kv_pool_resident_gb: 0.0,
+                    load_split: LoadMemorySplit::default(),
                     learned_weight_gb: None,
                     cpu_resident: (None, 0),
                     image_family,
@@ -5086,6 +6404,7 @@ impl ModelManager {
                     uncounted_image_admissions: std::sync::atomic::AtomicU64::new(0),
                     pending_load: None,
                     load_stalled: false,
+                    stuck_engine: None,
                     pinned: policy.pinned,
                     priority: policy.priority,
                     evictable: policy.evictable,
@@ -5093,6 +6412,14 @@ impl ModelManager {
                     domain,
                     reasoning_parser: policy.reasoning_parser,
                     generation_defaults: template::GenerationDefaults::default(),
+                    sampling: policy.sampling,
+                    thinking_budget_tokens: policy.thinking_budget_tokens,
+                    // Text-generating kinds only, like `ModelFiles::read`.
+                    file_sampling: if matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+                        sampling::load_file_sampling(&model_dir)
+                    } else {
+                        sampling::FileSampling::default()
+                    },
                     native_context_limit: template::read_native_context_limit(&model_dir),
                 },
             );
@@ -5121,15 +6448,28 @@ impl ModelManager {
         // the legacy `total_vram_gb`, so a single-dGPU box (and a CPU
         // `0.0`-disabled box) is byte-for-byte unchanged; other domains (system
         // RAM, secondary GPUs) get their own budgets.
+        #[cfg(test)]
+        let test_ratchet_tmp = if config.ov_cache_dir.is_none() {
+            tempfile::Builder::new()
+                .prefix("rustedvino-test-kv-ratchet-")
+                .tempdir()
+                .ok()
+        } else {
+            None
+        };
         let mm = Self {
             vram: Arc::new(RwLock::new(MemoryTracker::new(budgets))),
-            headroom: headroom::HeadroomRuntime::new(None),
+            // C22: the probe is attached before the preload below, so a vision model preloaded
+            // on a discrete GPU is sized, admitted and limited as a later load of it would be
+            // (attached after, every boot preload took the legacy limit).
+            headroom: headroom::HeadroomRuntime::new(probe),
             inference_domain,
             factory,
             next_request_id: Arc::new(AtomicU64::new(0)),
             models: Arc::new(RwLock::new(records)),
             gpu_poisoned: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            unload_notes_frozen: AtomicBool::new(false),
             request_starts: AtomicU64::new(0),
             solo_window: Mutex::new(None),
             poison_reaction: std::sync::OnceLock::new(),
@@ -5137,16 +6477,23 @@ impl ModelManager {
             forced_join_deadline_ms: AtomicU64::new(
                 u64::try_from(FORCED_EVICT_JOIN_DEADLINE.as_millis()).unwrap_or(u64::MAX),
             ),
+            evict_drain_ms: AtomicU64::new(
+                u64::try_from(EVICT_DRAIN_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+            ),
             load_lock: tokio::sync::Mutex::new(()),
-            // Unit tests never write into the real per-user cache.
-            ratchet_root: if cfg!(test) && config.ov_cache_dir.is_none() {
-                Some(
-                    std::env::temp_dir()
-                        .join(format!("rustedvino-test-kv-ratchet-{}", std::process::id())),
-                )
+            on_demand: on_demand::OnDemandWaits::default(),
+            // Unit tests never write into the real per-user cache: without an `ov_cache_dir`
+            // they get a private temporary root (`None` — nothing learned — if it cannot be made).
+            #[cfg(test)]
+            ratchet_root: if config.ov_cache_dir.is_none() {
+                test_ratchet_tmp.as_ref().map(|d| d.path().to_path_buf())
             } else {
                 crate::cache_manifest::ratchet_root(config.ov_cache_dir.as_deref())
             },
+            #[cfg(not(test))]
+            ratchet_root: crate::cache_manifest::ratchet_root(config.ov_cache_dir.as_deref()),
+            #[cfg(test)]
+            test_ratchet_tmp,
             config,
             inventory: Arc::clone(&inventory),
             dynamic_entries: RwLock::new(HashMap::new()),
@@ -5157,9 +6504,13 @@ impl ModelManager {
             kv_wedge_recovery_inflight: Mutex::new(HashSet::new()),
             config_mutation_lock: Mutex::new(()),
             kv_pressure: Mutex::new(HashMap::new()),
+            preloading: AtomicBool::new(false),
+            preload_no_room: Mutex::new(HashMap::new()),
+            deferred_preload: Mutex::new(HashSet::new()),
+            respawn_set: respawn_set.clone(),
         };
 
-        mm.load_preload_models().await;
+        mm.load_preload_models(respawn_set.as_deref()).await;
 
         Ok(mm)
     }
@@ -5174,8 +6525,49 @@ impl ModelManager {
     /// a single bad/exhausted model doesn't take every other preload model
     /// (and the server itself) down with it — see the 2026-07-14 incident,
     /// the project's internal engineering log.
-    async fn load_preload_models(&self) {
-        let preload = self.config.preload.clone();
+    ///
+    /// `respawn_set` (`Some` on a supervised respawn): only the `preload` models in it load, the
+    /// others are skipped with an INFO line — the respawn targets the crashed worker's set.
+    async fn load_preload_models(&self, respawn_set: Option<&[String]>) {
+        /// Clears [`ModelManager::preloading`] however the preload ends (also on a panic or a
+        /// cancelled future), so no later runtime load is ever treated as a boot preload.
+        struct PreloadingFlag<'a>(&'a AtomicBool);
+        impl Drop for PreloadingFlag<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.preloading.store(true, Ordering::Release);
+        let _flag = PreloadingFlag(&self.preloading);
+        crate::startup::note_preload(crate::startup::PreloadNote::PhaseStarted);
+        self.load_preload_list(respawn_set).await;
+        crate::startup::note_preload(crate::startup::PreloadNote::PhaseDone);
+    }
+
+    /// The loop of [`Self::load_preload_models`].
+    ///
+    /// Every preload load is `no_evict` (a preload never evicts another preload):
+    /// one that does not fit beside the models already loaded is skipped with a WARN and a
+    /// `preload_skipped` startup warning naming the shortfall, and stays `NotLoaded`.
+    async fn load_preload_list(&self, respawn_set: Option<&[String]>) {
+        let mut preload = self.config.preload.clone();
+        // M2 / N2: on a respawn the preload models whose KV pool is sized to the
+        // room left load last in the phase; they are deferred past listening (to the end of the
+        // restore) only when the set has a model they must leave room for — a registered,
+        // non-`preload` model whose own footprint is fixed.
+        let defer_elastic = respawn_set.is_some_and(|set| {
+            set.iter().any(|id| {
+                !self.config.preload.contains(id)
+                    && self.read_models("load_preload_list:defer").contains_key(id)
+                    && !self.kv_sized_to_room(id)
+            })
+        });
+        if respawn_set.is_some() {
+            // Stable: config order kept within each group.
+            preload.sort_by_key(|id| self.kv_sized_to_room(id));
+        }
+        // m4: the preload models a respawn skipped, for one startup warning.
+        let mut skipped_at_respawn: Vec<&str> = Vec::new();
         for (i, model_id) in preload.iter().enumerate() {
             // D-04 S2: a stop during preload lets the current load finish and skips the rest.
             if self.is_shutting_down() {
@@ -5185,6 +6577,35 @@ impl ModelManager {
                 );
                 break;
             }
+            // A respawn brings back the crashed worker's set — a preload model
+            // that was not Ready at the crash (unloaded, refused, failed) does not pre-empt it.
+            if let Some(set) = respawn_set
+                && !set.iter().any(|id| id == model_id)
+            {
+                tracing::info!(
+                    model = %model_id,
+                    reason = "not_ready_at_crash",
+                    "respawn: skipping a preload model - it was not loaded when the worker \
+                     crashed, so the respawn brings back the crashed worker's set instead"
+                );
+                skipped_at_respawn.push(model_id);
+                continue;
+            }
+            // M2: on a respawn a model whose KV pool is sized to the room left loads
+            // after the rest of the crashed set (at the end of the restore), so it cannot take
+            // the room the others held at the crash — when there is such a model (N2).
+            if defer_elastic && self.kv_sized_to_room(model_id) {
+                tracing::info!(
+                    model = %model_id,
+                    "respawn: deferring a preload model - its KV pool is sized to the room left, \
+                     so it loads after the rest of the crashed worker's set"
+                );
+                if let Ok(mut d) = self.deferred_preload.lock() {
+                    d.insert(model_id.clone());
+                }
+                continue;
+            }
+            crate::startup::note_model(crate::startup::ModelNote::PreloadModel(model_id));
             // G-1: the supervisor's health deadline follows the preload (the listener is not up
             // yet); `Done` after every outcome, so a timed-out preload does not look hung.
             let allowance = self.load_timeout(model_id).map_or(0, |d| d.as_secs());
@@ -5196,9 +6617,32 @@ impl ModelManager {
                 crate::startup::PRELOAD_LOG
             );
             crate::startup::note_preload(crate::startup::PreloadNote::Started(allowance));
-            let result = self.load_model(model_id).await;
+            let overrides = LoadOverrides {
+                no_evict: true,
+                ..LoadOverrides::default()
+            };
+            let result = self.load_model_with_overrides(model_id, overrides).await;
             crate::startup::note_preload(crate::startup::PreloadNote::Done);
-            if let Err(e) = result {
+            let no_room = self
+                .preload_no_room
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(model_id.as_str()));
+            if let (Err(e), Some(why)) = (&result, no_room) {
+                tracing::warn!(
+                    model = %model_id,
+                    error = %e,
+                    "preload skipped - the model does not fit beside the models already loaded, \
+                     and a preload never evicts another preload; model left NotLoaded"
+                );
+                crate::startup::push_startup_warning(
+                    "preload_skipped",
+                    format!(
+                        "preload of '{model_id}' skipped: {why}, and a preload never evicts \
+                         another preload - the server runs without it"
+                    ),
+                );
+            } else if let Err(e) = result {
                 tracing::warn!(
                     model = %model_id,
                     error = %e,
@@ -5210,9 +6654,17 @@ impl ModelManager {
                 );
             }
         }
+        push_respawn_preload_skipped(&skipped_at_respawn);
     }
 
     // ---- Public API ---------------------------------------------------
+
+    /// The crashed worker's set this worker was built with (a supervised respawn), `None` for
+    /// a fresh start. `serve` restores its non-`preload` models after listening.
+    #[must_use]
+    pub fn respawn_set(&self) -> Option<&[String]> {
+        self.respawn_set.as_deref()
+    }
 
     /// How many models are `Ready` — what the stop's teardown will evict (D-04 S6 budget).
     #[must_use]
@@ -5227,6 +6679,9 @@ impl ModelManager {
     /// finish. Idempotent (D-04 S2).
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        // F1b: requests waiting for an on-demand load answer `server_stopping` now instead of
+        // holding the drain for up to `on_demand_wait_secs`.
+        self.note_load_event();
     }
 
     /// D-04 S4: the loads and evictions that have not finished, as `"load <id> on <device>"` /
@@ -5317,6 +6772,37 @@ impl ModelManager {
         self.shutting_down.load(Ordering::Acquire) || crate::startup::shutdown_requested()
     }
 
+    /// F1b: a request to an `on_demand` model that is not loaded, through a
+    /// route its kind cannot serve, is refused with the route's own wrong-kind answer (`refusal`)
+    /// before any load starts or any wait begins — when that kind is certain (review N-1: from a
+    /// previous load, the config, or a marker file; not the `TextGen` fallback). A loaded model, an
+    /// eager one and an uncertain kind are left to the lookup and the load as before.
+    fn refuse_kind_before_load(
+        &self,
+        model_id: &str,
+        accepts: impl Fn(ModelKind) -> bool,
+        refusal: &dyn Fn(ModelKind) -> ModelError,
+    ) -> std::result::Result<(), ModelError> {
+        if !self.is_on_demand(model_id) || self.model_state(model_id) == Some(ModelState::Ready) {
+            return Ok(());
+        }
+        match self.certain_model_kind(model_id) {
+            Some(k) if !accepts(k) => Err(refusal(k)),
+            _ => Ok(()),
+        }
+    }
+
+    /// F1b (review N-1): the model's kind when it is certain — the kind of a previous load, or
+    /// one configured or found by a marker file at registration — and `None` for the `TextGen`
+    /// fallback of a directory with no markers (and for an unknown id). Only a certain kind
+    /// refuses a request before a load; an uncertain one is left to the load's own detection.
+    #[must_use]
+    pub fn certain_model_kind(&self, model_id: &str) -> Option<ModelKind> {
+        self.read_models("certain_model_kind")
+            .get(model_id)
+            .and_then(|r| r.last_kind.or(r.certain_kind))
+    }
+
     /// Returns a cloneable engine handle for `model_id` if it is Ready.
     ///
     /// Also updates `last_used` for LRU tracking.
@@ -5340,6 +6826,16 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<engine::TokenizerHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model - this endpoint serves text-generation and vision models only"
+            ))
+        };
+        self.refuse_kind_before_load(
+            model_id,
+            |k| matches!(k, ModelKind::TextGen | ModelKind::Vision),
+            &wrong,
+        )?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5352,9 +6848,7 @@ impl ModelManager {
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model - this endpoint serves text-generation and vision models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5369,6 +6863,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<(EngineHandle, usize), ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — this endpoint serves text-generation models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::TextGen, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         // R1: the enum is now multi-variant, so this destructure is refutable.
         // The text-only callers (`/tokenize`, `/v1/completions`) reject non-text
@@ -5386,9 +6886,7 @@ impl ModelManager {
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — this endpoint serves text-generation models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5410,10 +6908,33 @@ impl ModelManager {
         self.config.max_embedding_batch_tokens
     }
 
+    /// The engine stall watchdog's deadlines (`stream_first_token_timeout_secs`,
+    /// `stream_token_gap_timeout_secs`; 0.9.1 S1).
+    #[must_use]
+    pub(crate) fn stream_watch_spec(&self) -> crate::stall_watch::WatchSpec {
+        crate::stall_watch::WatchSpec::from_config(&self.config)
+    }
+
     /// The configured server-wide `max_tokens` ceiling (T7.1/T2.2); `0` = uncapped.
     #[must_use]
     pub fn max_tokens_cap(&self) -> usize {
         self.config.max_tokens_cap
+    }
+
+    /// Per-request image limits (`max_images_per_request`, `max_image_pixels_per_request`).
+    #[must_use]
+    pub fn image_limits(&self) -> crate::image_util::ImageLimits {
+        crate::image_util::ImageLimits {
+            max_images: self.config.max_images_per_request,
+            max_pixels: self.config.max_image_pixels_per_request,
+        }
+    }
+
+    /// Per-image downscale cap for vision models (`max_image_pixels`, 0.9.1 C28): a decoded chat
+    /// image with more pixels is resized to fit before it reaches the engine.
+    #[must_use]
+    pub fn max_image_pixels(&self) -> u64 {
+        self.config.max_image_pixels
     }
 
     /// Default embedding model to seed into new realtime sessions, or `None`
@@ -5437,6 +6958,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<crate::embed_engine::EmbeddingHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — /v1/embeddings serves embedding models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::Embedding, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5448,9 +6975,7 @@ impl ModelManager {
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — /v1/embeddings serves embedding models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5468,6 +6993,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<crate::pipelines::stt::SttHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — the speech-to-text routes (/v1/audio/transcriptions, /v1/audio/translations) serve STT models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::Stt, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5479,9 +7010,7 @@ impl ModelManager {
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — the speech-to-text routes (/v1/audio/transcriptions, /v1/audio/translations) serve STT models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5496,6 +7025,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<crate::pipelines::tts::TtsHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — /v1/audio/speech serves TTS models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::Tts, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5507,9 +7042,7 @@ impl ModelManager {
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::ImageGen(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — /v1/audio/speech serves TTS models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5550,6 +7083,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<crate::pipelines::image::ImageHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — /v1/images/generations serves image models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::ImageGen, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5561,9 +7100,7 @@ impl ModelManager {
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::Reranking(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — /v1/images/generations serves image models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5595,6 +7132,12 @@ impl ModelManager {
         &self,
         model_id: &str,
     ) -> std::result::Result<crate::rerank_engine::RerankingHandle, ModelError> {
+        let wrong = |kind: ModelKind| {
+            ModelError::WrongKind(format!(
+                "model '{model_id}' is a {kind:?} model — /v1/rerank serves reranking models only"
+            ))
+        };
+        self.refuse_kind_before_load(model_id, |k| k == ModelKind::Reranking, &wrong)?;
         let ctx = self.get_chat_context(model_id)?;
         let kind = ctx.handle.kind();
         match ctx.handle {
@@ -5606,9 +7149,7 @@ impl ModelManager {
             | EngineHandleKind::Stt(_)
             | EngineHandleKind::Tts(_)
             | EngineHandleKind::ImageGen(_)
-            | EngineHandleKind::Decision(_) => Err(ModelError::WrongKind(format!(
-                "model '{model_id}' is a {kind:?} model — /v1/rerank serves reranking models only"
-            ))),
+            | EngineHandleKind::Decision(_) => Err(wrong(kind)),
         }
     }
 
@@ -5688,6 +7229,34 @@ impl ModelManager {
         Ok(ctx)
     }
 
+    /// [`get_chat_context`](Self::get_chat_context) for a request that decides on the result (the
+    /// chat handler, a realtime turn): for a vision model with a device-headroom limit (a discrete
+    /// GPU, `kv_headroom_mode: "dynamic"`), an outside-memory reading older than
+    /// [`headroom::REQUEST_READING_MAX_AGE`] (30 s) is refreshed first, on the blocking pool, so
+    /// the cap is not computed from a reading taken before an idle gap (E3). Every
+    /// other model, an iGPU and a fresh reading skip the probe; nothing else changes.
+    ///
+    /// # Errors
+    /// Same as [`get_chat_context`](Self::get_chat_context).
+    pub async fn get_chat_context_for_request(
+        &self,
+        model_id: &str,
+    ) -> std::result::Result<ChatContext, ModelError> {
+        if self.config.kv_headroom_mode == "dynamic" {
+            let pdev = self
+                .read_models("get_chat_context_for_request")
+                .get(model_id)
+                .filter(|r| r.state == ModelState::Ready)
+                .and_then(|r| r.headroom.as_ref().map(|h| h.spec.pdev.clone()));
+            if let Some(pdev) = pdev {
+                self.headroom
+                    .refresh_if_older_than(&pdev, headroom::REQUEST_READING_MAX_AGE)
+                    .await;
+            }
+        }
+        self.get_chat_context(model_id)
+    }
+
     /// The part of [`get_chat_context`](Self::get_chat_context) that reads the record, with the
     /// headroom facts to apply once the models lock is released.
     fn chat_context_and_headroom(
@@ -5704,6 +7273,16 @@ impl ModelManager {
                     // Set before Ready in execute_load; taken before Evicting
                     // in begin_evict. If somehow None, report NotLoaded.
                     if let Some(h) = r.handle.clone() {
+                        // 0.9.1 S1: a generation on this engine stalled. Its thread is presumed
+                        // stuck, so new work would only queue behind it: refused. A GPU model
+                        // answers as the poisoned GPU context it was booked as.
+                        if h.generation_stalled() {
+                            return Err(if device_uses_gpu(&r.device) {
+                                ModelError::GpuPoisoned
+                            } else {
+                                ModelError::GenerationStalled(model_id.to_owned())
+                            });
+                        }
                         Ok((
                             ChatContext {
                                 handle: h,
@@ -5718,6 +7297,8 @@ impl ModelManager {
                                 max_concurrent_streams: r.max_concurrent_streams,
                                 reasoning_parser: r.reasoning_parser,
                                 generation_defaults: r.generation_defaults,
+                                sampling: r.sampling_profile(),
+                                thinking_budget_tokens: r.thinking_budget_tokens,
                             },
                             r.headroom.clone(),
                         ))
@@ -5727,6 +7308,9 @@ impl ModelManager {
                 }
                 ModelState::NotLoaded => Err(ModelError::NotLoaded),
                 ModelState::Loading => Err(ModelError::Loading),
+                ModelState::Evicting if r.stuck_engine.is_some() => {
+                    Err(ModelError::GenerationStalled(model_id.to_owned()))
+                }
                 ModelState::Evicting => Err(ModelError::Evicting),
             },
         }
@@ -5764,12 +7348,69 @@ impl ModelManager {
         model_id: &str,
         overrides: LoadOverrides,
     ) -> Result<()> {
-        let weight_gb = self.begin_load(model_id)?;
+        self.load_model_reported(model_id, overrides)
+            .await
+            .map(drop)
+    }
 
+    /// [`load_model_with_overrides`](Self::load_model_with_overrides), returning what each
+    /// eviction made for room did, in eviction order (V1-rv P1; empty when nothing was evicted,
+    /// and on the idempotent already-`Ready` path).
+    ///
+    /// # Errors
+    /// Same as [`load_model`](Self::load_model).
+    pub async fn load_model_reported(
+        &self,
+        model_id: &str,
+        overrides: LoadOverrides,
+    ) -> Result<Vec<EvictionReport>> {
+        // F1b: every load funnels through here, so this is where requests waiting for the
+        // model hear how it ended. A failure is recorded BEFORE the wake-up (a waiter that wakes
+        // must find it); a success already set `Ready` in `finish_load`. A dropped future wakes
+        // them from `LoadCancelGuard::drop`. Counted as under way until its end is recorded.
+        let _in_flight = self.load_in_flight(model_id);
+        let weight_gb = match self.begin_load(model_id) {
+            Ok(w) => w,
+            Err(LoadRefusal {
+                error,
+                ends_no_load,
+            }) => {
+                // A refused start (device stalled, GPU poisoned, evicting, ...) ends no load when
+                // another load owns the model (F1b review R-2), the model is already Ready (F1b
+                // N-2: a load just ended there; the requests it woke must not find this refusal
+                // recorded after it), or it is being evicted (P-C review R-2: its waiters restart
+                // the load when the eviction ends). From `NotLoaded` it is this start's end. The
+                // state is read under the refusal's `models` lock; the record below runs after
+                // that lock is dropped (a known microsecond window, see `LoadRefusal`).
+                if !ends_no_load {
+                    self.note_load_end(model_id, Some(&error));
+                }
+                return Err(error);
+            }
+        };
+        let result = self
+            .load_model_reported_inner(model_id, overrides, weight_gb)
+            .await;
+        self.note_load_end(model_id, result.as_ref().err());
+        result
+    }
+
+    /// [`load_model_reported`](Self::load_model_reported) once `begin_load` passed (`weight_gb`
+    /// is its answer).
+    #[allow(clippy::too_many_lines)] // one linear admission sequence, each step a guarded early exit
+    async fn load_model_reported_inner(
+        &self,
+        model_id: &str,
+        overrides: LoadOverrides,
+        weight_gb: f64,
+    ) -> Result<Vec<EvictionReport>> {
         // Sentinel: already Ready (idempotent path).
         if weight_gb == f64::NEG_INFINITY {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        // M1: models this load evicts are its victims for the supervisor until it
+        // reaches Ready (a crash before that keeps them in the restore set).
+        let _window = crate::startup::LoadWindow::open(model_id);
 
         // T5.1: cancellation guard. From here the record is `Loading`; if this
         // future is dropped at any await below (the HTTP client disconnecting
@@ -5798,6 +7439,9 @@ impl ModelManager {
         // rather than start a fresh engine build the stop would have to wait out. Nothing is
         // reserved yet, and the cancel guard resets the record to `NotLoaded`.
         if self.is_shutting_down() {
+            // A handled exit like the ones below (one load end, recorded by the caller).
+            guard.disarm();
+            self.abort_load(model_id);
             return Err(ModelError::ShuttingDown.into());
         }
 
@@ -5857,30 +7501,16 @@ impl ModelManager {
                 .is_some();
         let model_dir = self.config.models_dir.join(model_id);
 
-        // Validate the model's files actually exist BEFORE any VRAM reservation
-        // or LRU eviction below — a registered-but-absent model_id (stale config,
-        // typo, name drift from the real on-disk directory) must fail cheaply
-        // here rather than evict a healthy Ready model to make room for a load
-        // that was always going to fail once the factory tried to open the IR.
-        // Delegated to the factory (not a raw `is_dir()` here) because test
-        // factories never touch the real filesystem — only `OvEngineFactory`
-        // performs a real check; `EngineFactory::model_exists`'s default is `true`.
-        if !self.factory.model_exists(&model_dir) {
-            guard.disarm();
-            self.abort_load(model_id);
-            return Err(ModelError::FilesMissing(model_id.to_owned()).into());
-        }
-
-        // Completeness check (`crate::model_completeness`, 2026-08-03): the
-        // directory existing is not the same as the model actually having
-        // every file its kind needs — same placement principle as the
-        // `model_exists` check above, fail cheap before any VRAM
-        // reservation or eviction. See `incomplete_files`'s doc.
-        if let Some(missing) = self.incomplete_files(model_id, &model_dir) {
-            guard.disarm();
-            self.abort_load(model_id);
-            return Err(ModelError::FilesIncomplete(model_id.to_owned(), missing).into());
-        }
+        // The model's files, its completeness and its template override, checked BEFORE any VRAM
+        // reservation or eviction below (see `load_preflight`).
+        let template_override = match self.load_preflight(model_id, &model_dir).await {
+            Ok(t) => t,
+            Err(e) => {
+                guard.disarm();
+                self.abort_load(model_id);
+                return Err(e);
+            }
+        };
 
         let max_num_seqs =
             apply_moe_cap(model_id, params.max_num_seqs, &model_dir, cap_was_explicit);
@@ -5932,7 +7562,7 @@ impl ModelManager {
         // per-model KV target (`0.0` = unbounded grab-all).  For models with
         // vram_gb=0.0 (unknown) we bypass VRAM gating: honour an explicit KV
         // target if one was resolved, else fall back to the configured cap.
-        let (kv_plan, sizing, evicted) = match self
+        let (kv_plan, sizing, victims) = match self
             .reserve_kv_pool(
                 model_id,
                 weight_gb + draft_vram_gb,
@@ -5941,7 +7571,11 @@ impl ModelManager {
                 max_num_seqs,
                 entry.as_ref(),
                 speculative_spec.is_some(),
-                overrides.force,
+                EvictRule {
+                    force: overrides.force,
+                    no_evict: overrides.no_evict,
+                    resize_rollback: overrides.resize_rollback,
+                },
             )
             .await
         {
@@ -5954,17 +7588,23 @@ impl ModelManager {
         };
         let kv_gb = kv_plan.map_or_else(|| self.ungated_kv_gb(params.kv_cache_gb), |plan| plan.gb);
 
-        let gate = GateSource::new(sizing, kv_plan);
+        let commit = LoadCommit {
+            kv_gb,
+            max_num_seqs,
+            gate: GateSource::new(sizing, kv_plan),
+            kv_plan,
+            template_override,
+        };
         // F1 for the engine's own refusal (MR-2): the models evicted for room are named.
-        let result = self
-            .execute_load(model_id, kv_gb, max_num_seqs, gate, kv_plan)
-            .await
-            .map_err(|e| annotate_refusal_after_eviction(model_id, &evicted, e));
+        let result = self.execute_load(model_id, commit).await.map_err(|e| {
+            let evicted: Vec<String> = victims.iter().map(|r| r.model_id.clone()).collect();
+            annotate_refusal_after_eviction(model_id, &evicted, e)
+        });
         guard.disarm();
         if result.is_err() {
             self.abort_load(model_id);
         }
-        result
+        result.map(|()| victims)
     }
 
     /// Per device the headroom gate of a load reads (the loading model's `spec`, the `others`):
@@ -6146,8 +7786,8 @@ impl ModelManager {
 
     /// Reserve the weights and size the KV pool of one load (`None` for a model with no known
     /// weight footprint, which is not gated). Exact block sizing is tried first for models the
-    /// factory can describe; everything else keeps the whole-GiB sizing. Also returns the models
-    /// evicted for room (F1 naming, should the engine construction refuse).
+    /// factory can describe; everything else keeps the whole-GiB sizing. Also returns what was
+    /// evicted for room (F1 naming, should the engine construction refuse; V1-rv P1 reports).
     #[allow(clippy::too_many_arguments)]
     async fn reserve_kv_pool(
         &self,
@@ -6158,8 +7798,8 @@ impl ModelManager {
         max_num_seqs: usize,
         entry: Option<&config::ModelEntry>,
         speculative: bool,
-        force: bool,
-    ) -> Result<(Option<KvPoolPlan>, SizingOutcome, Vec<String>)> {
+        rule: EvictRule,
+    ) -> Result<(Option<KvPoolPlan>, SizingOutcome, Vec<EvictionReport>)> {
         let prefix_caching = entry
             .and_then(|e| e.policy.enable_prefix_caching)
             .unwrap_or(self.config.enable_prefix_caching);
@@ -6183,19 +7823,19 @@ impl ModelManager {
                 ..SizingOutcome::default()
             }
         };
-        let (plan, evicted) = self
+        let (plan, reports) = self
             .ensure_vram_for(
                 model_id,
                 weight_gb,
                 params.kv_cache_gb,
                 needs_kv_pool,
-                force,
+                rule,
                 sizing.spec.as_ref(),
             )
             .await?;
         // The exact block count for the engine (`None` clears a stale hint from an earlier load).
         self.factory.register_kv_blocks_hint(model_id, plan.blocks);
-        Ok((Some(plan), sizing, evicted))
+        Ok((Some(plan), sizing, reports))
     }
 
     /// The exact-sizing inputs for one load, or `None` (logged) when the model keeps the
@@ -6244,20 +7884,12 @@ impl ModelManager {
             self.config.kv_gate_exact_on_unknown_engine,
         ) {
             Ok(mut spec) => {
-                // The first probe scan walks /proc and the native-context read opens config.json:
-                // do both on the blocking pool, so the spec below finds them cached.
-                let rt = self.headroom.clone();
-                let pdevs: Vec<String> = self
-                    .inventory
-                    .devices()
-                    .iter()
-                    .filter_map(|d| d.pdev.clone())
-                    .collect();
+                // A fresh outside-memory reading of every discrete GPU (S2; nothing with
+                // `kv_headroom_mode: "off"`) and the native-context read, both on the blocking pool,
+                // so the spec below finds them cached.
+                self.refresh_all_device_probes().await;
                 let dir = self.config.models_dir.join(model_id);
                 let native = tokio::task::spawn_blocking(move || {
-                    for pdev in &pdevs {
-                        rt.outside_bytes(pdev);
-                    }
                     template::read_native_context_limit(&dir).filter(|n| *n > 0)
                 })
                 .await
@@ -6385,12 +8017,30 @@ impl ModelManager {
         kv_cache_gb: f64,
         force: bool,
     ) -> Result<f64> {
+        self.resize_model_kv_cache_reported(model_id, kv_cache_gb, force)
+            .await
+            .map(|(achieved, _)| achieved)
+    }
+
+    /// [`resize_model_kv_cache_with`](Self::resize_model_kv_cache_with), also returning what the
+    /// evictions did (V1-rv P1): the model's own eviction first, then any model its (forced)
+    /// reload evicted for room, in eviction order.
+    ///
+    /// # Errors
+    /// As [`resize_model_kv_cache`](Self::resize_model_kv_cache).
+    #[allow(clippy::too_many_lines)] // one linear preflight → evict → reload sequence
+    pub async fn resize_model_kv_cache_reported(
+        &self,
+        model_id: &str,
+        kv_cache_gb: f64,
+        force: bool,
+    ) -> Result<(f64, Vec<EvictionReport>)> {
         anyhow::ensure!(
             kv_cache_gb.is_finite() && kv_cache_gb > 0.0,
             "kv_cache_gb must be a finite positive number, got {kv_cache_gb}"
         );
 
-        let max_concurrent_streams = {
+        let (max_concurrent_streams, previous_kv_gb) = {
             let guard = self.read_models("resize_model_kv_cache");
             let record = guard
                 .get(model_id)
@@ -6398,13 +8048,16 @@ impl ModelManager {
             if record.state != ModelState::Ready {
                 return Err(ModelError::NotLoaded.into());
             }
-            record.max_concurrent_streams
+            (record.max_concurrent_streams, record.kv_cache_gb)
         };
 
         // Everything that can be known up front, BEFORE the cooldown is claimed: a refused resize
         // (busy model, or a reload that would not be admitted) must not burn the cooldown, or
         // the operator's forced retry would be answered 429 (D3-S1.F2).
         self.resize_preflight(model_id, kv_cache_gb, force)?;
+        // C8: the reload would refuse an unreadable `chat_template` override; refuse the resize
+        // now, while the model is still resident, instead of after evicting it.
+        self.read_template_override(model_id).await?;
 
         // Cooldown gate, claimed (not just checked) before evicting: a
         // second call arriving mid-resize should fail fast on the cooldown
@@ -6430,32 +8083,47 @@ impl ModelManager {
             previous
         };
 
-        let evicted = if force {
-            self.evict_model_forced(model_id).await
-        } else {
-            self.evict_model(model_id).await
-        };
-        if let Err(e) = evicted {
-            // Nothing was resized: give the cooldown back (the model turned busy after the
-            // preflight, or the eviction was refused / incomplete).
-            if let Ok(mut tracker) = self.kv_pressure.lock()
-                && let Some(state) = tracker.get_mut(model_id)
-            {
-                state.last_resized_at = previous_resize;
+        // M1: the resize evicts the model itself: until the reload reaches Ready a
+        // crash keeps it in the restore set.
+        let _window = crate::startup::LoadWindow::open(model_id);
+        let evicted = self.evict_model_reported(model_id, force).await;
+        let own = match evicted {
+            Ok(report) => report,
+            Err(e) => {
+                // Nothing was resized: give the cooldown back (the model turned busy after the
+                // preflight, or the eviction was refused / incomplete).
+                if let Ok(mut tracker) = self.kv_pressure.lock()
+                    && let Some(state) = tracker.get_mut(model_id)
+                {
+                    state.last_resized_at = previous_resize;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        self.load_model_with_overrides(
-            model_id,
-            LoadOverrides {
-                kv_cache_gb: Some(kv_cache_gb),
-                max_concurrent_streams: (max_concurrent_streams > 0)
-                    .then_some(max_concurrent_streams),
-                force,
-            },
-        )
-        .await
-        .map_err(|e| resize_reload_refused(model_id, e))?;
+        };
+        let streams = (max_concurrent_streams > 0).then_some(max_concurrent_streams);
+        let victims = match self
+            .load_model_reported(
+                model_id,
+                LoadOverrides {
+                    kv_cache_gb: Some(kv_cache_gb),
+                    max_concurrent_streams: streams,
+                    force,
+                    no_evict: false,
+                    resize_rollback: false,
+                },
+            )
+            .await
+        {
+            Ok(victims) => victims,
+            Err(e) => {
+                return Err(self
+                    .resize_rollback(model_id, e, previous_kv_gb, streams)
+                    .await);
+            }
+        };
+        let mut reports = Vec::with_capacity(1 + victims.len());
+        reports.push(own);
+        reports.extend(victims);
 
         // Report what the allocator delivered, not what was asked for. The
         // load path stores `ensure_vram_for`'s return (the `compute_kv_pool_gb`
@@ -6471,7 +8139,7 @@ impl ModelManager {
             .ok_or_else(|| {
                 anyhow::anyhow!("model '{model_id}' vanished from the registry during resize")
             })?;
-        Ok(achieved)
+        Ok((achieved, reports))
     }
 
     /// Image-gen provenance hint (Tier 3, the image-metadata plan),
@@ -6550,6 +8218,141 @@ impl ModelManager {
         Ok(spec.draft_vram_gb)
     }
 
+    /// M2: whether `model_id`'s KV pool is sized to the room left at its load (a
+    /// text or vision model with a KV pool): on a respawn it loads after the rest of the set.
+    fn kv_sized_to_room(&self, model_id: &str) -> bool {
+        self.read_models("kv_sized_to_room")
+            .get(model_id)
+            .is_some_and(ModelRecord::needs_kv_pool)
+    }
+
+    /// Whether a respawned worker restores `model_id` (C27): its effective load policy is
+    /// `Eager` and it is not in this process's `preload`.
+    fn restorable_after_respawn(&self, model_id: &str) -> bool {
+        !self.config.preload.iter().any(|p| p == model_id)
+            && self
+                .effective_entry(model_id)
+                .map(|e| e.policy.load)
+                .unwrap_or_default()
+                == config::LoadPolicy::Eager
+    }
+
+    /// C27: restore, after a crash respawn, the models the crashed worker had loaded at runtime
+    /// (`ids`, from the supervisor's [`RESTORE_MODELS_ENV`](crate::startup::RESTORE_MODELS_ENV)).
+    ///
+    /// One at a time, in order. Each restore loads with the model's **config** settings (load
+    /// overrides the crashed worker's admin load carried are not handed over) and never evicts
+    /// ([`LoadOverrides::no_evict`]). Skipped: a preload or non-`Eager` model, an unknown id, a
+    /// model already Ready or loading. A restore that does not fit or fails is skipped with a WARN
+    /// and a `restore_failed` startup warning. Stops at a shutdown. Returns the models restored.
+    pub async fn restore_after_respawn(&self, ids: &[String]) -> Vec<String> {
+        let mut restored = Vec::new();
+        // M2: models whose KV pool is sized to the room left go last (set order
+        // kept within each group), the preload models the preload phase deferred among them.
+        let (fixed, elastic): (Vec<&String>, Vec<&String>) =
+            ids.iter().partition(|id| !self.kv_sized_to_room(id));
+        for id in fixed.into_iter().chain(elastic) {
+            if self.is_shutting_down() {
+                break;
+            }
+            let in_preload = self.config.preload.iter().any(|p| p == id);
+            let deferred = self
+                .deferred_preload
+                .lock()
+                .is_ok_and(|d| d.contains(id.as_str()));
+            if in_preload && !deferred {
+                // The preload phase already brought it back (or skipped it).
+                tracing::debug!(model = %id, "respawn restore: preload model - handled by the preload phase");
+                continue;
+            }
+            let state = self
+                .read_models("restore_after_respawn:state")
+                .get(id.as_str())
+                .map(|r| r.state);
+            match state {
+                Some(ModelState::NotLoaded) => {}
+                Some(state) => {
+                    tracing::info!(model = %id, ?state, "respawn restore: model is not NotLoaded - skipped");
+                    continue;
+                }
+                None => {
+                    tracing::warn!(model = %id, "respawn restore: model is not registered - skipped");
+                    continue;
+                }
+            }
+            if !deferred && !self.restorable_after_respawn(id) {
+                tracing::info!(
+                    model = %id,
+                    "respawn restore: model is in preload or not load \"eager\" - skipped"
+                );
+                continue;
+            }
+            // A deferred preload model is still a preload model for the supervisor (no C27
+            // crash-loop rule): it notes `preload_model`, not `restore_started`.
+            crate::startup::note_model(if deferred {
+                crate::startup::ModelNote::PreloadModel(id)
+            } else {
+                crate::startup::ModelNote::RestoreStarted(id)
+            });
+            tracing::info!(
+                model = %id,
+                settings = "config",
+                "respawn restore: loading a model the crashed worker had loaded (config settings; \
+                 load overrides of the earlier admin load are not carried; never evicts)"
+            );
+            let overrides = LoadOverrides {
+                no_evict: true,
+                ..LoadOverrides::default()
+            };
+            match self.load_model_with_overrides(id, overrides).await {
+                Ok(()) => {
+                    tracing::info!(model = %id, "respawn restore: model restored");
+                    restored.push(id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %id,
+                        error = %e,
+                        "respawn restore: model not restored - skipped"
+                    );
+                    self.push_restore_failed(id, &e);
+                }
+            }
+        }
+        restored
+    }
+
+    /// C27 N3: push the `restore_failed` startup warning of `id`, then drop it again if the
+    /// model is Ready by now.
+    ///
+    /// The race this closes: the restore gets `Loading` because an operator's (or the Pyramu
+    /// panel's) admin load of the same model is in flight; that load reaches Ready and clears
+    /// the model's restore warning (nothing there yet); only then would the restore push it,
+    /// leaving a stale warning for a model that is serving. Push first, then re-read the state:
+    /// a load that becomes Ready after the re-read clears the warning itself (it clears under
+    /// the models write lock, after setting Ready), so every order ends without a stale warning.
+    fn push_restore_failed(&self, id: &str, error: &dyn std::fmt::Display) {
+        crate::startup::push_startup_warning(
+            "restore_failed",
+            format!(
+                "'{id}' was loaded before the worker crashed and was not restored after the \
+                 respawn: {error}"
+            ),
+        );
+        let ready = self
+            .read_models("push_restore_failed:state")
+            .get(id)
+            .is_some_and(|r| r.state == ModelState::Ready);
+        if ready {
+            tracing::info!(
+                model = %id,
+                "respawn restore: the model is Ready after all (a concurrent load) - its \
+                 restore_failed warning is cleared"
+            );
+            crate::startup::clear_restore_warning(id);
+        }
+    }
+
     /// Start a background load for a `NotLoaded` model **iff** its policy is
     /// `load: on_demand`, then return immediately (co-residency Slice 3c).
     ///
@@ -6570,18 +8373,9 @@ impl ModelManager {
     /// today's bare-503 behaviour intact; [`OnDemandLoad::ShuttingDown`] once a
     /// stop was requested.
     pub fn request_on_demand_load(self: &Arc<Self>, model_id: &str) -> OnDemandLoad {
-        // Eager (or no policy) ⇒ no auto-load. Overlay-first via
-        // `effective_entry` — this used to read `self.config.models` only,
-        // so a model registered via `add_model` with `load: on_demand` (or
-        // `patch_model`'d to it later) never actually got the on-demand
-        // behaviour its own config declared. No `.await` below this line
+        // Eager (or no policy) ⇒ no auto-load. No `.await` below this line
         // needs the models lock either way.
-        let on_demand = self
-            .effective_entry(model_id)
-            .map(|e| e.policy.load)
-            .unwrap_or_default()
-            == config::LoadPolicy::OnDemand;
-        if !on_demand {
+        if !self.is_on_demand(model_id) {
             return OnDemandLoad::NotApplicable;
         }
         // D-04 S2: a stopping server neither starts the load nor tells the client to retry it —
@@ -6607,7 +8401,10 @@ impl ModelManager {
         // unconditionally from this advisory check is safe.
         let mm = Arc::clone(self);
         let id = model_id.to_owned();
+        // F1b: under way from now, before the task runs (a waiter does not start it twice).
+        let in_flight = self.load_in_flight(model_id);
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             if let Err(e) = mm.load_model(&id).await {
                 tracing::warn!(model = %id, error = %e, "on-demand load failed");
             }
@@ -6661,6 +8458,21 @@ impl ModelManager {
     /// boot — exactly the shape every real fleet model takes. Was previously
     /// duplicated ad hoc (three sites had the precedence backwards; see the
     /// project's internal engineering log) — this is now the single source.
+    /// Whether `id`'s effective load policy is `load: on_demand` (`false` for an eager or
+    /// unknown model). Overlay-first via [`effective_entry`](Self::effective_entry): a model
+    /// registered by `add_model` with `load: on_demand`, or `patch_model`'d to it, counts.
+    ///
+    /// The single predicate behind both [`request_on_demand_load`](Self::request_on_demand_load)
+    /// and the `GET /v1/models` listing (F1a), so "listed" and "a request starts its load" cannot
+    /// drift apart. Takes the `dynamic_entries` lock only, never the models lock.
+    #[must_use]
+    pub fn is_on_demand(&self, id: &str) -> bool {
+        self.effective_entry(id)
+            .map(|e| e.policy.load)
+            .unwrap_or_default()
+            == config::LoadPolicy::OnDemand
+    }
+
     fn effective_entry(&self, id: &str) -> Option<config::ModelEntry> {
         self.dynamic_entries
             .read()
@@ -6691,6 +8503,25 @@ impl ModelManager {
         self.read_models("resolve_realtime_llm:is_ready")
             .get(id)
             .is_some_and(|r| r.state == ModelState::Ready)
+    }
+
+    /// `true` while `id` is being loaded. `pub` for the realtime handler, which
+    /// answers `request_model_load` for a model already loading with `started`
+    /// (0.9.1 Q3) rather than `failed`.
+    #[must_use]
+    pub fn is_loading(&self, id: &str) -> bool {
+        self.read_models("is_loading")
+            .get(id)
+            .is_some_and(|r| r.state == ModelState::Loading)
+    }
+
+    /// `id`'s state from one read of the registry, `None` for an id it does not hold. `pub`
+    /// for the realtime handler (0.9.1 C1/C1b), which must tell "loaded", "loading" and
+    /// "neither" apart: two separate reads ([`is_ready`](Self::is_ready) then
+    /// [`is_loading`](Self::is_loading)) misread a load that completes between them as failed.
+    #[must_use]
+    pub fn model_state(&self, id: &str) -> Option<ModelState> {
+        self.read_models("model_state").get(id).map(|r| r.state)
     }
 
     /// RTCC: best-effort lookup of `id`'s registered [`ModelKind`] — prefers
@@ -6760,10 +8591,24 @@ impl ModelManager {
     /// to their own dedicated fields; `Llm` covers text-gen and vision alike
     /// (one configured default serves both, matching `clears_viable_
     /// minimum`'s existing `TextGen | Vision` floor).
-    fn slot_default(&self, slot: RealtimeSlot) -> Option<String> {
+    ///
+    /// An LLM default placed on the NPU is ignored (0.9.1 Q12): realtime turns
+    /// cannot run the NPU text pipeline, so the session would fail every turn.
+    /// `pub(crate)` for the realtime handler, which labels a TTS id already
+    /// loading `default` only when it is this default (0.9.1 C1).
+    pub(crate) fn slot_default(&self, slot: RealtimeSlot) -> Option<String> {
         let d = self.config.realtime_defaults.as_ref()?;
         match slot {
-            RealtimeSlot::Llm => d.llm_model.clone(),
+            RealtimeSlot::Llm => d.llm_model.clone().filter(|id| {
+                let on_npu = self
+                    .read_models("slot_default:npu")
+                    .get(id.as_str())
+                    .is_some_and(|r| is_npu_device(&r.device));
+                if on_npu {
+                    warn_npu_realtime_default_once(id);
+                }
+                !on_npu
+            }),
             RealtimeSlot::Stt => d.stt_model.clone(),
             RealtimeSlot::Tts => d.tts_model.clone(),
             // Deliberately not `d.embed_model` — embed is grant-only (see
@@ -6789,7 +8634,8 @@ impl ModelManager {
         r: &ModelRecord,
     ) -> bool {
         match slot {
-            RealtimeSlot::Llm => self.clears_viable_minimum(id, r),
+            // The realtime turn has no NPU text path (0.9.1 Q12): never choose one.
+            RealtimeSlot::Llm => !is_npu_device(&r.device) && self.clears_viable_minimum(id, r),
             RealtimeSlot::Stt => r.last_kind.unwrap_or(r.configured_kind) == ModelKind::Stt,
             RealtimeSlot::Tts => r.last_kind.unwrap_or(r.configured_kind) == ModelKind::Tts,
             RealtimeSlot::Embed => false,
@@ -6994,7 +8840,23 @@ impl ModelManager {
     /// - Model ID not in registry → error
     /// - Model is not in `Ready` state → error (cannot evict what isn't loaded)
     pub async fn evict_model(&self, model_id: &str) -> Result<()> {
-        self.evict_model_inner(model_id, false, false, EVICT_DRAIN_DEADLINE)
+        self.evict_model_reported(model_id, false).await.map(drop)
+    }
+
+    /// [`evict_model`](Self::evict_model) (`force = false`) or
+    /// [`evict_model_forced`](Self::evict_model_forced) (`force = true`), returning what the
+    /// eviction did: how long it drained, how many requests it aborted at the drain deadline and
+    /// how long the engine teardown took (V1-rv P1). The admin unload answers
+    /// with it.
+    ///
+    /// # Errors
+    /// As [`evict_model`](Self::evict_model) / [`evict_model_forced`](Self::evict_model_forced).
+    pub async fn evict_model_reported(
+        &self,
+        model_id: &str,
+        force: bool,
+    ) -> Result<EvictionReport> {
+        self.evict_model_inner(model_id, false, force, self.evict_drain_deadline())
             .await
     }
 
@@ -7010,8 +8872,7 @@ impl ModelManager {
     /// # Errors
     /// As [`evict_model`](Self::evict_model), minus `TargetBusy`.
     pub async fn evict_model_forced(&self, model_id: &str) -> Result<()> {
-        self.evict_model_inner(model_id, false, true, EVICT_DRAIN_DEADLINE)
-            .await
+        self.evict_model_reported(model_id, true).await.map(drop)
     }
 
     /// Eviction as `ensure_vram_for` does it, to make room for another load:
@@ -7020,7 +8881,7 @@ impl ModelManager {
     ///
     /// `force` is the load's own `force`: a non-forced load never evicts a busy model (a victim
     /// that turned busy since it was picked comes back as `TargetBusy`).
-    async fn evict_model_for_load(&self, model_id: &str, force: bool) -> Result<()> {
+    async fn evict_model_for_load(&self, model_id: &str, force: bool) -> Result<EvictionReport> {
         self.evict_model_inner(model_id, false, force, LOAD_EVICT_DRAIN_DEADLINE)
             .await
     }
@@ -7041,15 +8902,20 @@ impl ModelManager {
         abort_inflight: bool,
         force: bool,
         drain: Duration,
-    ) -> Result<()> {
+    ) -> Result<EvictionReport> {
         let (handle, thread) = self.begin_evict(model_id, force)?;
         let kind = handle.kind();
+        // 0.9.1 S1 (owner b): a stalled engine's thread is presumed stuck in a call: the memory it
+        // holds stays booked until it really exits, whatever the engine kind (the CB engine's
+        // usual abandon-and-reconcile after `JOIN_DEADLINE` would free memory still in use). Not
+        // at process shutdown, where the process exit releases it.
+        let stalled = handle.generation_stalled() && !abort_inflight;
         // From here to the join, this future can be dropped at an await; the guard then
         // completes the eviction in the background (D3-S1.E4).
         // A forced eviction of an engine that cannot be aborted must not free the tracker while
         // the engine thread still runs its request (D3-S1.E5); everything else keeps the
         // bounded, abandon-and-reconcile join (#36).
-        let hold = force && !abort_inflight && !handle.aborts_on_shutdown();
+        let hold = stalled || (force && !abort_inflight && !handle.aborts_on_shutdown());
         let mut guard = EvictGuard {
             handle: Some(handle),
             tail: Some(EvictionTail {
@@ -7057,6 +8923,7 @@ impl ModelManager {
                 thread,
                 models: Arc::clone(&self.models),
                 vram: Arc::clone(&self.vram),
+                wake: self.on_demand_waker(),
                 device: self
                     .read_models("evict:device")
                     .get(model_id)
@@ -7077,13 +8944,20 @@ impl ModelManager {
         let handle = guard.handle.as_ref().ok_or_else(|| {
             anyhow::anyhow!("eviction guard lost its handle (cannot happen: just created)")
         })?;
-
-        if abort_inflight {
+        // V1-rv P1: what this eviction did — `(drained, aborted)`, for the caller (the admin
+        // routes' JSON answer). The stalled and shutdown paths do not drain.
+        let (drained, aborted) = if abort_inflight || stalled {
+            // A stalled engine has nothing to drain: ask it to stop (it does, if its call returns
+            // late) and go straight to the held join.
             // On the shutdown path, tell the engine to stop promptly BEFORE
             // dropping this clone: an in-flight request may hold another clone
             // that keeps the command channel open, so closing this one alone
             // would not stop it (#7).
+            // No drain, no drain deadline: nothing for the abort counter and so nothing in the
+            // report (`aborted` is what the counter gains). A stalled engine's
+            // requests have already ended with `generation_stalled` from the watchdog.
             handle.request_shutdown();
+            (Duration::ZERO, 0)
         } else {
             // Normal (admin/LRU) eviction: give any real in-flight request(s) a
             // genuine chance to reach their natural completion before we tear
@@ -7099,25 +8973,8 @@ impl ModelManager {
             // Bounded by EVICT_DRAIN_DEADLINE so a pathological runaway
             // generation cannot hang eviction forever: past that point, force
             // an abort (same as the shutdown path) rather than wait indefinitely.
-            let deadline = guard.drain_until;
-            while handle.as_managed().active() > 0 && Instant::now() < deadline {
-                tokio::time::sleep(EVICT_DRAIN_POLL_INTERVAL).await;
-            }
-            if handle.as_managed().active() > 0 {
-                tracing::warn!(
-                    model_id,
-                    kind = kind.label(),
-                    active = handle.as_managed().active(),
-                    deadline_s = drain.as_secs(),
-                    "eviction drain deadline exceeded — aborting remaining in-flight request(s)"
-                );
-                crate::metrics::record_eviction_aborted_requests(
-                    kind.label(),
-                    handle.as_managed().active(),
-                );
-                handle.request_shutdown();
-            }
-        }
+            drain_then_abort(handle, model_id, guard.drain_until, drain).await
+        };
         // Close this clone of the command channel. With no surviving clone the
         // channel disconnects; the engine either has no live requests left (the
         // normal path, having just drained above) or was just told to abort
@@ -7146,6 +9003,11 @@ impl ModelManager {
         let teardown_ms = u64::try_from(teardown_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if outcome == TailOutcome::Incomplete {
             crate::metrics::record_eviction_refusal("incomplete");
+            if stalled {
+                // The record stays `Evicting` with `stuck_engine`: booked, refused, until the join
+                // helper sees the thread exit.
+                return Err(ModelError::GenerationStalled(model_id.to_owned()).into());
+            }
             return Err(ModelError::EvictionIncomplete(model_id.to_owned()).into());
         }
         let clean_exit = outcome == TailOutcome::Clean;
@@ -7161,7 +9023,14 @@ impl ModelManager {
             return Err(UncleanEngineExit.into());
         }
 
-        tracing::info!(model_id, kind = kind.label(), teardown_ms, "model evicted");
+        tracing::info!(
+            model_id,
+            kind = kind.label(),
+            teardown_ms,
+            drained_ms = u64::try_from(drained.as_millis()).unwrap_or(u64::MAX),
+            aborted,
+            "model evicted"
+        );
         if let Some(vp) = &self.voice_pin {
             vp.clear_if_llm(model_id);
         }
@@ -7176,7 +9045,12 @@ impl ModelManager {
         {
             state.over_threshold_since = None;
         }
-        Ok(())
+        Ok(EvictionReport {
+            model_id: model_id.to_owned(),
+            drained,
+            aborted,
+            teardown_ms,
+        })
     }
 
     /// Evict every `Ready` model — the process-shutdown path (T6.1).
@@ -7195,6 +9069,8 @@ impl ModelManager {
     /// skip the C++ destructors (D-01, step 6a). A model that simply left
     /// `Ready` meanwhile is not in the list.
     pub async fn shutdown(&self) -> ShutdownReport {
+        // C27: the evictions below are teardown — keep the models restorable after a respawn.
+        self.unload_notes_frozen.store(true, Ordering::Release);
         // A poisoned GPU context refuses every eviction (`begin_evict`: tearing a
         // pipeline down on a broken context can `std::terminate`), so the loop
         // below would only log one failure per model. Process exit releases the
@@ -7216,6 +9092,7 @@ impl ModelManager {
                 && let Err(e) = self
                     .evict_model_inner(&info.id, true, true, EVICT_DRAIN_DEADLINE)
                     .await
+                    .map(drop)
             {
                 tracing::warn!(model_id = %info.id, error = %e, "eviction during shutdown failed");
                 if engine_may_still_run(&e) {
@@ -7251,10 +9128,18 @@ impl ModelManager {
                                 .map(|s| s.started.elapsed().as_secs())
                         })
                         .flatten(),
+                    generation_stalled: r.stuck_engine.is_some()
+                        || (r.state == ModelState::Ready
+                            && r.handle
+                                .as_ref()
+                                .is_some_and(EngineHandleKind::generation_stalled)),
                     kind: r.configured_kind,
                     vram_gb: r.vram_gb,
                     device: r.device.clone(),
                     generation_defaults: r.generation_defaults,
+                    sampling: matches!(r.configured_kind, ModelKind::TextGen | ModelKind::Vision)
+                        .then(|| (r.sampling_profile(), r.is_npu())),
+                    thinking_budget_tokens: r.thinking_budget_tokens,
                     // A vision model on a discrete GPU follows the free device memory right now.
                     max_prompt_tokens: r
                         .headroom
@@ -7273,16 +9158,26 @@ impl ModelManager {
                         .map(|h| self.headroom_cap_now(h)),
                     // Only an exactly-sized pool is known to the byte; a whole-GiB pool may have been
                     // built larger than booked, which would make the subtraction wrong.
-                    vram_measured_mib: measured_weights_mib(
+                    vram_measured_mib: load_weights_mib(
                         (r.state == ModelState::Ready && r.kv_pool_blocks.is_some())
                             .then_some(r.gpu_load_delta_bytes)
                             .flatten(),
+                        r.load_split,
                         r.kv_cache_gb,
                     ),
+                    kv_pool_resident_mib: r
+                        .load_split
+                        .pool_resident_bytes
+                        .filter(|_| {
+                            r.state == ModelState::Ready && r.gpu_load_delta_bytes.is_some()
+                        })
+                        .map(|b| b >> 20),
                     kv_gate_mode: r.kv_gate_mode,
                     kv_gate_clamped_by: r.kv_gate_clamped_by,
                     native_context_limit: r.native_context_limit,
                     kv_cache_usage_pct: live.map_or(0.0, ManagedEngine::cache_usage_pct),
+                    kv_cache_usage_supported: live
+                        .is_some_and(ManagedEngine::cache_usage_supported),
                     kv_pressure_flagged: self.kv_pressure_flagged_now(id),
                     #[allow(clippy::cast_precision_loss)]
                     gpu_memory_estimate_gb: self
@@ -7359,7 +9254,8 @@ impl ModelManager {
 
     /// Returns model IDs that are currently in the `Ready` state.
     ///
-    /// Used by `GET /v1/models` for the `OpenAI`-compatible model list.
+    /// Not what `GET /v1/models` lists: since 0.9.1 that also shows `on_demand` models that are
+    /// not loaded or loading (see `handlers::admin::models_list`).
     #[must_use]
     pub fn list_ready_models(&self) -> Vec<String> {
         let guard = self.read_models("list_ready_models");
@@ -7894,7 +9790,11 @@ impl ModelManager {
             .handle
             .as_ref()
             .map_or(Some(0), |h| h.as_managed().runtime_memory_growth_bytes())?;
-        let estimate = r.gpu_load_delta_bytes? + growth;
+        let estimate = load_footprint_bytes(
+            r.gpu_load_delta_bytes?,
+            r.load_split,
+            gib_to_bytes(r.kv_cache_gb.max(0.0)),
+        ) + growth;
         if estimate < 0 {
             return None; // only a polluted measurement goes negative
         }
@@ -8030,6 +9930,61 @@ impl ModelManager {
     /// streaming path (a raw `&str` from `StreamEvent::Error`) reuse it.
     pub(crate) fn mark_gpu_poisoned(&self, model_id: &str, err: impl std::fmt::Display) {
         self.mark_gpu_poisoned_inner(model_id, err, true);
+    }
+
+    /// The model-level action of the stall watchdog (0.9.1 S1), called once per engine instance by
+    /// its watcher when it marked `liveness` dead ([`crate::stall_watch`]). The flag on the engine
+    /// is itself the stalled state: the request path refuses the model from now on
+    /// (`chat_context_and_headroom`), and `list_models` reports it. A GPU model also sets the
+    /// GPU-poisoned flag through the serving-model path (`mark_gpu_poisoned`): supervised, the
+    /// worker drains and exits 75 so the supervisor respawns it; unsupervised it stays up and only
+    /// the stalled model is refused until a restart. A stall on an engine that is no longer this
+    /// model's current one (it was reloaded meanwhile) changes nothing.
+    pub(crate) fn on_generation_stalled(
+        &self,
+        model_id: &str,
+        liveness: &crate::stall_watch::EngineLiveness,
+        deadline: crate::stall_watch::StallDeadline,
+        elapsed: Duration,
+    ) {
+        let device = {
+            let guard = self.read_models("on_generation_stalled");
+            guard
+                .get(model_id)
+                .filter(|r| {
+                    r.handle
+                        .as_ref()
+                        .and_then(EngineHandleKind::liveness)
+                        .is_none_or(|l| l.same_engine(liveness))
+                })
+                .map(|r| r.device.clone())
+        };
+        let Some(device) = device else {
+            tracing::warn!(
+                model_id,
+                "the stalled engine is no longer this model's engine (reloaded meanwhile) — no \
+                 model state changed"
+            );
+            return;
+        };
+        if device_uses_gpu(&device) {
+            self.mark_gpu_poisoned(
+                model_id,
+                format_args!(
+                    "generation stalled: no engine progress for {} s ({}) on {device}; a GPU \
+                     engine that stops making progress is treated as a poisoned GPU context",
+                    elapsed.as_secs(),
+                    deadline.config_key()
+                ),
+            );
+        } else {
+            tracing::warn!(
+                model_id,
+                device,
+                "model booked as stalled: requests to it get 503 until the server restarts (an \
+                 unload frees it only once the stuck call returns)"
+            );
+        }
     }
 
     /// Same as [`mark_gpu_poisoned`](Self::mark_gpu_poisoned) for a failure
@@ -8279,6 +10234,8 @@ impl ModelManager {
         tokio::spawn(async move {
             // Forced: the wedged model is busy by definition (recovery must not be refused
             // by the busy-eviction policy, D3).
+            // M1: a crash between the evict and the reload keeps it in the set.
+            let _window = crate::startup::LoadWindow::open(&id);
             match mm.evict_model_forced(&id).await {
                 Ok(()) => {
                     if let Err(e) = mm.load_model(&id).await {
@@ -8316,45 +10273,96 @@ impl ModelManager {
     ///
     /// Returns the weight VRAM for this model (from config).
     /// Returns `f64::NEG_INFINITY` as a sentinel when the model is already Ready.
-    fn begin_load(&self, model_id: &str) -> Result<f64> {
+    ///
+    /// A refusal carries whether it ends no load ([`LoadRefusal::ends_no_load`]: the record was
+    /// `Loading` or `Ready`), read under the `models` lock (F1b N-2).
+    fn begin_load(&self, model_id: &str) -> std::result::Result<f64, LoadRefusal> {
         // L3 gate: refuse any new load when the GPU context is poisoned.
         // Acquiring load order ensures we see any store from a prior poisoning.
         if self.gpu_poisoned.load(Ordering::Acquire) {
-            return Err(ModelError::GpuPoisoned.into());
+            // The refusal is decided without the lock, so the state is read just after it (one
+            // short read lock, no other lock held: no new lock order). Either way an owning load
+            // goes in that gap, `Loading` or `Ready`, the refusal ends no load: only a
+            // `NotLoaded`/`Evicting` record (no load of its own to end) records it.
+            let ends_no_load = self
+                .read_models("begin_load")
+                .get(model_id)
+                .is_some_and(|r| ends_no_load(r.state));
+            return Err(LoadRefusal {
+                error: ModelError::GpuPoisoned.into(),
+                ends_no_load,
+            });
         }
 
         // Step 6b: a late result commits (or frees) first, so a retried load sees it.
         self.reap_stalled_loads();
         let mut guard = self.write_models("begin_load");
-        let device = guard
-            .get(model_id)
-            .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?
-            .device
-            .clone();
+        // Every refusal below is decided under this guard; so is `ends_no_load`.
+        let refuse = |guard: &HashMap<String, ModelRecord>, error: anyhow::Error| LoadRefusal {
+            ends_no_load: guard.get(model_id).is_some_and(|r| ends_no_load(r.state)),
+            error,
+        };
+        let Some(device) = guard.get(model_id).map(|r| r.device.clone()) else {
+            return Err(refuse(
+                &guard,
+                ModelError::NotFound(model_id.to_owned()).into(),
+            ));
+        };
         if let Some((stalled, secs)) = Self::stalled_load_on(&guard, &device) {
-            return Err(ModelError::DeviceStalled {
-                device,
-                model: stalled,
-                secs,
-            }
-            .into());
+            return Err(refuse(
+                &guard,
+                ModelError::DeviceStalled {
+                    device,
+                    model: stalled,
+                    secs,
+                }
+                .into(),
+            ));
         }
-        let record = guard
-            .get_mut(model_id)
-            .ok_or_else(|| ModelError::NotFound(model_id.to_owned()))?;
+        // Read before the record is borrowed mutably (an atomic: no lock).
+        let shutting_down = self.is_shutting_down();
+        let Some(record) = guard.get_mut(model_id) else {
+            // Unreachable (the id was found above under this guard); kept as a refusal.
+            return Err(LoadRefusal {
+                error: ModelError::NotFound(model_id.to_owned()).into(),
+                ends_no_load: false,
+            });
+        };
+        // A refusal from `Evicting` ends no load (P-C review R-2): the requests waiting through
+        // the eviction are woken by its end and restart the load themselves. One from
+        // `NotLoaded` (a stop under way) is this start's own end.
+        let evicting = |error: anyhow::Error| LoadRefusal {
+            error,
+            ends_no_load: true,
+        };
+        let other = |error: anyhow::Error| LoadRefusal {
+            error,
+            ends_no_load: false,
+        };
 
         match record.state {
             ModelState::Ready => return Ok(f64::NEG_INFINITY), // sentinel: already loaded
-            ModelState::Loading => return Err(ModelError::Loading.into()),
-            ModelState::Evicting => {
-                return Err(anyhow::anyhow!(
-                    "cannot load model while it is being evicted"
+            ModelState::Loading => {
+                return Err(LoadRefusal {
+                    error: ModelError::Loading.into(),
+                    ends_no_load: true,
+                });
+            }
+            // 0.9.1 S1 (owner b): the old engine's thread is stuck and still holds the memory.
+            ModelState::Evicting if record.stuck_engine.is_some() => {
+                return Err(evicting(
+                    ModelError::GenerationStalled(model_id.to_owned()).into(),
                 ));
+            }
+            ModelState::Evicting => {
+                return Err(evicting(anyhow::anyhow!(
+                    "cannot load model while it is being evicted"
+                )));
             }
             // D-04 S2: a load started now would hold up the stop for its whole duration. Only the
             // start of a load is refused — a Ready model still answers as loaded while draining.
-            ModelState::NotLoaded if self.is_shutting_down() => {
-                return Err(ModelError::ShuttingDown.into());
+            ModelState::NotLoaded if shutting_down => {
+                return Err(other(ModelError::ShuttingDown.into()));
             }
             ModelState::NotLoaded => record.state = ModelState::Loading,
         }
@@ -8506,6 +10514,64 @@ impl ModelManager {
             _ => native_clamped,
         };
         (max_prompt_tokens, formula_result)
+    }
+
+    /// What a load checks before any VRAM reservation or LRU eviction, so a load that was always
+    /// going to fail fails cheaply instead of evicting a healthy `Ready` model to make room. Returns
+    /// the configured `chat_template` override's content (see [`Self::read_template_override`]).
+    ///
+    /// # Errors
+    /// - The model's directory does not exist (a stale config, a typo, name drift from the real
+    ///   on-disk directory): [`ModelError::FilesMissing`]. Delegated to the factory (not a raw
+    ///   `is_dir()`) because test factories never touch the real filesystem — only
+    ///   `OvEngineFactory` performs a real check; `EngineFactory::model_exists`'s default is `true`.
+    /// - The directory lacks a file its kind needs (`crate::model_completeness`, 2026-08-03):
+    ///   [`ModelError::FilesIncomplete`]. See `incomplete_files`'s doc.
+    /// - C8: a configured `chat_template` override cannot be read (owner decision, 2026-11-09: never a silent
+    ///   fall-back to another template).
+    async fn load_preflight(
+        &self,
+        model_id: &str,
+        model_dir: &std::path::Path,
+    ) -> Result<Option<Arc<str>>> {
+        if !self.factory.model_exists(model_dir) {
+            return Err(ModelError::FilesMissing(model_id.to_owned()).into());
+        }
+        if let Some(missing) = self.incomplete_files(model_id, model_dir) {
+            return Err(ModelError::FilesIncomplete(model_id.to_owned(), missing).into());
+        }
+        self.read_template_override(model_id).await
+    }
+
+    /// The load's template pre-flight (C8): read `model_id`'s configured `chat_template` override,
+    /// on the blocking pool, before anything is reserved or evicted. `Ok(None)` when no override is
+    /// set, or the model's configured kind takes no chat template (media models ignore the key, as
+    /// before). The content travels to the commit in [`LoadCommit`], so the commit never reads the
+    /// file a second time (no window for it to vanish mid-load).
+    ///
+    /// # Errors
+    /// The override is set but cannot be read: [`ModelError::TemplateUnreadable`], naming the model
+    /// and the resolved path; the load is refused (owner decision, 2026-11-09).
+    async fn read_template_override(&self, model_id: &str) -> Result<Option<Arc<str>>> {
+        let generates = self
+            .read_models("load_model_with_overrides:template")
+            .get(model_id)
+            .is_none_or(|r| matches!(r.configured_kind, ModelKind::TextGen | ModelKind::Vision));
+        if !generates {
+            return Ok(None);
+        }
+        let Some(path) = self.resolve_template_override(model_id) else {
+            return Ok(None);
+        };
+        let id = model_id.to_owned();
+        let read =
+            tokio::task::spawn_blocking(move || template::read_chat_template_override(&id, &path))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("model '{model_id}': chat_template pre-flight failed: {e}")
+                })?;
+        // Every caller logs a failed load (admin: error, preload/on-demand: warn) with this message.
+        Ok(Some(Arc::from(read?)))
     }
 
     /// Absolute path of this model's `chat_template` override, if configured.
@@ -8772,6 +10838,50 @@ impl ModelManager {
             .saturating_sub(booked)
     }
 
+    /// PCI addresses of the discrete GPUs, the only devices the headroom limit reads.
+    fn discrete_gpu_pdevs(&self) -> Vec<String> {
+        self.inventory
+            .devices()
+            .iter()
+            .filter(|d| d.kind == crate::device_inventory::DeviceKind::DiscreteGpu)
+            .filter_map(|d| d.pdev.clone())
+            .collect()
+    }
+
+    /// Take a fresh outside-memory reading of each of `pdevs` whose cached one is older than the
+    /// probe TTL, on the blocking pool (a scan of every readable process takes about 0.1-0.2 s).
+    /// Paths that decide a load call this first, so the synchronous readers after it find the
+    /// reading of now and not the one of the previous request (S2). Nothing happens with
+    /// `kv_headroom_mode: "off"`, without a probe, or when every reading is fresh.
+    pub(crate) async fn refresh_device_probes(&self, mut pdevs: Vec<String>) {
+        if self.config.kv_headroom_mode != "dynamic" {
+            return;
+        }
+        pdevs.sort_unstable();
+        pdevs.dedup();
+        pdevs.retain(|p| self.headroom.needs_refresh(p));
+        if pdevs.is_empty() {
+            return;
+        }
+        let rt = self.headroom.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for pdev in &pdevs {
+                rt.outside_bytes_fresh(pdev);
+            }
+        })
+        .await
+        {
+            // The cached reading stays; the caller decides on it, as before S2.
+            tracing::debug!(error = %e, "device-memory probe refresh did not finish");
+        }
+    }
+
+    /// [`Self::refresh_device_probes`] for every discrete GPU (the `rv check` dry-run, which reads
+    /// the devices of the model and of every other vision model in its domain).
+    pub async fn refresh_all_device_probes(&self) {
+        self.refresh_device_probes(self.discrete_gpu_pdevs()).await;
+    }
+
     /// `(outside, own, leases)` bytes for a vision model's headroom right now.
     fn headroom_readings_now(&self, rec: &headroom::HeadroomRecord) -> (u64, u64, u64) {
         let booked = self
@@ -8858,14 +10968,9 @@ impl ModelManager {
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 
-    async fn execute_load(
-        &self,
-        model_id: &str,
-        kv_gb: f64,
-        max_num_seqs: usize,
-        gate: GateSource,
-        kv_plan: Option<KvPoolPlan>,
-    ) -> Result<()> {
+    #[allow(clippy::too_many_lines)] // one linear measure -> load -> commit sequence
+    async fn execute_load(&self, model_id: &str, commit: LoadCommit) -> Result<()> {
+        let (kv_gb, max_num_seqs) = (commit.kv_gb, commit.max_num_seqs);
         let model_path = self.config.models_dir.join(model_id);
         // Phase C1: load on the model's resolved device (per-model `device`
         // override → else `config.device`), set once at registration. Pre-C1
@@ -8905,8 +11010,9 @@ impl ModelManager {
             .then(os_memory::process_rss_anon_bytes)
             .flatten()
             .filter(|_| quiet);
-        let measure = LoadMeasure {
+        let mut measure = LoadMeasure {
             gpu_before,
+            probe: LoadProbe::default(),
             rss_before,
             gpu_window,
             measure_pdev,
@@ -8919,12 +11025,7 @@ impl ModelManager {
         // runs on; the reaper then commits or discards its result. The record holds the slot
         // before anything can cancel this future (no await in between).
         let timeout = self.load_timeout(model_id);
-        let slot = Arc::new(LoadSlot::new(LoadCommit {
-            kv_gb,
-            max_num_seqs,
-            gate,
-            kv_plan,
-        }));
+        let slot = Arc::new(LoadSlot::new(commit));
         if let Some(r) = self.write_models("execute_load:pending").get_mut(model_id) {
             r.pending_load = Some(Arc::clone(&slot));
             r.load_stalled = false;
@@ -8940,6 +11041,13 @@ impl ModelManager {
         // unbounded allowance keeps it at zero overdue; it still counts for the exit decision.
         let allowance = timeout.unwrap_or(Duration::MAX);
         // Detached on purpose: the slot, not the `JoinHandle`, carries the result.
+        // C25: the post-construction reading uses the load window's reader and device, and is
+        // only taken when the window has a `before` reading to pair it with.
+        let mid_pdev = measure.measure_pdev.clone();
+        let take_mid = measure.gpu_before.is_some();
+        // F1b (review R-1): a request waiting on this model is woken when the construction ends,
+        // so a load booked as stalled meanwhile is reaped by its next turn.
+        let wake = self.on_demand_waker();
         drop(tokio::task::spawn_blocking(move || {
             let token = crate::ffi_watch::global().arm(
                 crate::ffi_watch::FfiKind::Load,
@@ -8948,11 +11056,27 @@ impl ModelManager {
                 allowance,
             );
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                factory.load(&model_path, &device, kv_gb, max_num_seqs)
+                // C7 F1: always through the hooks, so the warm-up outcome reaches the record
+                // (residency rule b) on every load; the post-construction reading only in a quiet
+                // window that has a `before` reading to pair it with.
+                if take_mid {
+                    let disk = weights_on_disk_bytes(&model_path);
+                    worker.update_probe(|p| p.weights_on_disk = disk);
+                }
+                let hooks = SlotHooks {
+                    slot: &worker,
+                    take_mid,
+                    reader: || match mid_pdev.as_deref() {
+                        Some(p) => crate::gpu_memory::process_vram_bytes(p),
+                        None => crate::gpu_memory::process_total_bytes(),
+                    },
+                };
+                factory.load_with_hook(&model_path, &device, kv_gb, max_num_seqs, &hooks)
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("engine load panicked")));
             drop(token);
             worker.finish(result);
+            wake.notify_waiters();
         }));
 
         let finished = if let Some(limit) = timeout {
@@ -8972,6 +11096,7 @@ impl ModelManager {
         let (result, commit) = self
             .take_finished_load(model_id, &slot)
             .ok_or_else(|| anyhow::anyhow!("load result of '{model_id}' was already taken"))?;
+        measure.probe = slot.probe();
         // F2-S-7 + template-read opinion: the commit's file inputs are read on the blocking pool,
         // not in the commit below (which runs on this async task).
         let kind = result.as_ref().ok().map(|(h, _)| h.kind());
@@ -9005,7 +11130,7 @@ impl ModelManager {
             return (GateFiles::default(), ModelFiles::fallback());
         };
         let (model_dir, ratchet_dir, gate, kv_gb) = self.gate_files_args(model_id, commit);
-        let template_override = self.resolve_template_override(model_id);
+        let template_override = commit.template_override.clone();
         let id = model_id.to_owned();
         tokio::task::spawn_blocking(move || {
             (
@@ -9014,7 +11139,14 @@ impl ModelManager {
             )
         })
         .await
-        .unwrap_or_else(|_| (GateFiles::default(), ModelFiles::fallback()))
+        .unwrap_or_else(|_| {
+            // The override was already read: keep it even when the other reads failed.
+            let mut files = ModelFiles::fallback();
+            if let Some(t) = commit.template_override.as_deref() {
+                t.clone_into(&mut files.template);
+            }
+            (GateFiles::default(), files)
+        })
     }
 
     /// The same reads inline, for the synchronous stalled-load reaper (rare).
@@ -9028,10 +11160,14 @@ impl ModelManager {
             return (GateFiles::default(), ModelFiles::fallback());
         };
         let (model_dir, ratchet_dir, gate, kv_gb) = self.gate_files_args(model_id, commit);
-        let template_override = self.resolve_template_override(model_id);
         (
             GateFiles::read(&model_dir, ratchet_dir.as_deref(), gate.as_ref(), kv_gb),
-            ModelFiles::read(model_id, &model_dir, kind, template_override.as_deref()),
+            ModelFiles::read(
+                model_id,
+                &model_dir,
+                kind,
+                commit.template_override.as_deref(),
+            ),
         )
     }
 
@@ -9073,6 +11209,7 @@ impl ModelManager {
             max_num_seqs,
             gate,
             kv_plan,
+            template_override: _,
         } = commit;
         let load_duration_secs = started.elapsed().as_secs_f64();
         match result {
@@ -9089,6 +11226,7 @@ impl ModelManager {
                     template,
                     special_tokens: (eos_token, bos_token),
                     generation_defaults,
+                    file_sampling,
                 } = model_files;
                 let family = ModelFamily::detect(&template);
                 // The post-load device-memory reading (a /proc fdinfo scan) is taken before the
@@ -9104,6 +11242,10 @@ impl ModelManager {
                     .zip(os_memory::process_rss_anon_bytes())
                     .map(|(before, after)| after.saturating_sub(before));
 
+                // C27: whether a crash respawn brings this model back (read before the models
+                // lock): restored after listening, or loaded by the respawn's preload phase.
+                let restorable = self.restorable_after_respawn(model_id)
+                    || self.config.preload.iter().any(|p| p == model_id);
                 let mut guard = self.write_models("execute_load:commit");
                 let record = guard
                     .get_mut(model_id)
@@ -9111,15 +11253,30 @@ impl ModelManager {
                 record.last_kind = Some(kind);
                 record.last_load_duration_secs = Some(load_duration_secs);
                 record.cpu_resident = (rss_load_delta, 0);
+                // C7 B.3: what of the pool is resident (rule a/b/c, `resident_pool_gb`).
+                let mut residency = (None, None);
                 if let Some(m) = measure {
                     let window_quiet =
                         m.leases_at_start == 0 && self.headroom.lease_bytes(&m.domain, None) == 0;
-                    record.note_gpu_load(
-                        m.gpu_before.filter(|_| window_quiet),
+                    let readings = m.readings(
                         gpu_after.flatten(),
-                        m.gpu_window,
+                        window_quiet && m.gpu_window.is_clean(),
+                        kv_gb,
+                        kind,
                     );
+                    let outcome = record.note_gpu_load(&readings);
+                    if outcome.is_none() {
+                        log_load_not_measured(model_id, &readings, m.gpu_window, window_quiet);
+                    }
+                    residency = (
+                        outcome
+                            .and_then(Result::ok)
+                            .and_then(|s| s.pool_resident_bytes),
+                        readings.warm_up,
+                    );
+                    log_load_memory_split(model_id, &readings, outcome);
                 }
+                record.kv_pool_resident_gb = resident_pool_gb(residency.0, residency.1, kv_gb);
                 crate::gpu_memory::note_load_event();
                 record.handle = Some(handle);
                 record.thread = Some(thread);
@@ -9134,6 +11291,13 @@ impl ModelManager {
                 record.eos_token = Arc::from(eos_token.as_str());
                 record.bos_token = Arc::from(bos_token.as_str());
                 record.generation_defaults = generation_defaults;
+                record.file_sampling = file_sampling;
+                if matches!(kind, ModelKind::TextGen | ModelKind::Vision) {
+                    record.warn_if_sampling_rule_broken(model_id);
+                    record
+                        .sampling_profile()
+                        .log(model_id, record.is_npu(), "load");
+                }
                 record.kv_cache_gb = kv_gb;
                 record.max_prompt_tokens = max_prompt_tokens;
                 record.pool_capacity_tokens = pool_capacity_tokens;
@@ -9152,6 +11316,16 @@ impl ModelManager {
                 record.max_concurrent_streams = max_num_seqs;
                 record.state = ModelState::Ready;
                 record.last_used = Instant::now();
+                // C27: tell the supervisor, so a crash respawn can bring this model back. Under
+                // the models lock, so the notes are in the order of the state changes. Only the
+                // kinds a respawn brings back: `Eager` or in `preload` (a respawn's preload phase
+                // loads only the `preload` models Ready at the crash; `on_demand` loads on its
+                // first request).
+                if restorable {
+                    crate::startup::note_model(crate::startup::ModelNote::Ready(model_id));
+                }
+                // C27 F5: a model that reached Ready is no longer "not restored".
+                crate::startup::clear_restore_warning(model_id);
                 tracing::info!(
                     model_id,
                     kind = kind.label(),
@@ -9297,6 +11471,13 @@ impl ModelManager {
     /// `/v1/admin/models`): a late result shows up on the next touch. Cheap when nothing is
     /// stalled (one read-lock scan). Takes the models and VRAM locks: never call it while
     /// holding either (kept out of `list_models` for that reason).
+    ///
+    /// Safe on a request task, and on a poisoned GPU context (F1b N-3; the on-demand wait loop
+    /// and the listings call it there): the commit is bookkeeping only (file reads, no engine or
+    /// `OpenVINO` call; the KV warm-up ran inside the load). A late engine is stored in its
+    /// record, never dropped here, so no pipeline destructor runs on a broken context, and the
+    /// stop after a poisoning skips the teardown. A late failure frees only the reservation.
+    /// Test: `reaping_a_late_load_on_a_poisoned_context_commits_and_never_drops_the_engine`.
     pub fn reap_stalled_loads(&self) {
         let ready: Vec<(String, Arc<LoadSlot>)> = self
             .read_models("reap_stalled_loads")
@@ -9334,6 +11515,8 @@ impl ModelManager {
                         secs,
                         "stalled load returned after {secs} s — committed"
                     );
+                    // F1b: a request still waiting on this model finds it Ready.
+                    self.note_load_end(&model_id, None);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -9344,6 +11527,8 @@ impl ModelManager {
                          reservation freed"
                     );
                     self.abort_load(&model_id);
+                    // F1b: a request still waiting on this model gets the load's error.
+                    self.note_load_end(&model_id, Some(&e));
                 }
             }
         }
@@ -9413,6 +11598,10 @@ impl ModelManager {
         if domain != DOMAIN_SYSTEM {
             return None;
         }
+        #[cfg(test)]
+        if let Some(avail) = TEST_LIVE_AVAIL_GB.with(std::cell::Cell::get) {
+            return Some(avail);
+        }
         let avail = os_memory::available_ram_gb()? - self.cpu_outstanding_gb();
         let Some(budget) = self.config.system_ram_budget_gb else {
             return Some(avail);
@@ -9430,6 +11619,46 @@ impl ModelManager {
             .map_or(0.0, |v| v.domain_gb(DOMAIN_SYSTEM).1);
         let credit = (os_memory::reclaimable_gpu_cache_gb().unwrap_or(0.0) - tracked_used).max(0.0);
         Some((avail + credit).min(budget))
+    }
+
+    /// Why a boot preload (`no_evict`) does not fit beside the models already loaded, for the
+    /// `preload_skipped` warning: the binding gate (the memory budget or live system RAM, the one
+    /// short by more), that gate's own need and what it has, and the shortfall rounded up to
+    /// 0.1 GB (never "short by 0.0 GB").
+    fn preload_no_room_reason(&self, domain: &str, n: NoRoomNeed) -> String {
+        let free = self
+            .vram
+            .read()
+            .ok()
+            .and_then(|v| (!v.fits(domain, f64::INFINITY)).then(|| v.free_gb(domain)));
+        let budget_short = free.map(|f| n.total_minimum - f);
+        let ram_short = n.live_avail.map(|a| n.live_need + n.ram_floor - a);
+        let up = |gb: f64| ((gb * 10.0).ceil() / 10.0).max(0.1);
+        match ram_short {
+            Some(r) if budget_short.is_none_or(|b| r > b) => format!(
+                "it does not fit beside the models already loaded: system RAM is short by {:.1} \
+                 GB (it needs ~{:.1} GB - weights {:.1} + KV {:.1} + margin {:.1} - above the \
+                 {:.1} GB kept for the OS, and {:.1} GB is available)",
+                up(r),
+                n.live_need,
+                n.weight_gb,
+                n.kv_need,
+                n.margin,
+                n.ram_floor,
+                n.live_avail.unwrap_or_default(),
+            ),
+            _ => format!(
+                "it does not fit beside the models already loaded: the memory budget is short by \
+                 {:.1} GB (it needs {:.1} GB - weights {:.1} + min KV {:.1} + margin {:.1} - and \
+                 {:.1} GB is free)",
+                up(budget_short.unwrap_or_default()),
+                n.total_minimum,
+                n.weight_gb,
+                n.min_kv,
+                n.margin,
+                free.unwrap_or_default(),
+            ),
+        }
     }
 
     /// CPU over-admission: GiB the Ready `CPU` models are charged for but were not measured to
@@ -9459,6 +11688,16 @@ impl ModelManager {
             .iter()
             .map(|(id, resident)| (vram.allocated_gb(id) - resident).max(0.0))
             .sum()
+    }
+
+    /// C7 B.3: the Ready models with a KV pool taken to be resident and its GiB
+    /// ([`ModelRecord::kv_pool_resident_gb`]), for the eviction plan's RAM credit.
+    fn resident_pools(&self) -> HashMap<String, f64> {
+        self.read_models("resident_pools")
+            .iter()
+            .filter(|(_, r)| r.state == ModelState::Ready && r.kv_pool_resident_gb > 0.0)
+            .map(|(id, r)| (id.clone(), r.kv_pool_resident_gb))
+            .collect()
     }
 
     /// The Ready `CPU` models and the GiB each was measured to hold
@@ -9605,6 +11844,11 @@ impl ModelManager {
     ///
     /// # Errors
     /// [`ModelError::NotFound`] if `model_id` is not a registered model.
+    ///
+    /// Reads the device-headroom figures from the probe cache (S2): the admin `rv check` handler
+    /// refreshes them first (`refresh_all_device_probes`); the realtime slot preview does not
+    /// (request path), so it may answer on an older reading. The load it starts
+    /// decides on a fresh one.
     pub fn check_admission(&self, model_id: &str) -> Result<AdmissionCheck> {
         self.check_admission_with(model_id, false)
     }
@@ -9720,7 +11964,11 @@ impl ModelManager {
             + self.config.vram_safety_margin_gb;
 
         // Second gate, UMA only — see `RamGate`.
-        let ram_gate = self.ram_gate_for(model_id, &domain, weight_gb, needs_kv_pool);
+        // C7 P4: a load's preview charges the KV the load asked for (a `--kv-cache-gb` or resize
+        // override), not the configured target; the dry-run (no preview) has no override.
+        let kv_target_gb =
+            headroom.map_or_else(|| self.resolved_kv_target_gb(model_id), |p| p.kv_target_gb);
+        let ram_gate = self.ram_gate_for(&domain, weight_gb, needs_kv_pool, kv_target_gb);
         let (ram_needed_gb, ram_avail_gb) = (ram_gate.needed, ram_gate.avail);
         let ram_admits = |freed: f64| ram_gate.admits(freed);
 
@@ -9746,6 +11994,7 @@ impl ModelManager {
 
         let candidates = self.eviction_candidates(model_id, &domain, force);
         let cpu_residents = self.cpu_residents();
+        let resident_pools = self.resident_pools();
 
         let vram = self
             .vram
@@ -9788,7 +12037,7 @@ impl ModelManager {
 
         // Greedily evict candidates in order until BOTH gates are satisfied (or
         // we run out) — see [`plan_evictions`] for what each eviction is credited.
-        let plan = eviction_plan_candidates(&vram, &candidates, &cpu_residents);
+        let plan = eviction_plan_candidates(&vram, &candidates, &cpu_residents, &resident_pools);
         // Release the tracker before anything below takes it again (`busy_excluded` reads it):
         // a second read while this one is held deadlocks against a queued writer (0.9.0 review
         // A). Everything still needed from it is copied out above.
@@ -9890,29 +12139,31 @@ impl ModelManager {
         weight_gb: f64,
         kv_target_gb: f64,
         needs_kv_pool: bool,
-        force: bool,
+        rule: EvictRule,
         exact: Option<&ExactPoolSpec>,
-    ) -> Result<(KvPoolPlan, Vec<String>)> {
+    ) -> Result<(KvPoolPlan, Vec<EvictionReport>)> {
         let mut evicted = Vec::new();
+        let mut reports = Vec::new();
         match self
             .ensure_vram_loop(
                 model_id,
                 weight_gb,
                 kv_target_gb,
                 needs_kv_pool,
-                force,
+                rule,
                 exact,
                 &mut evicted,
+                &mut reports,
             )
             .await
         {
-            Ok(plan) => Ok((plan, evicted)),
+            Ok(plan) => Ok((plan, reports)),
             Err(e) => Err(annotate_refusal_after_eviction(model_id, &evicted, e)),
         }
     }
 
     /// The check/reserve/evict loop of [`Self::ensure_vram_for`]; `evicted` collects every model
-    /// this load evicted, for the caller's error.
+    /// this load evicted, for the caller's error, and `reports` what each eviction did (V1-rv P1).
     #[allow(clippy::too_many_lines)] // cohesive check/reserve/evict loop + M1 RAM gate
     #[allow(clippy::too_many_arguments)]
     async fn ensure_vram_loop(
@@ -9921,10 +12172,16 @@ impl ModelManager {
         weight_gb: f64,
         kv_target_gb: f64,
         needs_kv_pool: bool,
-        force: bool,
+        rule: EvictRule,
         exact: Option<&ExactPoolSpec>,
         evicted: &mut Vec<String>,
+        reports: &mut Vec<EvictionReport>,
     ) -> Result<KvPoolPlan> {
+        let EvictRule {
+            force,
+            no_evict,
+            resize_rollback,
+        } = rule;
         // STT / embedding / image / TTS models have no KV cache; charge them
         // weight only. LLM/VLM (or unknown kind) get the min_kv floor so the
         // error message is honest about what they require.
@@ -10001,9 +12258,12 @@ impl ModelManager {
         // for their in-flight clients) only to fail anyway once the last
         // evictable victim is gone — the eviction was doomed from the start (see
         // the project's internal engineering log).
-        {
+        // Not for a C27 respawn restore (`no_evict`): it never evicts, so "could it fit after
+        // evicting" is the wrong question; the loop below refuses it with its own reason.
+        if !no_evict {
             // VRAM is credited with the whole reservation (weights + KV), live RAM with the
-            // weights only — the same split `plan_evictions` uses, so this check and the
+            // weights plus the resident pool ([`ram_credit_gb`]) — the same split
+            // `plan_evictions` uses, so this check and the
             // dry-run cannot disagree about what a sweep frees.
             let (reclaimable_gb, reclaimable_weights_gb) =
                 self.max_reclaimable(model_id, &domain, force);
@@ -10065,10 +12325,14 @@ impl ModelManager {
                 if !os_memory::ram_floor_admits(max_avail, live_need, ram_floor) {
                     return Err(ModelError::InsufficientMemory(format!(
                         "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
-                         (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}), but even \
-                         evicting every evictable model in this domain would leave only \
+                         (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}){}, but \
+                         even evicting every evictable model in this domain would leave only \
                          ~{max_avail:.1} GB system RAM available and {ram_floor:.1} GB must stay \
-                         free for the OS — this load can never fit, nothing was evicted"
+                         free for the OS — this load can never fit, nothing was evicted",
+                        kv_charge_note(
+                            Self::kv_target_bound_gb(kv_target_gb, &self.config),
+                            kv_need
+                        ),
                     ))
                     .into());
                 }
@@ -10114,6 +12378,10 @@ impl ModelManager {
         // victims), and before giving up on a headroom refusal.
         let mut settled_before_plan = false;
         let mut resettled = false;
+        // D-F1: a boot preload takes the device-headroom gate refuse-only (no release waits, no
+        // eviction for headroom). Before C22 no probe existed at boot, so those paths were inert
+        // there; the tracker gate keeps exactly that boot behaviour.
+        let boot = self.preloading.load(Ordering::Acquire);
 
         loop {
             // Live system-RAM check: `None` unless this is the gated system domain
@@ -10126,6 +12394,17 @@ impl ModelManager {
             // One write-lock acquisition per iteration: check, compute, and
             // allocate atomically — no TOCTOU window for a concurrent load.
             let others = self.vision_headrooms_on(&domain, model_id);
+            // S2: a load decides on a reading taken now (on the blocking pool), not on one cached
+            // before an idle gap.
+            self.refresh_device_probes(
+                exact
+                    .and_then(|e| e.headroom.as_ref())
+                    .map(|h| h.pdev.clone())
+                    .into_iter()
+                    .chain(others.iter().map(|(_, s)| s.pdev.clone()))
+                    .collect(),
+            )
+            .await;
             // Probe readings are taken before the tracker lock: the first one scans /proc.
             let outsides =
                 self.headroom_outsides(&domain, exact.and_then(|e| e.headroom.as_ref()), &others);
@@ -10280,11 +12559,60 @@ impl ModelManager {
             // Not enough VRAM — pick a victim (T5.4 seam: `select_eviction_victim`)
             // in the *same domain* and evict it. `None` → nothing evictable in
             // this domain → the hard error below.
+            // D-F1: the headroom gate refused this boot preload: refuse it, whatever could be
+            // evicted (the earlier preloads stay Ready). A boot preload never evicts
+            // (`no_evict`), so there is no released engine to wait for (the D-N1
+            // re-settle after a boot eviction is gone with it).
+            if boot && headroom_refusal.is_some() {
+                let msg = headroom_refusal.take().unwrap_or_default();
+                return Err(ModelError::InsufficientMemory(format!(
+                    "cannot load {model_id}: {msg} (a boot preload does not evict for the \
+                     device-headroom rule)"
+                ))
+                .into());
+            }
+            // C27: a respawn restore never evicts — refuse instead of picking a victim. C7 N2: a
+            // resize rollback never evicts either, and says so in its own words.
+            if no_evict {
+                if boot {
+                    let why = self.preload_no_room_reason(
+                        &domain,
+                        NoRoomNeed {
+                            total_minimum,
+                            weight_gb,
+                            min_kv,
+                            margin,
+                            live_avail,
+                            live_need,
+                            kv_need,
+                            ram_floor,
+                        },
+                    );
+                    if let Ok(mut m) = self.preload_no_room.lock() {
+                        m.insert(model_id.to_owned(), why.clone());
+                    }
+                    return Err(ModelError::InsufficientMemory(format!(
+                        "preload of {model_id} skipped: {why}, and a preload never evicts another \
+                         preload"
+                    ))
+                    .into());
+                }
+                let why = headroom_refusal.take().unwrap_or_else(|| {
+                    "not enough free memory beside the resident models".to_owned()
+                });
+                return Err(ModelError::InsufficientMemory(no_evict_refusal(
+                    model_id,
+                    &why,
+                    resize_rollback,
+                ))
+                .into());
+            }
             let lru_id = self.select_eviction_victim(model_id, &domain, force);
 
             match lru_id {
                 None => {
                     if headroom_refusal.is_some()
+                        && !boot
                         && !resettled
                         && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
                     {
@@ -10333,9 +12661,13 @@ impl ModelManager {
                     {
                         return Err(ModelError::InsufficientMemory(format!(
                             "insufficient system memory: loading {model_id} needs ~{live_need:.1} GB \
-                             (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}), but only \
-                             {avail:.1} GB system RAM is available and {ram_floor:.1} GB must stay free \
-                             for the OS — free memory or load a smaller model"
+                             (weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}){}, but \
+                             only {avail:.1} GB system RAM is available and {ram_floor:.1} GB must \
+                             stay free for the OS — free memory or load a smaller model",
+                            kv_charge_note(
+                                Self::kv_target_bound_gb(kv_target_gb, &self.config),
+                                kv_need
+                            ),
                         )).into());
                     }
                     let free = self
@@ -10362,6 +12694,7 @@ impl ModelManager {
                         "LRU eviction to make room"
                     );
                     if predicted.is_none()
+                        && !boot
                         && !settled_before_plan
                         && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
                     {
@@ -10401,45 +12734,20 @@ impl ModelManager {
                         if let Some(c) = check.as_ref().filter(|c| !c.fits) {
                             // The live system-RAM gate can be the binding one while the
                             // logical tracker has room (a CPU-only box has a zero tracker
-                            // budget): name the figures that actually refused the load.
-                            if let (Some(need), Some(avail)) = (c.ram_needed_gb, c.ram_avail_gb)
-                                && !c.vram_gated
-                            {
-                                return Err(ModelError::InsufficientMemory(format!(
-                                    "insufficient system memory: loading {model_id} needs \
-                                     ~{need:.1} GB, but only {avail:.1} GB system RAM is \
-                                     available and {ram_floor:.1} GB must stay free for the OS, and evicting the \
-                                     models it could evict ({}) would not make enough room — \
-                                     nothing was evicted; free memory or load a smaller model",
-                                    if c.would_evict.is_empty() {
-                                        "none".to_owned()
-                                    } else {
-                                        c.would_evict.join(", ")
-                                    },
-                                ))
+                            // budget, a UMA box often): name the gate(s) that refused (C7).
+                            return Err(self
+                                .preview_refusal(model_id, c, &domain, force, kv_target_gb)
                                 .into());
-                            }
-                            return Err(ModelError::InsufficientMemory(format!(
-                                "insufficient memory: loading {model_id} needs {:.1} GB \
-                                 ({:.1} GB free), and evicting the models it could evict ({}) \
-                                 would still not make room — nothing was evicted; free memory \
-                                 or load a smaller model",
-                                c.needed_gb,
-                                c.free_gb,
-                                if c.would_evict.is_empty() {
-                                    "none".to_owned()
-                                } else {
-                                    c.would_evict.join(", ")
-                                },
-                            ))
-                            .into());
                         }
-                        predicted = Some(check.map(|c| c.would_evict).unwrap_or_default());
+                        let plan = check.map(|c| c.would_evict).unwrap_or_default();
+                        // (A boot preload never gets here: it is `no_evict`, refused above.)
+                        predicted = Some(plan);
                     }
                     if let Some(plan) = predicted.as_ref()
                         && !plan_permits(plan, evicted, &id)
                     {
                         if headroom_refusal.is_some()
+                            && !boot
                             && !resettled
                             && self.unbooked_excess_gib(&domain, &outsides) > Some(0.0)
                         {
@@ -10448,8 +12756,21 @@ impl ModelManager {
                             continue;
                         }
                         let reason = headroom_refusal.take().unwrap_or_else(|| {
-                            let free = self.vram.read().map_or(0.0, |v| v.free_gb(&domain));
-                            format!("tracked VRAM: need {total_minimum:.1} GB, {free:.1} GB free")
+                            // C7: name the gate that refused this iteration, not always the
+                            // tracker (on a UMA box it is often live system RAM).
+                            let (free, fits) = self.vram.read().map_or((0.0, false), |v| {
+                                (v.free_gb(&domain), v.fits(&domain, total_minimum))
+                            });
+                            gate_refusal_reason(
+                                live_avail
+                                    .filter(|_| !ram_ok)
+                                    .map(|avail| (avail, live_need, ram_floor)),
+                                &kv_charge_note(
+                                    Self::kv_target_bound_gb(kv_target_gb, &self.config),
+                                    kv_need,
+                                ),
+                                (!fits).then_some((total_minimum, free)),
+                            )
                         });
                         return Err(ModelError::InsufficientMemory(format!(
                             "loading {model_id} would have to evict {id}, which is not in its \
@@ -10460,20 +12781,25 @@ impl ModelManager {
                     }
                     // What the release wait expects back: the victim's RAM credit, read before
                     // the eviction frees its tracker allocation ([`ram_credit_gb`]).
-                    let (victim_weight, victim_resident) = self
+                    let (victim_weight, victim_resident, victim_pool) = self
                         .read_models("ensure_vram:victim_weight")
                         .get(&id)
-                        .map_or((0.0, None), |r| {
-                            (self.budget_weight_gb(r), r.cpu_resident_gb())
+                        .map_or((0.0, None, 0.0), |r| {
+                            (
+                                self.budget_weight_gb(r),
+                                r.cpu_resident_gb(),
+                                r.kv_pool_resident_gb,
+                            )
                         });
                     let victim_gb = ram_credit_gb(
                         victim_weight,
                         self.vram.read().map_or(0.0, |v| v.allocated_gb(&id)),
                         victim_resident,
+                        victim_pool,
                     );
                     // The victim was idle when picked; if it turned busy since, the load is
                     // refused (retryable) rather than aborting that request (D3).
-                    match self.evict_model_for_load(&id, force).await {
+                    let report = match self.evict_model_for_load(&id, force).await {
                         Err(e)
                             if matches!(
                                 e.downcast_ref::<ModelError>(),
@@ -10483,8 +12809,9 @@ impl ModelManager {
                             return Err(Self::refuse_load_busy(model_id, vec![id]));
                         }
                         other => other?,
-                    }
+                    };
                     evicted.push(id);
+                    reports.push(report);
                     if !ram_ok {
                         self.await_ram_release(
                             &domain, live_avail, victim_gb, live_need, ram_floor,
@@ -10642,6 +12969,52 @@ impl ModelManager {
             || self.realtime_serving_set_contains(id)
             || (!force && r.last_used.elapsed() < self.eviction_grace_for(id))
             || (busy_protects && r.has_in_flight())
+            // 0.9.1 S1 (review N3): a stalled engine's thread holds its memory until it exits, so
+            // evicting it frees nothing; the load picks another victim or reports no room.
+            || r.handle.as_ref().is_some_and(engine::EngineHandleKind::generation_stalled)
+    }
+
+    /// C7 F2: the resize reload of `model_id` was refused for memory (`err`). Best effort: load
+    /// the model again at its previous pool (`previous_kv_gb`), never evicting anything for it
+    /// ([`LoadOverrides::no_evict`]: what the refused reload already evicted stays evicted, nothing
+    /// more), and say in the error whether that worked. Other errors (not a memory refusal) are
+    /// returned as before: the model stays unloaded.
+    async fn resize_rollback(
+        &self,
+        model_id: &str,
+        err: anyhow::Error,
+        previous_kv_gb: f64,
+        streams: Option<usize>,
+    ) -> anyhow::Error {
+        let refused = err.chain().count() == 1
+            && matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::InsufficientMemory(_))
+            );
+        if !refused || previous_kv_gb <= 0.0 || self.is_shutting_down() {
+            return resize_reload_refused(model_id, err);
+        }
+        let restore = self
+            .load_model_with_overrides(
+                model_id,
+                LoadOverrides {
+                    kv_cache_gb: Some(previous_kv_gb),
+                    max_concurrent_streams: streams,
+                    force: false,
+                    no_evict: true,
+                    resize_rollback: true,
+                },
+            )
+            .await;
+        let restored = restore.as_ref().err().map(|e| format!("{e:#}"));
+        tracing::warn!(
+            model = model_id,
+            previous_kv_gb,
+            restored = restored.is_none(),
+            error = %err,
+            "resize reload refused; reloaded at the previous KV size (best effort)"
+        );
+        resize_rollback_error(model_id, err, previous_kv_gb, restored.as_deref())
     }
 
     /// Everything a resize can know before it changes anything (D3-S1.F2): a busy model is
@@ -10650,7 +13023,7 @@ impl ModelManager {
     /// to bring it back, which is exactly what "a growing resize leaves the model unloaded" was.
     /// Read-only: nothing is evicted, no cooldown claimed, no flag set.
     fn resize_preflight(&self, model_id: &str, kv_cache_gb: f64, force: bool) -> Result<()> {
-        let (weight_gb, domain, needs_kv_pool, active, resident) = {
+        let (weight_gb, domain, needs_kv_pool, active, resident, resident_pool) = {
             let guard = self.read_models("resize_preflight");
             let record = guard
                 .get(model_id)
@@ -10665,6 +13038,7 @@ impl ModelManager {
                 record.needs_kv_pool(),
                 active,
                 record.cpu_resident_gb(),
+                record.kv_pool_resident_gb,
             )
         };
         if active > 0 && self.busy_protects(force) {
@@ -10693,34 +13067,104 @@ impl ModelManager {
             (
                 vram.free_gb(&domain) + own_alloc + reclaim_alloc,
                 vram.fits(&domain, f64::INFINITY),
-                ram_credit_gb(weight_gb, own_alloc, resident),
+                resize_own_ram_credit_gb(
+                    resident.map(|_| ram_credit_gb(weight_gb, own_alloc, resident, 0.0)),
+                    weight_gb,
+                    kv_need,
+                    resident_pool,
+                ),
             )
         };
-        let floor = self
+        let floor_gb = self
             .config
             .system_ram_reservation_gb
             .unwrap_or_else(os_memory::default_reservation_gb);
         let live_need = weight_gb + kv_need + margin;
         let live_ram = self
             .live_system_avail_gb(&domain)
-            .map(|avail| (avail + own_credit + reclaim_weights, live_need, floor));
-        if resize_reload_admits(
-            capacity,
-            weight_gb + min_kv + margin,
-            gating_disabled,
-            live_ram,
-        ) {
+            .map(|avail| ResizeLiveRam {
+                avail,
+                own_credit,
+                reclaim: reclaim_weights,
+                need: live_need,
+                floor: floor_gb,
+                ceiling: self.ram_ceiling_gb(&domain),
+            });
+        let vram_need = weight_gb + min_kv + margin;
+        let gates = resize_reload_gates(capacity, vram_need, gating_disabled, live_ram.as_ref());
+        if gates.admits() {
             return Ok(());
         }
-        Err(ModelError::InsufficientMemory(format!(
-            "resize of {model_id} to a {kv_cache_gb:.1} GB KV cache refused before evicting \
-             anything: after it is unloaded the reload would not be admitted (needs ~{live_need:.1} \
-             GB of system RAM, weights {weight_gb:.1} + KV {kv_need:.1} + margin {margin:.1}, or \
-             {:.1} GB of VRAM; {capacity:.1} GB tracked VRAM is reachable) — the model was left \
-             as it was",
-            weight_gb + min_kv + margin
+        let figures = ResizeFigures {
+            requested_kv: kv_cache_gb,
+            weight: weight_gb,
+            kv_need,
+            margin,
+            vram_need,
+            vram_reachable: capacity,
+        };
+        tracing::info!(
+            model = model_id,
+            kv_cache_gb,
+            resident_pool_gb = resident_pool,
+            vram_ok = gates.vram_ok,
+            ram_ok = gates.ram_ok,
+            "resize refused by the preflight"
+        );
+        Err(ModelError::InsufficientMemory(resize_refusal_text(
+            model_id,
+            &figures,
+            live_ram.as_ref(),
+            gates,
         ))
         .into())
+    }
+
+    /// C7: the refusal of a load whose eviction preview (`check`, `fits == false`) found no plan.
+    /// Each gate is weighed alone against a full sweep of the evictable residents: the one that
+    /// cannot be met even then is named with its figures. 0.9.0 printed the tracked-VRAM figures
+    /// whenever the domain had a tracker budget, also when the live system-RAM gate refused
+    /// ("needs 18.0 GB, 23.3 GB free" for a load refused by RAM on a UMA box).
+    fn preview_refusal(
+        &self,
+        model_id: &str,
+        c: &AdmissionCheck,
+        domain: &str,
+        force: bool,
+        kv_target_gb: f64,
+    ) -> ModelError {
+        let (reclaim_alloc, reclaim_weights) = self.max_reclaimable(model_id, domain, force);
+        let floor = self
+            .config
+            .system_ram_reservation_gb
+            .unwrap_or_else(os_memory::default_reservation_gb);
+        let ram = c.ram_needed_gb.zip(c.ram_avail_gb).map(|(need, avail)| {
+            let reachable =
+                os_memory::credited_avail_gb(avail, reclaim_weights, self.ram_ceiling_gb(domain));
+            let weight = self
+                .read_models("preview_refusal")
+                .get(model_id)
+                .map_or(0.0, |r| self.budget_weight_gb(r));
+            let margin = self.config.vram_safety_margin_gb;
+            let kv = (need - weight - margin).max(0.0);
+            PreviewRam {
+                need,
+                avail,
+                reachable,
+                floor,
+                weight,
+                kv,
+                margin,
+                kv_note: kv_charge_note(Self::kv_target_bound_gb(kv_target_gb, &self.config), kv),
+            }
+        });
+        ModelError::InsufficientMemory(preview_refusal_text(
+            model_id,
+            ram.as_ref(),
+            c.vram_gated
+                .then_some((c.needed_gb, c.free_gb, c.free_gb + reclaim_alloc)),
+            &c.would_evict,
+        ))
     }
 
     /// Models kept out of the plan only because they are busy, whose eviction (after the idle
@@ -10779,6 +13223,51 @@ impl ModelManager {
         Duration::from_millis(self.forced_join_deadline_ms.load(Ordering::Relaxed))
     }
 
+    /// Test seam: the stall-watchdog liveness of a loaded model's engine.
+    #[cfg(test)]
+    pub(crate) fn liveness_for_test(
+        &self,
+        model_id: &str,
+    ) -> Option<crate::stall_watch::EngineLiveness> {
+        self.read_models("test")
+            .get(model_id)
+            .and_then(|r| r.handle.as_ref())
+            .and_then(|h| h.liveness().cloned())
+    }
+
+    /// Test seam: give a loaded mock model an L0 prompt gate (the mock factory's models get `0`,
+    /// gate off), so a request's tokenizer round-trip to the engine thread runs.
+    #[cfg(test)]
+    pub(crate) fn set_max_prompt_tokens_for_test(&self, model_id: &str, max_prompt_tokens: usize) {
+        if let Some(r) = self.write_models("test").get_mut(model_id) {
+            r.max_prompt_tokens = max_prompt_tokens;
+        }
+    }
+
+    /// Test seam: force a registered model's state (e.g. `Loading` without a real load in
+    /// flight), so a listing test can see every state. Touches nothing else in the record.
+    #[cfg(test)]
+    pub(crate) fn set_state_for_test(&self, model_id: &str, state: ModelState) {
+        if let Some(r) = self.write_models("test").get_mut(model_id) {
+            r.state = state;
+        }
+    }
+
+    /// The drain bound of an admin or recovery eviction ([`EVICT_DRAIN_DEADLINE`]).
+    fn evict_drain_deadline(&self) -> Duration {
+        Duration::from_millis(self.evict_drain_ms.load(Ordering::Relaxed))
+    }
+
+    /// Test seam: shorten the admin/recovery eviction drain deadline, so a test reaches the
+    /// abort at the deadline without waiting two minutes.
+    #[cfg(test)]
+    pub(crate) fn set_evict_drain_deadline_for_test(&self, deadline: Duration) {
+        self.evict_drain_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Test seam: shorten the forced-eviction join deadline.
     #[cfg(test)]
     pub(crate) fn set_forced_join_deadline_for_test(&self, deadline: Duration) {
@@ -10800,7 +13289,7 @@ impl ModelManager {
         if !self.busy_protects(force) {
             return Vec::new();
         }
-        let found: Vec<(String, f64, Option<f64>)> = {
+        let found: Vec<(String, f64, Option<f64>, f64)> = {
             let guard = self.read_models("ensure_vram:busy_excluded");
             guard
                 .iter()
@@ -10811,7 +13300,14 @@ impl ModelManager {
                         && r.has_in_flight()
                         && !self.eviction_protected_ex(id, r, force, false)
                 })
-                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r), r.cpu_resident_gb()))
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        self.budget_weight_gb(r),
+                        r.cpu_resident_gb(),
+                        r.kv_pool_resident_gb,
+                    )
+                })
                 .collect()
         };
         let Ok(vram) = self.vram.read() else {
@@ -10819,10 +13315,10 @@ impl ModelManager {
         };
         found
             .into_iter()
-            .map(|(id, weight_gb, resident)| {
+            .map(|(id, weight_gb, resident, pool)| {
                 let allocated_gb = vram.allocated_gb(&id);
                 BusyExcluded {
-                    weight_gb: ram_credit_gb(weight_gb, allocated_gb, resident),
+                    weight_gb: ram_credit_gb(weight_gb, allocated_gb, resident, pool),
                     allocated_gb,
                     id,
                 }
@@ -10915,9 +13411,10 @@ impl ModelManager {
     /// what the tracker releases) credits tracked VRAM; `weights_gb` (what
     /// [`budget_weight_gb`](Self::budget_weight_gb) charges) credits live system
     /// RAM, because a KV pool is reserved in the tracker but allocated lazily, so
-    /// an idle model gives back far less real RAM than it holds in the tracker.
+    /// an idle model gives back far less real RAM than it holds in the tracker; plus the pool
+    /// when it is known to be resident (C7 B.3, [`ram_credit_gb`]).
     fn max_reclaimable(&self, loading_id: &str, domain: &str, force: bool) -> (f64, f64) {
-        let candidates: Vec<(String, f64, Option<f64>)> = {
+        let candidates: Vec<(String, f64, Option<f64>, f64)> = {
             let guard = self.read_models("ensure_vram:max_reclaimable");
             guard
                 .iter()
@@ -10927,7 +13424,14 @@ impl ModelManager {
                         && r.domain == domain
                         && !self.eviction_protected(id, r, force)
                 })
-                .map(|(id, r)| (id.clone(), self.budget_weight_gb(r), r.cpu_resident_gb()))
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        self.budget_weight_gb(r),
+                        r.cpu_resident_gb(),
+                        r.kv_pool_resident_gb,
+                    )
+                })
                 .collect()
         };
         let Ok(vram) = self.vram.read() else {
@@ -10935,11 +13439,11 @@ impl ModelManager {
         };
         let allocated = candidates
             .iter()
-            .map(|(id, _, _)| vram.allocated_gb(id))
+            .map(|(id, _, _, _)| vram.allocated_gb(id))
             .sum();
         let weights = candidates
             .iter()
-            .map(|(id, w, res)| ram_credit_gb(*w, vram.allocated_gb(id), *res))
+            .map(|(id, w, res, pool)| ram_credit_gb(*w, vram.allocated_gb(id), *res, *pool))
             .sum();
         (allocated, weights)
     }
@@ -11033,7 +13537,7 @@ impl ModelManager {
              they finish, or load with force"
         } else if blocked_by_protected {
             "only protected (pinned / non-evictable / in active realtime use / \
-             within its eviction-grace window) models resident — unpin, mark \
+             within its eviction-grace window / stalled) models resident — unpin, mark \
              evictable, wait out the grace window, or free VRAM"
         } else {
             "no evictable model found"
@@ -11044,18 +13548,19 @@ impl ModelManager {
     ///
     /// **T5.4 seam — KV-size policy.** The single place that decides how much
     /// Builds this model's live system-RAM gate — the second of the two
-    /// conditions [`ensure_vram_for`](Self::ensure_vram_for) admits on.
+    /// conditions [`ensure_vram_for`](Self::ensure_vram_for) admits on. `kv_target_gb` is the KV
+    /// the load resolves to (its override when it has one, C7 P4), charged as the real gate does.
     fn ram_gate_for(
         &self,
-        model_id: &str,
         domain: &str,
         weight_gb: f64,
         needs_kv_pool: bool,
+        kv_target_gb: f64,
     ) -> RamGate {
         let avail_gb = self.live_system_avail_gb(domain);
         let needed_gb = avail_gb.map(|_| {
             let kv_need = if needs_kv_pool {
-                Self::conservative_kv_need_gb(self.resolved_kv_target_gb(model_id), &self.config)
+                Self::conservative_kv_need_gb(kv_target_gb, &self.config)
             } else {
                 0.0
             };
@@ -11120,6 +13625,24 @@ impl ModelManager {
         } else {
             config.min_kv_cache_gb // fully uncapped grab-all -> can't predict
         }
+    }
+
+    /// C7: the KV size the live-RAM charge starts from, before its whole-GiB round-up and the
+    /// `min_kv_cache_gb` floor: the target capped by `cache_size_gb`; `0.0` when both are
+    /// unbounded (grab-all, nothing to round). For the refusal text only.
+    fn kv_target_bound_gb(kv_target_gb: f64, config: &Config) -> f64 {
+        let target = if kv_target_gb > 0.0 {
+            kv_target_gb
+        } else {
+            f64::INFINITY
+        };
+        let cap = if config.cache_size_gb > 0.0 {
+            config.cache_size_gb
+        } else {
+            f64::INFINITY
+        };
+        let bound = target.min(cap);
+        if bound.is_finite() { bound } else { 0.0 }
     }
 
     /// The KV target a load of `model_id` would resolve to with no request-level
@@ -11355,10 +13878,24 @@ impl ModelManager {
             ModelState::Ready => {}
             ModelState::NotLoaded => return Err(anyhow::anyhow!(ModelError::NotLoaded)),
             ModelState::Loading => return Err(ModelError::Loading.into()),
+            ModelState::Evicting if record.stuck_engine.is_some() => {
+                return Err(ModelError::GenerationStalled(model_id.to_owned()).into());
+            }
             ModelState::Evicting => return Err(ModelError::Evicting.into()),
         }
 
-        if self.busy_protects(force)
+        // 0.9.1 S1: a stalled engine's "running" work is the stuck call and whatever queued
+        // behind it — nothing will drain, so the busy refusal does not apply (a plain unload acts
+        // as a forced one; the eviction then holds the booking until the thread exits).
+        let stuck_engine = record
+            .handle
+            .as_ref()
+            .filter(|h| h.generation_stalled())
+            .and_then(EngineHandleKind::liveness)
+            .cloned();
+        let stalled = stuck_engine.is_some();
+        if !stalled
+            && self.busy_protects(force)
             && let Some(handle) = record.handle.as_ref()
         {
             let engine = handle.as_managed();
@@ -11378,6 +13915,13 @@ impl ModelManager {
         }
 
         record.state = ModelState::Evicting;
+        record.stuck_engine = stuck_engine;
+        // C27: the model left Ready — the supervisor must not restore it after a crash. Written
+        // under the models lock, so the notes are in the order of the state changes. Not for
+        // this worker's own teardown (`unload_notes_frozen`).
+        if !self.unload_notes_frozen.load(Ordering::Acquire) {
+            crate::startup::note_model(crate::startup::ModelNote::Unloaded(model_id));
+        }
 
         let handle = record
             .handle
@@ -11395,6 +13939,10 @@ impl ModelManager {
         // then drained, or aborted at the drain deadline. The flag lives on the engine, which is
         // discarded when the eviction finishes; a reload builds a new one with it clear.
         handle.as_managed().set_closing(true);
+        // The eviction has committed (past the busy check, or forced): a multi-call request
+        // stops at its next call boundary (T1 N1). A refused eviction returned above and
+        // never gets here.
+        handle.as_managed().mark_eviction_committed();
 
         // A FORCED eviction that goes ahead although work is running is the one place requests
         // can be lost on purpose: say so once, with the model and how many (D3).
@@ -11422,11 +13970,13 @@ impl ModelManager {
         models: &RwLock<HashMap<String, ModelRecord>>,
         vram: &RwLock<MemoryTracker>,
         model_id: &str,
+        wake: &tokio::sync::Notify,
     ) {
         if let Ok(mut guard) = models.write()
             && let Some(r) = guard.get_mut(model_id)
         {
             r.state = ModelState::NotLoaded;
+            r.stuck_engine = None;
             r.kv_cache_gb = 0.0;
             r.kv_requested_gb = None;
             r.kv_clamped_by = None;
@@ -11443,6 +13993,9 @@ impl ModelManager {
         if let Ok(mut v) = vram.write() {
             v.free(model_id);
         }
+        // F1b (review R-3): a request waiting for this model's on-demand load looks again (it
+        // starts the load when nothing else is loading it).
+        wake.notify_waiters();
     }
 
     // ---- Lock helpers --------------------------------------------------
@@ -11496,20 +14049,23 @@ impl ModelManager {
             .map_or_else(|| self.config.device.clone(), |r| r.device.clone())
     }
 
-    /// A model's own shipped sampling defaults (`generation_config.json`),
-    /// resolved at its last successful load. `Default::default()` (all
-    /// `None`) for an unregistered id, a never-loaded model, or a
-    /// media/embedding model — same fallback shape as [`record_device`]'s
-    /// unregistered-id case. Lighter than [`get_chat_context`] — no
+    /// A model's effective sampling profile (V5b) and whether it sits on an NPU.
+    /// The server default (greedy, penalty 1.1) and `false` for an unregistered
+    /// id — same fallback shape as [`record_device`]'s unregistered-id case.
+    /// Lighter than [`get_chat_context`] — no
     /// `last_used` bump, no `Ready`-state requirement — for callers (like
     /// `/v1/completions`) that only need this one field, not the full chat
     /// routing context.
-    pub(crate) fn model_generation_defaults(&self, model_id: &str) -> template::GenerationDefaults {
-        self.read_models("model_generation_defaults")
+    pub(crate) fn model_sampling_profile(
+        &self,
+        model_id: &str,
+    ) -> (sampling::SamplingProfile, bool) {
+        self.read_models("model_sampling_profile")
             .get(model_id)
-            .map_or_else(template::GenerationDefaults::default, |r| {
-                r.generation_defaults
-            })
+            .map_or_else(
+                || (sampling::SamplingProfile::default(), false),
+                |r| (r.sampling_profile(), r.is_npu()),
+            )
     }
 
     /// Phase C1: the memory domain a model is charged to (resolved at
@@ -11533,18 +14089,52 @@ struct LoadCommit {
     max_num_seqs: usize,
     gate: GateSource,
     kv_plan: Option<KvPoolPlan>,
+    /// The configured `chat_template` override's content, read by the load's pre-flight (C8);
+    /// `None` when none is configured (the model directory's template is read at the commit).
+    template_override: Option<Arc<str>>,
 }
 
 /// The measurement window of a load that `execute_load` itself commits.
 #[derive(Debug)]
 struct LoadMeasure {
     gpu_before: Option<u64>,
+    /// C25: what the load thread reported ([`LoadSlot::probe`]): the post-construction reading,
+    /// the warm-up's outcome, the weight files' size.
+    probe: LoadProbe,
     /// `RssAnon` before a `CPU` load (CPU over-admission); `None` off `CPU` or when not quiet.
     rss_before: Option<u64>,
     gpu_window: crate::gpu_memory::MeasureWindow,
     measure_pdev: Option<String>,
     leases_at_start: u64,
     domain: String,
+}
+
+impl LoadMeasure {
+    /// C25: the [`LoadReadings`] of this load: `after` the post-load reading, `clean` whether
+    /// the window stayed clean and quiet (no lease), `kv_gb` the pool it booked, `kind` the engine
+    /// kind it loaded as.
+    fn readings(
+        &self,
+        after: Option<u64>,
+        clean: bool,
+        kv_gb: f64,
+        kind: ModelKind,
+    ) -> LoadReadings {
+        LoadReadings {
+            before: self.gpu_before,
+            mid: self.probe.mid,
+            after,
+            window_clean: clean,
+            pool_bytes: gib_to_bytes(kv_gb.max(0.0)),
+            engine: match kind {
+                ModelKind::Vision => Some(PoolEngine::Vision),
+                ModelKind::TextGen => Some(PoolEngine::Text),
+                _ => None,
+            },
+            weights_on_disk: self.probe.weights_on_disk,
+            warm_up: self.probe.warm_up,
+        }
+    }
 }
 
 /// Where a blocking load leaves its result (step 6b). Shared by the load thread, `execute_load`
@@ -11558,6 +14148,43 @@ struct LoadSlot {
     started: Instant,
     /// When the load thread delivered its result (for the late-commit log).
     finished_at: std::sync::Mutex<Option<Instant>>,
+    /// C25: what the load thread reported through [`SlotHooks`].
+    probe: std::sync::Mutex<LoadProbe>,
+}
+
+/// C25: what a load thread reports for the memory split ([`LoadSlot::probe`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoadProbe {
+    /// Device memory after engine construction, before the KV warm-up.
+    mid: Option<u64>,
+    /// `Some(succeeded)` when the KV warm-up ran.
+    warm_up: Option<bool>,
+    /// The model's weight files on disk, bytes ([`weights_on_disk_bytes`]).
+    weights_on_disk: Option<u64>,
+}
+
+/// C25: the [`lifecycle::LoadHooks`] of one load: write what the factory reports into its slot,
+/// reading device memory with `reader` (the load window's reader and device).
+struct SlotHooks<'a, R: Fn() -> Option<u64>> {
+    slot: &'a LoadSlot,
+    /// Take the post-construction reading (`engine_built`): only in a quiet, measured window.
+    /// The warm-up outcome is recorded either way (C7 F1).
+    take_mid: bool,
+    reader: R,
+}
+
+impl<R: Fn() -> Option<u64>> lifecycle::LoadHooks for SlotHooks<'_, R> {
+    fn engine_built(&self) {
+        if !self.take_mid {
+            return;
+        }
+        let reading = (self.reader)();
+        self.slot.update_probe(|p| p.mid = reading);
+    }
+
+    fn warm_up_finished(&self, succeeded: bool) {
+        self.slot.update_probe(|p| p.warm_up = Some(succeeded));
+    }
 }
 
 impl LoadSlot {
@@ -11568,7 +14195,20 @@ impl LoadSlot {
             done: tokio::sync::Notify::new(),
             started: Instant::now(),
             finished_at: std::sync::Mutex::new(None),
+            probe: std::sync::Mutex::new(LoadProbe::default()),
         }
+    }
+
+    /// C25: change what the load thread reported (called by the load thread).
+    fn update_probe(&self, f: impl FnOnce(&mut LoadProbe)) {
+        if let Ok(mut p) = self.probe.lock() {
+            f(&mut p);
+        }
+    }
+
+    /// C25: what the load thread reported.
+    fn probe(&self) -> LoadProbe {
+        self.probe.lock().map(|p| *p).unwrap_or_default()
     }
 
     /// Called once by the load thread.
@@ -11601,6 +14241,35 @@ impl LoadSlot {
     fn take_commit(&self) -> Option<LoadCommit> {
         self.commit.lock().ok()?.take()
     }
+}
+
+/// A start refused by `ModelManager::begin_load` (F1b N-2).
+#[derive(Debug)]
+struct LoadRefusal {
+    /// The refusal, as `load_model_reported` returns it.
+    error: anyhow::Error,
+    /// The refusal ends no load, so it is not recorded for the requests waiting on the model:
+    /// the record was `Loading` (another load owns it and records its own end) or `Ready` (a
+    /// load already ended, and the model is loaded; recording this refusal would hand a waiter
+    /// woken by that Ready the error for a loaded model) or `Evicting` (P-C review R-2: the
+    /// requests waiting through the eviction restart the load when it ends). Read under the
+    /// `models` lock of the refusal ([`ends_no_load`]).
+    ///
+    /// Known residual (P-C review R-1, accepted): a refusal with this flag `false` is recorded
+    /// after the guard is dropped. If another task starts a real load of the model in that
+    /// window (a few instructions), the waiters of that load see the stale failure as newer
+    /// than their baseline and get this refusal although the load goes on. The `ends` counter
+    /// orders load ends; it does not order a stale end against a later start. Closing it would
+    /// nest `ends` under `models` (a lock-order change), so it is left open.
+    ends_no_load: bool,
+}
+
+/// Whether a start refused while the record is in `state` ends no load ([`LoadRefusal`]).
+fn ends_no_load(state: ModelState) -> bool {
+    matches!(
+        state,
+        ModelState::Loading | ModelState::Ready | ModelState::Evicting
+    )
 }
 
 /// RAII cancellation guard for [`ModelManager::load_model`] (T5.1, committee
@@ -11636,6 +14305,9 @@ impl Drop for LoadCancelGuard<'_> {
                  booking it as stalled when the engine construction is already running"
             );
             self.mm.abort_load(self.model_id);
+            // F1b: a request waiting for this load re-checks the model (no failure is recorded:
+            // the load was abandoned, not refused).
+            self.mm.note_load_end(self.model_id, None);
         }
     }
 }
@@ -12265,7 +14937,7 @@ mod load_cancel_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
@@ -12594,27 +15266,285 @@ mod tests {
     /// the OS floor for the new KV size.
     #[test]
     fn resize_reload_admits_checks_both_gates() {
+        let ram = |avail: f64, need: f64, floor: f64| ResizeLiveRam {
+            avail,
+            own_credit: 0.0,
+            reclaim: 0.0,
+            need,
+            floor,
+            ceiling: None,
+        };
         // VRAM only (discrete GPU: no live RAM gate).
-        assert!(resize_reload_admits(10.0, 8.0, false, None));
-        assert!(!resize_reload_admits(7.0, 8.0, false, None));
+        assert!(resize_reload_gates(10.0, 8.0, false, None).admits());
+        assert!(!resize_reload_gates(7.0, 8.0, false, None).admits());
         assert!(
-            resize_reload_admits(0.0, 8.0, true, None),
+            resize_reload_gates(0.0, 8.0, true, None).admits(),
             "an ungated domain admits"
         );
         // UMA: 20 GB of RAM reachable, the grown pool needs 12 GB with a 4 GB OS floor.
-        assert!(resize_reload_admits(
-            10.0,
-            8.0,
-            false,
-            Some((20.0, 12.0, 4.0))
-        ));
+        assert!(resize_reload_gates(10.0, 8.0, false, Some(&ram(20.0, 12.0, 4.0))).admits());
         // The grown KV size no longer fits the RAM gate even though VRAM does.
-        assert!(!resize_reload_admits(
-            10.0,
-            8.0,
-            false,
-            Some((15.0, 12.0, 4.0))
-        ));
+        assert_eq!(
+            resize_reload_gates(10.0, 8.0, false, Some(&ram(15.0, 12.0, 4.0))),
+            ReloadGates {
+                vram_ok: true,
+                ram_ok: false
+            }
+        );
+    }
+
+    /// C7, the 2026-11-02 Lunar Lake laptop case: lfm2 (12.0 GB weights, 6 GiB pool) shrunk to 3 /
+    /// 3.5 GB with `MemAvailable` 2.9 GB, nanbeige (2.2 GB) evictable, margin 1.0, floor 2.0. 0.9.0
+    /// credited the weights only and charged the new KV as fresh RAM: refused. The own pool now
+    /// covers the new one, so the shrink admits.
+    #[test]
+    fn a_shrink_on_a_full_uma_box_admits() {
+        let (weights, current, margin, floor) = (12.0, 6.0, 1.0, 2.0);
+        let live = |kv_need: f64, avail: f64, reclaim: f64| ResizeLiveRam {
+            avail,
+            own_credit: resize_own_ram_credit_gb(None, weights, kv_need, current),
+            reclaim,
+            need: weights + kv_need + margin,
+            floor,
+            ceiling: None,
+        };
+        let vram_need = weights + 1.0 + margin;
+        // 3 GB, 3.5 GB (charged 4.0) and the same 6 GiB: all admit on Jerzy's figures.
+        for kv_need in [3.0, 4.0, 6.0] {
+            let l = live(kv_need, 2.9, 2.2);
+            assert!(
+                resize_reload_gates(27.0, vram_need, false, Some(&l)).admits(),
+                "KV {kv_need}: {l:?}"
+            );
+        }
+        // Nothing else evictable: admits once MemAvailable clears floor + margin.
+        assert!(resize_reload_gates(27.0, vram_need, false, Some(&live(3.0, 3.0, 0.0))).admits());
+        // 0.9.0's credit (weights only) refused the same shrink.
+        let old = ResizeLiveRam {
+            avail: 2.9,
+            own_credit: weights,
+            reclaim: 2.2,
+            need: weights + 3.0 + margin,
+            floor,
+            ceiling: None,
+        };
+        assert!(!resize_reload_gates(27.0, 14.0, false, Some(&old)).ram_ok);
+    }
+
+    /// C7 (no waiver): the margin is still charged. A shrink with nothing else
+    /// evictable and `MemAvailable` below floor + margin is refused, although with a resident pool
+    /// the real reload would see weights + the whole pool back and admit.
+    #[test]
+    fn a_shrink_with_nothing_evictable_still_pays_the_margin() {
+        let (weights, current, margin, floor, kv_need) = (12.0, 6.0, 1.0, 2.0, 3.0);
+        let live = ResizeLiveRam {
+            avail: 2.9,
+            own_credit: resize_own_ram_credit_gb(None, weights, kv_need, current),
+            reclaim: 0.0,
+            need: weights + kv_need + margin,
+            floor,
+            ceiling: None,
+        };
+        let gates = resize_reload_gates(27.0, weights + 1.0 + margin, false, Some(&live));
+        assert!(gates.vram_ok && !gates.ram_ok, "{gates:?}");
+    }
+
+    /// C7: the own credit off `CPU` is the weights plus `min(new charge, resident
+    /// pool)`; a pool that is not resident earns nothing; on `CPU` the eviction credit is kept.
+    #[test]
+    fn the_resize_own_credit_covers_at_most_the_resident_pool() {
+        let credit = |kv: f64, pool: f64| resize_own_ram_credit_gb(None, 12.0, kv, pool);
+        assert!(
+            (credit(4.0, 6.0) - 16.0).abs() < 1e-12,
+            "shrink: the new charge"
+        );
+        assert!(
+            (credit(8.0, 6.0) - 18.0).abs() < 1e-12,
+            "grow: the resident pool"
+        );
+        assert!(
+            (credit(4.0, 0.0) - 12.0).abs() < 1e-12,
+            "not resident: weights only"
+        );
+        // A fractional block-sized pool below the whole-GiB charge: the difference is charged.
+        assert!((credit(6.0, 5.8) - 17.8).abs() < 1e-12);
+        // No pool (embedding etc.): the weights.
+        assert!((resize_own_ram_credit_gb(None, 2.0, 0.0, 0.0) - 2.0).abs() < 1e-12);
+        // CPU: the eviction credit (allocation 19 GB), unchanged.
+        assert!((resize_own_ram_credit_gb(Some(19.0), 12.0, 4.0, 6.0) - 19.0).abs() < 1e-12);
+    }
+
+    /// C7: a shrink of a model whose pool is not resident (warm-up off or failed) gets no
+    /// own-pool credit: on Jerzy's figures it is refused, as the real reload (which sees only the
+    /// weights back) would need fresh RAM for the KV.
+    #[test]
+    fn a_shrink_of_a_non_resident_pool_earns_no_credit() {
+        let (weights, margin, kv_need) = (12.0, 1.0, 3.0);
+        let live = ResizeLiveRam {
+            avail: 2.9,
+            own_credit: resize_own_ram_credit_gb(None, weights, kv_need, 0.0),
+            reclaim: 2.2,
+            need: weights + kv_need + margin,
+            floor: 2.0,
+            ceiling: None,
+        };
+        assert!(!resize_reload_gates(27.0, 14.0, false, Some(&live)).ram_ok);
+    }
+
+    /// C7: a grow that does not fit is refused naming the live system-RAM gate, with the
+    /// available RAM, the floor and the whole-GiB charge; VRAM is named only when it refused.
+    #[test]
+    fn a_grow_that_does_not_fit_is_refused_naming_the_ram_gate() {
+        let (weights, current, margin) = (12.0, 6.0, 1.0);
+        let kv_need = 11.0; // 10.5 GB asked, whole GiB
+        let live = ResizeLiveRam {
+            avail: 2.9,
+            own_credit: resize_own_ram_credit_gb(None, weights, kv_need, current),
+            reclaim: 2.2,
+            need: weights + kv_need + margin,
+            floor: 2.0,
+            ceiling: None,
+        };
+        let gates = resize_reload_gates(27.0, weights + 1.0 + margin, false, Some(&live));
+        assert_eq!(
+            gates,
+            ReloadGates {
+                vram_ok: true,
+                ram_ok: false
+            }
+        );
+        let f = ResizeFigures {
+            requested_kv: 10.5,
+            weight: weights,
+            kv_need,
+            margin,
+            vram_need: weights + 1.0 + margin,
+            vram_reachable: 27.0,
+        };
+        let text = resize_refusal_text("lfm2", &f, Some(&live), gates);
+        for want in [
+            "refused before evicting anything",
+            "the live system-RAM gate",
+            "needs ~24.0 GB",
+            "2.9 GB now",
+            "18.0 GB credited for unloading lfm2",
+            "2.0 GB kept free for the OS",
+            "whole GiB: 10.5 GiB counts as 11.0 GiB",
+            "the model was left as it was",
+        ] {
+            assert!(text.contains(want), "{want:?} missing in: {text}");
+        }
+        assert!(!text.contains("tracked-VRAM"), "VRAM admitted: {text}");
+
+        let both = ReloadGates {
+            vram_ok: false,
+            ram_ok: false,
+        };
+        let text = resize_refusal_text("lfm2", &f, Some(&live), both);
+        assert!(
+            text.contains("system-RAM gate") && text.contains("; and by the tracked-VRAM gate")
+        );
+        // A discrete GPU has no RAM gate: only VRAM is named.
+        let vram_only = ReloadGates {
+            vram_ok: false,
+            ram_ok: true,
+        };
+        let text = resize_refusal_text("lfm2", &f, None, vram_only);
+        assert!(text.contains("tracked-VRAM gate") && !text.contains("system-RAM"));
+        assert!(kv_charge_note(3.0, 3.0).is_empty() && kv_charge_note(0.0, 2.0).is_empty());
+        // F6: a charge above the whole-GiB round-up is the min_kv_cache_gb floor, named as such.
+        assert_eq!(
+            kv_charge_note(0.5, 2.0),
+            " (the KV is charged at least min_kv_cache_gb, in whole GiB: 0.5 GiB counts as 2.0 GiB)"
+        );
+    }
+
+    /// C7: a load refused by its preview on a UMA box where the tracker has room but live RAM
+    /// does not (the 2026-11-02 Lunar Lake qwen3-coder-30b text "needs 18.0 GB, 23.3 GB free")
+    /// names the RAM gate and its figures, not the tracker's.
+    #[test]
+    fn a_preview_refusal_names_the_gate_that_refused() {
+        let ram = PreviewRam {
+            need: 23.0,
+            avail: 17.4,
+            reachable: 19.6,
+            floor: 2.0,
+            weight: 16.0,
+            kv: 6.0,
+            margin: 1.0,
+            kv_note: kv_charge_note(5.5, 6.0),
+        };
+        let text = preview_refusal_text("coder", Some(&ram), Some((18.0, 23.3, 25.5)), &[]);
+        for want in [
+            "refused by the live system-RAM gate",
+            "needs ~23.0 GB (weights 16.0 + KV 6.0 + margin 1.0)",
+            "whole GiB: 5.5 GiB counts as 6.0 GiB",
+            "17.4 GB system RAM is available now",
+            "~19.6 GB after evicting every evictable model",
+            "2.0 GB kept free for the OS",
+            "nothing was evicted",
+        ] {
+            assert!(text.contains(want), "{want:?} missing in: {text}");
+        }
+        assert!(
+            !text.contains("tracked-VRAM"),
+            "the tracker had room: {text}"
+        );
+
+        // The tracker is short and RAM is not: only the tracker is named.
+        let roomy = PreviewRam {
+            reachable: 30.0,
+            ..ram.clone()
+        };
+        let text = preview_refusal_text("coder", Some(&roomy), Some((18.0, 3.0, 10.0)), &[]);
+        assert!(text.contains("refused by the tracked-VRAM gate: it needs 18.0 GB"));
+        assert!(!text.contains("system-RAM"), "{text}");
+        // Each gate alone could be met (the plan failed on both together): neither is named.
+        let text = preview_refusal_text("coder", Some(&roomy), Some((18.0, 3.0, 20.0)), &[]);
+        assert!(text.contains("the memory gates together"), "{text}");
+        assert!(
+            !text.contains("system-RAM") && !text.contains("tracked-VRAM"),
+            "{text}"
+        );
+        // Both short: both named.
+        let text = preview_refusal_text("coder", Some(&ram), Some((18.0, 3.0, 10.0)), &[]);
+        assert!(text.contains("system-RAM gate") && text.contains("; and by the tracked-VRAM"));
+        // A CPU-only box (no tracker budget): RAM only.
+        let text = preview_refusal_text("coder", Some(&ram), None, &[]);
+        assert!(text.contains("system-RAM gate") && !text.contains("tracked-VRAM"));
+    }
+
+    /// C7: a refusal inside the load loop names live RAM when RAM refused (the 0.9.0 text named
+    /// the tracker: "tracked VRAM: need 18.0 GB, 23.3 GB free" while RAM refused).
+    #[test]
+    fn a_loop_refusal_names_the_gate_that_refused() {
+        let note = kv_charge_note(5.5, 6.0);
+        let ram_only = gate_refusal_reason(Some((17.4, 23.0, 2.0)), &note, None);
+        assert_eq!(
+            ram_only,
+            "live system RAM: need ~23.0 GB (the KV is charged in whole GiB: 5.5 GiB counts as \
+             6.0 GiB), 17.4 GB available, 2.0 GB kept free for the OS"
+        );
+        assert_eq!(
+            gate_refusal_reason(None, "", Some((18.0, 3.0))),
+            "tracked VRAM: need 18.0 GB, 3.0 GB free"
+        );
+        let both = gate_refusal_reason(Some((17.4, 23.0, 2.0)), "", Some((18.0, 3.0)));
+        assert!(both.starts_with("live system RAM") && both.ends_with("3.0 GB free"));
+        assert_eq!(gate_refusal_reason(None, "", None), "the memory gates");
+    }
+
+    /// C7: the KV bound the whole-GiB note compares against: the target capped by
+    /// `cache_size_gb`, `0.0` for grab-all.
+    #[test]
+    fn the_kv_target_bound_is_the_capped_target() {
+        let mut config = make_config(&[("x", 1.0)], 10.0);
+        config.cache_size_gb = 0.0;
+        assert!((ModelManager::kv_target_bound_gb(3.5, &config) - 3.5).abs() < 1e-12);
+        assert!(ModelManager::kv_target_bound_gb(0.0, &config).abs() < 1e-12);
+        config.cache_size_gb = 2.5;
+        assert!((ModelManager::kv_target_bound_gb(4.0, &config) - 2.5).abs() < 1e-12);
+        assert!((ModelManager::kv_target_bound_gb(0.0, &config) - 2.5).abs() < 1e-12);
     }
 
     /// D3-S1.C2: a load evicts only what its preview planned, each at most once; an empty plan
@@ -12836,7 +15766,7 @@ mod tests {
     }
 
     /// Build a Config with the given known models and no preload.
-    pub(super) fn make_config(models: &[(&str, f64)], total_vram_gb: f64) -> Config {
+    pub(crate) fn make_config(models: &[(&str, f64)], total_vram_gb: f64) -> Config {
         Config {
             models_dir: std::path::PathBuf::from("/tmp/test-models"),
             device: "CPU".to_owned(),
@@ -12861,6 +15791,10 @@ mod tests {
             vram_safety_margin_gb: 0.0, // no margin — keeps existing LRU test math simple
             npu_footprint_factor: 1.0,
             cpu_image_gen_max_pixels: 1024 * 1024,
+            max_audio_duration_secs: 7_200,
+            max_images_per_request: 16,
+            max_image_pixels_per_request: 64 * 1024 * 1024,
+            max_image_pixels: 4_000_000,
             min_kv_cache_gb: 0.0, // no minimum — allows any KV size including 0
             light_model_max_gb: 2.0, // C2 default; placement engine unused with empty inventory
             light_stt_max_gb: 1.0, // STT light/heavy threshold; engine unused with empty inventory
@@ -12887,7 +15821,9 @@ mod tests {
             max_prompt_array: 16, // the production default
             max_embedding_inputs: 256,
             max_embedding_batch_tokens: 32_768,
-            max_tokens_cap: 8192,              // the production default
+            max_tokens_cap: 8192, // the production default
+            stream_first_token_timeout_secs: 600,
+            stream_token_gap_timeout_secs: 120,
             bind_addr: "127.0.0.1".to_owned(), // loopback — irrelevant for unit tests
             port: 11_437,
             allow_insecure_public_bind: false,
@@ -12913,6 +15849,7 @@ mod tests {
             kv_pressure_sweep_interval_secs: 15,
             kv_resize_cooldown_secs: 30,
             load_timeout_secs: 600,
+            on_demand_wait_secs: 0,
         }
     }
 
@@ -13235,10 +16172,11 @@ mod tests {
         // Now that registration correctly detects this model's kind up front
         // (the build_not_loaded_record/new_with_inventory fix — see
         // the project's internal engineering log),
-        // `resolve_model_device` routes it through the real
-        // `resolve_embedding_device` probe like production does, which may
-        // land it on a different device/domain than the primary one — so
-        // check across every tracked domain instead of assuming a specific one.
+        // `resolve_model_device` routes it through `resolve_embedding_device`
+        // like production does, which may land it on a different device/domain
+        // than the primary one (with this empty inventory: `CPU`, on every host
+        // since 0.9.1 C2) — so check across every tracked domain instead of
+        // assuming a specific one.
         let total_used_across_domains: f64 = snap.domain_vram.iter().map(|(_, _, used)| used).sum();
         assert!(
             total_used_across_domains >= 1.5,
@@ -14585,6 +17523,731 @@ mod tests {
         );
     }
 
+    /// Review N3: a stalled engine cannot free its memory (its thread holds it), so it is never
+    /// an eviction victim: the load evicts the next candidate instead, and with no other
+    /// candidate it fails at once with the normal no-room refusal (not a held join).
+    #[tokio::test]
+    async fn a_stalled_engine_is_never_an_eviction_victim() {
+        let mut config = make_config(&[("n3-a", 5.0), ("n3-b", 5.0), ("n3-c", 5.0)], 17.0);
+        config.cache_size_gb = 2.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        let stall = |id: &str| {
+            mm.read_models("test")
+                .get(id)
+                .and_then(|r| r.handle.as_ref())
+                .and_then(|h| h.liveness())
+                .unwrap()
+                .declare_dead_for_test();
+        };
+        mm.load_model("n3-a").await.unwrap(); // oldest: the LRU victim
+        mm.load_model("n3-b").await.unwrap();
+        stall("n3-a");
+        mm.load_model("n3-c").await.unwrap(); // forces one eviction
+        let state = |id: &str| mm.read_models("test").get(id).unwrap().state;
+        assert_eq!(
+            state("n3-a"),
+            ModelState::Ready,
+            "the stalled LRU model is skipped"
+        );
+        assert_eq!(
+            state("n3-b"),
+            ModelState::NotLoaded,
+            "the next candidate is evicted"
+        );
+
+        stall("n3-c");
+        let started = std::time::Instant::now();
+        let err = mm.load_model("n3-b").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::InsufficientMemory(_))
+            ),
+            "only stalled models resident: the normal no-room refusal, {err:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "at once"
+        );
+        assert_eq!(state("n3-a"), ModelState::Ready);
+        assert_eq!(state("n3-c"), ModelState::Ready);
+    }
+
+    // ---- C27 respawn restore ---------------------------------------------------
+
+    /// A respawn restore that does not fit beside the resident models is skipped — it never
+    /// evicts (unlike a normal load of the same model, see the LRU test above) — and leaves a
+    /// `restore_failed` startup warning.
+    #[tokio::test]
+    async fn a_respawn_restore_that_does_not_fit_is_skipped_and_evicts_nothing() {
+        let mm = make_mm(&[("c27-resident", 6.0), ("c27-restore", 6.0)], 10.0).await;
+        mm.load_model("c27-resident").await.unwrap();
+
+        let restored = mm.restore_after_respawn(&["c27-restore".to_owned()]).await;
+
+        assert!(restored.is_empty(), "nothing restored: {restored:?}");
+        let models = mm.read_models("test");
+        assert_eq!(
+            models.get("c27-resident").unwrap().state,
+            ModelState::Ready,
+            "not evicted"
+        );
+        assert_eq!(
+            models.get("c27-restore").unwrap().state,
+            ModelState::NotLoaded
+        );
+        drop(models);
+        assert!(
+            crate::startup::startup_warnings()
+                .iter()
+                .any(|w| w.code == "restore_failed"
+                    && w.message.starts_with("'c27-restore' ")
+                    && w.message.contains("does not fit without evicting")),
+            "a restore_failed startup warning names the model and says why (F10)"
+        );
+    }
+
+    /// A restore that fits loads; preload, `on_demand`, unknown and already-Ready models are
+    /// skipped.
+    #[tokio::test]
+    async fn a_respawn_restore_loads_only_eager_non_preload_models() {
+        let mut config = make_config(
+            &[
+                ("c27-eager", 1.0),
+                ("c27-preload", 1.0),
+                ("c27-lazy", 1.0),
+                ("c27-ready", 1.0),
+            ],
+            40.0,
+        );
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["c27-preload".to_owned()];
+        if let Some(e) = config.models.get_mut("c27-lazy") {
+            e.policy.load = config::LoadPolicy::OnDemand;
+        }
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("c27-ready").await.unwrap();
+        mm.evict_model("c27-preload").await.unwrap();
+
+        let ids: Vec<String> = [
+            "c27-preload",
+            "c27-lazy",
+            "c27-ghost",
+            "c27-ready",
+            "c27-eager",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let restored = mm.restore_after_respawn(&ids).await;
+
+        assert_eq!(restored, vec!["c27-eager".to_owned()]);
+        let models = mm.read_models("test");
+        assert_eq!(models.get("c27-eager").unwrap().state, ModelState::Ready);
+        assert_eq!(
+            models.get("c27-preload").unwrap().state,
+            ModelState::NotLoaded
+        );
+        assert_eq!(models.get("c27-lazy").unwrap().state, ModelState::NotLoaded);
+    }
+
+    /// The model notes of `id`, load-window lines left out (see [`all_notes_for`]).
+    fn notes_for(id: &str) -> Vec<String> {
+        all_notes_for(id)
+            .into_iter()
+            .filter(|l| !l.starts_with("load_started ") && !l.starts_with("load_ended "))
+            .collect()
+    }
+
+    /// Every model note of `id`, in order.
+    fn all_notes_for(id: &str) -> Vec<String> {
+        let suffix = format!(" {id}\n");
+        crate::startup::TEST_MODEL_NOTES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.ends_with(&suffix))
+            .cloned()
+            .collect()
+    }
+
+    /// The manager as a respawned worker builds it at boot: `preload` from the config, the
+    /// crashed worker's set `respawn` (`None` = a fresh start).
+    async fn boot_with(config: Config, respawn: Option<&[&str]>) -> ModelManager {
+        ModelManager::new_for_boot(
+            config,
+            Arc::new(MockEngineFactory::default()),
+            Arc::new(DeviceInventory::default()),
+            None,
+            respawn.map(|ids| ids.iter().map(|&id| id.to_owned()).collect()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The notes of any of `ids`, in the order they were written (other tests' notes left out).
+    fn notes_of(ids: &[&str]) -> Vec<String> {
+        crate::startup::TEST_MODEL_NOTES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| ids.iter().any(|id| l.ends_with(&format!(" {id}\n"))))
+            .cloned()
+            .collect()
+    }
+
+    /// The supervisor's plan over `notes` cut just before `cut` (a crash at that point).
+    fn plan_if_crashed_before(notes: &[String], cut: &str) -> Option<Vec<String>> {
+        let end = notes.iter().position(|n| n == cut).unwrap_or(notes.len());
+        let mut st = crate::supervisor::RestoreState::default();
+        crate::supervisor::plan_restore(
+            &notes[..end].concat(),
+            &mut st,
+            Instant::now(),
+            Duration::from_secs(600),
+        );
+        st.handed
+    }
+
+    /// M1, `rv load` victim: the eviction of P falls inside big's load window, so a
+    /// crash before big is Ready keeps P in the restore set; after Ready, P is out.
+    #[tokio::test]
+    async fn m1_the_victim_of_a_runtime_load_is_kept_when_the_worker_crashes_before_ready() {
+        let mut config = make_config(&[("m1l-p", 4.0), ("m1l-big", 4.0)], 6.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["m1l-p".to_owned()];
+        let mm = boot_with(config, None).await;
+        mm.load_model("m1l-big").await.unwrap();
+        assert_eq!(state_of(&mm, "m1l-p"), ModelState::NotLoaded, "LRU victim");
+        let notes = notes_of(&["m1l-p", "m1l-big"]);
+        let at = |n: &str| notes.iter().position(|x| x == n).unwrap();
+        assert!(at("load_started m1l-big\n") < at("model_unloaded m1l-p\n"));
+        assert!(at("model_unloaded m1l-p\n") < at("model_ready m1l-big\n"));
+        assert!(at("model_ready m1l-big\n") < at("load_ended m1l-big\n"));
+        assert_eq!(
+            plan_if_crashed_before(&notes, "model_ready m1l-big\n"),
+            Some(vec!["m1l-p".to_owned()])
+        );
+        assert_eq!(
+            plan_if_crashed_before(&notes, ""),
+            Some(vec!["m1l-big".to_owned()])
+        );
+    }
+
+    /// N1: an `rv load` that evicts P and then fails with a GPU poison closes its window before
+    /// the worker leaves (exit 75): after that abnormal exit the supervisor keeps P; after a
+    /// clean one P is out (it was really evicted and the worker went on).
+    #[tokio::test]
+    async fn n1_the_victim_of_a_poisoned_load_is_kept_after_an_abnormal_exit() {
+        let mut config = make_config(&[("n1-p", 4.0), ("n1-big", 4.0)], 6.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["n1-p".to_owned()];
+        let factory = MockEngineFactory {
+            fail_message_for: Some((
+                "n1-big".to_owned(),
+                "ov_cb_create failed: CL_OUT_OF_RESOURCES (-5)".to_owned(),
+            )),
+            ..Default::default()
+        };
+        let mm = ModelManager::new_for_boot(
+            config,
+            Arc::new(factory),
+            Arc::new(DeviceInventory::default()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(mm.load_model("n1-big").await.is_err());
+        assert!(mm.is_gpu_poisoned());
+        assert_eq!(
+            state_of(&mm, "n1-p"),
+            ModelState::NotLoaded,
+            "evicted for big"
+        );
+        let notes = notes_of(&["n1-p", "n1-big"]);
+        let tail: Vec<&str> = notes
+            .iter()
+            .map(String::as_str)
+            .skip_while(|n| *n != "load_started n1-big\n")
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "load_started n1-big\n",
+                "model_unloaded n1-p\n",
+                "load_ended n1-big\n"
+            ]
+        );
+        let plan = |abnormal: bool| {
+            let mut st = crate::supervisor::RestoreState::default();
+            crate::supervisor::plan_restore_after(
+                &notes.concat(),
+                &mut st,
+                Instant::now(),
+                Duration::from_secs(600),
+                abnormal,
+            );
+            st.handed
+        };
+        assert_eq!(plan(true), Some(vec!["n1-p".to_owned()]));
+        assert_eq!(plan(false), Some(Vec::new()));
+    }
+
+    /// M1, resize: the self-eviction is inside the resize's window; a crash before the reload is
+    /// Ready keeps the model.
+    #[tokio::test]
+    async fn m1_a_model_whose_resize_crashed_before_the_reload_is_kept() {
+        let mut config = make_config(&[("m1r-m", 2.0)], 20.0);
+        config.cache_size_gb = 4.0;
+        config.kv_resize_cooldown_secs = 0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("m1r-m").await.unwrap();
+        mm.resize_model_kv_cache("m1r-m", 2.0).await.unwrap();
+        let notes = notes_of(&["m1r-m"]);
+        let unload = notes
+            .iter()
+            .position(|n| n == "model_unloaded m1r-m\n")
+            .unwrap();
+        let ready_after = notes[unload..]
+            .iter()
+            .position(|n| n == "model_ready m1r-m\n")
+            .unwrap()
+            + unload;
+        assert_eq!(
+            plan_if_crashed_before(&notes[..ready_after], ""),
+            Some(vec!["m1r-m".to_owned()])
+        );
+    }
+
+    /// M1, KV-wedge evict + reload: same window, same outcome.
+    #[tokio::test]
+    async fn m1_a_model_whose_wedge_reload_crashed_is_kept() {
+        let mm = Arc::new(make_mm(&[("m1w-vlm", 5.5)], 22.5).await);
+        mm.load_model("m1w-vlm").await.unwrap();
+        mm.spawn_kv_wedge_recovery("m1w-vlm", 5_000);
+        wait_for_wedge_recovery_to_finish(&mm, "m1w-vlm").await;
+        let notes = notes_of(&["m1w-vlm"]);
+        let unload = notes
+            .iter()
+            .position(|n| n == "model_unloaded m1w-vlm\n")
+            .unwrap();
+        assert!(
+            notes[..unload]
+                .iter()
+                .any(|n| n == "load_started m1w-vlm\n"),
+            "{notes:?}"
+        );
+        let ready_after = notes[unload..]
+            .iter()
+            .position(|n| n == "model_ready m1w-vlm\n")
+            .unwrap()
+            + unload;
+        assert_eq!(
+            plan_if_crashed_before(&notes[..ready_after], ""),
+            Some(vec!["m1w-vlm".to_owned()])
+        );
+    }
+
+    /// A respawn's preload phase loads only the `preload` models Ready at the
+    /// crash; one that was not is skipped (no `preload_model` note, stays `NotLoaded`). Both are
+    /// noted Ready when they load (the supervisor learns preload models too).
+    #[tokio::test]
+    async fn a_respawn_preloads_only_the_preload_models_ready_at_the_crash() {
+        let mut config = make_config(&[("rp-embed-ready", 1.0), ("rp-embed-not", 1.0)], 40.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["rp-embed-not".to_owned(), "rp-embed-ready".to_owned()];
+        let mm = boot_with(config, Some(&["rp-embed-ready", "rp-runtime"])).await;
+        assert_eq!(state_of(&mm, "rp-embed-ready"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "rp-embed-not"), ModelState::NotLoaded);
+        assert_eq!(
+            notes_for("rp-embed-ready"),
+            vec![
+                "preload_model rp-embed-ready\n",
+                "model_ready rp-embed-ready\n"
+            ]
+        );
+        assert!(notes_for("rp-embed-not").is_empty());
+    }
+
+    /// M2: on a respawn a preload model whose KV pool is sized to the room left
+    /// (vision, grab-all KV) is deferred to after the rest of the set. Budget 10: had the 3 GB
+    /// VLM preloaded first it would take 7 GB of KV and the 4 GB embedding restore would not fit;
+    /// deferred, the embedding loads first and the VLM sizes its pool to the 3 GB left.
+    #[tokio::test]
+    async fn m2_a_respawn_loads_the_elastic_kv_preload_after_the_rest_of_the_set() {
+        let mut config = make_config(&[("m2-vlm", 3.0), ("m2-embed", 4.0)], 10.0);
+        config.min_kv_cache_gb = 1.0;
+        config.preload = vec!["m2-vlm".to_owned()];
+        let mm = boot_with(config, Some(&["m2-vlm", "m2-embed"])).await;
+        assert_eq!(state_of(&mm, "m2-vlm"), ModelState::NotLoaded, "deferred");
+        let set = vec!["m2-vlm".to_owned(), "m2-embed".to_owned()];
+        let restored = mm.restore_after_respawn(&set).await;
+        assert_eq!(restored, vec!["m2-embed".to_owned(), "m2-vlm".to_owned()]);
+        assert_eq!(state_of(&mm, "m2-embed"), ModelState::Ready);
+        let kv = mm.read_models("test").get("m2-vlm").unwrap().kv_cache_gb;
+        assert!((kv - 3.0).abs() < 1e-9, "KV sized to the room left: {kv}");
+        // Still a preload model for the supervisor: no `restore_started`.
+        assert_eq!(
+            notes_for("m2-vlm"),
+            vec!["preload_model m2-vlm\n", "model_ready m2-vlm\n"]
+        );
+    }
+
+    /// N2: with no fixed-footprint runtime model in the set there is nothing to leave room for:
+    /// the elastic-KV preload stays in the preload phase (before listening), loaded last in it.
+    #[tokio::test]
+    async fn n2_an_elastic_preload_is_not_deferred_when_nothing_needs_its_room() {
+        let mut config = make_config(
+            &[("n2-vlm", 3.0), ("n2-embed", 2.0), ("n2-qwen", 2.0)],
+            20.0,
+        );
+        config.min_kv_cache_gb = 1.0;
+        config.cache_size_gb = 2.0;
+        // Config order puts the VLM first; the respawn loads it last in the phase.
+        config.preload = vec!["n2-vlm".to_owned(), "n2-embed".to_owned()];
+        // The only runtime model is elastic too (a text model): no deferral.
+        let mm = boot_with(config, Some(&["n2-vlm", "n2-embed", "n2-qwen"])).await;
+        assert_eq!(
+            state_of(&mm, "n2-vlm"),
+            ModelState::Ready,
+            "loaded in the phase"
+        );
+        assert_eq!(
+            notes_for("n2-vlm"),
+            vec!["preload_model n2-vlm\n", "model_ready n2-vlm\n"]
+        );
+        let notes = notes_of(&["n2-vlm", "n2-embed"]);
+        let at = |n: &str| notes.iter().position(|x| x == n).unwrap();
+        assert!(
+            at("model_ready n2-embed\n") < at("preload_model n2-vlm\n"),
+            "{notes:?}"
+        );
+        let set: Vec<String> = ["n2-vlm", "n2-embed", "n2-qwen"]
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        assert_eq!(
+            mm.restore_after_respawn(&set).await,
+            vec!["n2-qwen".to_owned()]
+        );
+    }
+
+    /// M2 in the restore alone: runtime models restore non-elastic first, whatever the set order.
+    #[tokio::test]
+    async fn m2_the_restore_loads_elastic_kv_models_last() {
+        let mut config = make_config(&[("m2b-vlm", 3.0), ("m2b-embed", 4.0)], 10.0);
+        config.min_kv_cache_gb = 1.0;
+        let mm = boot_with(config, Some(&["m2b-vlm", "m2b-embed"])).await;
+        let set = vec!["m2b-vlm".to_owned(), "m2b-embed".to_owned()];
+        let restored = mm.restore_after_respawn(&set).await;
+        assert_eq!(restored, vec!["m2b-embed".to_owned(), "m2b-vlm".to_owned()]);
+    }
+
+    /// A fresh start (no respawn set) loads the whole `preload`, as before, and notes each.
+    #[tokio::test]
+    async fn a_fresh_start_preloads_everything_and_notes_the_preload_models() {
+        let mut config = make_config(&[("fp-a", 1.0), ("fp-b", 1.0)], 40.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["fp-a".to_owned(), "fp-b".to_owned()];
+        let mm = boot_with(config, None).await;
+        assert_eq!(state_of(&mm, "fp-a"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "fp-b"), ModelState::Ready);
+        assert_eq!(
+            notes_for("fp-b"),
+            vec!["preload_model fp-b\n", "model_ready fp-b\n"]
+        );
+    }
+
+    /// A respawn handed an empty set (everything was unloaded before the crash) loads no preload.
+    #[tokio::test]
+    async fn a_respawn_with_an_empty_set_loads_no_preload() {
+        let mut config = make_config(&[("ep-a", 1.0)], 40.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["ep-a".to_owned()];
+        let mm = boot_with(config, Some(&[])).await;
+        assert_eq!(state_of(&mm, "ep-a"), ModelState::NotLoaded);
+    }
+
+    /// The 2026-11-16 16:40 shape on the worker side: preload 9b + tts; the crashed worker had
+    /// unloaded 9b and loaded e5 + 4b at runtime. The respawn loads tts (preload phase), skips
+    /// 9b, and its restore brings back e5 and 4b (tts is not restored twice) — nothing evicted.
+    #[tokio::test]
+    async fn the_1640_shape_respawn_brings_back_4b_not_9b() {
+        let mut config = make_config(
+            &[
+                ("s1640-9b", 6.0),
+                ("s1640-tts", 0.5),
+                ("s1640-e5", 1.0),
+                ("s1640-4b", 4.0),
+            ],
+            8.0,
+        );
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["s1640-9b".to_owned(), "s1640-tts".to_owned()];
+        let mm = boot_with(config, Some(&["s1640-tts", "s1640-e5", "s1640-4b"])).await;
+        assert_eq!(state_of(&mm, "s1640-9b"), ModelState::NotLoaded);
+        assert_eq!(state_of(&mm, "s1640-tts"), ModelState::Ready);
+        let set: Vec<String> = ["s1640-tts", "s1640-e5", "s1640-4b"]
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect();
+        let restored = mm.restore_after_respawn(&set).await;
+        assert_eq!(restored, vec!["s1640-e5".to_owned(), "s1640-4b".to_owned()]);
+        assert_eq!(state_of(&mm, "s1640-4b"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "s1640-9b"), ModelState::NotLoaded);
+        for id in ["s1640-tts", "s1640-e5", "s1640-4b"] {
+            assert!(
+                !notes_for(id)
+                    .iter()
+                    .any(|n| n.starts_with("model_unloaded")),
+                "{id} evicted: {:?}",
+                notes_for(id)
+            );
+        }
+    }
+
+    /// A preload never evicts another preload. Three 4 GB models (1 GB KV each)
+    /// on a 10 GB budget: the third is skipped with `preload_skipped` naming the shortfall, the
+    /// first two stay Ready and nothing is evicted.
+    #[tokio::test]
+    async fn a_preload_over_budget_skips_the_later_model_and_evicts_nothing() {
+        let mut config = make_config(&[("ps-a", 4.0), ("ps-b", 4.0), ("ps-c", 4.0)], 10.0);
+        config.cache_size_gb = 1.0;
+        config.preload = vec!["ps-a".to_owned(), "ps-b".to_owned(), "ps-c".to_owned()];
+        let mm = boot_with(config, None).await;
+        assert_eq!(state_of(&mm, "ps-a"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "ps-b"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "ps-c"), ModelState::NotLoaded);
+        for id in ["ps-a", "ps-b"] {
+            assert!(
+                !notes_for(id)
+                    .iter()
+                    .any(|n| n.starts_with("model_unloaded")),
+                "{id} was evicted: {:?}",
+                notes_for(id)
+            );
+        }
+        let warnings = crate::startup::startup_warnings();
+        let skipped = warnings
+            .iter()
+            .find(|w| w.code == "preload_skipped" && w.message.contains("'ps-c'"))
+            .expect("preload_skipped startup warning");
+        assert!(
+            skipped
+                .message
+                .contains("the memory budget is short by 4.0 GB"),
+            "{}",
+            skipped.message
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "preload_failed" && w.message.contains("'ps-c'")),
+            "a skip is not a failure"
+        );
+        // The side channel is consumed.
+        assert!(mm.preload_no_room.lock().unwrap().is_empty());
+        // A later runtime load may still evict (only the preload phase never does), and its
+        // `preload_skipped` warning is cleared once it is Ready (m5).
+        mm.load_model("ps-c").await.unwrap();
+        assert_eq!(state_of(&mm, "ps-c"), ModelState::Ready);
+        assert!(
+            !crate::startup::startup_warnings()
+                .iter()
+                .any(|w| w.code == "preload_skipped" && w.message.contains("'ps-c'")),
+            "cleared on Ready"
+        );
+    }
+
+    /// m4: a respawn that skipped preload models says so in one startup warning
+    /// naming them.
+    #[tokio::test]
+    async fn m4_a_respawn_that_skipped_preload_models_adds_one_warning() {
+        let mut config = make_config(
+            &[
+                ("m4-embed-a", 1.0),
+                ("m4-embed-b", 1.0),
+                ("m4-embed-c", 1.0),
+            ],
+            40.0,
+        );
+        config.preload = vec![
+            "m4-embed-a".to_owned(),
+            "m4-embed-b".to_owned(),
+            "m4-embed-c".to_owned(),
+        ];
+        let _mm = boot_with(config, Some(&["m4-embed-b"])).await;
+        let w: Vec<_> = crate::startup::startup_warnings()
+            .into_iter()
+            .filter(|w| w.code == "respawn_preload_skipped" && w.message.contains("m4-embed-"))
+            .collect();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].message.contains("'m4-embed-a', 'm4-embed-c'"),
+            "{}",
+            w[0].message
+        );
+        assert!(!w[0].message.contains("'m4-embed-b'"));
+    }
+
+    /// m3: a preload refused by the live system-RAM gate names that gate and its
+    /// own need (not the budget's). An iGPU (system domain) model: 2 GB weights + 1 GB KV, 1 GB
+    /// kept for the OS, 3.5 GB available -> short by 0.5 GB.
+    #[tokio::test]
+    async fn m3_a_preload_refused_by_system_ram_names_that_gate() {
+        let _ram = FakeLiveAvail::set(3.5);
+        let mut cfg = make_config(&[("m3-ram", 2.0)], 40.0);
+        cfg.device = "GPU.1".to_owned();
+        cfg.default_kv_cache_gb = 1.0;
+        cfg.system_ram_reservation_gb = Some(1.0);
+        cfg.domain_budgets.insert(DOMAIN_SYSTEM.to_owned(), 40.0);
+        cfg.models.entry("m3-ram".to_owned()).or_default().policy = config::ModelPolicy {
+            device: Some("GPU.0".to_owned()),
+            ..Default::default()
+        };
+        cfg.preload = vec!["m3-ram".to_owned()];
+        let mm = ModelManager::new_with_inventory(
+            cfg,
+            Arc::new(MockEngineFactory::default()),
+            Arc::new(fleet_inventory()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mm.read_models("test").get("m3-ram").unwrap().domain,
+            DOMAIN_SYSTEM
+        );
+        assert_eq!(state_of(&mm, "m3-ram"), ModelState::NotLoaded);
+        let w = crate::startup::startup_warnings()
+            .into_iter()
+            .find(|w| w.code == "preload_skipped" && w.message.contains("'m3-ram'"))
+            .expect("preload_skipped");
+        assert!(
+            w.message.contains("system RAM is short by 0.5 GB")
+                && w.message.contains("1.0 GB kept for the OS")
+                && !w.message.contains("memory budget"),
+            "{}",
+            w.message
+        );
+    }
+
+    /// A vision preload placed last whose KV pool is sized to the room left still loads when it
+    /// fits at its minimum KV (the earlier preload untouched); one 0.5 GB short of its minimum is
+    /// skipped, where 0.9.0 evicted the earlier preload to load it.
+    #[tokio::test]
+    async fn a_vision_preload_that_fits_at_its_minimum_kv_still_loads() {
+        let build = |total: f64| {
+            let mut config = make_config(&[("pv-embed", 4.0), ("pv-vlm", 3.0)], total);
+            config.min_kv_cache_gb = 1.0;
+            config.preload = vec!["pv-embed".to_owned(), "pv-vlm".to_owned()];
+            boot_with(config, None)
+        };
+        let mm = build(8.0).await;
+        assert_eq!(
+            mm.read_models("test")
+                .get("pv-vlm")
+                .unwrap()
+                .configured_kind,
+            ModelKind::Vision
+        );
+        assert_eq!(state_of(&mm, "pv-embed"), ModelState::Ready);
+        assert_eq!(state_of(&mm, "pv-vlm"), ModelState::Ready);
+        let kv = mm.read_models("test").get("pv-vlm").unwrap().kv_cache_gb;
+        assert!((kv - 1.0).abs() < 1e-9, "KV sized to the 1 GB left: {kv}");
+        // 7.5 GB: 4 + 3 + 1 does not fit, the embedding stays, the VLM is skipped.
+        let mm = build(7.5).await;
+        assert_eq!(state_of(&mm, "pv-embed"), ModelState::Ready, "not evicted");
+        assert_eq!(state_of(&mm, "pv-vlm"), ModelState::NotLoaded);
+        assert!(
+            !notes_for("pv-embed")
+                .iter()
+                .any(|n| n.starts_with("model_unloaded"))
+        );
+    }
+
+    /// C27 F2: an eviction is an unload (`model_unloaded`), but the worker's own teardown
+    /// (`shutdown`) is not — else a worker that drains before its respawn restores nothing.
+    #[tokio::test]
+    async fn shutdown_evictions_write_no_unload_notes_but_an_eviction_does() {
+        // A 1 GB KV cap, so both fit (a grab-all pool would make the second load evict the first).
+        let mut config = make_config(&[("f2-evicted", 1.0), ("f2-torn-down", 1.0)], 40.0);
+        config.cache_size_gb = 1.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("f2-evicted").await.unwrap();
+        mm.load_model("f2-torn-down").await.unwrap();
+        assert_eq!(notes_for("f2-evicted"), vec!["model_ready f2-evicted\n"]);
+
+        mm.evict_model("f2-evicted").await.unwrap();
+        assert_eq!(
+            notes_for("f2-evicted"),
+            vec!["model_ready f2-evicted\n", "model_unloaded f2-evicted\n"]
+        );
+
+        let _ = mm.shutdown().await;
+        assert_eq!(
+            mm.read_models("test").get("f2-torn-down").unwrap().state,
+            ModelState::NotLoaded,
+            "shutdown tore it down"
+        );
+        assert_eq!(
+            notes_for("f2-torn-down"),
+            vec!["model_ready f2-torn-down\n"],
+            "a teardown eviction is not an unload"
+        );
+    }
+
+    /// C27 F5: a model whose restore failed (e.g. lost a race with an operator's load) and then
+    /// reaches Ready loses its `restore_failed` warning.
+    #[tokio::test]
+    async fn reaching_ready_clears_the_models_restore_warning() {
+        let mm = make_mm(&[("f5-raced", 1.0)], 40.0).await;
+        crate::startup::push_startup_warning(
+            "restore_failed",
+            "'f5-raced' was loaded before the worker crashed and was not restored: Loading",
+        );
+        mm.load_model("f5-raced").await.unwrap();
+        assert!(
+            !crate::startup::startup_warnings()
+                .iter()
+                .any(|w| w.code == "restore_failed" && w.message.starts_with("'f5-raced' "))
+        );
+    }
+
+    /// C27 N3: the restore lost the race to an admin load that reached Ready before the restore
+    /// pushed its warning (the Ready-time clear found nothing). The warning must not stay; a
+    /// restore that failed for a model that is still not loaded keeps it.
+    #[tokio::test]
+    async fn a_restore_warning_pushed_after_the_racing_load_is_ready_is_cleared() {
+        let mm = make_mm(&[("n3-raced", 1.0), ("n3-failed", 1.0)], 40.0).await;
+        mm.load_model("n3-raced").await.unwrap();
+
+        mm.push_restore_failed("n3-raced", &"model 'n3-raced' is Loading");
+        mm.push_restore_failed("n3-failed", &"does not fit without evicting");
+
+        let warnings = crate::startup::startup_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "restore_failed" && w.message.starts_with("'n3-raced' ")),
+            "a Ready model has no restore_failed warning: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "restore_failed" && w.message.starts_with("'n3-failed' ")),
+            "a model left NotLoaded keeps its warning: {warnings:?}"
+        );
+    }
+
     /// T5.4/#37: a busy (in-flight) model is never the eviction victim while a
     /// genuinely idle model exists — even when the busy model is the LEAST
     /// recently used by `last_used`. Naive LRU evicts the active stream; the
@@ -15479,9 +19142,12 @@ mod tests {
     /// weights, a `CPU` one the larger of its allocation and what it holds.
     #[test]
     fn ram_credit_is_weights_off_cpu_and_allocation_or_resident_on_cpu() {
-        assert!((ram_credit_gb(5.0, 7.0, None) - 5.0).abs() < 1e-12);
-        assert!((ram_credit_gb(5.0, 7.0, Some(0.8)) - 7.0).abs() < 1e-12);
-        assert!((ram_credit_gb(5.0, 7.0, Some(9.0)) - 9.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, None, 0.0) - 5.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, Some(0.8), 0.0) - 7.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, Some(9.0), 0.0) - 9.0).abs() < 1e-12);
+        // C7 B.3: off CPU a resident pool is credited on top of the weights; CPU unchanged.
+        assert!((ram_credit_gb(5.0, 7.0, None, 2.0) - 7.0).abs() < 1e-12);
+        assert!((ram_credit_gb(5.0, 7.0, Some(0.8), 2.0) - 7.0).abs() < 1e-12);
     }
 
     /// D3-S1.B3: the automatic-recovery eviction behaves like `evict_model` today — it drains a
@@ -15923,6 +19589,156 @@ mod tests {
         assert_eq!(
             mm.read_models("test").get("a").unwrap().state,
             ModelState::NotLoaded
+        );
+    }
+
+    /// V1-rv P1: an eviction reports what it did — nothing running (drained exactly zero), a
+    /// running request that finished during the drain, and one aborted at the drain deadline
+    /// (shortened here; 2 minutes in service), which is also what the abort counter reads.
+    #[tokio::test]
+    async fn eviction_reports_nothing_running_drained_and_aborted() {
+        let mm = busy_rule_fixture().await;
+
+        // Idle: no drain at all.
+        let idle = mm.evict_model_reported("a", true).await.unwrap();
+        assert_eq!(idle.model_id, "a");
+        assert_eq!(idle.drained, Duration::ZERO);
+        assert_eq!(idle.aborted, 0);
+
+        // Busy, finishing during the drain: drained > 0, nothing aborted.
+        let permit = hold_busy(&mm, "b");
+        let evicting = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move { mm.evict_model_reported("b", true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(permit);
+        let drained = evicting.await.unwrap().unwrap();
+        assert!(drained.drained > Duration::ZERO, "{drained:?}");
+        assert_eq!(drained.aborted, 0, "{drained:?}");
+
+        // Busy past the drain deadline: aborted.
+        mm.load_model("a").await.unwrap();
+        mm.set_evict_drain_deadline_for_test(Duration::from_millis(200));
+        let permit = hold_busy(&mm, "a");
+        let aborted = mm.evict_model_reported("a", true).await.unwrap();
+        drop(permit);
+        assert_eq!(aborted.aborted, 1, "{aborted:?}");
+        assert!(aborted.drained >= Duration::from_millis(150), "{aborted:?}");
+        assert!(aborted.drained < Duration::from_secs(5), "{aborted:?}");
+        assert_eq!(
+            mm.read_models("test").get("a").unwrap().state,
+            ModelState::NotLoaded
+        );
+    }
+
+    /// V1-rv R-1: a non-abortable engine (STT here) still running at the drain
+    /// deadline reports those requests as `aborted`, the same number the abort counter gains; the
+    /// eviction then waits for its thread (D3-S1.E5) and completes.
+    #[test]
+    fn a_non_abortable_engine_past_the_deadline_reports_what_the_counter_counts() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = ::metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let mm = make_mm(&[("whisper-stt-ov", 1.5)], 22.5).await;
+                mm.load_model("whisper-stt-ov").await.unwrap();
+                mm.set_evict_drain_deadline_for_test(Duration::from_millis(150));
+                let permit = match mm
+                    .read_models("test")
+                    .get("whisper-stt-ov")
+                    .unwrap()
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                {
+                    EngineHandleKind::Stt(h) => h.occupy_slot_for_test().unwrap(),
+                    other => panic!("must be an STT mock, got {other:?}"),
+                };
+                let report = mm
+                    .evict_model_reported("whisper-stt-ov", true)
+                    .await
+                    .unwrap();
+                drop(permit);
+                report
+            })
+        });
+        assert_eq!(report.aborted, 1, "{report:?}");
+        assert!(report.drained >= Duration::from_millis(100), "{report:?}");
+        let out = handle.render();
+        let counted = out
+            .lines()
+            .find(|l| l.starts_with("rustedvino_eviction_aborted_requests_total{kind=\"stt\"}"))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no abort counter in:\n{out}"));
+        assert!((counted - 1.0).abs() < 1e-9, "{out}");
+    }
+
+    /// V1-rv R-2: the stalled-engine path has no drain deadline and does not move
+    /// the abort counter, so its report says `aborted: 0` and `drained: 0`.
+    #[tokio::test]
+    async fn a_stalled_engine_eviction_reports_no_aborts() {
+        let mm = make_mm(&[("model-a", 5.0)], 17.0).await;
+        mm.load_model("model-a").await.unwrap();
+        let permit = hold_busy(&mm, "model-a");
+        mm.read_models("test")
+            .get("model-a")
+            .and_then(|r| r.handle.as_ref())
+            .and_then(|h| h.liveness())
+            .unwrap()
+            .declare_dead_for_test();
+        mm.set_forced_join_deadline_for_test(Duration::from_secs(5));
+        let report = mm.evict_model_reported("model-a", true).await.unwrap();
+        drop(permit);
+        assert_eq!(report.aborted, 0, "{report:?}");
+        assert_eq!(report.drained, Duration::ZERO, "{report:?}");
+    }
+
+    /// V1-rv R-8: rv prints these drain deadlines before a forced call and cannot ask the server
+    /// for them — `tools/rv/src/commands/outcome.rs` (`EVICT_DRAIN_S`, `LOAD_EVICT_DRAIN_S`)
+    /// mirrors them. Change both together.
+    #[test]
+    fn drain_deadlines_match_what_rv_prints() {
+        assert_eq!(EVICT_DRAIN_DEADLINE, Duration::from_secs(120));
+        assert_eq!(LOAD_EVICT_DRAIN_DEADLINE, Duration::from_secs(15));
+    }
+
+    /// V1-rv P1: a forced load reports the victims it evicted for room, with their drain.
+    #[tokio::test]
+    async fn forced_load_reports_its_victims() {
+        let mm = busy_rule_fixture().await;
+        let (pa, pb) = (hold_busy(&mm, "a"), hold_busy(&mm, "b"));
+        let load = tokio::spawn({
+            let mm = Arc::clone(&mm);
+            async move {
+                mm.load_model_reported(
+                    "incoming",
+                    LoadOverrides {
+                        force: true,
+                        ..LoadOverrides::default()
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop((pa, pb));
+        let victims = load.await.unwrap().unwrap();
+        assert_eq!(victims.len(), 1, "{victims:?}");
+        assert!(["a", "b"].contains(&victims[0].model_id.as_str()));
+        assert!(victims[0].drained > Duration::ZERO, "{victims:?}");
+        assert_eq!(victims[0].aborted, 0);
+        // The idempotent path evicts nothing.
+        assert!(
+            mm.load_model_reported("incoming", LoadOverrides::default())
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -16607,6 +20423,33 @@ mod tests {
         outside_bytes: u64,
         edit: impl FnOnce(&mut Config),
     ) -> (ModelManager, Arc<FakeProbe>) {
+        let (config, factory, inventory) = headroom_fixture(models, cache_size_gb, edit);
+        let probe = fake_probe(outside_bytes);
+        let mm =
+            ModelManager::new_with_inventory(config, factory as Arc<dyn EngineFactory>, inventory)
+                .await
+                .unwrap()
+                .with_vram_probe(Some(
+                    Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
+                ));
+        (mm, probe)
+    }
+
+    /// A [`FakeProbe`] reporting `outside_bytes` held by other processes and no own memory.
+    fn fake_probe(outside_bytes: u64) -> Arc<FakeProbe> {
+        Arc::new(FakeProbe(
+            std::sync::atomic::AtomicU64::new(outside_bytes),
+            std::sync::atomic::AtomicU64::new(0),
+        ))
+    }
+
+    /// The config, factory and inventory of [`headroom_manager_with`] (a 24 GiB discrete `GPU.1`,
+    /// a 27B-shaped hybrid vision profile), for tests that build the manager themselves.
+    fn headroom_fixture(
+        models: &[(&str, f64)],
+        cache_size_gb: f64,
+        edit: impl FnOnce(&mut Config),
+    ) -> (Config, Arc<MockEngineFactory>, Arc<DeviceInventory>) {
         let mut config = make_config(models, 24.0);
         config.device = "GPU.1".to_owned();
         config.cache_size_gb = cache_size_gb;
@@ -16635,18 +20478,415 @@ mod tests {
             total_mem_gb: Some(24.0),
             pdev: Some("0000:03:00.0".to_owned()),
         }]));
-        let probe = Arc::new(FakeProbe(
-            std::sync::atomic::AtomicU64::new(outside_bytes),
-            std::sync::atomic::AtomicU64::new(0),
-        ));
-        let mm =
-            ModelManager::new_with_inventory(config, factory as Arc<dyn EngineFactory>, inventory)
-                .await
+        (config, factory, inventory)
+    }
+
+    /// C22: the manager as `new_production` builds it at boot, with `preload` and `probe`.
+    async fn headroom_boot(
+        models: &[(&str, f64)],
+        preload: &[&str],
+        probe: Option<Arc<dyn crate::gpu_memory::VramProbe>>,
+    ) -> ModelManager {
+        let (config, factory, inventory) = headroom_fixture(models, 4.0, |c| {
+            c.preload = preload.iter().map(|&p| p.to_owned()).collect();
+        });
+        ModelManager::new_with_inventory_and_probe(
+            config,
+            factory as Arc<dyn EngineFactory>,
+            inventory,
+            probe,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `(max_prompt_tokens, pool_capacity_tokens, kv_cache_gb, gate mode, gate clamp, headroom)`
+    /// of a model's record.
+    fn gate_of(
+        mm: &ModelManager,
+        id: &str,
+    ) -> (
+        usize,
+        usize,
+        f64,
+        &'static str,
+        Option<GateClamp>,
+        Option<headroom::HeadroomSpec>,
+    ) {
+        let m = mm.read_models("t");
+        let r = m.get(id).unwrap();
+        (
+            r.max_prompt_tokens,
+            r.pool_capacity_tokens,
+            r.kv_cache_gb,
+            r.kv_gate_mode,
+            r.kv_gate_clamped_by,
+            r.headroom.as_ref().map(|h| h.spec.clone()),
+        )
+    }
+
+    /// C22 (S300, B70): a vision model preloaded at boot on a discrete GPU gets the exact gate with
+    /// the device-headroom limit, as a later load does, not the legacy estimate. 15 GiB weights +
+    /// a 4 GiB pool on 24 GiB with 0.5 GiB elsewhere and a 0.5 GiB margin leave 4 GiB for one
+    /// prompt (5120 x 4 x 2 B per token): the same ~105k as
+    /// `vision_on_a_discrete_gpu_is_limited_by_the_device_headroom`.
+    #[tokio::test]
+    async fn c22_a_boot_preloaded_vision_model_on_a_dgpu_gets_the_headroom_limit() {
+        let probe = fake_probe(512 << 20);
+        let mm = headroom_boot(
+            &[("vlm-a", 15.0)],
+            &["vlm-a"],
+            Some(probe as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await;
+        assert_eq!(state_of(&mm, "vlm-a"), ModelState::Ready);
+        let (limit, _, _, mode, by, spec) = gate_of(&mm, "vlm-a");
+        assert_eq!(
+            mode, "exact",
+            "boot preload must not keep the legacy estimate"
+        );
+        assert!(
+            spec.is_some(),
+            "the headroom record exists after a boot preload"
+        );
+        assert_eq!(by, Some(GateClamp::DeviceHeadroom));
+        assert!((104_000..106_000).contains(&limit), "{limit}");
+    }
+
+    /// C22: the boot-preload limit, pool and gate equal what a reload of the same model alone gets
+    /// in the same memory situation (the probe readings do not change in between).
+    #[tokio::test]
+    async fn c22_the_boot_preload_limit_equals_a_reload_alone() {
+        let probe = fake_probe(512 << 20);
+        let mm = headroom_boot(
+            &[("vlm-a", 15.0)],
+            &["vlm-a"],
+            Some(probe as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await;
+        let boot = gate_of(&mm, "vlm-a");
+        let boot_listed = mm.list_models()[0].max_prompt_tokens;
+        mm.evict_model("vlm-a").await.unwrap();
+        mm.load_model("vlm-a").await.unwrap();
+        let reload = gate_of(&mm, "vlm-a");
+        assert_eq!(boot.3, "exact");
+        assert_eq!(
+            (boot.0, boot.1, boot.3, boot.4),
+            (reload.0, reload.1, reload.3, reload.4)
+        );
+        assert!(
+            (boot.2 - reload.2).abs() < 1e-9,
+            "{} vs {}",
+            boot.2,
+            reload.2
+        );
+        assert_eq!(boot.5, reload.5);
+        assert_eq!(boot_listed, mm.list_models()[0].max_prompt_tokens);
+    }
+
+    /// C22 item 3 (S300 residency rows): with a second vision model resident, the big model's
+    /// limit is the device-headroom cap from the memory left after both, and its pool is clamped
+    /// by the tracker's free memory, not by the headroom. Shape of the B70 numbers (27B alone
+    /// 180,781 of a 191,648 pool; with the 4B resident a smaller pool of 168,176 but a limit of
+    /// only 52,328), on a 24 GiB fake dGPU: 0.5 GiB elsewhere, 0.5 GiB headroom margin, 1.5 GiB
+    /// tracker safety margin, 40,960 B per prompt token.
+    #[tokio::test]
+    async fn c22_a_resident_vision_model_lowers_the_others_limit_through_the_headroom_cap() {
+        let probe = fake_probe(512 << 20);
+        let (config, factory, inventory) =
+            headroom_fixture(&[("vlm-big", 17.0), ("vlm-small", 1.0)], 4.0, |c| {
+                c.vram_safety_margin_gb = 1.5;
+                c.models.get_mut("vlm-small").unwrap().policy.kv_cache_gb = Some(1.0);
+            });
+        let mm = ModelManager::new_with_inventory_and_probe(
+            config,
+            factory as Arc<dyn EngineFactory>,
+            inventory,
+            Some(probe as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await
+        .unwrap();
+        let listed = |mm: &ModelManager| {
+            mm.list_models()
+                .into_iter()
+                .find(|m| m.id == "vlm-big")
+                .map(|m| m.max_prompt_tokens)
                 .unwrap()
-                .with_vram_probe(Some(
-                    Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
-                ));
-        (mm, probe)
+        };
+        // Alone: pool 4 GiB (the cache_size_gb cap); free 24 - 0.5 - 17 - 4 - 0.5 = 2 GiB.
+        mm.load_model("vlm-big").await.unwrap();
+        let (alone, _, alone_gb, mode, by, _) = gate_of(&mm, "vlm-big");
+        assert_eq!((mode, by), ("exact", Some(GateClamp::DeviceHeadroom)));
+        assert!((alone_gb - 4.0).abs() < 0.01, "{alone_gb}");
+        assert!((52_000..53_000).contains(&alone), "{alone}");
+        mm.evict_model("vlm-big").await.unwrap();
+
+        // vlm-small (1 GiB weights + 1 GiB pool) first, then vlm-big: the tracker has
+        // 24 - 1.5 - 2 - 17 = 3.5 GiB for its pool (the B70's 7.4 -> 6.5 GB), and the device keeps
+        // 24 - 0.5 - 2 - 17 - 3.5 - 0.5 = 0.5 GiB free for one prompt.
+        mm.load_model("vlm-small").await.unwrap();
+        mm.load_model("vlm-big").await.unwrap();
+        let (beside, pool_tokens, beside_gb, mode, by, _) = gate_of(&mm, "vlm-big");
+        assert_eq!((mode, by), ("exact", Some(GateClamp::DeviceHeadroom)));
+        assert!(
+            (beside_gb - 3.5).abs() < 0.01,
+            "pool clamped by the tracker: {beside_gb}"
+        );
+        assert!((13_000..13_300).contains(&beside), "{beside}");
+        assert!(
+            pool_tokens > 10 * beside,
+            "the pool holds far more than the limit"
+        );
+        // Counted once: the drop is the small model's 2 GiB minus the 0.5 GiB of pool vlm-big gave
+        // back = 1.5 GiB = 39,321 tokens.
+        assert!(
+            (39_000..39_700).contains(&(alone - beside)),
+            "{alone} - {beside}"
+        );
+
+        // The limit is live: once vlm-small goes, vlm-big's limit rises without a reload (its pool
+        // stays 3.5 GiB, so 2.5 GiB free = about 65,500).
+        mm.evict_model("vlm-small").await.unwrap();
+        assert!((65_000..66_000).contains(&listed(&mm)), "{}", listed(&mm));
+    }
+
+    /// C22: a two-model boot preload gives each model what the same loads in the same order give
+    /// at runtime (the headroom admission gates now run at boot too).
+    #[tokio::test]
+    async fn c22_a_two_model_boot_preload_matches_the_same_loads_at_runtime() {
+        let build = |preload: &'static [&'static str]| async move {
+            let (config, factory, inventory) =
+                headroom_fixture(&[("vlm-big", 17.0), ("vlm-small", 1.0)], 4.0, |c| {
+                    c.vram_safety_margin_gb = 1.5;
+                    c.models.get_mut("vlm-small").unwrap().policy.kv_cache_gb = Some(1.0);
+                    c.preload = preload.iter().map(|&p| p.to_owned()).collect();
+                });
+            ModelManager::new_with_inventory_and_probe(
+                config,
+                factory as Arc<dyn EngineFactory>,
+                inventory,
+                Some(fake_probe(512 << 20) as Arc<dyn crate::gpu_memory::VramProbe>),
+            )
+            .await
+            .unwrap()
+        };
+        let boot = build(&["vlm-small", "vlm-big"]).await;
+        let runtime = build(&[]).await;
+        runtime.load_model("vlm-small").await.unwrap();
+        runtime.load_model("vlm-big").await.unwrap();
+        for id in ["vlm-small", "vlm-big"] {
+            let (b, r) = (gate_of(&boot, id), gate_of(&runtime, id));
+            assert_eq!(b.3, "exact", "{id}");
+            assert_eq!((b.0, b.1, b.3, b.4), (r.0, r.1, r.3, r.4), "{id}");
+            assert!((b.2 - r.2).abs() < 1e-9, "{id}: {} vs {}", b.2, r.2);
+        }
+    }
+
+    /// C22 fix round, owner decision D-F1: a second boot preload that the device-headroom gate
+    /// refuses is refused and does not evict the first, which a runtime load of the same pair does
+    /// (`headroom_refusal_evicts_before_it_gives_up`, shown here too). vlm-a 8 GiB + 4 GiB pool
+    /// is resident; vlm-b's 12 GiB of weights leave no room for its floor while vlm-a is booked.
+    #[tokio::test]
+    async fn c22_a_boot_preload_refused_by_the_headroom_gate_does_not_evict_an_earlier_one() {
+        let models = [("c22r-vlm-a", 8.0), ("c22r-vlm-b", 12.0)];
+        let probe = fake_probe(512 << 20);
+        let mm = headroom_boot(
+            &models,
+            &["c22r-vlm-a", "c22r-vlm-b"],
+            Some(probe as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await;
+        assert_eq!(state_of(&mm, "c22r-vlm-a"), ModelState::Ready, "kept");
+        assert_eq!(state_of(&mm, "c22r-vlm-b"), ModelState::NotLoaded);
+        // The startup-warning list is process-global and shared by every test: match this test's own
+        // model ids, and never clear the list (a clear would race the other tests that read it).
+        let warning = crate::startup::startup_warnings()
+            .into_iter()
+            .find(|w| w.code == "preload_failed" && w.message.contains("'c22r-vlm-b'"))
+            .expect("preload_failed startup warning for the refused preload");
+        assert!(
+            warning.message.contains("kv_headroom_min_tokens")
+                && warning.message.contains("does not evict"),
+            "{}",
+            warning.message
+        );
+        assert!(
+            !crate::startup::startup_warnings()
+                .iter()
+                .any(|w| w.message.contains("'c22r-vlm-a'")),
+            "the first preload did not fail"
+        );
+
+        // The same two loads at runtime: vlm-a is evicted to make room (unchanged behaviour).
+        let runtime = headroom_boot(
+            &models,
+            &[],
+            Some(fake_probe(512 << 20) as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await;
+        runtime.load_model("c22r-vlm-a").await.unwrap();
+        runtime.load_model("c22r-vlm-b").await.unwrap();
+        assert_eq!(state_of(&runtime, "c22r-vlm-a"), ModelState::NotLoaded);
+        assert_eq!(state_of(&runtime, "c22r-vlm-b"), ModelState::Ready);
+    }
+
+    /// D-F1: the eviction plan of a boot preload. The tracker alone needs one victim (vlm-x); the
+    /// device headroom needs vlm-y as well. At runtime both are evicted and the load succeeds (the
+    /// F1 preview, unchanged); at boot the preload is refused and nothing is evicted.
+    #[tokio::test]
+    async fn c22_a_boot_preload_never_evicts_the_extra_victims_the_headroom_plan_needs() {
+        let models = [
+            ("c22p-vlm-x", 3.0),
+            ("c22p-vlm-y", 2.0),
+            ("c22p-vlm-big", 19.0),
+        ];
+        let build = |preload: &'static [&'static str]| async move {
+            let (config, factory, inventory) = headroom_fixture(&models, 1.0, |c| {
+                c.vram_safety_margin_gb = 1.0;
+                c.min_kv_cache_gb = 1.0;
+                c.kv_headroom_margin_gib = 0.5;
+                c.dgpu_size_ceiling_fraction = 1.0;
+                c.preload = preload.iter().map(|&p| p.to_owned()).collect();
+            });
+            ModelManager::new_with_inventory_and_probe(
+                config,
+                factory as Arc<dyn EngineFactory>,
+                inventory,
+                Some(fake_probe(512 << 20) as Arc<dyn crate::gpu_memory::VramProbe>),
+            )
+            .await
+            .unwrap()
+        };
+        let runtime = build(&[]).await;
+        runtime.load_model("c22p-vlm-x").await.unwrap();
+        runtime.load_model("c22p-vlm-y").await.unwrap();
+        runtime.load_model("c22p-vlm-big").await.unwrap();
+        assert_eq!(state_of(&runtime, "c22p-vlm-big"), ModelState::Ready);
+        assert_eq!(state_of(&runtime, "c22p-vlm-x"), ModelState::NotLoaded);
+        assert_eq!(state_of(&runtime, "c22p-vlm-y"), ModelState::NotLoaded);
+
+        let boot = build(&["c22p-vlm-x", "c22p-vlm-y", "c22p-vlm-big"]).await;
+        assert_eq!(state_of(&boot, "c22p-vlm-x"), ModelState::Ready);
+        assert_eq!(state_of(&boot, "c22p-vlm-y"), ModelState::Ready);
+        assert_eq!(state_of(&boot, "c22p-vlm-big"), ModelState::NotLoaded);
+        // The startup-warning list is process-global and shared by every test: match this test's own
+        // model ids, and never clear the list (a clear would race the other tests that read it).
+        // A preload never evicts another preload — big does not fit beside x and
+        // y, so it is skipped (`preload_skipped`, with the shortfall) before any eviction plan.
+        let warning = crate::startup::startup_warnings()
+            .into_iter()
+            .find(|w| w.code == "preload_skipped" && w.message.contains("'c22p-vlm-big'"))
+            .expect("preload_skipped startup warning");
+        assert!(
+            warning.message.contains("short by") && warning.message.contains("never evicts"),
+            "{}",
+            warning.message
+        );
+    }
+
+    /// D-F1: a boot preload refused by the headroom gate does not wait for the driver to release
+    /// memory. The driver reports 20 GiB this process holds and the tracker never booked, which
+    /// at runtime sends a headroom refusal with nothing to evict into [`VRAM_RELEASE_WAIT`]
+    /// (20 s, the resettle path of `ensure_vram_loop`); at boot it is refused at once.
+    #[tokio::test]
+    async fn c22_a_boot_preload_refused_by_the_headroom_gate_does_not_wait() {
+        let probe = fake_probe(512 << 20);
+        probe
+            .1
+            .store(20 << 30, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let mm = headroom_boot(
+            &[("c22w-vlm-a", 15.0)],
+            &["c22w-vlm-a"],
+            Some(probe as Arc<dyn crate::gpu_memory::VramProbe>),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "boot took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(state_of(&mm, "c22w-vlm-a"), ModelState::NotLoaded);
+        // The startup-warning list is process-global and shared by every test: match this test's own
+        // model ids, and never clear the list (a clear would race the other tests that read it).
+        assert!(
+            crate::startup::startup_warnings()
+                .iter()
+                .any(|w| w.code == "preload_failed" && w.message.contains("'c22w-vlm-a'"))
+        );
+    }
+
+    /// A probe whose reading always fails (`/proc` unreadable, driver without fdinfo).
+    #[derive(Debug)]
+    struct DeadProbe;
+
+    impl crate::gpu_memory::VramProbe for DeadProbe {
+        fn outside_used_bytes(&self, _pdev: &str) -> Option<u64> {
+            None
+        }
+    }
+
+    /// C22 item 2: when the probe is genuinely unavailable at boot (none at all, or every reading
+    /// fails) a boot-preloaded vision model on a discrete GPU keeps the legacy limit: mode
+    /// `legacy`, the legacy estimate of its pool (the model directory has a `config.json`), no
+    /// headroom record.
+    ///
+    /// The once-per-process WARN (`warn_vision_without_headroom_cap_once`) is on this path but not
+    /// asserted: its latch is a process-global `static AtomicBool`, so whether this test sees the
+    /// line depends on whether another test in the same process reached that path first, and a
+    /// thread-local tracing capture cannot see a line another test's thread logged. Asserting it
+    /// would need a reset hook on the latch, which parallel tests would race.
+    #[tokio::test]
+    async fn c22_an_unreadable_probe_at_boot_keeps_the_legacy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vlm-a")).unwrap();
+        std::fs::write(
+            dir.path().join("vlm-a").join("config.json"),
+            r#"{"num_hidden_layers":64,"num_attention_heads":24,"num_key_value_heads":4,"hidden_size":5120}"#,
+        )
+        .unwrap();
+        for probe in [
+            None,
+            Some(Arc::new(DeadProbe) as Arc<dyn crate::gpu_memory::VramProbe>),
+        ] {
+            let dead = probe.is_some();
+            let (config, factory, inventory) = headroom_fixture(&[("vlm-a", 15.0)], 4.0, |c| {
+                c.models_dir = dir.path().to_path_buf();
+                c.preload = vec!["vlm-a".to_owned()];
+            });
+            let mm = ModelManager::new_with_inventory_and_probe(
+                config,
+                factory as Arc<dyn EngineFactory>,
+                inventory,
+                probe,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state_of(&mm, "vlm-a"),
+                ModelState::Ready,
+                "dead probe: {dead}"
+            );
+            let (limit, pool_tokens, kv_gb, mode, by, spec) = gate_of(&mm, "vlm-a");
+            assert_eq!(mode, "legacy", "dead probe: {dead}");
+            assert_eq!((by, spec), (None, None), "dead probe: {dead}");
+            let precision = mm
+                .read_models("t")
+                .get("vlm-a")
+                .and_then(|r| r.kv_gate_detail.as_ref().map(|d| d.precision))
+                .unwrap();
+            let legacy = ModelManager::compute_max_prompt_tokens(
+                "vlm-a",
+                &GateFiles::read(&dir.path().join("vlm-a"), None, None, kv_gb),
+                kv_gb,
+                precision,
+            );
+            assert!(legacy.0 > 0, "the legacy estimate is on");
+            assert_eq!((limit, pool_tokens), legacy, "dead probe: {dead}");
+            let info = mm.list_models().into_iter().next().unwrap();
+            assert_eq!(info.max_prompt_tokens, legacy.0);
+            assert!(info.kv_headroom_cap_tokens.is_none());
+        }
     }
 
     /// T7: a vision model on a discrete GPU is limited by the free device memory as well as by its
@@ -16688,6 +20928,312 @@ mod tests {
         assert_eq!(
             mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens,
             limit
+        );
+    }
+
+    /// A probe that records which devices it was asked about and, like the real `/proc` scan
+    /// (about 0.2 s on a desktop), takes a while: a background refresh does not land before the
+    /// load that started it has read the value.
+    #[derive(Debug, Default)]
+    struct RecordingProbe {
+        outside: std::sync::atomic::AtomicU64,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl crate::gpu_memory::VramProbe for RecordingProbe {
+        fn outside_used_bytes(&self, pdev: &str) -> Option<u64> {
+            // A mutation guard, not a correctness need: long enough that a background refresh
+            // started by a reverted fix cannot land before the mock load reads the value.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.asked.lock().unwrap().push(pdev.to_owned());
+            Some(self.outside.load(std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    /// S2: a load after an idle gap decides on the device memory of now, not on the reading the
+    /// previous load left in the cache; and only discrete GPUs are scanned (an iGPU with a PCI
+    /// address is never asked about).
+    #[tokio::test]
+    async fn a_load_after_an_idle_gap_reads_the_device_again_and_skips_the_igpu() {
+        let mut config = make_config(&[("vlm-a", 15.0)], 24.0);
+        config.device = "GPU.1".to_owned();
+        // The global device, not capability placement (which would pick the iGPU here).
+        config.default_placement = config::DefaultPlacement::Device;
+        config.cache_size_gb = 4.0;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        config.enable_prefix_caching = false;
+        config.embedding_device = Some("GPU.1".to_owned());
+        let mut hybrid = kv_profile_fixture(16, 4, 256, 79_429_632);
+        hybrid.hidden_size = 5120;
+        let factory = Arc::new(MockEngineFactory {
+            pool_inputs: Some(pool_inputs(
+                hybrid,
+                explicit_u4(),
+                kv_precision::EnginePath::Vlm,
+            )),
+            ..MockEngineFactory::default()
+        });
+        let dev = |name: &str, kind, pdev: &str, mem| DeviceInfo {
+            name: name.to_owned(),
+            full_name: format!("test {name}"),
+            architecture: None,
+            kind,
+            tier: DeviceTier::Heavy,
+            domain_id: name.to_owned(),
+            total_mem_gb: Some(mem),
+            pdev: Some(pdev.to_owned()),
+        };
+        let inventory = Arc::new(DeviceInventory::from_devices(vec![
+            dev("GPU.0", DeviceKind::IntegratedGpu, "0000:00:02.0", 16.0),
+            dev("GPU.1", DeviceKind::DiscreteGpu, "0000:03:00.0", 24.0),
+        ]));
+        let probe = Arc::new(RecordingProbe::default());
+        probe
+            .outside
+            .store(512 << 20, std::sync::atomic::Ordering::Relaxed);
+        let mm =
+            ModelManager::new_with_inventory(config, factory as Arc<dyn EngineFactory>, inventory)
+                .await
+                .unwrap()
+                .with_vram_probe(Some(
+                    Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
+                ));
+        let limit = |mm: &ModelManager| mm.read_models("t").get("vlm-a").unwrap().max_prompt_tokens;
+
+        mm.load_model("vlm-a").await.unwrap();
+        // 24 - 0.5 outside - 15 weights - 4 pool - 0.5 margin = 4 GiB / (5120 x 4 x 2 B).
+        assert!((104_000..106_000).contains(&limit(&mm)), "{}", limit(&mm));
+        mm.evict_model("vlm-a").await.unwrap();
+
+        // An idle gap; meanwhile another process takes 2 GiB more of the card.
+        mm.headroom
+            .age_readings(std::time::Duration::from_secs(876));
+        probe
+            .outside
+            .store(2_560 << 20, std::sync::atomic::Ordering::Relaxed);
+        mm.load_model("vlm-a").await.unwrap();
+        // The old reading would give the same ~105k; the fresh one leaves 2 GiB = about 52k.
+        assert!((51_000..54_000).contains(&limit(&mm)), "{}", limit(&mm));
+
+        // The dry-run refresh reads discrete GPUs only, too.
+        mm.headroom
+            .age_readings(std::time::Duration::from_secs(876));
+        mm.refresh_all_device_probes().await;
+        let asked = probe.asked.lock().unwrap().clone();
+        assert!(!asked.is_empty());
+        assert!(
+            asked.iter().all(|p| p == "0000:03:00.0"),
+            "only the discrete GPU is scanned: {asked:?}"
+        );
+    }
+
+    /// A probe that records, at entry, the thread each reading ran on, then takes 100 ms like a
+    /// real `/proc` scan (so a background refresh cannot land before the caller reads the value).
+    #[derive(Debug, Default)]
+    pub(crate) struct ThreadProbe {
+        /// Bytes other processes hold, as the probe reports them.
+        pub(crate) outside: std::sync::atomic::AtomicU64,
+        /// The thread (id, name) of every reading, in order.
+        pub(crate) calls: Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
+    }
+
+    impl ThreadProbe {
+        /// The readings taken on a thread other than the background refresh's (`vram-probe`).
+        pub(crate) fn synchronous_calls(&self) -> Vec<(std::thread::ThreadId, Option<String>)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, name)| name.as_deref() != Some("vram-probe"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl crate::gpu_memory::VramProbe for ThreadProbe {
+        fn outside_used_bytes(&self, _pdev: &str) -> Option<u64> {
+            let t = std::thread::current();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((t.id(), t.name().map(str::to_owned)));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Some(self.outside.load(std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    /// [`headroom_fixture`]'s manager over a [`ThreadProbe`] reading `outside` bytes, `vlm-a`
+    /// (a vision model, 15 GiB of weights, 4 GiB pool) Ready on a 24 GiB discrete `GPU.1`; the
+    /// probe's calls are cleared after the load. For the handler tests of E3 as well.
+    pub(crate) async fn thread_probe_vision_manager(
+        outside: u64,
+    ) -> (ModelManager, Arc<ThreadProbe>) {
+        let (mm, probe) = thread_probe_manager(outside).await;
+        mm.load_model("vlm-a").await.unwrap();
+        probe.calls.lock().unwrap().clear();
+        (mm, probe)
+    }
+
+    /// Tests: [`ModelManager::headroom`] (the age hook for the handler tests).
+    pub(crate) fn headroom_of(mm: &ModelManager) -> &headroom::HeadroomRuntime {
+        &mm.headroom
+    }
+
+    /// [`headroom_fixture`]'s manager over a [`ThreadProbe`] reading `outside` bytes.
+    async fn thread_probe_manager(outside: u64) -> (ModelManager, Arc<ThreadProbe>) {
+        let (config, factory, inventory) = headroom_fixture(&[("vlm-a", 15.0)], 4.0, |_| {});
+        let probe = Arc::new(ThreadProbe::default());
+        probe
+            .outside
+            .store(outside, std::sync::atomic::Ordering::Relaxed);
+        let mm =
+            ModelManager::new_with_inventory(config, factory as Arc<dyn EngineFactory>, inventory)
+                .await
+                .unwrap()
+                .with_vram_probe(Some(
+                    Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
+                ));
+        (mm, probe)
+    }
+
+    /// E3: a request after an idle gap (reading 31 s old) takes a fresh reading
+    /// before the cap is computed and decides on it. The probe runs on the blocking pool, not on
+    /// the async runtime: this `#[tokio::test]` is a current-thread runtime, so a reading on the
+    /// runtime would run on this test's own thread; and not on the background refresh thread
+    /// (`vram-probe`), which could not have landed within the probe's 100 ms anyway.
+    #[tokio::test]
+    async fn a_request_after_an_idle_gap_reads_the_device_first_off_the_runtime() {
+        let (mm, probe) = thread_probe_manager(512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let load_limit = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        assert!((104_000..106_000).contains(&load_limit), "{load_limit}");
+        probe.calls.lock().unwrap().clear();
+
+        mm.headroom.age_readings(std::time::Duration::from_secs(31));
+        // Meanwhile another process took 3 GiB more of the card (free 4.0 -> 1.0 GiB).
+        probe
+            .outside
+            .store(3_584 << 20, std::sync::atomic::Ordering::Relaxed);
+        let ctx = mm.get_chat_context_for_request("vlm-a").await.unwrap();
+        assert!(
+            (25_000..27_500).contains(&ctx.max_prompt_tokens),
+            "decided on the fresh reading: {}",
+            ctx.max_prompt_tokens
+        );
+        let sync = probe.synchronous_calls();
+        assert_eq!(sync.len(), 1, "one synchronous probe: {sync:?}");
+        assert_ne!(
+            sync[0].0,
+            std::thread::current().id(),
+            "the probe must not run on the async runtime's thread"
+        );
+    }
+
+    /// E3: within 30 s (29 s old) a request does not probe synchronously — it decides on the
+    /// cached reading. The cache TTL is raised past 29 s so no background refresh runs either:
+    /// the result cannot depend on a refresh thread racing the read.
+    #[tokio::test]
+    async fn a_request_within_30_s_uses_the_cached_reading() {
+        let (mut mm, probe) = thread_probe_manager(512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        mm.headroom.set_ttl(std::time::Duration::from_secs(60));
+        let load_limit = mm.get_chat_context("vlm-a").unwrap().max_prompt_tokens;
+        probe.calls.lock().unwrap().clear();
+
+        mm.headroom.age_readings(std::time::Duration::from_secs(29));
+        probe
+            .outside
+            .store(3_584 << 20, std::sync::atomic::Ordering::Relaxed);
+        let ctx = mm.get_chat_context_for_request("vlm-a").await.unwrap();
+        assert_eq!(
+            ctx.max_prompt_tokens, load_limit,
+            "the cached reading decides"
+        );
+        assert!(
+            probe.calls.lock().unwrap().is_empty(),
+            "no probe within 30 s: {:?}",
+            probe.calls.lock().unwrap()
+        );
+    }
+
+    /// E3: concurrent requests after an idle gap run one synchronous probe for the device; the
+    /// others wait for it and use its reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_after_an_idle_gap_share_one_probe() {
+        let (mm, probe) = thread_probe_manager(512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        probe.calls.lock().unwrap().clear();
+        mm.headroom.age_readings(std::time::Duration::from_secs(31));
+        probe
+            .outside
+            .store(3_584 << 20, std::sync::atomic::Ordering::Relaxed);
+        let mm = Arc::new(mm);
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let mm = Arc::clone(&mm);
+                tokio::spawn(async move {
+                    mm.get_chat_context_for_request("vlm-a")
+                        .await
+                        .unwrap()
+                        .max_prompt_tokens
+                })
+            })
+            .collect();
+        for t in tasks {
+            let limit = t.await.unwrap();
+            assert!((25_000..27_500).contains(&limit), "{limit}");
+        }
+        let sync = probe.synchronous_calls();
+        assert_eq!(sync.len(), 1, "one probe for four requests: {sync:?}");
+    }
+
+    /// E3: a vision model on an integrated GPU has no headroom limit and its device is never
+    /// scanned, also not by the request-side age check after an idle gap.
+    #[tokio::test]
+    async fn a_request_on_an_igpu_never_probes() {
+        let _ram = FakeLiveAvail::set(64.0);
+        let mut config = make_config(&[("vlm-a", 5.0)], 24.0);
+        config.device = "GPU.0".to_owned();
+        config.default_placement = config::DefaultPlacement::Device;
+        config.cache_size_gb = 2.0;
+        config.vram_safety_margin_gb = 0.0;
+        config.min_kv_cache_gb = 0.0;
+        config.enable_prefix_caching = false;
+        config.embedding_device = Some("GPU.0".to_owned());
+        let inventory = Arc::new(DeviceInventory::from_devices(vec![DeviceInfo {
+            name: "GPU.0".to_owned(),
+            full_name: "test iGPU".to_owned(),
+            architecture: None,
+            kind: DeviceKind::IntegratedGpu,
+            tier: DeviceTier::Heavy,
+            domain_id: DOMAIN_SYSTEM.to_owned(),
+            total_mem_gb: Some(32.0),
+            pdev: Some("0000:00:02.0".to_owned()),
+        }]));
+        let probe = Arc::new(ThreadProbe::default());
+        let mm = ModelManager::new_with_inventory(
+            config,
+            Arc::new(MockEngineFactory::default()) as Arc<dyn EngineFactory>,
+            inventory,
+        )
+        .await
+        .unwrap()
+        .with_vram_probe(Some(
+            Arc::clone(&probe) as Arc<dyn crate::gpu_memory::VramProbe>
+        ));
+        mm.load_model("vlm-a").await.unwrap();
+        assert!(
+            mm.read_models("t").get("vlm-a").unwrap().headroom.is_none(),
+            "no headroom limit on an iGPU"
+        );
+        mm.headroom
+            .age_readings(std::time::Duration::from_secs(876));
+        mm.get_chat_context_for_request("vlm-a").await.unwrap();
+        assert!(
+            probe.calls.lock().unwrap().is_empty(),
+            "the iGPU is never scanned: {:?}",
+            probe.calls.lock().unwrap()
         );
     }
 
@@ -16915,11 +21461,12 @@ mod tests {
         assert!(err.to_string().contains("no room left to answer"), "{err}");
     }
 
-    /// Template-read opinion: `ModelFiles::read` gives a text model its own template and
-    /// tokens, a media model the fallback template (tokens still read), an unreadable override
-    /// the fallback; `fallback()` is never an empty template.
+    /// Template-read opinion + C8: `ModelFiles::read` gives a text model its own template and
+    /// tokens, a media model the fallback template (tokens still read), the pre-read override's
+    /// content when one was configured, and the generic fallback (unchanged, with a WARN) only to
+    /// a model with no override and no template of its own; `fallback()` is never empty.
     #[test]
-    fn model_files_read_text_media_and_unreadable_override() {
+    fn model_files_read_text_media_override_and_fallback() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "TPL {{ messages }}").unwrap();
         std::fs::write(
@@ -16933,10 +21480,129 @@ mod tests {
         let media = ModelFiles::read("m", dir.path(), ModelKind::Embedding, None);
         assert_eq!(media.template, template::FALLBACK_TEMPLATE);
         assert_eq!(media.special_tokens.0, "</s>");
-        let missing = std::path::Path::new("/nonexistent/override.jinja");
-        let bad = ModelFiles::read("m", dir.path(), ModelKind::TextGen, Some(missing));
-        assert_eq!(bad.template, template::FALLBACK_TEMPLATE);
+        let over = ModelFiles::read("m", dir.path(), ModelKind::Vision, Some("OVERRIDE"));
+        assert_eq!(over.template, "OVERRIDE");
+        let empty = tempfile::tempdir().unwrap();
+        let none = ModelFiles::read("m", empty.path(), ModelKind::TextGen, None);
+        assert_eq!(none.template, template::FALLBACK_TEMPLATE);
         assert!(!ModelFiles::fallback().template.is_empty());
+    }
+
+    /// A manager whose model `tpl-model` (text, 5 GB) has `chat_template` set to `path`, plus a
+    /// resident-to-be `resident-a` (10 GB), on a 12 GB budget: loading `tpl-model` needs
+    /// `resident-a` evicted.
+    async fn mm_with_template_override(path: &std::path::Path) -> ModelManager {
+        let mut config = make_config(&[("resident-a", 10.0), ("tpl-model", 5.0)], 12.0);
+        if let Some(e) = config.models.get_mut("tpl-model") {
+            e.policy.chat_template = Some(path.to_path_buf());
+        }
+        ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap()
+    }
+
+    /// C8 (owner decision, 2026-11-09): a configured `chat_template` override that cannot be read refuses the
+    /// load, with a message naming the model and the path, before anything is reserved or evicted:
+    /// the record is back to `NotLoaded`, nothing is booked for it, and the resident model that
+    /// would have made room is still `Ready`.
+    #[tokio::test]
+    async fn an_unreadable_chat_template_override_refuses_the_load_before_evicting() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("lfm2.jinja");
+        let mm = mm_with_template_override(&missing).await;
+        mm.load_model("resident-a").await.unwrap();
+        let err = mm.load_model("tpl-model").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<ModelError>(),
+                Some(ModelError::TemplateUnreadable { model, path, .. })
+                    if model == "tpl-model" && path == &missing
+            ),
+            "{err:#}"
+        );
+        let err = err.to_string();
+        assert!(err.contains("'tpl-model'"), "{err}");
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(err.contains("chat_template"), "{err}");
+        assert_eq!(state_of(&mm, "tpl-model"), ModelState::NotLoaded);
+        assert_eq!(
+            state_of(&mm, "resident-a"),
+            ModelState::Ready,
+            "nothing evicted"
+        );
+        assert!(mm.vram.read().unwrap().allocated_gb("tpl-model").abs() < f64::EPSILON);
+        // Fixing the file is enough: the next load uses it (and makes room as usual).
+        std::fs::write(&missing, "LFM2 {{ messages }}").unwrap();
+        mm.load_model("tpl-model").await.unwrap();
+        let ctx = mm.get_chat_context("tpl-model").unwrap();
+        assert_eq!(&*ctx.template, "LFM2 {{ messages }}");
+    }
+
+    /// C8: the template a load commits is the one its pre-flight read, so removing the file after
+    /// the load cannot change the resident model; a resize (evict + reload) of that model with the
+    /// file gone is refused while it is still resident, not after evicting it.
+    #[tokio::test]
+    async fn a_resize_with_an_unreadable_override_is_refused_before_evicting() {
+        let dir = tempfile::tempdir().unwrap();
+        let tpl = dir.path().join("lfm2.jinja");
+        std::fs::write(&tpl, "LFM2 {{ messages }}").unwrap();
+        let mm = mm_with_template_override(&tpl).await;
+        mm.load_model("tpl-model").await.unwrap();
+        std::fs::remove_file(&tpl).unwrap();
+        let err = mm
+            .resize_model_kv_cache("tpl-model", 1.0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("chat_template"), "{err}");
+        assert_eq!(state_of(&mm, "tpl-model"), ModelState::Ready);
+        let ctx = mm.get_chat_context("tpl-model").unwrap();
+        assert_eq!(&*ctx.template, "LFM2 {{ messages }}");
+    }
+
+    /// C8: a media model ignores `chat_template` as before: an unreadable one does not refuse its
+    /// load (the key never applied to it).
+    #[tokio::test]
+    async fn a_media_model_ignores_an_unreadable_chat_template() {
+        let mut config = make_config(&[("embed-model", 1.0)], 12.0);
+        if let Some(e) = config.models.get_mut("embed-model") {
+            e.kind = Some("embedding".to_owned());
+            e.policy.chat_template = Some("/nonexistent/c8/override.jinja".into());
+        }
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        mm.load_model("embed-model").await.unwrap();
+        assert_eq!(state_of(&mm, "embed-model"), ModelState::Ready);
+    }
+
+    /// C8: `add_model` with an unreadable override fails and leaves no registration behind.
+    #[tokio::test]
+    async fn adding_a_model_with_an_unreadable_override_fails_and_rolls_back() {
+        // `add_model` checks the model directory on disk: a scratch `models_dir`, not /tmp.
+        let models = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(models.path().join("tpl-bad-model")).unwrap();
+        let mut config = make_config(&[], 22.5);
+        config.models_dir = models.path().to_path_buf();
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        let err = mm
+            .add_model(
+                "tpl-bad-model".to_owned(),
+                2.0,
+                None,
+                config::ModelPolicy {
+                    chat_template: Some("/nonexistent/c8/bad.jinja".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("/nonexistent/c8/bad.jinja"),
+            "{err}"
+        );
+        assert!(mm.list_models().iter().all(|m| m.id != "tpl-bad-model"));
     }
 
     /// Template-read opinion side finding: a `chat_template` given to `add_model` (admin add /
@@ -17027,6 +21693,685 @@ mod tests {
         assert_eq!(measured_weights_mib(None, 4.0), None);
         assert_eq!(measured_weights_mib(Some(2 * gib), 4.0), None, "polluted");
         assert_eq!(measured_weights_mib(Some(-1), 0.0), None);
+    }
+
+    /// C25 fake probe: scripted device readings around a load. 0.2 GiB held before it, `weights`
+    /// taken by engine construction, `warm_up_growth` by the KV warm-up; a clean window.
+    const C25_GIB: u64 = 1 << 30;
+    const C25_WEIGHTS: u64 = 15_870_000_000; // the B70 27B, ~14.78 GiB
+    const C25_POOL: u64 = 7_945_000_000; // ~7.4 GiB
+    fn c25_readings(engine: PoolEngine, weights: u64, warm_up_growth: u64) -> LoadReadings {
+        let before = C25_GIB / 5;
+        LoadReadings {
+            before: Some(before),
+            mid: Some(before + weights),
+            after: Some(before + weights + warm_up_growth),
+            window_clean: true,
+            pool_bytes: C25_POOL,
+            engine: Some(engine),
+            weights_on_disk: None,
+            warm_up: Some(true),
+        }
+    }
+
+    /// C25: a vision load whose pool never became resident during the load (warm-up off, failed,
+    /// or not allocating: the B70) is split into the real weights and a resident pool of 0; a
+    /// partial pool is reported as such; the warm-up's own scratch on top of a whole pool is
+    /// capped at the pool.
+    #[test]
+    fn c25_split_measures_vision_weights_whether_or_not_the_pool_appeared() {
+        let never = split_load_memory(&c25_readings(PoolEngine::Vision, C25_WEIGHTS, 0)).unwrap();
+        assert_eq!(never.weights_bytes, Some(C25_WEIGHTS));
+        assert_eq!(never.pool_resident_bytes, Some(0));
+        assert!(!never.pool_seen_resident(C25_POOL));
+        let partly =
+            split_load_memory(&c25_readings(PoolEngine::Vision, C25_WEIGHTS, C25_POOL / 3))
+                .unwrap();
+        assert_eq!(partly.pool_resident_bytes, Some(C25_POOL / 3));
+        assert!(!partly.pool_seen_resident(C25_POOL));
+        let whole = split_load_memory(&c25_readings(
+            PoolEngine::Vision,
+            C25_WEIGHTS,
+            C25_POOL + (64 << 20),
+        ))
+        .unwrap();
+        assert_eq!(whole.weights_bytes, Some(C25_WEIGHTS));
+        assert_eq!(
+            whole.pool_resident_bytes,
+            Some(C25_POOL),
+            "capped at the pool"
+        );
+        assert!(whole.pool_seen_resident(C25_POOL));
+    }
+
+    /// C25 F8: "seen resident" starts at exactly 90 % of the pool.
+    #[test]
+    fn c25_pool_seen_resident_boundary_is_90_percent() {
+        let at = |resident: u64| LoadMemorySplit {
+            weights_bytes: Some(1),
+            pool_resident_bytes: Some(resident),
+        };
+        assert!(at(900).pool_seen_resident(1000));
+        assert!(!at(899).pool_seen_resident(1000));
+        assert!(
+            !LoadMemorySplit::default().pool_seen_resident(1000),
+            "not split"
+        );
+    }
+
+    /// C25 F1: the text engine is split only when its pool was seen resident (>= 90 %) or its
+    /// construction took less than the pool; the 10-90 % band (and nothing at all) with
+    /// construction >= pool falls back.
+    #[test]
+    fn c25_text_split_needs_the_pool_seen_resident_or_small_weights() {
+        let text =
+            |weights, growth| split_load_memory(&c25_readings(PoolEngine::Text, weights, growth));
+        for growth in [0, C25_POOL / 10, C25_POOL / 2, C25_POOL * 89 / 100] {
+            assert_eq!(
+                text(C25_WEIGHTS, growth),
+                Err(SplitFallback::TextPoolNotSeenResident),
+                "growth {growth}"
+            );
+        }
+        let resident = text(C25_WEIGHTS, C25_POOL * 9 / 10).unwrap();
+        assert_eq!(resident.weights_bytes, Some(C25_WEIGHTS));
+        assert_eq!(resident.pool_resident_bytes, Some(C25_POOL * 9 / 10));
+        // Construction took less than the pool: it cannot hold it, whatever the warm-up did.
+        let small = text(C25_GIB, C25_POOL / 2).unwrap();
+        assert_eq!(small.weights_bytes, Some(C25_GIB));
+    }
+
+    /// C25 F3: the vision split falls back when construction took at least the weight files on
+    /// disk plus 90 % of the pool (the pool was probably built at construction); below that bound,
+    /// or without a known disk size, it is split.
+    #[test]
+    fn c25_vision_split_is_bounded_by_the_weight_files_on_disk() {
+        let disk = 13_000_000_000_u64;
+        let with_disk = |weights| LoadReadings {
+            weights_on_disk: Some(disk),
+            ..c25_readings(PoolEngine::Vision, weights, 0)
+        };
+        let bound = disk + C25_POOL * 9 / 10;
+        assert_eq!(
+            split_load_memory(&with_disk(bound)),
+            Err(SplitFallback::VisionAboveDiskSize)
+        );
+        assert!(split_load_memory(&with_disk(bound - 1)).is_ok());
+        assert!(
+            split_load_memory(&with_disk(C25_WEIGHTS)).is_ok(),
+            "the B70 case"
+        );
+        assert!(
+            split_load_memory(&c25_readings(PoolEngine::Vision, bound, 0)).is_ok(),
+            "no disk size"
+        );
+    }
+
+    /// C25: the other fallbacks, each with its reason: no post-construction reading (draft,
+    /// CPU/NPU, other kinds), a missing reading, no pool, and (UMA sanity) non-monotonic readings
+    /// or an absurd warm-up growth — never a negative or absurd figure.
+    #[test]
+    fn c25_split_fallbacks_carry_their_reason() {
+        let base = c25_readings(PoolEngine::Vision, 4 * C25_GIB, 0);
+        let b = 10 * C25_GIB;
+        let pool = 2 * C25_GIB;
+        let uma = |mid: u64, after: u64| LoadReadings {
+            before: Some(b),
+            mid: Some(mid),
+            after: Some(after),
+            pool_bytes: pool,
+            ..base
+        };
+        for (r, want) in [
+            (
+                LoadReadings { mid: None, ..base },
+                SplitFallback::NoMidReading,
+            ),
+            (
+                LoadReadings {
+                    engine: None,
+                    ..base
+                },
+                SplitFallback::NoMidReading,
+            ),
+            (
+                LoadReadings {
+                    before: None,
+                    ..base
+                },
+                SplitFallback::MissingReading,
+            ),
+            (
+                LoadReadings {
+                    pool_bytes: 0,
+                    ..base
+                },
+                SplitFallback::NoPool,
+            ),
+            (uma(b - C25_GIB, b + C25_GIB), SplitFallback::NotMonotonic),
+            (
+                uma(b + 4 * C25_GIB, b + C25_GIB),
+                SplitFallback::NotMonotonic,
+            ),
+            (
+                uma(b + 4 * C25_GIB, b + 10 * C25_GIB),
+                SplitFallback::AbsurdWarmUpGrowth,
+            ),
+        ] {
+            assert_eq!(split_load_memory(&r), Err(want), "{r:?}");
+            assert!(!want.reason().is_empty());
+        }
+        // At the edge (2 x pool + 1 GiB) it is still split, resident capped at the pool.
+        let edge = split_load_memory(&uma(b + C25_GIB, b + 6 * C25_GIB)).unwrap();
+        assert_eq!(edge.pool_resident_bytes, Some(pool));
+    }
+
+    /// C25 F3: the weight files' size is the top-level `*.bin` total; none → `None`.
+    #[test]
+    fn c25_weights_on_disk_sums_the_top_level_bin_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(weights_on_disk_bytes(dir.path()), None, "no .bin");
+        std::fs::write(
+            dir.path().join("openvino_language_model.bin"),
+            vec![0_u8; 300],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("openvino_vision_embeddings_model.bin"),
+            vec![0_u8; 20],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("openvino_language_model.xml"),
+            vec![0_u8; 999],
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("x.bin"), vec![0_u8; 999]).unwrap();
+        assert_eq!(weights_on_disk_bytes(dir.path()), Some(320));
+        assert_eq!(weights_on_disk_bytes(&dir.path().join("missing")), None);
+    }
+
+    /// C25 N1: a symlinked `.bin` (HF-cache layout) counts at its target's size; a dangling link
+    /// counts nothing.
+    #[cfg(unix)]
+    #[test]
+    fn c25_weights_on_disk_follows_symlinked_bin_files() {
+        let blobs = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = blobs.path().join("sha256-abc");
+        std::fs::write(&blob, vec![0_u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&blob, dir.path().join("openvino_language_model.bin")).unwrap();
+        std::os::unix::fs::symlink(
+            blobs.path().join("gone"),
+            dir.path().join("openvino_text_embeddings_model.bin"),
+        )
+        .unwrap();
+        assert_eq!(weights_on_disk_bytes(dir.path()), Some(4096));
+    }
+
+    /// C25 F2 (c): `ModelRecord::note_gpu_load` splits a clean window, measures nothing on a
+    /// dirty one (and resets an earlier split), and honours the engine (the same readings split
+    /// for a vision engine fall back for a text engine).
+    #[tokio::test]
+    async fn c25_note_gpu_load_splits_clean_windows_and_honours_the_engine() {
+        let (mm, _probe) = headroom_manager(&[("vlm-a", 15.0)], 7.4, 512 << 20).await;
+        let mut guard = mm.write_models("t");
+        let r = guard.get_mut("vlm-a").unwrap();
+        let clean = c25_readings(PoolEngine::Vision, C25_WEIGHTS, 0);
+        let outcome = r.note_gpu_load(&clean);
+        assert!(matches!(outcome, Some(Ok(_))), "{outcome:?}");
+        assert_eq!(r.load_split.weights_bytes, Some(C25_WEIGHTS));
+        assert_eq!(r.gpu_load_delta_bytes, Some(C25_WEIGHTS.cast_signed()));
+
+        let dirty = LoadReadings {
+            window_clean: false,
+            ..clean
+        };
+        assert_eq!(r.note_gpu_load(&dirty), None);
+        assert_eq!(r.gpu_load_delta_bytes, None);
+        assert_eq!(r.load_split, LoadMemorySplit::default(), "reset");
+
+        let text = LoadReadings {
+            engine: Some(PoolEngine::Text),
+            ..clean
+        };
+        assert_eq!(
+            r.note_gpu_load(&text),
+            Some(Err(SplitFallback::TextPoolNotSeenResident))
+        );
+        assert_eq!(r.load_split, LoadMemorySplit::default());
+        assert!(
+            r.gpu_load_delta_bytes.is_some(),
+            "still measured the old way"
+        );
+    }
+
+    /// C7 P4: a load's eviction preview charges the live-RAM gate the KV the load asked for (a
+    /// `--kv-cache-gb` or resize override, carried in `HeadroomPreview::kv_target_gb`), not the
+    /// configured target; the dry-run without a preview keeps the configured one. Needs a readable
+    /// `/proc/meminfo` (the RAM gate exists only then); its figure does not enter the charge.
+    #[tokio::test]
+    async fn a_preview_charges_the_requested_kv_not_the_configured_one() {
+        let mut config = make_config(&[("p4-model", 2.0)], 40.0);
+        config.default_kv_cache_gb = 6.0;
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        // The RAM gate runs on the UMA `system` domain only: put the model there.
+        if let Some(r) = mm.write_models("test").get_mut("p4-model") {
+            r.domain = DOMAIN_SYSTEM.to_owned();
+        }
+        let outsides = HashMap::new();
+        let preview = HeadroomPreview {
+            spec: None,
+            others: &[],
+            outsides: &outsides,
+            weight_gb: 2.0,
+            kv_target_gb: 3.0,
+            needs_kv_pool: true,
+            round_whole_gib: true,
+            exact: None,
+        };
+        let asked = mm
+            .check_admission_inner("p4-model", false, Some(&preview))
+            .unwrap();
+        let configured = mm.check_admission_inner("p4-model", false, None).unwrap();
+        if os_memory::available_ram_gb().is_none() {
+            return; // no live RAM gate on this platform: nothing to compare
+        }
+        assert_eq!(
+            asked.ram_needed_gb,
+            Some(2.0 + 3.0),
+            "weights + the requested KV"
+        );
+        assert_eq!(
+            configured.ram_needed_gb,
+            Some(2.0 + 6.0),
+            "weights + the configured KV"
+        );
+    }
+
+    /// C7 B.3: the resident part of a pool: (a) measured wins over the booked
+    /// pool, capped at it; (b) a succeeded warm-up = the booked pool; (c) warm-up failed, off, or
+    /// not run (draft-attached, CPU, a late commit) = nothing.
+    #[test]
+    fn the_resident_pool_is_measured_else_warmed_else_nothing() {
+        let gib: u64 = 1 << 30;
+        assert!((resident_pool_gb(Some(2 * gib), Some(true), 6.0) - 2.0).abs() < 1e-12);
+        assert!((resident_pool_gb(Some(9 * gib), Some(true), 6.0) - 6.0).abs() < 1e-12);
+        assert!(
+            resident_pool_gb(Some(0), Some(true), 6.0).abs() < 1e-12,
+            "measured empty"
+        );
+        assert!((resident_pool_gb(None, Some(true), 6.0) - 6.0).abs() < 1e-12);
+        assert!(
+            resident_pool_gb(None, Some(false), 6.0).abs() < 1e-12,
+            "warm-up failed"
+        );
+        assert!(
+            resident_pool_gb(None, None, 6.0).abs() < 1e-12,
+            "no warm-up"
+        );
+        assert!(
+            resident_pool_gb(None, Some(true), 0.0).abs() < 1e-12,
+            "no pool"
+        );
+        // A warmed GPU model on UMA is credited its weights plus the pool; CPU unchanged.
+        let pool = resident_pool_gb(None, Some(true), 6.0);
+        assert!((ram_credit_gb(12.0, 18.0, None, pool) - 18.0).abs() < 1e-12);
+        assert!((ram_credit_gb(12.0, 18.0, Some(13.0), pool) - 18.0).abs() < 1e-12);
+    }
+
+    /// C7 B.3: a factory whose loads report a KV warm-up outcome (`None` = no warm-up, like a
+    /// draft-attached engine) and no post-construction moment.
+    struct WarmingFactory(lifecycle::MockEngineFactory, Option<bool>);
+    impl EngineFactory for WarmingFactory {
+        fn detect_kind(&self, model_dir: &std::path::Path) -> engine::ModelKind {
+            self.0.detect_kind(model_dir)
+        }
+        fn load(
+            &self,
+            model_path: &std::path::Path,
+            device: &str,
+            cache_size_gb: f64,
+            max_num_seqs: usize,
+        ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+            self.0.load(model_path, device, cache_size_gb, max_num_seqs)
+        }
+        fn load_with_hook(
+            &self,
+            model_path: &std::path::Path,
+            device: &str,
+            cache_size_gb: f64,
+            max_num_seqs: usize,
+            hooks: &dyn lifecycle::LoadHooks,
+        ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+            // No `engine_built`: no post-construction reading, so no split (rule a) whatever
+            // the host's memory readings do; only the warm-up outcome (rule b) is tested.
+            let loaded = self.0.load(model_path, device, cache_size_gb, max_num_seqs);
+            if let Some(succeeded) = self.1 {
+                hooks.warm_up_finished(succeeded);
+            }
+            loaded
+        }
+    }
+
+    async fn warming_mm(warm_up: Option<bool>) -> ModelManager {
+        let mut config = make_config(&[("b3-model", 2.0)], 40.0);
+        config.cache_size_gb = 3.0;
+        let factory = WarmingFactory(lifecycle::MockEngineFactory::default(), warm_up);
+        ModelManager::new(config, Arc::new(factory)).await.unwrap()
+    }
+
+    /// C7 B.3: the commit records the pool as resident from the factory's warm-up report: a
+    /// succeeded warm-up books the whole pool, a failed one or none (a draft-attached engine is
+    /// not warmed) books nothing. Host-independent: rule (b) does not need a memory reading.
+    #[tokio::test]
+    async fn a_load_records_its_pool_as_resident_only_after_a_succeeded_warm_up() {
+        for (warm_up, resident) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mm = warming_mm(warm_up).await;
+            mm.load_model("b3-model").await.unwrap();
+            let models = mm.read_models("test");
+            let r = models.get("b3-model").unwrap();
+            assert!(r.kv_cache_gb > 0.0, "the load booked a pool");
+            let want = if resident { r.kv_cache_gb } else { 0.0 };
+            assert!(
+                (r.kv_pool_resident_gb - want).abs() < 1e-9,
+                "warm-up {warm_up:?}: {} resident of {}",
+                r.kv_pool_resident_gb,
+                r.kv_cache_gb
+            );
+            drop(models);
+            assert_eq!(
+                mm.resident_pools().contains_key("b3-model"),
+                resident,
+                "warm-up {warm_up:?}"
+            );
+        }
+    }
+
+    /// C7 F1: a load in a non-quiet window (another model holds a transient lease, as when it is
+    /// generating) takes no memory reading, but its warm-up outcome still reaches the record, so
+    /// rule (b) credits the pool. 0.9.1's first cut loaded without the hooks then: no credit.
+    #[tokio::test]
+    async fn a_load_during_another_models_request_still_records_its_warmed_pool() {
+        let mm = warming_mm(Some(true)).await;
+        let domain = mm.record_domain("b3-model");
+        let spec = headroom::HeadroomSpec {
+            hidden_size: 4096,
+            pdev: "0000:03:00.0".to_owned(),
+            total_bytes: 24 << 30,
+            factor: 2.0,
+            margin_bytes: 1 << 29,
+            floor_tokens: 4096,
+        };
+        let lease = mm.headroom.acquire(&domain, "other-model", &spec, 10_000);
+        assert!(
+            mm.headroom.lease_bytes(&domain, None) > 0,
+            "the window is not quiet"
+        );
+        mm.load_model("b3-model").await.unwrap();
+        drop(lease);
+        let models = mm.read_models("test");
+        let r = models.get("b3-model").unwrap();
+        assert!(r.kv_cache_gb > 0.0);
+        assert!(
+            (r.kv_pool_resident_gb - r.kv_cache_gb).abs() < 1e-9,
+            "{} resident of {}",
+            r.kv_pool_resident_gb,
+            r.kv_cache_gb
+        );
+    }
+
+    /// C7 B.3: victim planning on a UMA box picks fewer victims when the residents' pools are
+    /// resident. Two idle residents of 2 GB weights + a 6 GiB pool each; the load needs 7 GB of
+    /// RAM back. Credited weights only (un-warmed pools), the plan evicts both and still does
+    /// not fit; with resident pools one eviction gives 8 GB back and the plan stops there.
+    #[test]
+    fn victim_planning_on_uma_picks_fewer_victims_when_pools_are_resident() {
+        let mut vram = MemoryTracker::new([(DOMAIN_SYSTEM.to_owned(), 30.0)]);
+        vram.allocate(DOMAIN_SYSTEM, "a", 8.0);
+        vram.allocate(DOMAIN_SYSTEM, "b", 8.0);
+        let candidates = vec![("a".to_owned(), 2.0, false), ("b".to_owned(), 2.0, false)];
+        let ram_admits = |freed: f64| freed >= 7.0;
+        let lazy = eviction_plan_candidates(&vram, &candidates, &HashMap::new(), &HashMap::new());
+        let (victims, fits) = plan_evictions(&lazy, 14.0, 10.0, ram_admits);
+        assert!(!fits, "weights only: 4 GB back at most ({victims:?})");
+        let pools: HashMap<String, f64> = [("a".to_owned(), 6.0), ("b".to_owned(), 6.0)].into();
+        let warm = eviction_plan_candidates(&vram, &candidates, &HashMap::new(), &pools);
+        let (victims, fits) = plan_evictions(&warm, 14.0, 10.0, ram_admits);
+        assert!(fits);
+        assert_eq!(
+            victims,
+            vec!["a".to_owned()],
+            "one victim with resident pools"
+        );
+    }
+
+    /// C25 F2: the wiring from the factory's hooks to the record. A factory reporting both
+    /// moments, [`SlotHooks`] with a scripted reader, the slot's probe, `LoadMeasure::readings`
+    /// and `note_gpu_load` give the measured weights and the warm-up outcome.
+    #[tokio::test]
+    async fn c25_hooks_carry_the_mid_reading_and_the_warm_up_to_the_record() {
+        struct HookingFactory(lifecycle::MockEngineFactory);
+        impl EngineFactory for HookingFactory {
+            fn detect_kind(&self, model_dir: &std::path::Path) -> engine::ModelKind {
+                self.0.detect_kind(model_dir)
+            }
+            fn load(
+                &self,
+                model_path: &std::path::Path,
+                device: &str,
+                cache_size_gb: f64,
+                max_num_seqs: usize,
+            ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+                self.0.load(model_path, device, cache_size_gb, max_num_seqs)
+            }
+            fn load_with_hook(
+                &self,
+                model_path: &std::path::Path,
+                device: &str,
+                cache_size_gb: f64,
+                max_num_seqs: usize,
+                hooks: &dyn lifecycle::LoadHooks,
+            ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+                let loaded = self.0.load(model_path, device, cache_size_gb, max_num_seqs);
+                hooks.engine_built();
+                hooks.warm_up_finished(true);
+                loaded
+            }
+        }
+        let slot = LoadSlot::new(LoadCommit {
+            kv_gb: 7.4,
+            max_num_seqs: 1,
+            gate: GateSource {
+                exact: None,
+                inputs: None,
+                prefix_caching: false,
+            },
+            kv_plan: None,
+            template_override: None,
+        });
+        let before = C25_GIB / 5;
+        let hooks = SlotHooks {
+            slot: &slot,
+            take_mid: true,
+            reader: || Some(before + C25_WEIGHTS),
+        };
+        let (handle, thread) = HookingFactory(lifecycle::MockEngineFactory::default())
+            .load_with_hook(
+                std::path::Path::new("vlm-vision-ov"),
+                "GPU.1",
+                7.4,
+                1,
+                &hooks,
+            )
+            .unwrap();
+        drop(handle);
+        let _ = thread.join();
+        let probe = slot.probe();
+        assert_eq!(probe.mid, Some(before + C25_WEIGHTS), "the hook's reading");
+        assert_eq!(probe.warm_up, Some(true));
+
+        let measure = LoadMeasure {
+            gpu_before: Some(before),
+            probe,
+            rss_before: None,
+            gpu_window: crate::gpu_memory::MeasureWindow::open(),
+            measure_pdev: None,
+            leases_at_start: 0,
+            domain: "GPU.1".to_owned(),
+        };
+        let readings = measure.readings(Some(before + C25_WEIGHTS), true, 7.4, ModelKind::Vision);
+        assert_eq!(readings.engine, Some(PoolEngine::Vision));
+        assert_eq!(readings.warm_up, Some(true));
+        let (mm, _p) = headroom_manager(&[("vlm-a", 15.0)], 7.4, 512 << 20).await;
+        let mut guard = mm.write_models("t");
+        let r = guard.get_mut("vlm-a").unwrap();
+        assert!(matches!(r.note_gpu_load(&readings), Some(Ok(_))));
+        assert_eq!(r.load_split.weights_bytes, Some(C25_WEIGHTS));
+        assert_eq!(r.load_split.pool_resident_bytes, Some(0));
+    }
+
+    /// C25: the "warm-up succeeded but no vision pool appeared" warning condition.
+    #[test]
+    fn c25_warns_only_for_a_succeeded_vision_warm_up_with_no_pool() {
+        let r = c25_readings(PoolEngine::Vision, C25_WEIGHTS, 0);
+        let split = split_load_memory(&r).unwrap();
+        assert!(vision_pool_absent_after_warm_up(&r, split));
+        let failed = LoadReadings {
+            warm_up: Some(false),
+            ..r
+        };
+        assert!(!vision_pool_absent_after_warm_up(&failed, split));
+        let off = LoadReadings { warm_up: None, ..r };
+        assert!(!vision_pool_absent_after_warm_up(&off, split));
+        let text = LoadReadings {
+            engine: Some(PoolEngine::Text),
+            ..r
+        };
+        assert!(!vision_pool_absent_after_warm_up(&text, split));
+        let grown = c25_readings(PoolEngine::Vision, C25_WEIGHTS, C25_POOL);
+        let split = split_load_memory(&grown).unwrap();
+        assert!(!vision_pool_absent_after_warm_up(&grown, split));
+    }
+
+    /// C25 wire figures through `note_gpu_load`: on the B70 case `vram_measured_mib` is the
+    /// measured weights (not delta - pool: 7,560 MiB on 0.9.0) and the estimate (admin and
+    /// `/metrics`) holds the whole booked pool; a partial pool is reported in
+    /// `kv_pool_resident_mib` and the estimate still holds the whole pool; a resident pool plus
+    /// warm-up scratch keeps the delta (scratch included) as the estimate; the fallback path keeps
+    /// today's figures and has no `kv_pool_resident_mib`; presence stays today's.
+    #[tokio::test]
+    async fn c25_admin_and_metrics_figures_follow_the_split() {
+        let (mm, _probe) = headroom_manager(&[("vlm-a", 15.0)], 7.4, 512 << 20).await;
+        mm.load_model("vlm-a").await.unwrap();
+        let (pool, kv_gb) = {
+            let guard = mm.read_models("t");
+            let r = guard.get("vlm-a").unwrap();
+            assert!(
+                r.kv_pool_blocks.is_some(),
+                "exact pool (vram_measured_mib shown)"
+            );
+            (gib_to_bytes(r.kv_cache_gb), r.kv_cache_gb)
+        };
+        let set = |growth: u64, mid: bool| {
+            let mut guard = mm.write_models("t");
+            let r = guard.get_mut("vlm-a").unwrap();
+            let mut readings = c25_readings(PoolEngine::Vision, C25_WEIGHTS, growth);
+            readings.pool_bytes = pool;
+            if !mid {
+                readings.mid = None;
+            }
+            r.note_gpu_load(&readings);
+        };
+        let figures = |mm: &ModelManager| {
+            let info = mm
+                .list_models()
+                .into_iter()
+                .find(|i| i.id == "vlm-a")
+                .unwrap();
+            let gauge = mm
+                .metrics_snapshot()
+                .models
+                .into_iter()
+                .find(|m| m.id == "vlm-a")
+                .unwrap()
+                .gpu_memory_estimate_bytes;
+            (
+                info.vram_measured_mib,
+                info.gpu_memory_estimate_gb,
+                info.kv_pool_resident_mib,
+                gauge,
+            )
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let gib = |b: u64| b as f64 / GIB_F64;
+
+        // Pool never resident during the load (the B70).
+        set(0, true);
+        let (measured, estimate, resident, gauge) = figures(&mm);
+        assert_eq!(
+            measured,
+            Some(C25_WEIGHTS >> 20),
+            "weights, not delta - pool"
+        );
+        assert!(
+            (estimate.unwrap() - gib(C25_WEIGHTS + pool)).abs() < 0.01,
+            "{estimate:?}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let want_bytes = (C25_WEIGHTS + pool) as f64;
+        assert!((gauge.unwrap() - want_bytes).abs() < 1.0, "{gauge:?}");
+        assert_eq!(resident, Some(0));
+
+        // Half the pool resident: reported, and the estimate still holds the whole pool.
+        set(pool / 2, true);
+        let (measured, estimate, resident, _) = figures(&mm);
+        assert_eq!(measured, Some(C25_WEIGHTS >> 20));
+        assert!((estimate.unwrap() - gib(C25_WEIGHTS + pool)).abs() < 0.01);
+        assert_eq!(resident, Some((pool / 2) >> 20));
+
+        // Whole pool plus 512 MiB of warm-up scratch: the estimate is the delta (scratch counted,
+        // the documented limit), the resident figure is capped at the pool.
+        let scratch = 512 << 20;
+        set(pool + scratch, true);
+        let (measured, estimate, resident, _) = figures(&mm);
+        assert_eq!(measured, Some(C25_WEIGHTS >> 20));
+        assert!(
+            (estimate.unwrap() - gib(C25_WEIGHTS + pool + scratch)).abs() < 0.01,
+            "the delta branch: {estimate:?}"
+        );
+        assert_eq!(resident, Some(pool >> 20));
+
+        // Presence is today's: a direct split whose load delta is below the booked pool shows no
+        // `vram_measured_mib` (the old formula has none there either).
+        let small = LoadMemorySplit {
+            weights_bytes: Some(C25_GIB),
+            pool_resident_bytes: Some(0),
+        };
+        assert_eq!(
+            load_weights_mib(Some(C25_GIB.cast_signed()), small, 2.0),
+            None
+        );
+        assert_eq!(
+            load_weights_mib(Some((3 * C25_GIB).cast_signed()), small, 2.0),
+            Some(1024)
+        );
+
+        // Fallback (no mid reading): today's figures, no residency field.
+        set(0, false);
+        let (measured, estimate, resident, _) = figures(&mm);
+        assert_eq!(
+            measured,
+            measured_weights_mib(Some(C25_WEIGHTS.cast_signed()), kv_gb)
+        );
+        assert!(
+            (estimate.unwrap() - gib(C25_WEIGHTS)).abs() < 0.01,
+            "delta only"
+        );
+        assert_eq!(resident, None);
     }
 
     /// Never-0: a pool that would push the limit under the floor is shrunk until it keeps it, and a
@@ -17213,6 +22558,57 @@ mod tests {
         );
     }
 
+    /// S2 (Fable review): a load without a KV pool has no pre-warm, so the load loop's own fresh
+    /// read is what keeps it from deciding on the reading cached before an idle gap. vlm-a
+    /// (15 + 4 GiB, pinned) is resident; another process then takes 2 GiB more. On the old reading
+    /// a 2 GiB embedding model would leave vlm-a 2 GiB (~52k tokens); on the fresh one it leaves
+    /// nothing, under the 4,096 floor, so the load is refused.
+    #[tokio::test]
+    async fn a_load_without_a_kv_pool_after_an_idle_gap_reads_the_device_again() {
+        let (mm, probe) =
+            headroom_manager_with(&[("vlm-a", 15.0), ("embed-x", 2.0)], 4.0, 512 << 20, |c| {
+                // Pinned to the discrete GPU by a per-model device (before 0.9.1 C2 the
+                // `embedding_device` route asked the real OpenVINO, and a box without GPU.1 put
+                // the embedder on the CPU; it now asks the fixture's inventory).
+                if let Some(e) = c.models.get_mut("embed-x") {
+                    e.policy.device = Some("GPU.1".to_owned());
+                }
+            })
+            .await;
+        mm.load_model("vlm-a").await.unwrap();
+        mm.write_models("t").get_mut("vlm-a").unwrap().pinned = true;
+        mm.headroom
+            .age_readings(std::time::Duration::from_secs(876));
+        probe
+            .0
+            .store(2_560 << 20, std::sync::atomic::Ordering::Relaxed);
+        let err = mm.load_model("embed-x").await.unwrap_err().to_string();
+        assert!(
+            err.contains("vlm-a") && err.contains("kv_headroom_min_tokens"),
+            "{err}"
+        );
+        assert_eq!(
+            mm.read_models("t").get("embed-x").unwrap().device,
+            "GPU.1",
+            "the embedder was placed on the discrete GPU"
+        );
+    }
+
+    /// S2 (Fable review): with `kv_headroom_mode: "off"` a load reads nothing from `/proc` (the
+    /// pre-warm goes through the same mode-gated refresh as the load loop).
+    #[tokio::test]
+    async fn headroom_off_reads_no_device_memory_on_a_load() {
+        let (mm, _probe) = headroom_manager_with(&[("vlm-a", 15.0)], 4.0, 512 << 20, |c| {
+            c.kv_headroom_mode = "off".to_owned();
+        })
+        .await;
+        mm.load_model("vlm-a").await.unwrap();
+        assert!(
+            mm.headroom.needs_refresh("0000:03:00.0"),
+            "no reading was taken"
+        );
+    }
+
     /// A headroom refusal is a capacity miss like any other: the loop evicts the least-recently
     /// used model and tries again, and only reports the refusal when nothing is left to evict.
     #[tokio::test]
@@ -17250,6 +22646,56 @@ mod tests {
             ma.ratchet_dir("x/../y").unwrap().parent(),
             Some(root.as_path())
         );
+    }
+
+    /// A unit-test manager without an `ov_cache_dir` learns into a private temporary root: two
+    /// managers never share it, it is under the temp dir, and it is gone once the manager drops,
+    /// so a `cargo test` run leaves no `rustedvino-test-kv-ratchet-*` directory behind.
+    #[tokio::test]
+    async fn test_ratchet_root_is_private_and_removed_on_drop() {
+        let factory = || Arc::new(MockEngineFactory::default()) as Arc<dyn EngineFactory>;
+        let config = || make_config(&[("m", 1.0)], 8.0);
+        let ma = ModelManager::new(config(), factory()).await.unwrap();
+        let mb = ModelManager::new(config(), factory()).await.unwrap();
+        let (ra, rb) = (
+            ma.ratchet_root.clone().unwrap(),
+            mb.ratchet_root.clone().unwrap(),
+        );
+        assert_ne!(ra, rb);
+        assert!(ra.starts_with(std::env::temp_dir()), "{}", ra.display());
+        assert!(
+            ra.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rustedvino-test-kv-ratchet-"),
+            "{}",
+            ra.display()
+        );
+        // A learned ceiling lands inside it, and goes with it.
+        let model_dir = ma.ratchet_dir("m").unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("probe"), b"x").unwrap();
+        assert!(ra.is_dir() && rb.is_dir());
+        drop(ma);
+        assert!(!ra.exists(), "{} left behind", ra.display());
+        assert!(rb.is_dir(), "the other manager's root is its own");
+        drop(mb);
+        assert!(!rb.exists(), "{} left behind", rb.display());
+    }
+
+    /// With an `ov_cache_dir` the test build takes the production rule (`kv_ratchet/` beside it)
+    /// and holds no temporary root.
+    #[tokio::test]
+    async fn test_ratchet_root_follows_ov_cache_dir_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = make_config(&[("m", 1.0)], 8.0);
+        let cache = dir.path().join("ovcache");
+        config.ov_cache_dir = Some(cache.to_string_lossy().into_owned());
+        let mm = ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+            .await
+            .unwrap();
+        assert_eq!(mm.ratchet_root, Some(dir.path().join("kv_ratchet")));
+        assert!(mm.test_ratchet_tmp.is_none());
     }
 
     /// F1 fixture (B60 QA 2026-10-28, BIG-08 rung 9): two embedding residents, `embed-e1` the least
@@ -17428,10 +22874,11 @@ mod tests {
         );
     }
 
-    /// A vision model on a discrete GPU keeps the legacy limit (no device-headroom cap yet), with
-    /// the refusal detail taken from the factory's resolution: hybrid, prefix caching and the
-    /// precision the engine really got (E-10 / review S2); the same model sized exactly on a
-    /// shared-memory device gets the exact gate.
+    /// A vision model on a GPU keeps the legacy limit when the device-headroom cap cannot apply
+    /// (here: an empty inventory, so `GPU.1` is not known as a discrete GPU with a readable
+    /// probe, and `GPU` is GPU-class too), with the refusal detail taken from the factory's
+    /// resolution: hybrid, prefix caching and the precision the engine really got (E-10 / review
+    /// S2); the same model on the CPU gets the exact gate.
     #[tokio::test]
     async fn vision_models_on_any_gpu_keep_the_legacy_limit() {
         // GPU.1 = discrete, GPU = also GPU-class (shared-memory iGPU boxes name it so); CPU is not
@@ -17905,6 +23352,13 @@ mod tests {
     /// (0.7.0 plan item 12: 12.5 GB charged vs ~5.0 GB measured).
     #[tokio::test]
     async fn npu_llm_is_not_charged_a_kv_pool() {
+        // R-11: an indexed NPU name (`NPU.0`) is the NPU too.
+        for npu_device in ["NPU", "NPU.0"] {
+            npu_llm_is_not_charged_a_kv_pool_on(npu_device).await;
+        }
+    }
+
+    async fn npu_llm_is_not_charged_a_kv_pool_on(npu_device: &str) {
         let mut config = make_config(&[("cb-llm", 5.0), ("npu-llm", 5.0)], 64.0);
         config.min_kv_cache_gb = 1.0;
         config
@@ -17912,7 +23366,7 @@ mod tests {
             .entry("npu-llm".to_owned())
             .or_default()
             .policy = config::ModelPolicy {
-            device: Some("NPU".to_owned()),
+            device: Some(npu_device.to_owned()),
             ..Default::default()
         };
         let margin = config.vram_safety_margin_gb;
@@ -18168,6 +23622,8 @@ mod tests {
             kv_cache_gb: Some(2.0),
             max_concurrent_streams: Some(2),
             force: false,
+            no_evict: false,
+            resize_rollback: false,
         };
         let chat_over = resolve_runtime_params(&cfg, cfg.models.get("chat"), &over);
         assert!((chat_over.kv_cache_gb - 2.0).abs() < 1e-9);
@@ -18368,15 +23824,17 @@ mod tests {
         let draft = std::env::temp_dir().join(format!("rv-spec-npu-d-{}", std::process::id()));
         write_dense_llm_dir(&target, "qwen3", 151_936);
         write_dense_llm_dir(&draft, "qwen3", 151_936);
-        let err = validate_speculative_pairing(
-            &target,
-            &draft,
-            ModelKind::TextGen,
-            "NPU",
-            &default_spec("draft"),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("NPU"));
+        for npu_device in ["NPU", "NPU.0"] {
+            let err = validate_speculative_pairing(
+                &target,
+                &draft,
+                ModelKind::TextGen,
+                npu_device,
+                &default_spec("draft"),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("not supported on NPU"), "{err}");
+        }
         std::fs::remove_dir_all(&target).ok();
         std::fs::remove_dir_all(&draft).ok();
     }
@@ -19164,6 +24622,56 @@ mod tests {
         );
     }
 
+    /// 0.9.1 Q12: an NPU text model is never chosen for the realtime LLM slot,
+    /// neither as a substitute nor as the configured default; named explicitly,
+    /// it is still granted (its turns then fail with the documented `llm` error).
+    #[tokio::test]
+    async fn an_npu_text_model_is_never_chosen_for_the_realtime_llm_slot() {
+        let mut config = make_config(&[("npu-llm", 2.0), ("gpu-llm", 2.0)], 10.0);
+        config
+            .models
+            .entry("npu-llm".to_owned())
+            .or_default()
+            .policy = config::ModelPolicy {
+            device: Some("NPU".to_owned()),
+            ..Default::default()
+        };
+        config.realtime_defaults = Some(config::RealtimeDefaults {
+            stt_model: None,
+            llm_model: Some("npu-llm".to_owned()),
+            tts_model: None,
+            embed_model: None,
+        });
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+
+        // The NPU default is not loaded: it is neither chosen nor loaded.
+        let res = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert!(res.model_id.is_empty(), "{res:?}");
+        assert_eq!(res.source, "substituted");
+        assert!(!res.loading);
+        assert!(!mm.is_loading("npu-llm"));
+
+        // Only the NPU model is loaded, and it is the default: nothing is chosen.
+        mm.load_model("npu-llm").await.unwrap();
+        let res = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert!(res.model_id.is_empty(), "{res:?}");
+        assert!(!res.loading);
+
+        // With a GPU text model loaded, that one is chosen.
+        mm.load_model("gpu-llm").await.unwrap();
+        let res = mm.resolve_realtime_slot(RealtimeSlot::Llm, None);
+        assert_eq!(res.model_id, "gpu-llm");
+
+        // Named explicitly, the NPU model is still granted.
+        let res = mm.resolve_realtime_slot(RealtimeSlot::Llm, Some("npu-llm"));
+        assert_eq!(res.model_id, "npu-llm");
+        assert_eq!(res.source, "requested");
+    }
+
     /// RTCC (the project's internal engineering log): `resolve_
     /// realtime_slot` generalizes D5 step 1 to the STT slot — an
     /// already-`Ready` requested STT model is granted outright, same rule
@@ -19888,7 +25396,7 @@ mod tests {
         );
     }
 
-    /// The shared classifier recognises both OOM-class markers and nothing else
+    /// The shared classifier recognises the OOM-class markers and nothing else
     /// — the load path and the inference path must agree on what "poison" means.
     #[test]
     fn is_gpu_poison_error_matches_only_oom_markers() {
@@ -19912,6 +25420,23 @@ mod tests {
         ));
         assert!(!is_gpu_poison_error("could not execute a primitive"));
         assert!(!is_gpu_poison_error(""));
+        // The -14 form that reached the handler on 2026-11-15 (ext-091/server.log:68-70, verbatim,
+        // the explicit CL_OUT_OF_RESOURCES only on OpenVINO's own stderr).
+        assert!(is_gpu_poison_error(
+            "ov_vlm_generate failed: Exception from src/inference/src/cpp/infer_request.cpp:224:\n\
+             Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp:593:\n\
+             [GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST\n\n"
+        ));
+        // Capacity refusals stay non-poison next to the new marker.
+        assert!(!is_gpu_poison_error(GENAI_BUDGET_ERR));
+        assert!(!is_gpu_poison_error(&format!(
+            "generation ignored by the CB scheduler — {POOL_EXHAUSTED_MARKER} \
+             (observed_prompt_tokens=900 active_requests=1)"
+        )));
+        // A bare error code without the symbolic name is not matched.
+        assert!(!is_gpu_poison_error(
+            "[GPU] clWaitForEvents, error code: -14"
+        ));
     }
 
     /// Both wedge-marker parsers share one `extract_marker_field` helper —
@@ -19935,6 +25460,32 @@ mod tests {
              (observed_prompt_tokens=12000 active_requests=5)"
         );
         assert_eq!(pool_exhausted_active_requests(&congested_msg), Some(5));
+
+        // E2: the generated count, after `active_requests=`; absent = unknown.
+        let grown_msg = format!(
+            "generation ignored by the CB scheduler — {POOL_EXHAUSTED_MARKER} \
+             (observed_prompt_tokens=12000 active_requests=1 generated_tokens=640)"
+        );
+        assert_eq!(pool_exhausted_generated_tokens(&grown_msg), Some(640));
+        assert_eq!(pool_exhausted_active_requests(&grown_msg), Some(1));
+        assert_eq!(kv_wedge_observed_prompt_tokens(&grown_msg), Some(12_000));
+        assert_eq!(pool_exhausted_generated_tokens(&pool_msg), None);
+        assert_eq!(pool_exhausted_generated_tokens(&vlm_msg), None);
+        assert_eq!(pool_exhausted_generated_tokens("generated_tokens=x"), None);
+        // F5: order does not matter; a duplicated field reads its first occurrence; a value past
+        // usize is None (unknown), never a wrapped or clamped number.
+        let reordered = "generated_tokens=5 active_requests=2 observed_prompt_tokens=7";
+        assert_eq!(pool_exhausted_generated_tokens(reordered), Some(5));
+        assert_eq!(pool_exhausted_active_requests(reordered), Some(2));
+        assert_eq!(kv_wedge_observed_prompt_tokens(reordered), Some(7));
+        assert_eq!(
+            pool_exhausted_generated_tokens("generated_tokens=3 generated_tokens=900"),
+            Some(3)
+        );
+        assert_eq!(
+            pool_exhausted_generated_tokens("generated_tokens=184467440737095516160"),
+            None
+        );
 
         assert_eq!(kv_wedge_observed_prompt_tokens("no marker here"), None);
         assert_eq!(pool_exhausted_active_requests("no marker here"), None);
@@ -20190,6 +25741,40 @@ mod tests {
         );
     }
 
+    /// The -14 form (2026-11-15, ext-091 — the VLM 8 MP OOM whose exception carried only
+    /// `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`) poisons the context through the same
+    /// handler helper: the next load is refused with `GpuPoisoned`, and so is the forced unload
+    /// that followed the -14 reply in the evidence run (the model stays `Ready`, its engine is not
+    /// torn down on the dead context).
+    #[tokio::test]
+    async fn streaming_exec_status_minus_14_frame_poisons_gpu() {
+        let mm = Arc::new(make_mm(&[("m", 5.5), ("other", 5.5)], 22.5).await);
+        mm.load_model("m").await.unwrap();
+        assert!(!mm.gpu_poisoned.load(Ordering::Acquire));
+        let _ = crate::handlers::error::sse_inference_error_event(
+            Some(&mm),
+            "m",
+            "ov_vlm_generate failed: Exception from src/inference/src/cpp/infer_request.cpp:224:\n\
+             Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp:593:\n\
+             [GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST\n\n",
+        );
+        assert!(
+            mm.gpu_poisoned.load(Ordering::Acquire),
+            "the -14 form must poison the GPU context"
+        );
+        let err = mm.evict_model_forced("m").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ModelError>(),
+            Some(&ModelError::GpuPoisoned)
+        );
+        assert_eq!(mm.list_ready_models(), vec!["m".to_owned()]);
+        let err = mm.load_model("other").await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ModelError>(),
+            Some(&ModelError::GpuPoisoned)
+        );
+    }
+
     /// A non-OOM streaming error must NOT poison the context (no false positive
     /// that would wedge the node into restart-required on a benign failure).
     #[tokio::test]
@@ -20366,6 +25951,99 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// E2: a solo pool exhaustion after the request generated tokens returns the
+    /// same 503 but spawns no recovery and writes no ratchet; with zero generated tokens (or no
+    /// count in the message) today's evict + reload + ratchet runs.
+    #[tokio::test]
+    async fn solo_pool_exhaustion_after_output_growth_neither_reloads_nor_ratchets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("txt-1")).unwrap();
+        let mut config = make_config(&[("txt-1", 5.5)], 22.5);
+        config.models_dir = dir.path().to_path_buf();
+        let mm = Arc::new(
+            ModelManager::new(config, Arc::new(MockEngineFactory::default()))
+                .await
+                .unwrap(),
+        );
+        mm.load_model("txt-1").await.unwrap();
+        {
+            let mut guard = mm.write_models("test setup");
+            let record = guard.get_mut("txt-1").unwrap();
+            record.max_prompt_tokens = 100_000;
+            record.kv_cache_gb = 8.0;
+        }
+        let ratchet_dir = mm.ratchet_dir("txt-1").unwrap();
+        let msg = |generated: Option<usize>| {
+            let field = generated.map_or(String::new(), |g| format!(" generated_tokens={g}"));
+            format!(
+                "generation ignored by the CB scheduler — {POOL_EXHAUSTED_MARKER} \
+                 (observed_prompt_tokens=37847 active_requests=1{field})"
+            )
+        };
+        let code = |resp: axum::response::Response| async move {
+            assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            json["error"]["code"].as_str().unwrap().to_owned()
+        };
+
+        // Output growth: the 503 as today, no claim, no reload, no ratchet.
+        let resp =
+            crate::handlers::error::inference_error_from_text(Some(&mm), "txt-1", &msg(Some(512)));
+        assert_eq!(code(resp).await, "pool_exhausted");
+        assert!(
+            !mm.kv_wedge_recovery_inflight
+                .lock()
+                .unwrap()
+                .contains("txt-1"),
+            "no recovery for a pool that filled from the answer"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(state_of(&mm, "txt-1"), ModelState::Ready);
+        assert!(
+            !ratchet_dir.exists(),
+            "no ratchet file for output growth: {}",
+            ratchet_dir.display()
+        );
+
+        // Prompt side (zero generated tokens): today's recovery and ratchet.
+        let resp =
+            crate::handlers::error::inference_error_from_text(Some(&mm), "txt-1", &msg(Some(0)));
+        assert_eq!(code(resp).await, "pool_exhausted");
+        assert!(
+            mm.kv_wedge_recovery_inflight
+                .lock()
+                .unwrap()
+                .contains("txt-1"),
+            "zero generated tokens keeps the recovery"
+        );
+        wait_for_wedge_recovery_to_finish(&mm, "txt-1").await;
+        assert_eq!(
+            template::read_kv_capacity_ratchet(&ratchet_dir, 8.0),
+            Some(35_954),
+            "zero generated tokens keeps the ratchet at 0.95 x the prompt"
+        );
+        std::fs::remove_dir_all(&ratchet_dir).ok();
+
+        // No count in the message (older shape): unknown, today's recovery.
+        mm.write_models("test setup")
+            .get_mut("txt-1")
+            .unwrap()
+            .max_prompt_tokens = 100_000;
+        let _ = crate::handlers::error::inference_error_from_text(Some(&mm), "txt-1", &msg(None));
+        assert!(
+            mm.kv_wedge_recovery_inflight
+                .lock()
+                .unwrap()
+                .contains("txt-1"),
+            "an absent count keeps the recovery"
+        );
+        wait_for_wedge_recovery_to_finish(&mm, "txt-1").await;
+        std::fs::remove_dir_all(&ratchet_dir).ok();
+    }
+
     // ---- R1: Vision (VLM) as a managed model ------------------------------
     //
     // `MockEngineFactory` classifies any model id containing "vlm" as a Vision
@@ -20374,11 +26052,11 @@ mod tests {
     /// `add_model` takes an id that names a folder inside `models_dir`, nothing else.
     #[test]
     fn model_id_must_be_a_plain_folder_name() {
-        for ok in ["qwen3-8b-int4-ov", "a.b", "Model_1"] {
+        for ok in ["qwen3-8b-int4-ov", "a.b", "Model_1", "qwen:7b"] {
             assert!(is_plain_model_id(ok), "{ok}");
         }
         for bad in [
-            "", ".", "..", "../x", "a/b", "/etc", "a\\b", "x\0y", "..\\x",
+            "", ".", "..", "../x", "a/b", "/etc", "a\\b", "x\0y", "..\\x", "C:", "c:foo", "Z:\\x",
         ] {
             assert!(!is_plain_model_id(bad), "{bad:?}");
         }
@@ -20686,6 +26364,172 @@ mod tests {
         );
     }
 
+    /// C7 F4: the preflight wiring on a UMA (`system`) box with a scripted `MemAvailable`: a
+    /// warmed model's shrink admits on its own resident pool; the same shrink of an un-warmed
+    /// model and a grow past the RAM are refused before anything is evicted, naming the RAM gate.
+    #[tokio::test]
+    async fn the_resize_preflight_credits_the_resident_pool_on_a_uma_box() {
+        async fn mm_on_system(warm_up: Option<bool>) -> ModelManager {
+            let mut config = make_config(&[("b3-model", 2.0)], 40.0);
+            config.default_kv_cache_gb = 3.0; // a 3 GiB pool, no cap on a resize
+            config.system_ram_reservation_gb = Some(1.0);
+            let factory = WarmingFactory(lifecycle::MockEngineFactory::default(), warm_up);
+            let mm = ModelManager::new(config, Arc::new(factory)).await.unwrap();
+            mm.load_model("b3-model").await.unwrap();
+            // An iGPU model: the `system` domain, and not `CPU` (whose credit is unchanged).
+            if let Some(r) = mm.write_models("test").get_mut("b3-model") {
+                r.domain = DOMAIN_SYSTEM.to_owned();
+                r.device = "GPU.0".to_owned();
+            }
+            mm
+        }
+        let _ram = FakeLiveAvail::set(1.5);
+        // Warmed: pool 3 GiB resident; shrink to 2: need 2 + 2, credit 2 + 2 -> 1.5 >= floor 1.
+        let warm = mm_on_system(Some(true)).await;
+        assert!(warm.resize_preflight("b3-model", 2.0, true).is_ok());
+        // Grow to 6: need 2 + 6, credit 2 + 3 -> -1.5 < 1: refused, naming the RAM gate.
+        let err = warm.resize_preflight("b3-model", 6.0, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("live system-RAM gate"),
+            "{err:#}"
+        );
+        // Not warmed: no own-pool credit, the shrink is refused (credit 2, need 4 -> -0.5).
+        let cold = mm_on_system(Some(false)).await;
+        let err = cold.resize_preflight("b3-model", 2.0, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refused before evicting anything"),
+            "{err:#}"
+        );
+    }
+
+    /// C7 F2: a factory that refuses a pool above `max_kv_gb` with `GenAI`'s free-memory error (a
+    /// memory refusal), and refuses every load once `loads_ok` loads have succeeded.
+    struct BudgetFactory {
+        inner: lifecycle::MockEngineFactory,
+        max_kv_gb: f64,
+        loads_ok: usize,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+    impl EngineFactory for BudgetFactory {
+        fn detect_kind(&self, model_dir: &std::path::Path) -> engine::ModelKind {
+            self.inner.detect_kind(model_dir)
+        }
+        fn load(
+            &self,
+            model_path: &std::path::Path,
+            device: &str,
+            cache_size_gb: f64,
+            max_num_seqs: usize,
+        ) -> anyhow::Result<(EngineHandleKind, std::thread::JoinHandle<()>)> {
+            let done = self.loads.load(std::sync::atomic::Ordering::SeqCst);
+            if cache_size_gb > self.max_kv_gb || done >= self.loads_ok {
+                return Err(anyhow::anyhow!(GENAI_BUDGET_ERR));
+            }
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .load(model_path, device, cache_size_gb, max_num_seqs)
+        }
+    }
+
+    async fn budget_mm(loads_ok: usize) -> ModelManager {
+        let config = make_config(&[("rb-model", 2.0)], 40.0);
+        let factory = BudgetFactory {
+            inner: lifecycle::MockEngineFactory::default(),
+            max_kv_gb: 3.0,
+            loads_ok,
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mm = ModelManager::new(config, Arc::new(factory)).await.unwrap();
+        mm.load_model_with_overrides(
+            "rb-model",
+            LoadOverrides {
+                kv_cache_gb: Some(2.0),
+                ..LoadOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+        mm
+    }
+
+    /// C7 F2: a resize whose reload is refused for memory reloads the model at its previous pool
+    /// and says so; the error keeps its kind (same HTTP status).
+    #[tokio::test]
+    async fn a_refused_resize_reload_rolls_back_to_the_previous_pool() {
+        let mm = budget_mm(usize::MAX).await;
+        let err = mm.resize_model_kv_cache("rb-model", 6.0).await.unwrap_err();
+        let Some(ModelError::InsufficientMemory(msg)) = err.downcast_ref::<ModelError>() else {
+            panic!("a memory refusal: {err:#}");
+        };
+        assert!(
+            msg.contains(
+                "the resize was refused and rb-model was reloaded at its previous 2.0 GiB"
+            ) && msg.contains("resize_rolled_back"),
+            "{msg}"
+        );
+        let models = mm.read_models("test");
+        let r = models.get("rb-model").unwrap();
+        assert_eq!(r.state, ModelState::Ready);
+        assert!((r.kv_cache_gb - 2.0).abs() < 1e-9, "{}", r.kv_cache_gb);
+    }
+
+    /// C7 F2: when the rollback fails too, the error says the model stays unloaded.
+    #[tokio::test]
+    async fn a_failed_rollback_says_the_model_stays_unloaded() {
+        let mm = budget_mm(1).await;
+        let err = mm.resize_model_kv_cache("rb-model", 6.0).await.unwrap_err();
+        let Some(ModelError::InsufficientMemory(msg)) = err.downcast_ref::<ModelError>() else {
+            panic!("a memory refusal: {err:#}");
+        };
+        assert!(
+            msg.contains("failed too") && msg.contains("resize_not_restored"),
+            "{msg}"
+        );
+        assert_eq!(
+            mm.read_models("test").get("rb-model").unwrap().state,
+            ModelState::NotLoaded
+        );
+    }
+
+    /// C7 N2: a resize rollback's no-evict refusal speaks of the rollback; a respawn restore keeps
+    /// its C27 wording.
+    #[test]
+    fn a_no_evict_refusal_names_the_rollback_or_the_restore() {
+        let rollback = no_evict_refusal("m", "no room", true);
+        assert!(
+            rollback.starts_with("resize rollback of m:")
+                && rollback.contains("a rollback never evicts"),
+            "{rollback}"
+        );
+        assert!(
+            !rollback.contains("respawn") && !rollback.contains("restore"),
+            "{rollback}"
+        );
+        let restore = no_evict_refusal("m", "no room", false);
+        assert_eq!(
+            restore,
+            "respawn restore of m skipped: it does not fit without evicting a loaded model (no \
+             room), and a restore never evicts"
+        );
+    }
+
+    /// C7 F2: the preflight's reachable RAM is capped at `MemTotal` like the reload's own upfront
+    /// check: credits cannot promise more RAM than the machine has.
+    #[test]
+    fn the_resize_preflight_ram_is_capped_at_mem_total() {
+        let live = |ceiling: Option<f64>| ResizeLiveRam {
+            avail: 20.0,
+            own_credit: 18.0,
+            reclaim: 4.0,
+            need: 29.0,
+            floor: 2.0,
+            ceiling,
+        };
+        assert!((live(Some(30.0)).reachable_gb() - 30.0).abs() < 1e-9);
+        assert!(resize_reload_gates(40.0, 10.0, false, Some(&live(None))).ram_ok);
+        assert!(!resize_reload_gates(40.0, 10.0, false, Some(&live(Some(30.0)))).ram_ok);
+    }
+
     /// MR-2: both `<= total_available_memory` forms match; the pool-sizing form and poison do not.
     #[test]
     fn genai_memory_budget_errors_are_recognised() {
@@ -20813,6 +26657,45 @@ mod tests {
         );
     }
 
+    /// 0.9.1 C2: plays the host's `MemAvailable` for this test's thread (the `system` domain's
+    /// live RAM gate, [`TEST_LIVE_AVAIL_GB`]) until dropped, so a test of domain arithmetic does
+    /// not pass or fail with the RAM the box running it has free.
+    struct FakeLiveAvail(Option<f64>);
+
+    impl FakeLiveAvail {
+        fn set(gb: f64) -> Self {
+            Self(TEST_LIVE_AVAIL_GB.with(|c| c.replace(Some(gb))))
+        }
+    }
+
+    impl Drop for FakeLiveAvail {
+        /// Restores what was there before (nested guards unwind in order).
+        fn drop(&mut self) {
+            TEST_LIVE_AVAIL_GB.with(|c| c.set(self.0));
+        }
+    }
+
+    #[test]
+    fn fake_live_avail_restores_the_previous_value() {
+        let read = || TEST_LIVE_AVAIL_GB.with(std::cell::Cell::get);
+        {
+            let _outer = FakeLiveAvail::set(8.0);
+            {
+                let _inner = FakeLiveAvail::set(2.0);
+                assert_eq!(read(), Some(2.0));
+            }
+            assert_eq!(
+                read(),
+                Some(8.0),
+                "the inner guard restores the outer value"
+            );
+        }
+        assert_eq!(read(), None);
+    }
+
+    /// The `MemAvailable` [`FakeLiveAvail`] plays for tests that are not about RAM: plenty.
+    const ROOMY_LIVE_AVAIL_GB: f64 = 64.0;
+
     /// Build a manager over the three-device fleet with `tiny` routed to the
     /// iGPU (`GPU.0` → system domain) and everything else on the primary dGPU
     /// (`GPU.1`). Bounded KV (1 GB) leaves observable free space in each domain.
@@ -20840,6 +26723,7 @@ mod tests {
     /// dGPU pool untouched, and its metrics carry the actual `GPU.0` device.
     #[tokio::test]
     async fn per_model_device_charges_its_own_domain() {
+        let _ram = FakeLiveAvail::set(ROOMY_LIVE_AVAIL_GB);
         let mm = fleet_mm(&[("big", 10.0), ("tiny", 1.0)], 16.0, 8.0).await;
 
         mm.load_model("big").await.unwrap();
@@ -20879,6 +26763,7 @@ mod tests {
     /// resident and never the iGPU model in the other domain.
     #[tokio::test]
     async fn eviction_is_domain_scoped() {
+        let _ram = FakeLiveAvail::set(ROOMY_LIVE_AVAIL_GB);
         // GPU.1 budget 12: one 10 GB model + 1 GB KV (=11) fits; a second does not.
         let mm = fleet_mm(&[("a", 10.0), ("b", 10.0), ("tiny", 1.0)], 12.0, 8.0).await;
 
@@ -21123,10 +27008,11 @@ mod tests {
     }
 
     /// On the shipped config's ungated CPU domain a chat model gets the KV pool the config asks for
-    /// (`cache_size_gb` 2.0), not the 1.0 GB floor that a `0.0` "free" used to pin it to. (Needs a
-    /// few GB of free RAM on the machine running the test, as any load test of this size does.)
+    /// (`cache_size_gb` 2.0), not the 1.0 GB floor that a `0.0` "free" used to pin it to. The
+    /// host's free RAM is faked (0.9.1 C2): it failed on a box with ~5 GB free.
     #[tokio::test]
     async fn ungated_cpu_domain_gets_the_configured_kv_pool() {
+        let _ram = FakeLiveAvail::set(ROOMY_LIVE_AVAIL_GB);
         let cpu_only = Arc::new(DeviceInventory::from_devices(vec![tiered_dev(
             "CPU",
             DeviceKind::Cpu,
@@ -21625,6 +27511,63 @@ mod tests {
         );
     }
 
+    /// C8: a reload that changes a loaded model's `chat_template` names the model and the field in
+    /// `models_not_applied` (and still lists it `left_untouched`). The three-step recipe the notice
+    /// gives is the one that works: unload + load alone keeps the old template (reload staged
+    /// nothing), a second reload then reports the model `updated`, and the next load uses the new
+    /// template. A reload with no edit reports nothing.
+    #[tokio::test]
+    async fn reload_names_a_loaded_models_unapplied_template_change_and_the_recipe_works() {
+        let (mm, dir) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        std::fs::write(dir.path().join("old.jinja"), "OLD {{ messages }}").unwrap();
+        std::fs::write(dir.path().join("new.jinja"), "NEW {{ messages }}").unwrap();
+        let config_with = |tpl: &str| {
+            format!(
+                r#"{{"models_dir": "/tmp/test-models", "device": "CPU", "total_vram_gb": 0.0,
+                    "models": {{ "existing": {{ "vram_gb": 1.0, "chat_template": "{tpl}" }} }} }}"#
+            )
+        };
+        // Stage the old template through a reload while NotLoaded, then load with it.
+        std::fs::write(dir.path().join("config.json"), config_with("old.jinja")).unwrap();
+        assert_eq!(mm.reload_config().unwrap().updated, vec!["existing"]);
+        mm.load_model("existing").await.unwrap();
+        let template = |mm: &ModelManager| mm.get_chat_context("existing").unwrap().template;
+        assert_eq!(&*template(&mm), "OLD {{ messages }}");
+
+        // Nothing edited: nothing reported.
+        assert!(mm.reload_config().unwrap().models_not_applied.is_empty());
+
+        std::fs::write(dir.path().join("config.json"), config_with("new.jinja")).unwrap();
+        let report = mm.reload_config().unwrap();
+        assert_eq!(report.left_untouched, vec!["existing"]);
+        assert_eq!(
+            report.models_not_applied,
+            vec![ModelChangesNotApplied {
+                model: "existing".to_owned(),
+                fields: vec!["chat_template".to_owned()],
+            }]
+        );
+        assert_eq!(
+            &*template(&mm),
+            "OLD {{ messages }}",
+            "the live model is untouched"
+        );
+
+        // Unload + load alone: still the old template.
+        mm.evict_model("existing").await.unwrap();
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(&*template(&mm), "OLD {{ messages }}");
+
+        // The recipe: unload, reload again (now `updated`), load.
+        mm.evict_model("existing").await.unwrap();
+        let report = mm.reload_config().unwrap();
+        assert_eq!(report.updated, vec!["existing"]);
+        assert!(report.models_not_applied.is_empty());
+        mm.load_model("existing").await.unwrap();
+        assert_eq!(&*template(&mm), "NEW {{ messages }}");
+    }
+
     /// A new entry whose directory doesn't exist is skipped and reported,
     /// not silently registered as an unloadable ghost.
     #[tokio::test]
@@ -21810,6 +27753,42 @@ mod tests {
             vec!["sk-admin".to_string()],
             "admin_api_keys must stay exactly as it was"
         );
+    }
+
+    /// 0.9.1 S3: removing the last inference key on a network bind still applies (refusing
+    /// would keep a key being revoked alive); the server WARNs instead. `binds_to_network`
+    /// is what picks the WARN: loopback no, a wildcard yes.
+    #[tokio::test]
+    async fn reload_keys_file_removing_last_api_key_on_network_bind_applies() {
+        let public_config = BASE_CONFIG.replacen('{', r#"{ "bind_addr": "0.0.0.0","#, 1);
+        let (mm, _dir, keys_path) = make_mm_with_keys(
+            &public_config,
+            r#"{"api_keys": ["sk-only"], "admin_api_keys": ["sk-admin"]}"#,
+            Arc::new(MockEngineFactory::default()),
+        )
+        .await;
+        assert!(mm.binds_to_network());
+        std::fs::write(
+            &keys_path,
+            r#"{"api_keys": [], "admin_api_keys": ["sk-admin"]}"#,
+        )
+        .expect("rewrite keys file");
+
+        let report = mm.reload_keys_file().expect("reload_keys_file");
+        assert!(report.keys_updated);
+        assert_eq!(report.api_key_count, 0);
+        assert!(
+            report.inference_open_on_network,
+            "rv must be able to show it"
+        );
+        // State, not transition: a second reload of the same file still says so.
+        assert!(mm.reload_keys_file().unwrap().inference_open_on_network);
+        let (live_api, _) = mm.auth_snapshot_for_test().expect("auth wired");
+        assert!(live_api.is_empty(), "the revocation must take effect");
+
+        let (loopback, _dir2) =
+            make_mm_from_file(BASE_CONFIG, Arc::new(MockEngineFactory::default())).await;
+        assert!(!loopback.binds_to_network());
     }
 
     /// `reload_keys_file` with no `auth`/`keys_file_path` wired (test builds
@@ -22111,5 +28090,283 @@ mod tests {
             value["models"].get("existing").is_some(),
             "unrelated entry must survive"
         );
+    }
+}
+
+/// 0.9.1 V5 review fixes (F6, F7): the sampling layers across load, reload and PATCH.
+#[cfg(test)]
+mod v5_sampling_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::model_manager::lifecycle::MockEngineFactory;
+
+    const SAMPLES: &str = r#"{"do_sample": true, "temperature": 0.6, "top_k": 20}"#;
+
+    /// A manager over a temp `models_dir` holding `m1` (with `gen_config` as its
+    /// `generation_config.json` when given) and a durable config file.
+    async fn setup(
+        stanza: serde_json::Value,
+        gen_config: Option<&str>,
+        factory: MockEngineFactory,
+    ) -> (Arc<ModelManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(models.join("m1")).unwrap();
+        if let Some(g) = gen_config {
+            std::fs::write(models.join("m1").join("generation_config.json"), g).unwrap();
+        }
+        write_config(&dir, &stanza);
+        let path = dir.path().join("config.json");
+        let config = Config::load(&path).unwrap();
+        let mm = ModelManager::new(config, Arc::new(factory))
+            .await
+            .unwrap()
+            .with_config_path(path);
+        (Arc::new(mm), dir)
+    }
+
+    fn write_config(dir: &tempfile::TempDir, stanza: &serde_json::Value) {
+        let cfg = serde_json::json!({
+            "models_dir": dir.path().join("models"), "device": "CPU", "total_vram_gb": 0.0,
+            "models": { "m1": stanza }
+        });
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+    }
+
+    fn patch(v: serde_json::Value) -> config::ModelEntryPatch {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// F6: a model file re-exported after the operator set `top_p` without a temperature: the
+    /// load still succeeds and the record reports the broken rule (the commit WARNs); boot
+    /// validation passes (WARN) and a PATCH of an unrelated field is not blocked, while a PATCH
+    /// setting the same kind of `sampling` is refused.
+    #[tokio::test]
+    async fn a_re_exported_file_breaking_the_do_sample_rule_is_flagged_at_load() {
+        let (mm, dir) = setup(
+            serde_json::json!({"vram_gb": 0.0}),
+            Some(SAMPLES),
+            MockEngineFactory::default(),
+        )
+        .await;
+        mm.patch_model(
+            "m1",
+            &patch(serde_json::json!({"sampling": {"top_p": 0.9}})),
+        )
+        .unwrap();
+        mm.load_model("m1").await.unwrap();
+        assert!(
+            mm.read_models("t")["m1"]
+                .sampling_rule_error("m1")
+                .is_none(),
+            "rule holds"
+        );
+        mm.evict_model("m1").await.unwrap();
+        std::fs::write(
+            dir.path().join("models/m1/generation_config.json"),
+            r#"{"temperature": 0.6}"#,
+        )
+        .unwrap();
+        mm.load_model("m1").await.unwrap();
+        assert!(
+            mm.read_models("t")["m1"]
+                .sampling_rule_error("m1")
+                .is_some(),
+            "the re-read file no longer allows the configured sampling"
+        );
+        // Ruling B: the whole-file check before a mutation, and boot, only WARN about it.
+        Config::load(&dir.path().join("config.json")).expect("boot validation passes");
+        mm.patch_model("m1", &patch(serde_json::json!({"priority": 3})))
+            .expect("an unrelated PATCH is not blocked");
+        let err = mm
+            .patch_model("m1", &patch(serde_json::json!({"sampling": {"top_k": 5}})))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do_sample"), "{err}");
+    }
+
+    /// F7: a reload while the model is `Loading` stages nothing: `sampling` stays in
+    /// `models_not_applied`, not `applied_live`.
+    #[tokio::test]
+    async fn reload_on_a_loading_model_does_not_apply_sampling() {
+        // The load blocks on a gate this test releases, so the model cannot reach `Ready`
+        // before the reload however slow or loaded the machine is.
+        let gate = Arc::new(crate::model_manager::lifecycle::LoadGate::default());
+        let factory = MockEngineFactory {
+            load_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        };
+        let (mm, dir) = setup(serde_json::json!({"vram_gb": 0.0}), None, factory).await;
+        let loader = {
+            let mm = Arc::clone(&mm);
+            tokio::spawn(async move { mm.load_model("m1").await })
+        };
+        // The state flips to `Loading` before the worker reaches the gate; wait for that flip
+        // (bounded at 60 s so a regression fails instead of hanging).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while mm.model_state("m1") != Some(ModelState::Loading) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "model never reached Loading"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        write_config(
+            &dir,
+            &serde_json::json!({"vram_gb": 0.0, "sampling": {"temperature": 0.3}}),
+        );
+        let report = mm.reload_config().unwrap();
+        assert!(report.applied_live.is_empty(), "{report:?}");
+        assert_eq!(report.models_not_applied.len(), 1);
+        assert_eq!(report.models_not_applied[0].fields, vec!["sampling"]);
+        assert_eq!(mm.model_state("m1"), Some(ModelState::Loading));
+        gate.release();
+        loader.await.unwrap().unwrap();
+        assert_eq!(
+            mm.get_chat_context("m1").unwrap().sampling.temperature,
+            None,
+            "the loading model kept the entry it was loading with"
+        );
+    }
+
+    /// 0.9.1: a config reload applies `thinking_budget_tokens` hot to a `Ready` model
+    /// (`applied_live`, not `models_not_applied`), together with `sampling` in one entry.
+    #[tokio::test]
+    async fn reload_applies_thinking_budget_hot_on_a_ready_model() {
+        let (mm, dir) = setup(
+            serde_json::json!({"vram_gb": 0.0, "thinking_budget_tokens": null}),
+            None,
+            MockEngineFactory::default(),
+        )
+        .await;
+        mm.load_model("m1").await.unwrap();
+        assert_eq!(
+            mm.get_chat_context("m1").unwrap().thinking_budget_tokens,
+            None
+        );
+        write_config(
+            &dir,
+            &serde_json::json!({"vram_gb": 0.0, "thinking_budget_tokens": 4096,
+                "sampling": {"temperature": 0.3}}),
+        );
+        let report = mm.reload_config().unwrap();
+        assert_eq!(
+            report.applied_live,
+            vec![ModelChangesNotApplied {
+                model: "m1".to_owned(),
+                fields: vec!["sampling".to_owned(), "thinking_budget_tokens".to_owned()],
+            }],
+            "{report:?}"
+        );
+        assert!(report.models_not_applied.is_empty(), "{report:?}");
+        assert_eq!(
+            mm.get_chat_context("m1").unwrap().thinking_budget_tokens,
+            Some(4096)
+        );
+        write_config(
+            &dir,
+            &serde_json::json!({"vram_gb": 0.0, "thinking_budget_tokens": null,
+                "sampling": {"temperature": 0.3}}),
+        );
+        let report = mm.reload_config().unwrap();
+        assert_eq!(
+            report.applied_live[0].fields,
+            vec!["thinking_budget_tokens".to_owned()]
+        );
+        assert_eq!(
+            mm.get_chat_context("m1").unwrap().thinking_budget_tokens,
+            None
+        );
+    }
+
+    /// F7: a placement PATCH (rebuilds the `NotLoaded` record) carrying `sampling` keeps it, and
+    /// the next load serves with it.
+    #[tokio::test]
+    async fn a_placement_patch_carrying_sampling_keeps_it() {
+        let (mm, _dir) = setup(
+            serde_json::json!({"vram_gb": 0.0}),
+            Some(SAMPLES),
+            MockEngineFactory::default(),
+        )
+        .await;
+        let report = mm
+            .patch_model(
+                "m1",
+                &patch(serde_json::json!({"device": "CPU",
+                    "sampling": {"temperature": 0.2, "presence_penalty": 1.0}})),
+            )
+            .unwrap();
+        assert!(report.applied_live.contains(&"sampling"));
+        mm.load_model("m1").await.unwrap();
+        let p = mm.get_chat_context("m1").unwrap().sampling;
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.top_k, Some(20), "file top_k under the operator T");
+        assert_eq!(p.presence_penalty, Some(1.0));
+    }
+
+    /// F7: the admin add validates `sampling` (the `do_sample` rule read from the model's own
+    /// file on the blocking pool) and a valid one is the model's profile. Own temp
+    /// `models_dir`, cleaned on every path.
+    #[tokio::test]
+    async fn add_model_validates_and_applies_sampling() {
+        let (mm, dir) = setup(
+            serde_json::json!({"vram_gb": 0.0}),
+            None,
+            MockEngineFactory::default(),
+        )
+        .await;
+        std::fs::create_dir_all(dir.path().join("models/m2")).unwrap();
+        let policy = |s: config::SamplingConfig| config::ModelPolicy {
+            sampling: Some(s),
+            ..Default::default()
+        };
+        let err = mm
+            .add_model(
+                "m2".to_owned(),
+                0.0,
+                None,
+                policy(config::SamplingConfig {
+                    top_p: Some(0.9),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("do_sample"), "{err}");
+        assert!(mm.model_state("m2").is_none(), "nothing half-registered");
+        mm.add_model(
+            "m2".to_owned(),
+            0.0,
+            None,
+            policy(config::SamplingConfig {
+                temperature: Some(0.15),
+                top_p: Some(0.9),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ctx = mm.get_chat_context("m2").unwrap();
+        assert_eq!(ctx.sampling.temperature, Some(0.15));
+        assert_eq!(ctx.sampling.top_p, Some(0.9));
+    }
+
+    /// F9: a non-text kind gets no file layer (its `generation_config.json` is not read).
+    #[tokio::test]
+    async fn a_non_text_kind_reads_no_file_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("embed-x");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("generation_config.json"), SAMPLES).unwrap();
+        let entry = config::ModelEntry::default();
+        let files = RegistrationFiles::read(&MockEngineFactory::default(), &d, &entry);
+        assert_eq!(files.kind, ModelKind::Embedding);
+        assert_eq!(files.file_sampling, sampling::FileSampling::default());
+        let t = dir.path().join("m-text");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("generation_config.json"), SAMPLES).unwrap();
+        let files = RegistrationFiles::read(&MockEngineFactory::default(), &t, &entry);
+        assert!(files.file_sampling.samples_with_temperature());
     }
 }

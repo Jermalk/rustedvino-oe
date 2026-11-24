@@ -32,6 +32,7 @@
 // stalled.
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstddef>
@@ -2195,10 +2196,13 @@ size_t ov_embed_count_tokens(OvEmbedHandle handle, const char* text) {
 // TextRerankPipeline C-API (/v1/rerank)
 // ─────────────────────────────────────────────────────────────────────────────
 // Thin extern "C" wrapper around ov::genai::TextRerankPipeline.
-// Takes a query string + a batch of documents, returns (original_index, score)
+// Takes a query string + a list of documents, returns (original_index, score)
 // pairs sorted by relevance score descending via a per-result callback.
-// The pipeline is created once per model load; top_n is set to a large value
-// so all documents are scored and Rust applies the per-request top_n trim.
+// Each document is scored with its own one-document rerank() call (C27, see
+// ov_rerank_documents); the bridge maps every result back to the document's
+// position and sorts the full set. The pipeline is created once per model
+// load; top_n is set to a large value so nothing is dropped and Rust applies
+// the per-request top_n trim.
 //
 // Like TextEmbeddingPipeline, TextRerankPipeline does not expose its own
 // tokenizer (no get_tokenizer()), so we bundle a standalone ov::genai::Tokenizer
@@ -2265,8 +2269,10 @@ void ov_rerank_free(OvRerankHandle handle) {
     }
 }
 
-/// Rerank documents against query. Calls callback once per result (sorted by
-/// score descending, up to top_n). Returns 0 on success, -1 on error.
+/// Rerank documents against query. Calls callback once per document with
+/// (original index, score), sorted by score descending (ties: lower index
+/// first). Every document is scored before the first callback, so an error
+/// delivers nothing. Returns 0 on success, -1 on error.
 int ov_rerank_documents(OvRerankHandle     handle,
                         const char*        query,
                         const char* const* texts,
@@ -2280,13 +2286,38 @@ int ov_rerank_documents(OvRerankHandle     handle,
     if (!callback)   { set_error("ov_rerank_documents: null callback"); return -1; }
     auto* state = static_cast<OvRerankState*>(handle);
     try {
-        std::vector<std::string> docs;
-        docs.reserve(n);
+        const std::string q(query);
+        std::vector<std::pair<size_t, float>> scored;
+        scored.reserve(n);
+        // ONE DOCUMENT PER rerank() CALL — deliberately, do not batch this
+        // back up (C27). openvino.genai TextRerankPipeline
+        // 2026.2.1 and 2026.4.1 corrupt the heap and abort the process
+        // ("double free or corruption", SIGABRT inside the pipeline's own
+        // paired Tokenizer::encode on the CPU plugin) when the query is longer
+        // than the documents and about 3+ documents go in one call; batch
+        // sizes >= 2 are not safe (a 1000-word query crashes at 3). A single
+        // document per call never crashed (600-call soak under MALLOC_CHECK_)
+        // and scores identically to the batch where the batch works.
         for (size_t i = 0; i < n; ++i) {
-            docs.emplace_back(texts[i] ? texts[i] : "");
+            const std::vector<std::string> one{std::string(texts[i] ? texts[i] : "")};
+            auto results = state->pipe->rerank(q, one);
+            if (results.size() != 1) {
+                set_error(("ov_rerank_documents: rerank() of one document returned " +
+                           std::to_string(results.size()) + " results").c_str());
+                return -1;
+            }
+            // The pipeline numbers results within its own one-document call
+            // (always 0): use the loop index, never results[0].first.
+            scored.emplace_back(i, results[0].second);
         }
-        auto results = state->pipe->rerank(std::string(query), docs);
-        for (const auto& [idx, score] : results) {
+        // The batched call's order (score descending), made deterministic for
+        // equal scores: the lower original index first. A NaN score sorts
+        // last, so the comparator stays a strict weak ordering.
+        const auto key = [](float s) { return std::isnan(s) ? -INFINITY : s; };
+        std::stable_sort(scored.begin(), scored.end(), [&key](const auto& a, const auto& b) {
+            return key(a.second) > key(b.second);
+        });
+        for (const auto& [idx, score] : scored) {
             callback(user_data, idx, score);
         }
         return 0;

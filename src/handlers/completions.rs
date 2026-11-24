@@ -34,14 +34,15 @@ use axum::{
 };
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::ReceiverStream;
 
 use super::chat::{
     StreamOptions, Usage, clamp_max_tokens, drain_channel, gate_prompt, next_response_seq,
-    parse_stop, resolve_repetition_penalty, resolve_sampling_defaults, spawn_mock_generation,
-    unix_now, usage_for, usage_sse_event, validate_sampling_params, zero_token_budget_error,
+    parse_stop, spawn_mock_generation, unix_now, usage_for, usage_sse_event,
+    validate_sampling_params, zero_token_budget_error,
 };
 use std::sync::Arc;
+
+use super::on_demand;
 
 use super::error::{
     JsonBody, device_admission_error_response, inference_error_from_text, model_error_response,
@@ -50,7 +51,7 @@ use super::error::{
 use crate::{
     app_state::AppState,
     cb_engine::SubmitResult,
-    model_manager::ModelManager,
+    model_manager::{ModelError, ModelManager, on_demand::WaitPlace},
     ov_cb::GenParams,
     streaming::{StreamEvent, TokenReceiver, stream_channel},
 };
@@ -236,10 +237,14 @@ struct CompletionChoice {
 /// raw generated text. Streaming (`stream: true`) emits `text_completion`
 /// chunks; non-streaming returns a single `text_completion` object. Multiple
 /// prompts are supported for non-streaming only.
-#[allow(clippy::too_many_lines)]
+///
+/// F1b *(since 0.9.1)*: an `on_demand` model that is not loaded is loaded, as on chat; the
+/// request waits for it up to `on_demand_wait_secs` (a streaming one with SSE keep-alives), else
+/// answers 503 `Loading` + `Retry-After`. The wait runs after the request is validated and before
+/// the model's sampling profile is read (its `generation_config.json` layer is filled at load).
 pub async fn completions(
     State(state): State<AppState>,
-    JsonBody(req): JsonBody<CompletionRequest>,
+    JsonBody(mut req): JsonBody<CompletionRequest>,
 ) -> Response {
     // Zero point for per-request latency metrics, captured at handler entry
     // (matches the chat handler).
@@ -271,10 +276,13 @@ pub async fn completions(
     }
 
     let stream = req.stream.unwrap_or(false);
-    let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let created = unix_now();
-    let id = format!("cmpl-rv-{created}-{}", next_response_seq());
-    let prompts = req.prompt.into_vec();
+    let start = CompletionStart {
+        stream,
+        include_usage: req.stream_options.as_ref().is_some_and(|o| o.include_usage),
+        created: unix_now(),
+        requested_at,
+    };
+    let prompts = std::mem::take(&mut req.prompt).into_vec();
 
     if prompts.is_empty() {
         return openai_error(
@@ -306,42 +314,6 @@ pub async fn completions(
         );
     }
 
-    // OpenAI legacy default max_tokens is 16 (chat uses the model default);
-    // both are bounded by the server-wide ceiling (T2.2, shared clamp).
-    let max_tokens_cap = state
-        .model_manager
-        .as_ref()
-        .map_or_else(crate::model_manager::config::default_max_tokens_cap, |mm| {
-            mm.max_tokens_cap()
-        });
-    // Model-shipped sampling defaults (generation_config.json), same
-    // resolution `/v1/chat/completions` uses — see `resolve_sampling_defaults`'s
-    // doc comment. `tools_active` is always `false` here: legacy completions
-    // has no tool-calling concept at all, so the tools-pin branch of that function is
-    // never reachable on this endpoint (the temperature branches are, as on chat).
-    let model_defaults = state
-        .model_manager
-        .as_ref()
-        .map_or_else(Default::default, |mm| {
-            mm.model_generation_defaults(&req.model)
-        });
-    let (temperature, top_p, top_k) =
-        resolve_sampling_defaults(req.temperature, req.top_p, req.top_k, false, model_defaults);
-    let gen_params = GenParams {
-        max_new_tokens: clamp_max_tokens(req.max_tokens, 16, max_tokens_cap),
-        temperature,
-        top_p: super::chat::clamp_top_p(top_p),
-        presence_penalty: req.presence_penalty,
-        frequency_penalty: req.frequency_penalty,
-        repetition_penalty: resolve_repetition_penalty(req.repetition_penalty),
-        seed: req.seed,
-        stop: parse_stop(req.stop.as_ref()),
-        // G1 structured output is chat-only (per OpenAI); legacy completions
-        // stay free-form.
-        json_schema: None,
-        top_k,
-    };
-
     if stream && prompts.len() > 1 {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -351,9 +323,124 @@ pub async fn completions(
         );
     }
 
+    // F1b: the on-demand wait, after every check on the request itself.
+    if let Some(mm) = state.model_manager.clone() {
+        let first = mm.get_text_context(&req.model).map(drop);
+        let waited = first.is_err();
+        // Streaming: answer 200 now and send SSE keep-alives while the request waits.
+        if stream && let Some(slot) = on_demand::streaming_wait_slot(&mm, &req.model, &first) {
+            let every = on_demand::keep_alive_every(Some(&mm));
+            return on_demand::sse_after_wait(every, async move {
+                let model = req.model.clone();
+                let lookup = || std::future::ready(mm.get_text_context(&model).map(drop));
+                let place = WaitPlace::Held(slot);
+                if let Err(u) = on_demand::resolve_waiting(&mm, &model, first, place, lookup).await
+                {
+                    return u.into_response(&model);
+                }
+                completions_ready(state, req, prompts, start.after_wait()).await
+            });
+        }
+        // A streaming request that got no place does not wait (review R-4).
+        let place = if stream {
+            WaitPlace::NoWait
+        } else {
+            WaitPlace::Take
+        };
+        let lookup = || std::future::ready(mm.get_text_context(&req.model).map(drop));
+        if let Err(u) = on_demand::resolve_waiting(&mm, &req.model, first, place, lookup).await {
+            return u.into_response(&req.model);
+        }
+        if waited {
+            return completions_ready(state, req, prompts, start.after_wait()).await;
+        }
+    }
+    completions_ready(state, req, prompts, start).await
+}
+
+/// The per-request values [`completions`] fixes before the on-demand wait.
+#[derive(Clone, Copy)]
+struct CompletionStart {
+    stream: bool,
+    include_usage: bool,
+    created: u64,
+    requested_at: Instant,
+}
+
+impl CompletionStart {
+    /// After an on-demand wait: `created` and the metrics' zero point are taken again, as chat
+    /// takes them after its wait (TTFT and duration measure serving).
+    fn after_wait(self) -> Self {
+        Self {
+            created: unix_now(),
+            requested_at: Instant::now(),
+            ..self
+        }
+    }
+}
+
+/// [`completions`] once the request is checked and its model was found loaded (or is about to
+/// answer the not-ready error itself, in `submit_prompts`).
+async fn completions_ready(
+    state: AppState,
+    req: CompletionRequest,
+    prompts: Vec<String>,
+    start: CompletionStart,
+) -> Response {
+    let CompletionStart {
+        stream,
+        include_usage,
+        created,
+        requested_at,
+    } = start;
+    let id = format!("cmpl-rv-{created}-{}", next_response_seq());
+
+    // OpenAI legacy default max_tokens is 16 (chat uses the model default);
+    // both are bounded by the server-wide ceiling (T2.2, shared clamp).
+    let max_tokens_cap = state
+        .model_manager
+        .as_ref()
+        .map_or_else(crate::model_manager::config::default_max_tokens_cap, |mm| {
+            mm.max_tokens_cap()
+        });
+    // The model's sampling profile (0.9.1 V5b: operator `sampling` over the model's
+    // generation_config.json over the server default), resolved with the same rules
+    // `/v1/chat/completions` uses — see `apply_sampling_profile`. `tools_active` is
+    // always `false` here: legacy completions has no tool-calling concept, so the
+    // tools pin is never reachable on this endpoint.
+    let (profile, npu) = state
+        .model_manager
+        .as_ref()
+        .map_or_else(Default::default, |mm| mm.model_sampling_profile(&req.model));
+    let mut gen_params = GenParams {
+        max_new_tokens: clamp_max_tokens(req.max_tokens, 16, max_tokens_cap),
+        seed: req.seed,
+        stop: parse_stop(req.stop.as_ref()),
+        // G1 structured output is chat-only (per OpenAI); legacy completions
+        // stay free-form.
+        json_schema: None,
+        ..GenParams::default()
+    };
+    super::chat::apply_sampling_profile(
+        &mut gen_params,
+        super::chat::ClientSampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+        },
+        false,
+        &profile,
+        npu,
+        &req.model,
+    );
+    let gen_params = gen_params;
+
     // Submit every prompt (real engine or mock), collecting a receiver each.
     let receivers =
-        match submit_prompts(&state, &req.model, prompts, &gen_params, requested_at).await {
+        match submit_prompts(&state, &req.model, &id, prompts, &gen_params, requested_at).await {
             Ok(r) => r,
             Err(resp) => return *resp,
         };
@@ -397,6 +484,7 @@ pub async fn completions(
 async fn submit_prompts(
     state: &AppState,
     model: &str,
+    request_id: &str,
     prompts: Vec<String>,
     gen_params: &GenParams,
     requested_at: Instant,
@@ -405,9 +493,18 @@ async fn submit_prompts(
 
     match state.model_manager.as_ref() {
         Some(mm) => {
-            let (handle, max_prompt_tokens) = mm
-                .get_text_context(model)
-                .map_err(|e| Box::new(model_error_response(e)))?;
+            let (handle, max_prompt_tokens) = mm.get_text_context(model).map_err(|e| {
+                Box::new(match e {
+                    // Gone again since the wait (evicted in between): the documented re-check
+                    // answer — start the load again, `503` + `Retry-After` (an eager model: the
+                    // plain not-loaded `503`, as before).
+                    ModelError::NotLoaded => {
+                        on_demand::Unready::OnDemand(mm.request_on_demand_load(model))
+                            .into_response(model)
+                    }
+                    e => model_error_response(e),
+                })
+            })?;
             // Live device lookup — see `record_device`'s doc comment on why
             // this must not be cached across requests (admin reload can move
             // a model on its next load). Resolved once here since it cannot
@@ -443,16 +540,20 @@ async fn submit_prompts(
                 };
 
                 let (tx, rx) = stream_channel();
+                // 0.9.1 S1: on the engine's liveness before the submit (the stall verdict reaches
+                // this prompt's channel whether it is queued or running).
+                handle.liveness().register(&tx, request_id, model, mm);
                 let req_id = mm.next_id();
+                // 0.9.1 V1-usage (P3): no reasoning parser runs on this endpoint (the text comes
+                // back raw), so the engine counts the raw `<think>…</think>` rule — from the
+                // start when the client's own prompt ends in an open `<think>`.
+                let mut params = gen_params.clone();
+                params.reasoning = crate::prompt_builder::ReasoningSplit::new(
+                    None,
+                    crate::prompt_builder::prompt_ends_in_thinking(&prompt),
+                );
                 match handle
-                    .add_request(
-                        req_id,
-                        prompt,
-                        prompt_ids,
-                        gen_params.clone(),
-                        tx,
-                        requested_at,
-                    )
+                    .add_request(req_id, prompt, prompt_ids, params, tx, requested_at)
                     .await
                 {
                     SubmitResult::Submitted => receivers.push((rx, device_lease)),
@@ -505,6 +606,7 @@ async fn collect_completions(
     let mut choices = Vec::with_capacity(receivers.len());
     let mut prompt_total = 0usize;
     let mut completion_total = 0usize;
+    let mut reasoning_total = 0usize;
 
     for (index, rx) in receivers.into_iter().enumerate() {
         let drained = match drain_channel(rx).await {
@@ -514,6 +616,7 @@ async fn collect_completions(
         };
         prompt_total += drained.prompt_tokens;
         completion_total += drained.completion_tokens;
+        reasoning_total += drained.reasoning_tokens.min(drained.completion_tokens);
         choices.push(CompletionChoice {
             index: u32::try_from(index).unwrap_or(u32::MAX),
             text: drained.content,
@@ -528,7 +631,7 @@ async fn collect_completions(
         created,
         model,
         choices,
-        usage: usage_for(prompt_total, completion_total),
+        usage: usage_for(prompt_total, completion_total, reasoning_total),
     };
     Json(body).into_response()
 }
@@ -538,6 +641,8 @@ struct CompletionScanState {
     prompt_tokens: usize,
     /// Count of non-empty raw `Token` events — proxy for generated tokens.
     completion_tokens: usize,
+    /// The engine's reasoning-token count (raw `<think>` rule on this endpoint, 0.9.1 V1-usage).
+    reasoning_tokens: usize,
     /// Set once a mid-stream `Error` has been emitted (T3.2). Mirrors the
     /// chat path's `ScanState::errored`.
     errored: bool,
@@ -564,11 +669,14 @@ fn completion_stream(
     // `errored` is latched by a mid-stream Error — the error arm emits the
     // full terminal sequence itself, and the flag suppresses the engine's
     // trailing Done(Stop) (T3.2; mirrors the chat path's ScanState).
-    let token_stream = ReceiverStream::new(rx)
+    // `until_done`: the stream ends at the terminal `Done` (0.9.1 S1 — a stalled engine never
+    // closes its sender).
+    let token_stream = crate::streaming::until_done(rx)
         .scan(
             CompletionScanState {
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                reasoning_tokens: 0,
                 errored: false,
                 device_lease,
             },
@@ -589,12 +697,19 @@ fn completion_stream(
                     crate::streaming::StreamEvent::CompletionTokens(n) => {
                         state.completion_tokens = *n;
                     }
+                    crate::streaming::StreamEvent::ReasoningTokens(n) => {
+                        state.reasoning_tokens = *n;
+                    }
                     crate::streaming::StreamEvent::Error(_) => state.errored = true,
                     _ => {}
                 }
                 std::future::ready(Some((
                     event,
-                    (state.prompt_tokens, state.completion_tokens),
+                    (
+                        state.prompt_tokens,
+                        state.completion_tokens,
+                        state.reasoning_tokens,
+                    ),
                     was_errored,
                 )))
             },
@@ -621,7 +736,7 @@ fn completion_stream(
 ///
 /// Unlike the chat path there is no leading `role` frame. `Done` expands to
 /// the finish chunk, an optional usage chunk (when `include_usage`), and `[DONE]`.
-/// `counts` is `(prompt_tokens, completion_tokens)` accumulated via `scan`;
+/// `counts` is `(prompt_tokens, completion_tokens, reasoning_tokens)` accumulated via `scan`;
 /// `was_errored` is true when a previous event already terminated the stream
 /// with an error (the trailing `Done` is then swallowed — T3.2).
 // A pure event→frames mapper: every argument is a distinct render input
@@ -635,13 +750,17 @@ fn completion_event_to_sse(
     id: &str,
     model: &str,
     created: u64,
-    counts: (usize, usize),
+    counts: (usize, usize, usize),
     include_usage: bool,
     was_errored: bool,
     mm: Option<&Arc<ModelManager>>,
 ) -> Vec<Result<Event, Infallible>> {
     match event {
-        StreamEvent::PromptTokens(_) | StreamEvent::CompletionTokens(_) => vec![],
+        StreamEvent::PromptTokens(_)
+        | StreamEvent::CompletionTokens(_)
+        | StreamEvent::ReasoningTokens(_) => {
+            vec![]
+        }
         StreamEvent::Token(tok, _) => {
             vec![Ok(completion_chunk_event(id, model, created, tok, None))]
         }
@@ -657,7 +776,7 @@ fn completion_event_to_sse(
                 Some(reason.as_openai()),
             ))];
             if include_usage {
-                let (pt, ct) = counts;
+                let (pt, ct, rt) = counts;
                 frames.push(Ok(usage_sse_event(
                     id,
                     "text_completion",
@@ -665,6 +784,7 @@ fn completion_event_to_sse(
                     created,
                     pt,
                     ct,
+                    rt,
                 )));
             }
             frames.push(Ok(Event::default().data("[DONE]")));
@@ -1103,6 +1223,59 @@ mod tests {
         assert!(
             body.contains("\"completion_tokens\":7"),
             "must sum 4+3=7 real tokens across 2 events, not count 2 events: {body}"
+        );
+    }
+
+    /// 0.9.1 V1-usage: legacy completions carry `completion_tokens_details.reasoning_tokens` too
+    /// (the engine's raw-`<think>` count; no parser on this endpoint), summed over prompts and
+    /// never above `completion_tokens`, in both stream modes.
+    #[tokio::test]
+    async fn completions_usage_reports_reasoning_tokens() {
+        use crate::ov_cb::FinishReason;
+        use crate::streaming::StreamEvent;
+
+        let events = || {
+            let (tx, rx) = stream_channel();
+            for e in [
+                StreamEvent::PromptTokens(3),
+                StreamEvent::Token("<think>".into(), 1),
+                StreamEvent::Token("hm".into(), 1),
+                StreamEvent::Token("</think>".into(), 1),
+                StreamEvent::Token("ok".into(), 1),
+                StreamEvent::ReasoningTokens(3),
+                StreamEvent::Done(FinishReason::Stop),
+            ] {
+                tx.try_send(e).unwrap();
+            }
+            rx
+        };
+        let resp = collect_completions(vec![events(), events()], "cmpl-x", "m", 0, None).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["usage"]["completion_tokens"], 8);
+        assert_eq!(
+            json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            6
+        );
+
+        let resp = completion_stream(
+            events(),
+            "cmpl-x".to_owned(),
+            "m".to_owned(),
+            0,
+            true,
+            None,
+            crate::admission::WorkLease::default(),
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#""completion_tokens_details":{"reasoning_tokens":3}"#),
+            "{body}"
         );
     }
 }

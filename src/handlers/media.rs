@@ -26,15 +26,17 @@ use serde::{Deserialize, Serialize};
 use super::chat::unix_now;
 use super::error::{
     JsonBody, MultipartBody, device_admission_error_response, inference_error_response,
-    model_error_response, openai_error,
+    openai_error, openai_error_with_param,
 };
 use crate::Authenticated;
 use crate::app_state::AppState;
 use crate::device_inventory::DeviceInfo;
-use crate::model_manager::{ModelError, ModelManager, OnDemandLoad};
+use crate::model_manager::ModelManager;
 use crate::ov_image::{ImageEditOptions, ImageGenOptions, RgbImage};
 use crate::pipelines::stt::{Segment, SttTask, Transcription};
 use crate::pipelines::tts::TTS_SAMPLE_RATE;
+use crate::tts_split::{TTS_SEGMENT_CAP_HEADER, TTS_SEGMENTS_HEADER};
+use axum::http::{HeaderName, HeaderValue};
 
 // ---- Request types --------------------------------------------------
 
@@ -164,20 +166,17 @@ async fn speech_to_text(state: &AppState, multipart: Multipart, task: SttTask) -
     );
 
     let transcription = if let Some(mm) = state.model_manager.as_ref() {
-        let handle = match mm.get_stt_handle(&req.model) {
+        // Slice 3c parity: a NotLoaded model declared `load: on_demand` loads lazily on first
+        // use; F1b: the request waits for it up to `on_demand_wait_secs`, else 503 Loading +
+        // Retry-After. Eager models keep failing fast with a bare NotLoaded 503. Mirrors the
+        // chat path (`chat.rs`).
+        let handle = match super::on_demand::resolve_with_wait(mm, &req.model, || {
+            mm.get_stt_handle(&req.model)
+        })
+        .await
+        {
             Ok(h) => h,
-            // Slice 3c parity: a NotLoaded model declared `load: on_demand` loads
-            // lazily on first use — kick off a background load and tell the client
-            // to retry (503 Loading + Retry-After). Eager models keep failing fast
-            // with a bare NotLoaded 503. Mirrors the chat path (`chat.rs`).
-            Err(ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-                    OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
-                };
-            }
-            Err(e) => return model_error_response(e),
+            Err(u) => return u.into_response(&req.model),
         };
         if task == SttTask::Translate && !handle.can_translate() {
             return bad_request(
@@ -303,6 +302,24 @@ async fn parse_request(mut multipart: Multipart) -> Result<TranscriptionRequest,
     let model = model
         .filter(|m| !m.is_empty())
         .ok_or_else(|| bad_request("missing required field 'model'", "missing_model"))?;
+    // FM-3: normalise the hint (`PL`, `pl-PL` -> `pl`; `auto` -> detect) and refuse a code Whisper
+    // has no token for here, as a 400, instead of a 500 from inside the pipeline.
+    let language = match language
+        .as_deref()
+        .map(crate::pipelines::stt::normalize_language)
+    {
+        None => None,
+        Some(Ok(l)) => l,
+        Some(Err(message)) => {
+            return Err(openai_error_with_param(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                Some("invalid_language"),
+                Some("language"),
+            ));
+        }
+    };
     let response_format =
         ResponseFormat::parse(response_format_raw.as_deref()).ok_or_else(|| {
             bad_request(
@@ -429,6 +446,36 @@ fn speech_input_error(input: &str) -> Option<Response> {
     None
 }
 
+/// The 400 for `SpeechT5` input that splits into more than
+/// [`crate::tts_split::SPEECHT5_MAX_PIECES`] pieces (0.9.1 T5), naming the
+/// limit, the count and the per-piece `cap`. `None` when the request is within it.
+fn speech_pieces_error(pieces: usize, cap: usize) -> Option<Response> {
+    let max = crate::tts_split::SPEECHT5_MAX_PIECES;
+    (pieces > max).then(|| {
+        bad_request_owned(
+            format!(
+                "input is too long for this model: it splits into {pieces} pieces after \
+                 normalisation, at most {max} pieces of {cap} characters are accepted per request"
+            ),
+            "input_too_long",
+        )
+    })
+}
+
+/// The 400 for an edit `image`/`mask` that could not be decoded, or that passes the request's
+/// image limits (0.9.1 S5: `too_many_images` / `image_too_large`, naming the limit).
+fn image_decode_error(field: &str, e: &anyhow::Error) -> Response {
+    if let Some(limit) = e.downcast_ref::<crate::image_util::ImageLimitExceeded>() {
+        return bad_request_owned(format!("'{field}': {}", limit.message), limit.code);
+    }
+    let code = if field == "mask" {
+        "invalid_mask"
+    } else {
+        "invalid_image"
+    };
+    bad_request_owned(format!("could not decode '{field}': {e}"), code)
+}
+
 /// The 400 for an upload that could not be decoded as audio, or `None` when
 /// `e` is any other (engine) failure. Retrying the same bytes cannot help, so
 /// this is the caller's error, not a 500.
@@ -508,13 +555,19 @@ fn default_true() -> bool {
 /// The text to synthesise: `input` with digits and symbols spoken out, unless
 /// the request opted out or names a language with no number words. The
 /// request's `language` wins over `model_language` (what the loaded model
-/// speaks); with neither, English (as realtime does).
+/// speaks); with neither, English (as realtime does). Unicode spaces become
+/// plain spaces first, in every case ([`crate::tts_normalize::plain_spaces`],
+/// 0.9.1 C6).
 fn speech_text(
     input: String,
     normalize: bool,
     request_language: Option<&str>,
     model_language: Option<&str>,
 ) -> String {
+    let input = match crate::tts_normalize::plain_spaces(&input) {
+        std::borrow::Cow::Borrowed(_) => input,
+        std::borrow::Cow::Owned(mapped) => mapped,
+    };
     if !normalize {
         return input;
     }
@@ -598,23 +651,19 @@ pub async fn speech(
     // per backend (SpeechT5 = 16 kHz, Kokoro = 24 kHz). The mock path defaults to
     // `TTS_SAMPLE_RATE` (SpeechT5) since it doesn't have a live handle.
     let sample_rate;
+    // `(pieces, cap)` when the engine splits its input (SpeechT5): sent back as
+    // the `x-rustedvino-tts-segments` / `-segment-cap` headers.
+    let mut segments: Option<(usize, usize)> = None;
     let samples = if let Some(mm) = state.model_manager.as_ref() {
-        let handle = match mm.get_tts_handle(&req.model) {
+        // Slice 3c / F1b: an `on_demand` TTS model loads on first use, the request waiting up
+        // to `on_demand_wait_secs` (see the STT path above).
+        let handle = match super::on_demand::resolve_with_wait(mm, &req.model, || {
+            mm.get_tts_handle(&req.model)
+        })
+        .await
+        {
             Ok(h) => h,
-            Err(crate::model_manager::ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => {
-                        model_error_response(crate::model_manager::ModelError::Loading)
-                    }
-                    OnDemandLoad::ShuttingDown => {
-                        model_error_response(crate::model_manager::ModelError::ShuttingDown)
-                    }
-                    OnDemandLoad::NotApplicable => {
-                        model_error_response(crate::model_manager::ModelError::NotLoaded)
-                    }
-                };
-            }
-            Err(e) => return model_error_response(e),
+            Err(u) => return u.into_response(&req.model),
         };
 
         tracing::debug!(
@@ -625,6 +674,46 @@ pub async fn speech(
         );
 
         sample_rate = handle.sample_rate();
+
+        let text = speech_text(
+            req.input,
+            req.normalize,
+            req.language.as_deref(),
+            handle.language(),
+        );
+        // 0.9.1 T1: SpeechT5 drops input past ~600 characters with a 200, so its
+        // (normalised) text is split into sentence pieces of at most `cap`
+        // characters, synthesized in order and joined. Text within the cap is one
+        // piece, unchanged. Other engines take the whole text in one call.
+        // Split before the device admission below, so the T5 piece cap refuses
+        // an oversized request without queueing it or touching the engine.
+        let pieces: Vec<String> = match handle.segment_cap() {
+            Some(cap) => {
+                let pieces: Vec<String> = crate::tts_split::split_for_speech(&text, cap)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                tracing::info!(
+                    model = %req.model,
+                    segments = pieces.len(),
+                    cap,
+                    input_chars = text.chars().count(),
+                    "TTS segments"
+                );
+                if let Some(resp) = speech_pieces_error(pieces.len(), cap) {
+                    tracing::info!(
+                        model = %req.model,
+                        pieces = pieces.len(),
+                        limit = crate::tts_split::SPEECHT5_MAX_PIECES,
+                        "TTS request refused: too many pieces"
+                    );
+                    return resp;
+                }
+                segments = Some((pieces.len(), cap));
+                pieces
+            }
+            None => vec![text],
+        };
 
         // Cross-pipeline device admission (step 2): a second gate in front of
         // the engine's own per-engine gate below, capping concurrency across
@@ -639,36 +728,13 @@ pub async fn speech(
             Err(e) => return device_admission_error_response(&e),
         };
 
-        let text = speech_text(
-            req.input,
-            req.normalize,
-            req.language.as_deref(),
-            handle.language(),
-        );
-        match handle.synthesize(text, req.voice, req.speed).await {
+        // One admission for the whole request, all pieces (T1 F1/F2). SpeechT5's
+        // own output starts and ends near silence (~40 ms lead, ~150-190 ms tail,
+        // edges about -52 dBFS, measured on the T1 sweep), so the pieces are
+        // joined as they are: no inserted gap, no fade.
+        match handle.synthesize_pieces(pieces, req.voice, req.speed).await {
             Ok(s) => s,
-            Err(crate::cb_engine::AdmitError::AtCapacity) => {
-                return openai_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "server at capacity — all inference slots busy, retry shortly",
-                    "rate_limit_error",
-                    Some("server_overloaded"),
-                );
-            }
-            Err(crate::cb_engine::AdmitError::Closing) => {
-                return super::error::model_closing_response();
-            }
-            Err(crate::cb_engine::AdmitError::EngineDead) => {
-                return openai_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "TTS engine unavailable (engine thread exited)",
-                    "server_error",
-                    Some("engine_unavailable"),
-                );
-            }
-            Err(crate::cb_engine::AdmitError::Failed(e)) => {
-                return inference_error_response(Some(mm), handle.model_id(), &e);
-            }
+            Err(e) => return speech_admit_error_response(e, mm, &handle),
         }
     } else {
         // Mock path (no GPU): one second of silence so the route and both
@@ -677,7 +743,7 @@ pub async fn speech(
         vec![0.0_f32; TTS_SAMPLE_RATE as usize]
     };
 
-    match fmt {
+    let mut response = match fmt {
         "wav" => {
             let bytes = encode_wav_i16(&samples, sample_rate);
             (StatusCode::OK, [(CONTENT_TYPE, "audio/wav")], bytes).into_response()
@@ -699,6 +765,44 @@ pub async fn speech(
                 .into_response()
         }
         _ => unreachable!("fmt already validated to 'wav' or 'pcm'"),
+    };
+    if let Some((n, cap)) = segments {
+        let headers = response.headers_mut();
+        headers.insert(
+            HeaderName::from_static(TTS_SEGMENTS_HEADER),
+            HeaderValue::from(n),
+        );
+        headers.insert(
+            HeaderName::from_static(TTS_SEGMENT_CAP_HEADER),
+            HeaderValue::from(cap),
+        );
+    }
+    response
+}
+
+/// The response for a failed TTS synthesis call (one piece of a request).
+fn speech_admit_error_response(
+    e: crate::cb_engine::AdmitError,
+    mm: &std::sync::Arc<ModelManager>,
+    handle: &crate::pipelines::tts::TtsHandle,
+) -> Response {
+    match e {
+        crate::cb_engine::AdmitError::AtCapacity => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "server at capacity — all inference slots busy, retry shortly",
+            "rate_limit_error",
+            Some("server_overloaded"),
+        ),
+        crate::cb_engine::AdmitError::Closing => super::error::model_closing_response(),
+        crate::cb_engine::AdmitError::EngineDead => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TTS engine unavailable (engine thread exited)",
+            "server_error",
+            Some("engine_unavailable"),
+        ),
+        crate::cb_engine::AdmitError::Failed(e) => {
+            inference_error_response(Some(mm), handle.model_id(), &e)
+        }
     }
 }
 
@@ -906,7 +1010,7 @@ pub async fn image_generations(
         "image generation request"
     );
 
-    let t0 = std::time::Instant::now();
+    let mut t0 = std::time::Instant::now();
     let mut hmeta = HandleMetadata::default();
     let mut device = None;
     let pngs = if let Some(mm) = state.model_manager.as_ref() {
@@ -914,19 +1018,18 @@ pub async fn image_generations(
         if let Some(resp) = cpu_pixel_limit_refusal(mm, &req.model, pixels) {
             return resp;
         }
-        let handle = match mm.get_image_handle(&req.model) {
+        // Slice 3c parity (see the STT path above): lazy-load an `on_demand` image model on
+        // first request rather than failing flat; F1b: waiting up to `on_demand_wait_secs`.
+        let handle = match super::on_demand::resolve_with_wait(mm, &req.model, || {
+            mm.get_image_handle(&req.model)
+        })
+        .await
+        {
             Ok(h) => h,
-            // Slice 3c parity (see the STT path above): lazy-load an `on_demand`
-            // image model on first request rather than failing flat.
-            Err(ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-                    OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
-                };
-            }
-            Err(e) => return model_error_response(e),
+            Err(u) => return u.into_response(&req.model),
         };
+        // `elapsed_ms` measures the generation, not an on-demand wait.
+        t0 = std::time::Instant::now();
         hmeta = HandleMetadata::from_handle(&handle);
         device = mm
             .device_info_for(handle.model_id())
@@ -1196,21 +1299,42 @@ pub async fn image_edits(
     authenticated: Option<Extension<Authenticated>>,
     MultipartBody(multipart): MultipartBody,
 ) -> Response {
-    let req = match parse_edit_request(multipart).await {
+    let mut req = match parse_edit_request(multipart).await {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
 
-    // Decode the source image (and translate the OpenAI alpha mask → OV mask).
-    let init = match crate::image_util::decode_image_bytes(&req.image) {
-        Ok(d) => RgbImage {
-            width: d.width,
-            height: d.height,
-            data: d.data,
-        },
-        Err(e) => {
-            return bad_request_owned(format!("could not decode 'image': {e}"), "invalid_image");
-        }
+    // Decode the source image (and translate the OpenAI alpha mask → OV mask), image and mask
+    // within one request budget (0.9.1 S5). No manager (no-GPU test path): the config defaults.
+    let limits = state
+        .model_manager
+        .as_ref()
+        .map_or_else(crate::image_util::ImageLimits::default, |mm| {
+            mm.image_limits()
+        });
+    // Both decoded on the blocking pool, two requests at a time server-wide (0.9.1 S5b).
+    let image_bytes = std::mem::take(&mut req.image);
+    let mask_bytes = req.mask.take();
+    let decoded = crate::image_util::decode_off_runtime(move || {
+        let mut budget = crate::image_util::ImageBudget::new(limits);
+        let image = crate::image_util::decode_image_bytes(&image_bytes, &mut budget)
+            .map_err(|e| ("image", e))?;
+        let mask = mask_bytes
+            .map(|b| crate::image_util::decode_mask_bytes(&b, &mut budget))
+            .transpose()
+            .map_err(|e| ("mask", e))?;
+        Ok::<_, (&'static str, anyhow::Error)>((image, mask))
+    })
+    .await;
+    let (image, mask) = match decoded {
+        Ok(Ok(pair)) => pair,
+        Ok(Err((field, e))) => return image_decode_error(field, &e),
+        Err(e) => return image_decode_error("image", &e),
+    };
+    let init = RgbImage {
+        width: image.width,
+        height: image.height,
+        data: image.data,
     };
     // Measured incident: a source image smaller than the pipeline's own downsampling
     // stack can tolerate makes OpenVINO's shape-inference throw ("Kernel after
@@ -1234,28 +1358,23 @@ pub async fn image_edits(
             "image_too_small",
         );
     }
-    let mask = match req.mask.as_deref() {
-        Some(bytes) => match crate::image_util::decode_mask_bytes(bytes) {
-            Ok(d) => {
-                if (d.width, d.height) != (init.width, init.height) {
-                    return bad_request_owned(
-                        format!(
-                            "'mask' dimensions {}x{} must match 'image' {}x{}",
-                            d.width, d.height, init.width, init.height
-                        ),
-                        "mask_size_mismatch",
-                    );
-                }
-                Some(RgbImage {
-                    width: d.width,
-                    height: d.height,
-                    data: d.data,
-                })
+    let mask = match mask {
+        Some(d) => {
+            if (d.width, d.height) != (init.width, init.height) {
+                return bad_request_owned(
+                    format!(
+                        "'mask' dimensions {}x{} must match 'image' {}x{}",
+                        d.width, d.height, init.width, init.height
+                    ),
+                    "mask_size_mismatch",
+                );
             }
-            Err(e) => {
-                return bad_request_owned(format!("could not decode 'mask': {e}"), "invalid_mask");
-            }
-        },
+            Some(RgbImage {
+                width: d.width,
+                height: d.height,
+                data: d.data,
+            })
+        }
         None => None,
     };
 
@@ -1282,7 +1401,7 @@ pub async fn image_edits(
         );
     }
 
-    let t0 = std::time::Instant::now();
+    let mut t0 = std::time::Instant::now();
     let mut hmeta = HandleMetadata::default();
     let mut device = None;
     let pngs = if let Some(mm) = state.model_manager.as_ref() {
@@ -1290,19 +1409,18 @@ pub async fn image_edits(
         if let Some(resp) = cpu_pixel_limit_refusal(mm, &req.model, pixels) {
             return resp;
         }
-        let handle = match mm.get_image_handle(&req.model) {
+        // Slice 3c parity (see image_generations): lazy-load an `on_demand` image model on
+        // first request rather than failing flat; F1b: waiting up to `on_demand_wait_secs`.
+        let handle = match super::on_demand::resolve_with_wait(mm, &req.model, || {
+            mm.get_image_handle(&req.model)
+        })
+        .await
+        {
             Ok(h) => h,
-            // Slice 3c parity (see image_generations): lazy-load an `on_demand`
-            // image model on first request rather than failing flat.
-            Err(ModelError::NotLoaded) => {
-                return match mm.request_on_demand_load(&req.model) {
-                    OnDemandLoad::Loading => model_error_response(ModelError::Loading),
-                    OnDemandLoad::ShuttingDown => model_error_response(ModelError::ShuttingDown),
-                    OnDemandLoad::NotApplicable => model_error_response(ModelError::NotLoaded),
-                };
-            }
-            Err(e) => return model_error_response(e),
+            Err(u) => return u.into_response(&req.model),
         };
+        // `elapsed_ms` measures the generation, not an on-demand wait.
+        t0 = std::time::Instant::now();
         hmeta = HandleMetadata::from_handle(&handle);
         device = mm
             .device_info_for(handle.model_id())
@@ -1610,6 +1728,24 @@ mod tests {
         assert_eq!(
             speech_text("5".into(), true, Some("pl-PL"), Some("en")),
             "pięć"
+        );
+    }
+
+    /// 0.9.1 C6: Unicode spaces reach no backend, with normalisation on, off, or skipped for a
+    /// language without number words; with it on, the digits are then spelled out.
+    #[test]
+    fn speech_text_maps_unicode_spaces_before_anything_else() {
+        assert_eq!(
+            speech_text("328\u{202f}feet".into(), true, Some("en"), None),
+            "three hundred twenty eight feet"
+        );
+        assert_eq!(
+            speech_text("328\u{202f}feet\u{a0}high".into(), false, None, None),
+            "328 feet high"
+        );
+        assert_eq!(
+            speech_text("328\u{2009}Fu\u{2007}ss".into(), true, Some("de"), None),
+            "328 Fu ss"
         );
     }
 
@@ -1966,6 +2102,368 @@ mod tests {
             keys,
             std::collections::BTreeSet::from(["id", "full_name", "kind", "tier"]),
             "architecture/total_mem_gb must be absent when None, never null: {obj:?}"
+        );
+    }
+
+    // ── 0.9.1 T1: SpeechT5 input split into pieces, audio joined ──────────
+
+    /// A manager-backed app with one mock TTS model loaded. A `speecht5` name
+    /// gets the SpeechT5-like mock (segment cap 200, one sample per character
+    /// encoding it); any other name the plain mock (no cap).
+    async fn tts_app(model: &str) -> axum::Router {
+        tts_app_and_manager(model).await.0
+    }
+
+    async fn tts_app_and_manager(model: &str) -> (axum::Router, std::sync::Arc<ModelManager>) {
+        let json = format!(
+            r#"{{"models_dir":"/tmp/test-t1-tts-models","device":"CPU","preload":[],
+                "models":{{"{model}":{{"vram_gb":0.5}}}},"total_vram_gb":22.5,
+                "vram_safety_margin_gb":0.0,"min_kv_cache_gb":0.0,"eviction_grace_secs":0.0}}"#
+        );
+        let cfg: crate::model_manager::Config = serde_json::from_str(&json).unwrap();
+        let mm = ModelManager::new(
+            cfg,
+            std::sync::Arc::new(crate::model_manager::lifecycle::MockEngineFactory::default()),
+        )
+        .await
+        .unwrap();
+        mm.load_model(model).await.unwrap();
+        let mm = std::sync::Arc::new(mm);
+        (
+            crate::create_router(AppState::new().with_model_manager(std::sync::Arc::clone(&mm))),
+            mm,
+        )
+    }
+
+    async fn post_speech(
+        app: axum::Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    /// The i16 PCM the handler writes for `samples` (same quantisation).
+    fn pcm_of(samples: &[f32]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for s in samples {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            v.extend_from_slice(&i.to_le_bytes());
+        }
+        v
+    }
+
+    fn header<'a>(h: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        h.get(name).map(|v| v.to_str().unwrap())
+    }
+
+    #[tokio::test]
+    async fn speecht5_long_input_is_split_and_the_audio_joined_in_order() {
+        let text =
+            "The keeper climbed the narrow stairs and lit the great lamp before the sun went down. "
+                .repeat(6) + "Ships passed in the night, trusting its steady beam.";
+        let text = text.trim().to_owned();
+        assert!(text.chars().count() > 400);
+        let pieces = crate::tts_split::split_for_speech(&text, 200);
+        assert!(pieces.len() >= 3, "{pieces:?}");
+
+        let app = tts_app("speecht5-tts-ov").await;
+        let (status, headers, body) = post_speech(
+            app,
+            serde_json::json!({"model":"speecht5-tts-ov","input":text,"response_format":"pcm"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header(&headers, "x-rustedvino-tts-segments"),
+            Some(pieces.len().to_string().as_str())
+        );
+        assert_eq!(
+            header(&headers, "x-rustedvino-tts-segment-cap"),
+            Some("200")
+        );
+        // The mock answers each piece with one sample per character encoding it:
+        // the body is the per-piece outputs concatenated, in order.
+        let expected: Vec<f32> = pieces
+            .iter()
+            .flat_map(|p| crate::pipelines::tts::mock_samples_for(p))
+            .collect();
+        assert_eq!(body, pcm_of(&expected));
+        // And not the single-call output (that would be one long piece).
+        assert_ne!(
+            body,
+            pcm_of(&crate::pipelines::tts::mock_samples_for(&text))
+        );
+    }
+
+    #[tokio::test]
+    async fn speecht5_short_input_is_one_unchanged_piece_and_still_gets_the_headers() {
+        // Leading/trailing spaces survive: the text handed to the engine is unchanged.
+        let text = "  Hello there, keeper.  ";
+        let app = tts_app("speecht5-tts-ov").await;
+        let (status, headers, body) = post_speech(
+            app,
+            serde_json::json!({"model":"speecht5-tts-ov","input":text,"response_format":"pcm"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&headers, "x-rustedvino-tts-segments"), Some("1"));
+        assert_eq!(
+            header(&headers, "x-rustedvino-tts-segment-cap"),
+            Some("200")
+        );
+        let normalised = speech_text(text.to_owned(), true, None, Some("en"));
+        assert_eq!(
+            body,
+            pcm_of(&crate::pipelines::tts::mock_samples_for(&normalised))
+        );
+    }
+
+    #[tokio::test]
+    async fn speecht5_split_runs_after_normalisation() {
+        // 40 four-digit numbers: ~200 chars raw, far more once spelled out.
+        let text = "1234 ".repeat(40);
+        let normalised = speech_text(text.clone(), true, None, Some("en"));
+        let expect_n = crate::tts_split::split_for_speech(&normalised, 200).len();
+        assert!(expect_n > 1);
+        let app = tts_app("speecht5-tts-ov").await;
+        let (status, headers, _) = post_speech(
+            app,
+            serde_json::json!({"model":"speecht5-tts-ov","input":text}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header(&headers, "x-rustedvino-tts-segments"),
+            Some(expect_n.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_a_cap_gets_no_split_and_no_headers() {
+        let app = tts_app("kokoro-tts-ov").await;
+        let (status, headers, body) = post_speech(
+            app,
+            serde_json::json!({"model":"kokoro-tts-ov","input":"word ".repeat(200),"response_format":"pcm"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("x-rustedvino-tts-segments").is_none());
+        assert!(headers.get("x-rustedvino-tts-segment-cap").is_none());
+        // The plain mock answers its one call with 1 s of 16 kHz silence.
+        assert_eq!(body.len(), 16_000 * 2);
+    }
+
+    #[tokio::test]
+    async fn speecht5_a_failing_second_piece_is_an_error_with_no_headers_and_no_held_slot() {
+        let marker = crate::pipelines::tts::MOCK_FAIL_MARKER;
+        let first = "The keeper climbed the narrow stairs and lit the great lamp. ".repeat(3);
+        let text = format!("{first}Then the {marker} came in the night. And the end came too.");
+        let pieces = crate::tts_split::split_for_speech(&text, 200);
+        assert!(pieces.len() >= 2 && !pieces[0].contains(marker) && pieces[1].contains(marker));
+
+        let (app, mm) = tts_app_and_manager("speecht5-tts-ov").await;
+        let (status, headers, _) = post_speech(
+            app,
+            serde_json::json!({"model":"speecht5-tts-ov","input":text}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(headers.get("x-rustedvino-tts-segments").is_none());
+        assert!(headers.get("x-rustedvino-tts-segment-cap").is_none());
+        let handle = mm.get_tts_handle("speecht5-tts-ov").unwrap();
+        let mut active = usize::MAX;
+        for _ in 0..200 {
+            active = crate::model_manager::ManagedEngine::active(&handle);
+            if active == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(active, 0, "the request's admission slot is released");
+    }
+
+    /// T1 F3 worst case: a 4096-character run of digits is read digit by digit,
+    /// so normalisation makes it about six times longer and `SpeechT5` gets well
+    /// over 100 pieces — far past the T5 cap of 50, so it is refused (0.9.1 T5).
+    /// The numbers here are the ones INTERFACE.md quotes.
+    #[test]
+    fn worst_case_digit_input_piece_count() {
+        let digits = "7".repeat(MAX_SPEECH_INPUT_CHARS);
+        let normalised = speech_text(digits, true, None, Some("en"));
+        let chars = normalised.chars().count();
+        let n = crate::tts_split::split_for_speech(&normalised, 200).len();
+        eprintln!("worst case: {chars} chars normalised, {n} pieces");
+        assert!((20_000..=30_000).contains(&chars), "{chars}");
+        assert!((100..=160).contains(&n), "{n}");
+    }
+
+    // ── 0.9.1 T5: SpeechT5 refuses more than 50 pieces per request ────────
+
+    /// `n` sentences that each become one piece of their own after
+    /// normalisation (each spells out to more than half the 200 cap, so no two
+    /// pack), short enough raw that 51 fit the 4096-character input limit.
+    fn speech_text_of_pieces(n: usize) -> String {
+        let text = (0..n)
+            .map(|i| format!("Call {} 4444 4444 now.", 1000 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.chars().count() <= MAX_SPEECH_INPUT_CHARS);
+        let normalised = speech_text(text.clone(), true, None, Some("en"));
+        let got = crate::tts_split::split_for_speech(&normalised, 200).len();
+        assert_eq!(got, n, "the helper must produce exactly {n} pieces");
+        text
+    }
+
+    #[tokio::test]
+    async fn speecht5_input_over_50_pieces_is_refused_before_any_synthesis() {
+        const MODEL: &str = "speecht5-t5cap51-tts-ov";
+        assert_eq!(crate::tts_split::SPEECHT5_MAX_PIECES, 50);
+        let (app, mm) = tts_app_and_manager(MODEL).await;
+        let (status, headers, body) = post_speech(
+            app,
+            serde_json::json!({"model":MODEL,"input":speech_text_of_pieces(51)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["code"], "input_too_long", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("51 pieces"), "{msg}");
+        assert!(msg.contains("at most 50 pieces"), "{msg}");
+        assert!(headers.get("x-rustedvino-tts-segments").is_none());
+        assert_eq!(
+            crate::pipelines::tts::mock_pieces_seen(MODEL),
+            0,
+            "no piece reached the engine"
+        );
+        let handle = mm.get_tts_handle(MODEL).unwrap();
+        assert_eq!(crate::model_manager::ManagedEngine::active(&handle), 0);
+    }
+
+    #[tokio::test]
+    async fn speecht5_input_of_exactly_50_pieces_is_synthesized() {
+        const MODEL: &str = "speecht5-t5cap50-tts-ov";
+        let app = tts_app(MODEL).await;
+        let (status, headers, _) = post_speech(
+            app,
+            serde_json::json!({"model":MODEL,"input":speech_text_of_pieces(50),"response_format":"pcm"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&headers, "x-rustedvino-tts-segments"), Some("50"));
+        assert_eq!(crate::pipelines::tts::mock_pieces_seen(MODEL), 50);
+    }
+
+    #[tokio::test]
+    async fn the_piece_cap_does_not_apply_to_an_engine_without_a_segment_cap() {
+        // The same 51-piece input, to a non-SpeechT5 engine: one call, 200 OK.
+        let app = tts_app("kokoro-t5cap-tts-ov").await;
+        let (status, headers, body) = post_speech(
+            app,
+            serde_json::json!({"model":"kokoro-t5cap-tts-ov","input":speech_text_of_pieces(51),"response_format":"pcm"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("x-rustedvino-tts-segments").is_none());
+        assert_eq!(body.len(), 16_000 * 2);
+    }
+
+    /// A split request whose every piece takes `MOCK_SLOW_PIECE_MS` in the mock.
+    fn slow_split_text() -> (String, usize) {
+        let marker = crate::pipelines::tts::MOCK_SLOW_MARKER;
+        let sentence = format!(
+            "The keeper climbed the stairs and the {marker} lit the lamp before night came down."
+        );
+        let text = vec![sentence; 16].join(" ");
+        let n = crate::tts_split::split_for_speech(&text, 200).len();
+        assert!(n >= 8, "{n}");
+        (text, n)
+    }
+
+    /// T1 N1: a forced eviction during a split request stops the request
+    /// between pieces with the retryable 503 and completes promptly (no wait for
+    /// the remaining pieces, no `EvictionIncomplete`).
+    #[tokio::test]
+    async fn speecht5_a_forced_eviction_mid_request_ends_it_and_the_eviction_completes() {
+        // A model id of its own, so the mock's piece count is this test's alone.
+        const MODEL: &str = "speecht5-forced-evict-tts-ov";
+        let (text, n) = slow_split_text();
+        let (app, mm) = tts_app_and_manager(MODEL).await;
+        mm.set_forced_join_deadline_for_test(std::time::Duration::from_secs(2));
+        let request = tokio::spawn(post_speech(
+            app,
+            serde_json::json!({"model":MODEL,"input":text}),
+        ));
+        // Wait (bounded) until piece 1 is with the engine.
+        for _ in 0..1000 {
+            if crate::pipelines::tts::mock_pieces_seen(MODEL) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            crate::pipelines::tts::mock_pieces_seen(MODEL) >= 1,
+            "the request started"
+        );
+
+        // Ok, not EvictionIncomplete (the forced join deadline is 2 s here).
+        mm.evict_model_forced(MODEL).await.unwrap();
+        let (status, headers, _) = request.await.unwrap();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.get("x-rustedvino-tts-segments").is_none());
+        // The piece in flight at the commit finishes; no later piece is sent.
+        // Counted, not timed, so a loaded box cannot flake it.
+        let seen = crate::pipelines::tts::mock_pieces_seen(MODEL);
+        assert!(seen <= 2, "the engine got {seen} of {n} pieces");
+        assert!(mm.get_tts_handle(MODEL).is_err(), "the model is gone");
+    }
+
+    /// T1 N1: a non-forced eviction refused because the request is running
+    /// does not cut it: every piece is synthesized and the response is a 200.
+    #[tokio::test]
+    async fn speecht5_a_refused_eviction_mid_request_does_not_cut_it() {
+        let (text, n) = slow_split_text();
+        let piece = std::time::Duration::from_millis(crate::pipelines::tts::MOCK_SLOW_PIECE_MS);
+        let (app, mm) = tts_app_and_manager("speecht5-tts-ov").await;
+        let request = tokio::spawn(post_speech(
+            app,
+            serde_json::json!({"model":"speecht5-tts-ov","input":text}),
+        ));
+        tokio::time::sleep(piece + piece / 3).await; // between / inside pieces 1-2
+        let refused = mm.evict_model("speecht5-tts-ov").await.unwrap_err();
+        assert!(
+            matches!(
+                refused.downcast_ref::<crate::model_manager::ModelError>(),
+                Some(crate::model_manager::ModelError::TargetBusy(_))
+            ),
+            "{refused}"
+        );
+        let (status, headers, _) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header(&headers, "x-rustedvino-tts-segments"),
+            Some(n.to_string().as_str())
         );
     }
 }

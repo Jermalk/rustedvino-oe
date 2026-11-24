@@ -142,6 +142,12 @@ pub trait ManagedEngine: Send + Sync {
     /// handle sees it; a reload builds a new engine with the flag clear. Default: no-op for a
     /// kind that does not implement the flag yet.
     fn set_closing(&self, _closing: bool) {}
+    /// Tell the engine an eviction of it has **committed** (forced, or non-forced past the
+    /// busy check), as opposed to the transient `set_closing(true)` a refused non-forced
+    /// eviction raises and clears. An engine that runs one HTTP request as several
+    /// engine calls (the split `SpeechT5` request, 0.9.1 T1 N1) stops between calls on it.
+    /// Never cleared: a reload builds a new engine. Default: no-op.
+    fn mark_eviction_committed(&self) {}
     /// Net measured device-memory change (bytes) across this engine's requests
     /// since load — working memory the runtime keeps between requests, which
     /// the config-declared `vram_gb` doesn't see. Only the embedding engine
@@ -278,6 +284,14 @@ pub enum EngineHandleKind {
 }
 
 impl EngineHandleKind {
+    /// The engine is the NPU text pipeline. The one place the sampling resolver's NPU
+    /// rule (no operator presence/frequency penalty there) learns it, for chat, legacy
+    /// completions and realtime alike (0.9.1 V5).
+    #[must_use]
+    pub fn is_npu(&self) -> bool {
+        matches!(self, Self::NpuTextGen(_))
+    }
+
     /// The [`ModelKind`] of the wrapped engine.
     ///
     /// Kept as a `match` (not a constant) so that adding a variant in a
@@ -319,6 +333,30 @@ impl EngineHandleKind {
     #[must_use]
     pub fn aborts_on_shutdown(&self) -> bool {
         matches!(self, Self::TextGen(_))
+    }
+
+    /// The stall-watchdog liveness of a text-generation engine (CB, NPU, VLM; 0.9.1 S1), `None`
+    /// for every other kind (embeddings, media, rerank, decision: out of the watchdog's scope).
+    #[must_use]
+    pub fn liveness(&self) -> Option<&crate::stall_watch::EngineLiveness> {
+        match self {
+            Self::TextGen(h) => Some(h.liveness()),
+            Self::NpuTextGen(h) => Some(h.liveness()),
+            Self::Vision(h) => Some(h.liveness()),
+            Self::Embedding(_)
+            | Self::Stt(_)
+            | Self::Tts(_)
+            | Self::ImageGen(_)
+            | Self::Reranking(_)
+            | Self::Decision(_) => None,
+        }
+    }
+
+    /// True once a generation on this engine instance stalled (0.9.1 S1).
+    #[must_use]
+    pub fn generation_stalled(&self) -> bool {
+        self.liveness()
+            .is_some_and(crate::stall_watch::EngineLiveness::is_dead)
     }
 
     /// Borrow the engine as its uniform [`ManagedEngine`] facade — what the
@@ -444,5 +482,23 @@ mod tests {
             "from_sender's test cap, not the production default"
         );
         assert_eq!(managed.waiting(), 0, "idle VLM has nothing queued");
+    }
+}
+
+#[cfg(test)]
+mod v5_npu_flag_tests {
+    use super::*;
+
+    /// F5: the sampling resolver's NPU flag comes from the engine handle kind only.
+    #[test]
+    fn is_npu_is_true_only_for_the_npu_text_engine() {
+        let (npu, _t1) = crate::npu_engine::spawn_mock_npu("npu-m");
+        assert!(EngineHandleKind::NpuTextGen(npu).is_npu());
+        let (vlm, _t2) = crate::vlm_engine::spawn_mock_vlm("vlm-m");
+        assert!(!EngineHandleKind::Vision(vlm).is_npu());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            !EngineHandleKind::TextGen(crate::cb_engine::EngineHandle::from_sender(tx)).is_npu()
+        );
     }
 }

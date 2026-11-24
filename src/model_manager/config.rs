@@ -159,6 +159,44 @@ pub struct Config {
     #[serde(default = "default_cpu_image_gen_max_pixels")]
     pub cpu_image_gen_max_pixels: u64,
 
+    /// Longest audio upload `/v1/audio/transcriptions` and `/translations` decode, in seconds of
+    /// audio (0.9.1 S4, outside review I-01). The request-body limit bounds the *compressed*
+    /// file only; a highly compressible one (FLAC of silence, a very low bitrate) decodes to
+    /// orders of magnitude more, and one such request could exhaust memory and kill the
+    /// process. Decoding stops with a `400 invalid_audio` once the audio passes this length
+    /// (refused before decoding when the container declares its length). Default 7200 (2 h).
+    /// Worst-case decode memory is this x 48 000 (the highest accepted source rate) x 4 bytes,
+    /// plus this x 16 000 x 4 bytes for the 16 kHz copy: ~1.4 GB + ~0.5 GB at the default.
+    /// At least 1. Restart-only.
+    #[serde(default = "default_max_audio_duration_secs")]
+    pub max_audio_duration_secs: u64,
+
+    /// Most images one request may carry: `image_url` parts of the last chat message to a
+    /// vision model, or the image and mask of `/v1/images/edits` (0.9.1 S5, outside review
+    /// I-02). Over it is a `400 too_many_images`. Default 16. At least 1. Restart-only.
+    #[serde(default = "default_max_images_per_request")]
+    pub max_images_per_request: usize,
+
+    /// Most pixels (`width x height`, summed over the request's images) one request may decode
+    /// (0.9.1 S5). A tiny PNG can declare 16k x 16k; each image's size is read from its header
+    /// and the request refused (`400 image_too_large`) before any pixel is allocated. Decoded
+    /// RGB costs 3 bytes per pixel: the default 67 108 864 (64 MP — one 50 MP photo, or 16
+    /// screenshots at 2560x1600) is ~192 MB, ~512 MB transient for a 16-bit PNG. At least
+    /// 65 536. Restart-only.
+    #[serde(default = "default_max_image_pixels_per_request")]
+    pub max_image_pixels_per_request: u64,
+
+    /// Most pixels (`width x height`) one image may have when it reaches a vision model (0.9.1
+    /// C28). A decoded chat image over it is downscaled — both sides by the same factor, aspect
+    /// kept — to at most this many pixels; one at or under it is passed through untouched. The
+    /// vision encoder's memory grows with the image (qwen3.5-9B on an Arc 140V iGPU: 1 MP
+    /// ~0.65 GiB, 2 MP ~1.15 GiB, 4 MP ~3 GiB, 8 MP out of GPU memory), so one large photo
+    /// could take a UMA box down. Default 4 000 000 (4 MP). At least 65 536. Per image;
+    /// [`Self::max_image_pixels_per_request`] still counts the original (header) pixels.
+    /// Image edits (`/v1/images/edits`) are not affected. Restart-only.
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u64,
+
     /// Minimum KV cache pool size in GB.
     ///
     /// If the computed KV pool (free VRAM minus safety margin) would be smaller
@@ -517,10 +555,25 @@ pub struct Config {
     #[serde(default = "default_max_tokens_cap")]
     pub max_tokens_cap: usize,
 
+    /// No-token watchdog, first deadline (0.9.1 S1): the most seconds a text generation (chat,
+    /// legacy completions, a realtime LLM turn) may go from the moment its engine starts it (not
+    /// while it waits for a slot) to its first generated token. When it passes, the request ends
+    /// with `generation_stalled` and the model's engine is marked dead (a GPU model sets the
+    /// GPU-poisoned flag; a CPU or NPU model is booked as stalled until it is unloaded and
+    /// loaded again). Default 600; `0` = off. Restart-only.
+    #[serde(default = "default_stream_first_token_timeout_secs")]
+    pub stream_first_token_timeout_secs: u64,
+
+    /// No-token watchdog, second deadline (0.9.1 S1): the longest gap, in seconds, between two
+    /// generated tokens after the first. Same action as
+    /// [`Self::stream_first_token_timeout_secs`]. Default 120; `0` = off. Restart-only.
+    #[serde(default = "default_stream_token_gap_timeout_secs")]
+    pub stream_token_gap_timeout_secs: u64,
+
     /// IP address the HTTP server binds to. Default **`127.0.0.1`**
     /// (loopback — secure by default, T4.2). Set `"0.0.0.0"` for LAN/public
-    /// exposure; with `api_keys` empty that additionally requires
-    /// [`allow_insecure_public_bind`](Self::allow_insecure_public_bind).
+    /// exposure; with no `api_keys` in the keys file (admin keys do not count) that
+    /// additionally requires [`allow_insecure_public_bind`](Self::allow_insecure_public_bind).
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
@@ -529,8 +582,9 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// Explicit opt-in to a non-loopback bind while auth is OFF
-    /// (`api_keys` empty). Default **false**: a public bind with no auth
+    /// Explicit opt-in to a non-loopback bind while inference auth is OFF
+    /// (no `api_keys` in the keys file; admin keys alone do not close inference,
+    /// 0.9.1 S3). Default **false**: a public bind with open inference
     /// refuses to start (committee finding 32 — the shipped defaults must
     /// never boot an open server on the network by accident).
     #[serde(default)]
@@ -715,6 +769,15 @@ pub struct Config {
     /// Otherwise at least 60. Per-model `load_timeout_secs` overrides it.
     #[serde(default = "default_load_timeout_secs")]
     pub load_timeout_secs: u64,
+
+    /// F1b: how long (seconds) a request to a `load: on_demand` model that is
+    /// not loaded holds while its load runs, instead of an immediate `503` + `Retry-After`.
+    /// `0` (the default) = no wait, the pre-0.9.1 answer. At most [`MAX_ON_DEMAND_WAIT_SECS`],
+    /// and below a non-zero global `load_timeout_secs`; per request it is also kept below the
+    /// model's own effective `load_timeout_secs`. Global only; a config reload does not apply it
+    /// (restart).
+    #[serde(default)]
+    pub on_demand_wait_secs: u64,
 
     /// Tuning for the `--supervise` crash auto-restart wrapper (Linux only —
     /// inert on Windows, where supervise mode never runs). Absent block =
@@ -966,6 +1029,31 @@ pub(crate) fn default_load_timeout_secs() -> u64 {
 
 /// Smallest non-zero `load_timeout_secs`: a cold compile of a large model takes minutes.
 pub(crate) const MIN_LOAD_TIMEOUT_SECS: u64 = 60;
+
+/// Largest `on_demand_wait_secs` (F1b): covers the slow fleet loads (a big VLM
+/// on a dGPU) and stays well below the 600 s default `load_timeout_secs`.
+pub const MAX_ON_DEMAND_WAIT_SECS: u64 = 300;
+
+/// F1b: `on_demand_wait_secs` is at most [`MAX_ON_DEMAND_WAIT_SECS`] and, when the global
+/// `load_timeout_secs` is not `0` (no deadline), below it: a request must never be told to
+/// wait longer than the load it waits for may run.
+fn validate_on_demand_wait(wait_secs: u64, load_timeout_secs: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        wait_secs <= MAX_ON_DEMAND_WAIT_SECS,
+        "on_demand_wait_secs must be at most {MAX_ON_DEMAND_WAIT_SECS} (got {wait_secs})"
+    );
+    anyhow::ensure!(
+        load_timeout_secs == 0 || wait_secs < load_timeout_secs,
+        "on_demand_wait_secs ({wait_secs}) must be below load_timeout_secs \
+         ({load_timeout_secs}): a request may not wait longer than its load may run"
+    );
+    Ok(())
+}
+
+/// Upper bound on the `supervisor` seconds fields and the two sweep intervals: one year (FM-4).
+/// Far above any useful value, and low enough that summing several of them or adding one to an
+/// `Instant` cannot overflow.
+pub const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// Default eviction-grace window: 2s. It only has to cover the race between a
 /// load finishing and its first request arriving; a model with a running
@@ -1362,6 +1450,22 @@ pub struct ModelPolicy {
     /// one-time warning. Speculative-decoding models ignore it too.
     #[serde(default)]
     pub kv_cache_precision: Option<String>,
+
+    /// The operator's per-model sampling profile layer (0.9.1 V5a): defaults
+    /// for a request that does not set its own, over the model's
+    /// `generation_config.json`. `None` (the default) = no operator layer.
+    /// Hot: a change applies to the next request. See [`SamplingConfig`].
+    #[serde(default)]
+    pub sampling: Option<SamplingConfig>,
+
+    /// The model's default thinking budget in tokens (0.9.1): a request that sets no
+    /// `thinking_budget_tokens` / `reasoning_effort` / `enable_thinking` of its own thinks at
+    /// most this long. STRICT: a request that reaches it inside its reasoning stops with
+    /// `finish_reason: "length"` and normally no answer. `0` = thinking off by default; `None`
+    /// (the default) = no budget. Hot: a change applies to the next request. See
+    /// `crate::thinking_budget` for the precedence and the clamp below `max_tokens`.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl Default for ModelPolicy {
@@ -1388,6 +1492,8 @@ impl Default for ModelPolicy {
             load_timeout_secs: None,
             enable_prefix_caching: None,
             kv_cache_precision: None,
+            sampling: None,
+            thinking_budget_tokens: None,
         }
     }
 }
@@ -1426,6 +1532,142 @@ pub struct SpeculativeConfig {
     /// verified on this exact box/driver/OV version.
     #[serde(default = "default_verify_on_load")]
     pub verify_on_load: bool,
+}
+
+/// The operator's per-model sampling defaults (0.9.1 V5a), nested so a typo
+/// (`temprature`) is an error instead of a silently ignored key. Values a
+/// client sends always win; see `model_manager::sampling::SamplingProfile` for
+/// the precedence. Validated by [`validate_model_entry`] (ranges) and
+/// [`validate_sampling_against_file`] (the `do_sample` rule). Stored as `f64`
+/// like the other numeric settings, so a value is written back to `config.json`
+/// exactly as the operator typed it (an `f32` widens to `0.15000000596046448`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingConfig {
+    /// `[0, 2]`; `0` = greedy (then `top_p`/`top_k` are rejected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// `(0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// At least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+    /// `[1.0, 2.0]`; `1.0` is an explicit opt-out of the server's 1.1 net.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f64>,
+    /// `[-2, 2]`. Not forwarded on NPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    /// `[-2, 2]`. Not forwarded on NPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+}
+
+/// Range checks of a model's `sampling` object (no disk access).
+fn validate_sampling(model_id: &str, s: &SamplingConfig) -> anyhow::Result<()> {
+    let at = |f: &str| format!("models['{model_id}'].sampling.{f}");
+    if let Some(t) = s.temperature {
+        anyhow::ensure!(
+            (0.0..=2.0).contains(&t),
+            "{} must be between 0 and 2, got {t}",
+            at("temperature")
+        );
+    }
+    if let Some(p) = s.top_p {
+        anyhow::ensure!(
+            p > 0.0 && p <= 1.0,
+            "{} must be greater than 0 and at most 1, got {p}",
+            at("top_p")
+        );
+    }
+    if let Some(k) = s.top_k {
+        anyhow::ensure!(
+            k >= 1,
+            "{} must be at least 1, got {k} (omit it for no top-k cut)",
+            at("top_k")
+        );
+    }
+    if s.temperature.is_some_and(|t| t <= 0.0) {
+        anyhow::ensure!(
+            s.top_p.is_none() && s.top_k.is_none(),
+            "{} is 0 (greedy): top_p/top_k cannot be combined with it — remove them, \
+             or set a temperature above 0",
+            at("temperature")
+        );
+    }
+    if let Some(r) = s.repetition_penalty {
+        anyhow::ensure!(
+            (1.0..=2.0).contains(&r),
+            "{} must be between 1.0 and 2.0 (1.0 turns the server's 1.1 default off), got {r}",
+            at("repetition_penalty")
+        );
+    }
+    for (name, v) in [
+        ("presence_penalty", s.presence_penalty),
+        ("frequency_penalty", s.frequency_penalty),
+    ] {
+        if let Some(v) = v {
+            anyhow::ensure!(
+                (-2.0..=2.0).contains(&v),
+                "{} must be between -2 and 2, got {v}",
+                at(name)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `sampling` rule that needs the model's own `generation_config.json`
+/// (blocking file I/O; call off the async runtime): an operator `top_p` /
+/// `top_k` without a `temperature` is rejected unless the file says
+/// `do_sample: true` with a valid temperature — otherwise the engine would
+/// sample at its own T 1.0 (see `FileSampling::samples_with_temperature`).
+/// A missing file counts as no `do_sample`. The file is read only when the
+/// rule can fire (see [`check_sampling_do_sample`]).
+///
+/// # Errors
+/// The rule above is violated.
+pub(crate) fn validate_sampling_against_file(
+    model_id: &str,
+    entry: &ModelEntry,
+    model_dir: &Path,
+) -> anyhow::Result<()> {
+    if !sampling_needs_do_sample(entry) {
+        return Ok(());
+    }
+    let file = super::sampling::load_file_sampling(model_dir);
+    check_sampling_do_sample(model_id, entry, file.samples_with_temperature())
+}
+
+/// `entry`'s `sampling` sets `top_p`/`top_k` without a `temperature`.
+fn sampling_needs_do_sample(entry: &ModelEntry) -> bool {
+    entry
+        .policy
+        .sampling
+        .is_some_and(|s| s.temperature.is_none() && (s.top_p.is_some() || s.top_k.is_some()))
+}
+
+/// [`validate_sampling_against_file`] with the file's answer already known (a
+/// registered model's record holds its file layer): `do_sample` is
+/// `FileSampling::samples_with_temperature`.
+///
+/// # Errors
+/// `entry`'s `sampling` sets `top_p`/`top_k` without a temperature and
+/// `do_sample` is `false`.
+pub(crate) fn check_sampling_do_sample(
+    model_id: &str,
+    entry: &ModelEntry,
+    do_sample: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        do_sample || !sampling_needs_do_sample(entry),
+        "models['{model_id}'].sampling sets top_p/top_k without a temperature, and the model's \
+         generation_config.json has no do_sample: true with a valid temperature — the engine \
+         would sample at its own default temperature 1.0. Set sampling.temperature, or remove \
+         top_p/top_k"
+    );
+    Ok(())
 }
 
 fn default_num_assistant_tokens() -> usize {
@@ -1475,6 +1717,28 @@ impl Default for ModelEntry {
             policy: ModelPolicy::default(),
         }
     }
+}
+
+/// The JSON keys of a model stanza whose value in `file` differs from `current`, sorted (C8: what
+/// a config reload did not apply to a loaded model). Compared as the serialised stanza, so a field
+/// added to [`ModelEntry`] or [`ModelPolicy`] is covered without listing it here; a key absent on
+/// one side counts as `null`.
+pub(crate) fn model_entry_changes(current: &ModelEntry, file: &ModelEntry) -> Vec<String> {
+    let as_map = |e: &ModelEntry| match serde_json::to_value(e) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let (a, b) = (as_map(current), as_map(file));
+    let null = serde_json::Value::Null;
+    let mut keys: Vec<String> = a
+        .keys()
+        .chain(b.keys())
+        .filter(|k| a.get(*k).unwrap_or(&null) != b.get(*k).unwrap_or(&null))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Deserialize helper for a tri-state optional field: JSON key absent ⇒
@@ -1578,6 +1842,13 @@ pub struct ModelEntryPatch {
     pub capabilities: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub eviction_grace_secs: Option<Option<f64>>,
+    /// Whole-object replace when supplied; `null` clears the operator layer.
+    /// Hot: applies to the next request, a `Ready` model included.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub sampling: Option<Option<SamplingConfig>>,
+    /// `null` clears it (no budget). Hot: applies to the next request, a `Ready` model included.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub thinking_budget_tokens: Option<Option<u32>>,
 }
 
 impl ModelEntryPatch {
@@ -1605,6 +1876,8 @@ impl ModelEntryPatch {
             && self.model_revision.is_none()
             && self.capabilities.is_none()
             && self.eviction_grace_secs.is_none()
+            && self.sampling.is_none()
+            && self.thinking_budget_tokens.is_none()
     }
 
     /// `true` when `device` or `tier_preference` was supplied — the two
@@ -1715,9 +1988,34 @@ impl ModelEntryPatch {
             entry.policy.capabilities = v;
         }
         hot_opt!(eviction_grace_secs, "eviction_grace_secs");
+        hot_opt!(sampling, "sampling");
+        hot_opt!(thinking_budget_tokens, "thinking_budget_tokens");
 
         (entry, out)
     }
+}
+
+/// True when `id` is a single plain path component, so `models_dir.join(id)` stays inside
+/// `models_dir`: non-empty, not `.` or `..`, no separators, no NUL, and no Windows drive prefix
+/// (`C:`, `c:foo`). The drive check is explicit so it holds on every platform: on Linux `C:` is an
+/// ordinary name, but a config written there may be served on Windows, where `join("C:")` replaces
+/// the base. A `:` elsewhere (`qwen:7b`) stays allowed. Used for model ids and
+/// `speculative.draft_model` (FM-7).
+pub(crate) fn is_plain_model_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    let drive_prefix = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !drive_prefix
+        && !id.contains(['/', '\\', '\0'])
+        && matches!(
+            std::path::Path::new(id)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [std::path::Component::Normal(_)]
+        )
 }
 
 /// `0` (no deadline) or at least [`MIN_LOAD_TIMEOUT_SECS`].
@@ -1801,6 +2099,26 @@ pub(crate) fn default_cpu_image_gen_max_pixels() -> u64 {
     1024 * 1024
 }
 
+/// Default for [`Config::max_audio_duration_secs`]: two hours of audio.
+pub(crate) fn default_max_audio_duration_secs() -> u64 {
+    2 * 60 * 60
+}
+
+/// Default for [`Config::max_images_per_request`].
+pub(crate) fn default_max_images_per_request() -> usize {
+    16
+}
+
+/// Default for [`Config::max_image_pixels_per_request`]: 64 MP.
+pub(crate) fn default_max_image_pixels_per_request() -> u64 {
+    64 * 1024 * 1024
+}
+
+/// Default for [`Config::max_image_pixels`]: 4 MP (decimal — the measured "4 MP" step).
+pub(crate) fn default_max_image_pixels() -> u64 {
+    4_000_000
+}
+
 fn default_vram_safety_margin() -> f64 {
     1.0 // 1 GB — observed headroom for the OV/OpenCL runtime on Battlemage
 }
@@ -1873,6 +2191,17 @@ pub(crate) fn default_max_prompt_array() -> usize {
 /// generous for real outputs, fatal to slot-pinning abuse.
 pub(crate) fn default_max_tokens_cap() -> usize {
     8192
+}
+
+/// Default for [`Config::stream_first_token_timeout_secs`]: 600 s (S1): about
+/// 120k prompt tokens at the 200 tok/s prefill floor the generation watchdog assumes.
+pub(crate) fn default_stream_first_token_timeout_secs() -> u64 {
+    600
+}
+
+/// Default for [`Config::stream_token_gap_timeout_secs`]: 120 s (S1).
+pub(crate) fn default_stream_token_gap_timeout_secs() -> u64 {
+    120
 }
 
 /// Default HTTP bind address: loopback (secure by default, T4.2).
@@ -1986,6 +2315,7 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         normalize_kv_precision(&self.kv_cache_precision)?;
         validate_load_timeout("load_timeout_secs", self.load_timeout_secs)?;
+        validate_on_demand_wait(self.on_demand_wait_secs, self.load_timeout_secs)?;
         anyhow::ensure!(
             matches!(self.ov_cache_layout.as_str(), "keyed" | "flat"),
             "ov_cache_layout {:?} is not supported; accepted values: \"keyed\", \"flat\"",
@@ -2024,6 +2354,11 @@ impl Config {
             self.max_embedding_inputs >= 1,
             "max_embedding_inputs must be at least 1 (0 would reject every /v1/embeddings request)"
         );
+        anyhow::ensure!(
+            self.max_prompt_array >= 1,
+            "max_prompt_array must be at least 1 (0 would reject every /v1/completions request)"
+        );
+        self.validate_intervals()?;
         let knobs: [(&str, f64); 7] = [
             ("total_vram_gb", self.total_vram_gb),
             ("cache_size_gb", self.cache_size_gb),
@@ -2049,6 +2384,26 @@ impl Config {
             self.cpu_image_gen_max_pixels >= 256 * 256,
             "config cpu_image_gen_max_pixels must be at least 65536 (256x256), got {}",
             self.cpu_image_gen_max_pixels
+        );
+        anyhow::ensure!(
+            self.max_images_per_request >= 1,
+            "config max_images_per_request must be at least 1, got {}",
+            self.max_images_per_request
+        );
+        anyhow::ensure!(
+            self.max_image_pixels_per_request >= 256 * 256,
+            "config max_image_pixels_per_request must be at least 65536 (256x256), got {}",
+            self.max_image_pixels_per_request
+        );
+        anyhow::ensure!(
+            self.max_image_pixels >= 256 * 256,
+            "config max_image_pixels must be at least 65536 (256x256), got {}",
+            self.max_image_pixels
+        );
+        anyhow::ensure!(
+            self.max_audio_duration_secs >= 1,
+            "config max_audio_duration_secs must be at least 1, got {}",
+            self.max_audio_duration_secs
         );
         anyhow::ensure!(
             self.kv_pressure_threshold_pct <= 100.0,
@@ -2080,7 +2435,33 @@ impl Config {
         // runtime registration path) via `validate_model_entry` so both ways of
         // registering a model enforce identical invariants.
         for (model, entry) in &self.models {
+            // P-C (firmness leftover): a `models` id names a folder inside `models_dir`, as
+            // `models/add` and `speculative.draft_model` already require; `../x`, `a/b`, an
+            // absolute path or a drive letter would read a model from outside it. Refused here
+            // (boot: exit 78; config reload: 422), not skipped.
+            anyhow::ensure!(
+                is_plain_model_id(model),
+                "models['{model}']: the model id must be the name of a folder directly inside \
+                 models_dir (no '/', '\\', '..' or drive letter)"
+            );
             validate_model_entry(model, entry)?;
+            // V5a: the `do_sample` rule reads the model's own file, which can change on disk
+            // without the operator touching config.json (a re-export), so here (boot, reload,
+            // the whole-file check before a config mutation) it only WARNs; it is a hard 400
+            // where the operator writes `sampling` (add, a PATCH setting it). A model whose
+            // directory is missing is skipped at registration, so it is skipped here too.
+            let model_dir = self.models_dir.join(model);
+            if model_dir.is_dir()
+                && let Err(e) = validate_sampling_against_file(model, entry, &model_dir)
+            {
+                tracing::warn!(
+                    model = %model,
+                    error = %e,
+                    "sampling: top_p/top_k are set without a temperature and the model's \
+                     generation_config.json does not turn sampling on — this model samples at \
+                     the engine's default temperature 1.0 when a request sends no temperature"
+                );
+            }
             // Speculative "resident twice" warning needs the full models map,
             // so it stays here rather than in the shared per-entry validator.
             if let Some(spec) = &entry.policy.speculative
@@ -2179,6 +2560,98 @@ impl Config {
         Ok(())
     }
 
+    /// FM-4: the period and count knobs whose `0` would panic, spin or give up at once, and an
+    /// upper bound on every seconds field of the `supervisor` block and both sweep intervals.
+    /// Nothing here is "0 = off": the knobs that do mean off at 0 (`watchdog_hang_ceiling_secs`,
+    /// `gpu_first_load_deadline_secs`, `gpu_probe_deadline_secs`) stay allowed at 0.
+    ///
+    /// - `supervisor.watchdog_poll_secs: 0` — tokio's `interval` panics on a zero period.
+    /// - `supervisor.max_restarts: 0` — "gave up after 0 restarts" before the first worker runs.
+    /// - `supervisor.health_timeout_secs: 0` — every new worker is treated as hung at once.
+    /// - `supervisor.restart_window_secs: 0` — every restart ages out immediately, so the cap
+    ///   never trips and a crash loop never ends.
+    /// - `ov_cache_sweep_interval_secs: 0` / `kv_pressure_sweep_interval_secs: 0` — the sweep
+    ///   re-runs back to back for the life of the process (a directory walk with hashing, in the
+    ///   cache sweep's case).
+    /// - Upper bound [`MAX_INTERVAL_SECS`] (one year): the supervisor adds several of these
+    ///   seconds fields and adds them to `Instant`s, which overflow (wrap in release, panic in a
+    ///   debug build) for values near `u64::MAX`.
+    fn validate_intervals(&self) -> anyhow::Result<()> {
+        let sup = &self.supervisor;
+        let at_least_one: [(&str, u64, &str); 6] = [
+            (
+                "supervisor.watchdog_poll_secs",
+                sup.watchdog_poll_secs,
+                "a zero poll period crashes the supervisor; to turn the generation watchdog off \
+                 set supervisor.watchdog_hang_ceiling_secs to 0",
+            ),
+            (
+                "supervisor.max_restarts",
+                u64::try_from(sup.max_restarts).unwrap_or(u64::MAX),
+                "0 gives up before the first worker runs",
+            ),
+            (
+                "supervisor.health_timeout_secs",
+                sup.health_timeout_secs,
+                "0 treats every new worker as hung at once",
+            ),
+            (
+                "supervisor.restart_window_secs",
+                sup.restart_window_secs,
+                "0 makes the restart cap never trip",
+            ),
+            (
+                "ov_cache_sweep_interval_secs",
+                self.ov_cache_sweep_interval_secs,
+                "0 re-runs the cache sweep back to back; it is not \"off\"",
+            ),
+            (
+                "kv_pressure_sweep_interval_secs",
+                self.kv_pressure_sweep_interval_secs,
+                "0 re-runs the pressure sweep back to back; to turn it off set \
+                 kv_pressure_monitor_enabled to false",
+            ),
+        ];
+        for (name, v, why) in at_least_one {
+            anyhow::ensure!(v >= 1, "config {name} must be at least 1 ({why})");
+        }
+        let bounded: [(&str, u64); 11] = [
+            ("supervisor.backoff_base_secs", sup.backoff_base_secs),
+            ("supervisor.backoff_max_secs", sup.backoff_max_secs),
+            ("supervisor.restart_window_secs", sup.restart_window_secs),
+            ("supervisor.health_timeout_secs", sup.health_timeout_secs),
+            ("supervisor.hang_kill_grace_secs", sup.hang_kill_grace_secs),
+            ("supervisor.watchdog_poll_secs", sup.watchdog_poll_secs),
+            (
+                "supervisor.watchdog_hang_ceiling_secs",
+                sup.watchdog_hang_ceiling_secs,
+            ),
+            (
+                "supervisor.gpu_first_load_deadline_secs",
+                sup.gpu_first_load_deadline_secs,
+            ),
+            (
+                "supervisor.gpu_probe_deadline_secs",
+                sup.gpu_probe_deadline_secs,
+            ),
+            (
+                "ov_cache_sweep_interval_secs",
+                self.ov_cache_sweep_interval_secs,
+            ),
+            (
+                "kv_pressure_sweep_interval_secs",
+                self.kv_pressure_sweep_interval_secs,
+            ),
+        ];
+        for (name, v) in bounded {
+            anyhow::ensure!(
+                v <= MAX_INTERVAL_SECS,
+                "config {name} must be at most {MAX_INTERVAL_SECS} (one year), got {v}"
+            );
+        }
+        Ok(())
+    }
+
     /// T4.1: surface every unknown top-level config key.
     ///
     /// A typo'd key is silently dropped by serde, and for security keys the
@@ -2232,29 +2705,43 @@ impl Config {
     /// T4.2: the public-bind security gate, split out of
     /// [`validated_bind`](Self::validated_bind) — see its doc comment for why.
     ///
-    /// A non-loopback `addr` with `has_keys: false` (the keys file — real
-    /// [`crate::AuthConfig`], not this struct's deprecated `api_keys` field —
-    /// resolved to no keys at all) refuses to start unless
-    /// `allow_insecure_public_bind: true` explicitly accepts it. Call after
+    /// A non-loopback `addr` refuses to start unless `allow_insecure_public_bind: true`
+    /// explicitly accepts it when the keys file (real [`crate::AuthConfig`], not this
+    /// struct's deprecated `api_keys` field) has **no inference keys**
+    /// (`has_inference_keys: false`). Admin keys do not count (0.9.1 S3, outside review
+    /// I-05): inference is gated by `api_keys` alone, so a keys file with only
+    /// `admin_api_keys` — the one `rv start` creates — serves inference to anyone who can
+    /// reach the port. `has_admin_keys` only picks the refusal's wording. Call after
     /// resolving the keys file, before any model load.
     ///
     /// # Errors
-    /// Non-loopback bind + no keys configured, without the explicit opt-in.
+    /// Non-loopback bind + no inference keys, without the explicit opt-in.
     pub fn enforce_open_bind_gate(
         &self,
         addr: std::net::SocketAddr,
-        has_keys: bool,
+        has_inference_keys: bool,
+        has_admin_keys: bool,
     ) -> anyhow::Result<()> {
-        if !addr.ip().is_loopback() && !has_keys && !self.allow_insecure_public_bind {
+        if addr.ip().is_loopback() || has_inference_keys || self.allow_insecure_public_bind {
+            return Ok(());
+        }
+        if has_admin_keys {
             anyhow::bail!(
-                "refusing to start: bind_addr '{}' is reachable from the network but no \
-                 keys are configured (auth OFF). Set keys in the keys file (see \
-                 keys_file/resolve_keys_file_path), bind to 127.0.0.1, or set \
-                 allow_insecure_public_bind: true to explicitly run an open server",
+                "refusing to start: bind_addr '{}' is reachable from the network and the keys \
+                 file has admin_api_keys but no api_keys. Admin keys protect only /v1/admin/*; \
+                 with no api_keys, inference is open to anyone who can reach the port. Add an \
+                 api_keys entry to the keys file, bind to 127.0.0.1, or set \
+                 allow_insecure_public_bind: true to serve inference without a key on purpose",
                 self.bind_addr
             );
         }
-        Ok(())
+        anyhow::bail!(
+            "refusing to start: bind_addr '{}' is reachable from the network but no keys are \
+             configured (auth OFF). Set keys in the keys file (see \
+             keys_file/resolve_keys_file_path), bind to 127.0.0.1, or set \
+             allow_insecure_public_bind: true to explicitly run an open server",
+            self.bind_addr
+        );
     }
 }
 
@@ -2366,6 +2853,9 @@ pub(crate) fn validate_model_entry(model_id: &str, entry: &ModelEntry) -> anyhow
             "models['{model_id}'].eviction_grace_secs must be a finite non-negative number, got {g}"
         );
     }
+    if let Some(s) = &policy.sampling {
+        validate_sampling(model_id, s)?;
+    }
     // Speculative decoding (Layer A — pure config, no disk access; see
     // the project's internal engineering log).
     if let Some(spec) = &policy.speculative {
@@ -2389,6 +2879,12 @@ pub(crate) fn validate_model_entry(model_id: &str, entry: &ModelEntry) -> anyhow
         anyhow::ensure!(
             !spec.draft_model.is_empty(),
             "models['{model_id}'].speculative.draft_model must not be empty"
+        );
+        anyhow::ensure!(
+            is_plain_model_id(&spec.draft_model),
+            "models['{model_id}'].speculative.draft_model '{}' must be the name of a folder \
+             directly inside models_dir (no '/', '\\', '..' or drive letter)",
+            spec.draft_model
         );
         anyhow::ensure!(
             spec.draft_model != model_id,
@@ -2443,7 +2939,8 @@ define_globals_not_applied! {
     diffed: [
         models_dir, device, preload, total_vram_gb, max_num_seqs, cache_size_gb,
         default_kv_cache_gb, vram_safety_margin_gb, npu_footprint_factor,
-        cpu_image_gen_max_pixels, min_kv_cache_gb,
+        cpu_image_gen_max_pixels, max_audio_duration_secs, max_images_per_request,
+        max_image_pixels_per_request, max_image_pixels, min_kv_cache_gb,
         system_ram_reservation_gb, system_ram_budget_gb, default_placement, light_model_max_gb,
         light_stt_max_gb, dgpu_size_ceiling_fraction, domain_budgets,
         eviction_grace_secs, realtime_defaults, realtime_viable_minimum,
@@ -2451,14 +2948,15 @@ define_globals_not_applied! {
         cors_allowed_origins, admission_queue_timeout_ms,
         device_admission_queue_timeout_ms, embedding_device, default_embed_model,
         embedding_pooling, embedding_normalize, max_prompt_array, max_embedding_inputs,
-        max_embedding_batch_tokens, max_tokens_cap,
-        bind_addr, port, allow_insecure_public_bind, ov_cache_dir,
+        max_embedding_batch_tokens, max_tokens_cap, stream_first_token_timeout_secs,
+        stream_token_gap_timeout_secs, bind_addr, port, allow_insecure_public_bind, ov_cache_dir,
         ov_cache_max_gb, ov_cache_sweep_interval_secs, ov_cache_layout, kv_precision_pass,
         kv_gate_mode, kv_gate_exact_on_unknown_engine, kv_headroom_mode, kv_transient_factor,
         kv_headroom_margin_gib, kv_headroom_min_tokens, kv_headroom_inflight_tokens, kv_warmup,
         kv_pressure_monitor_enabled,
         kv_pressure_threshold_pct, kv_pressure_sustained_secs,
-        kv_pressure_sweep_interval_secs, kv_resize_cooldown_secs, load_timeout_secs, supervisor,
+        kv_pressure_sweep_interval_secs, kv_resize_cooldown_secs, load_timeout_secs,
+        on_demand_wait_secs, supervisor,
     ],
 }
 
@@ -2467,6 +2965,214 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    // ---- 0.9.1 V5a: the per-model `sampling` object ----
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn entry_with(sampling: serde_json::Value) -> serde_json::Result<ModelEntry> {
+        serde_json::from_value(serde_json::json!({"vram_gb": 1.0, "sampling": sampling}))
+    }
+
+    /// `deny_unknown_fields`: a typo inside `sampling` is an error, not a silent no-op.
+    #[test]
+    fn sampling_typo_is_rejected() {
+        let err = entry_with(serde_json::json!({"temprature": 0.7}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("temprature"), "{err}");
+        let e = entry_with(serde_json::json!({"temperature": 0.7, "top_p": 0.8})).unwrap();
+        assert_eq!(e.policy.sampling.unwrap().top_p, Some(0.8));
+        // Absent and null are both "no operator layer".
+        let e: ModelEntry = serde_json::from_value(serde_json::json!({"vram_gb": 1.0})).unwrap();
+        assert_eq!(e.policy.sampling, None);
+        assert_eq!(
+            entry_with(serde_json::Value::Null).unwrap().policy.sampling,
+            None
+        );
+    }
+
+    #[test]
+    fn sampling_ranges_and_greedy_combination() {
+        let ok = [
+            serde_json::json!({"temperature": 0.0}),
+            serde_json::json!({"temperature": 2.0, "top_p": 1.0, "top_k": 1}),
+            serde_json::json!({"repetition_penalty": 1.0}),
+            serde_json::json!({"repetition_penalty": 2.0}),
+            serde_json::json!({"presence_penalty": -2.0, "frequency_penalty": 2.0}),
+            serde_json::json!({}),
+        ];
+        for s in ok {
+            let e = entry_with(s.clone()).unwrap();
+            assert!(validate_model_entry("m", &e).is_ok(), "{s}");
+        }
+        let bad = [
+            (serde_json::json!({"temperature": 2.1}), "temperature"),
+            (serde_json::json!({"temperature": -0.1}), "temperature"),
+            (
+                serde_json::json!({"temperature": 0.5, "top_p": 0.0}),
+                "top_p",
+            ),
+            (
+                serde_json::json!({"temperature": 0.5, "top_p": 1.1}),
+                "top_p",
+            ),
+            (serde_json::json!({"temperature": 0.5, "top_k": 0}), "top_k"),
+            (
+                serde_json::json!({"temperature": 0.0, "top_p": 0.9}),
+                "greedy",
+            ),
+            (
+                serde_json::json!({"temperature": 0.0, "top_k": 20}),
+                "greedy",
+            ),
+            (
+                serde_json::json!({"repetition_penalty": 0.9}),
+                "repetition_penalty",
+            ),
+            (
+                serde_json::json!({"repetition_penalty": 2.5}),
+                "repetition_penalty",
+            ),
+            (
+                serde_json::json!({"presence_penalty": 2.5}),
+                "presence_penalty",
+            ),
+            (
+                serde_json::json!({"frequency_penalty": -3.0}),
+                "frequency_penalty",
+            ),
+        ];
+        for (s, needle) in bad {
+            let e = entry_with(s.clone()).unwrap();
+            let err = validate_model_entry("m", &e).unwrap_err().to_string();
+            assert!(err.contains(needle), "{s}: {err}");
+        }
+    }
+
+    /// Operator `top_p`/`top_k` without a temperature: rejected unless the model's own file says
+    /// `do_sample: true` (a missing file counts as no `do_sample`); with a temperature, fine.
+    #[test]
+    fn sampling_top_p_without_temperature_needs_a_do_sample_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let top_p_only = entry_with(serde_json::json!({"top_p": 0.9})).unwrap();
+        let err = validate_sampling_against_file("m", &top_p_only, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do_sample"), "{err}");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.7, "top_k": 20}"#,
+        )
+        .unwrap();
+        assert!(validate_sampling_against_file("m", &top_p_only, dir.path()).is_err());
+        let with_t = entry_with(serde_json::json!({"temperature": 0.2, "top_p": 0.9})).unwrap();
+        assert!(validate_sampling_against_file("m", &with_t, dir.path()).is_ok());
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"do_sample": true, "temperature": 0.6, "top_k": 20}"#,
+        )
+        .unwrap();
+        assert!(validate_sampling_against_file("m", &top_p_only, dir.path()).is_ok());
+        // F6: `do_sample: true` with no temperature, or a package dropped for a bad value,
+        // leaves the engine at T 1.0 — counts as no `do_sample`.
+        for body in [
+            r#"{"do_sample": true, "top_k": 20}"#,
+            r#"{"do_sample": true, "temperature": 0.6, "top_p": 7.0}"#,
+        ] {
+            std::fs::write(dir.path().join("generation_config.json"), body).unwrap();
+            assert!(
+                validate_sampling_against_file("m", &top_p_only, dir.path()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    /// 0.9.1 `thinking_budget_tokens`: default `null` (in the model template too), an integer
+    /// >= 0 in a stanza, PATCH set / unchanged / `null` clears, all hot; negatives refused.
+    #[test]
+    fn thinking_budget_tokens_config_and_patch() {
+        let template = Config::default_model_template().unwrap();
+        assert_eq!(
+            template.get("thinking_budget_tokens"),
+            Some(&serde_json::Value::Null)
+        );
+        let e: ModelEntry = serde_json::from_value(
+            serde_json::json!({"vram_gb": 1.0, "thinking_budget_tokens": 0}),
+        )
+        .unwrap();
+        assert_eq!(e.policy.thinking_budget_tokens, Some(0));
+        assert!(
+            serde_json::from_value::<ModelEntry>(
+                serde_json::json!({"vram_gb": 1.0, "thinking_budget_tokens": -5})
+            )
+            .is_err()
+        );
+        let base = ModelEntry::default();
+        let set: ModelEntryPatch =
+            serde_json::from_value(serde_json::json!({"thinking_budget_tokens": 2048})).unwrap();
+        assert!(!set.is_empty());
+        let (merged, out) = set.apply_to(&base);
+        assert_eq!(merged.policy.thinking_budget_tokens, Some(2048));
+        assert_eq!(out.applied_live, vec!["thinking_budget_tokens"]);
+        let (_, again) = set.apply_to(&merged);
+        assert_eq!(again.unchanged, vec!["thinking_budget_tokens"]);
+        let clear: ModelEntryPatch =
+            serde_json::from_value(serde_json::json!({"thinking_budget_tokens": null})).unwrap();
+        assert!(!clear.is_empty(), "a null-only body is a clear, not empty");
+        let (cleared, out) = clear.apply_to(&merged);
+        assert_eq!(cleared.policy.thinking_budget_tokens, None);
+        assert_eq!(out.applied_live, vec!["thinking_budget_tokens"]);
+        assert!(
+            serde_json::from_value::<ModelEntryPatch>(
+                serde_json::json!({"thinking_budget_tokens": -1})
+            )
+            .is_err()
+        );
+    }
+
+    /// PATCH `sampling`: whole-object replace, hot; `null` clears; a null-only body is not empty.
+    #[test]
+    fn sampling_patch_replaces_whole_object_and_null_clears() {
+        let base = entry_with(serde_json::json!({"temperature": 0.7, "top_p": 0.8})).unwrap();
+        let p: ModelEntryPatch = serde_json::from_value(
+            serde_json::json!({"sampling": {"top_k": 5, "temperature": 1.0}}),
+        )
+        .unwrap();
+        let (merged, out) = p.apply_to(&base);
+        let s = merged.policy.sampling.unwrap();
+        assert_eq!(
+            (s.temperature, s.top_p, s.top_k),
+            (Some(1.0), None, Some(5))
+        );
+        assert_eq!(out.applied_live, vec!["sampling"]);
+        let clear: ModelEntryPatch =
+            serde_json::from_value(serde_json::json!({"sampling": null})).unwrap();
+        assert!(!clear.is_empty());
+        let (merged, _) = clear.apply_to(&base);
+        assert_eq!(merged.policy.sampling, None);
+        let typo = serde_json::from_value::<ModelEntryPatch>(
+            serde_json::json!({"sampling": {"temprature": 1.0}}),
+        );
+        assert!(typo.is_err());
+    }
+
+    /// The file-dependent `do_sample` rule never fails `Config::load` (boot, reload): a missing
+    /// model directory is skipped, a present one only WARNs.
+    #[test]
+    fn config_validate_skips_the_file_check_for_a_missing_model_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = serde_json::json!({
+            "models_dir": dir.path().join("models"), "device": "CPU", "total_vram_gb": 0.0,
+            "models": {"m": {"vram_gb": 0.0, "sampling": {"top_p": 0.9}}}
+        });
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        assert!(Config::load(&path).is_ok());
+        // With the directory present the rule is checked, but at load/boot it only WARNs
+        // (the model file can change on disk; coordinator ruling B).
+        std::fs::create_dir_all(dir.path().join("models").join("m")).unwrap();
+        assert!(Config::load(&path).is_ok());
+    }
 
     /// Step 6b: `load_timeout_secs` is 0 (off) or at least 60, globally and per model (the
     /// per-model check is the one `add_model` shares).
@@ -2495,6 +3201,52 @@ mod tests {
                 .unwrap()
                 .load_timeout_secs,
             600
+        );
+    }
+
+    /// F1b: `on_demand_wait_secs` defaults to 0, is at most 300 and below a
+    /// non-zero global `load_timeout_secs`; with `load_timeout_secs: 0` (no deadline) only the
+    /// 300 cap applies. The error names the key (boot refusal, exit 78).
+    #[test]
+    fn on_demand_wait_is_bounded_by_300_and_the_load_timeout() {
+        let base = r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":0.0"#;
+        for (extra, ok) in [
+            ("", true),
+            (r#","on_demand_wait_secs":0"#, true),
+            (r#","on_demand_wait_secs":120"#, true),
+            (r#","on_demand_wait_secs":300"#, true),
+            (r#","on_demand_wait_secs":301"#, false),
+            (r#","on_demand_wait_secs":18446744073709551615"#, false),
+            (r#","load_timeout_secs":60,"on_demand_wait_secs":59"#, true),
+            (r#","load_timeout_secs":60,"on_demand_wait_secs":60"#, false),
+            (r#","load_timeout_secs":60,"on_demand_wait_secs":61"#, false),
+            (r#","load_timeout_secs":0,"on_demand_wait_secs":300"#, true),
+            (r#","load_timeout_secs":0,"on_demand_wait_secs":301"#, false),
+        ] {
+            let cfg: Config = serde_json::from_str(&format!("{base}{extra}}}")).unwrap();
+            let r = cfg.validate();
+            assert_eq!(r.is_ok(), ok, "{extra}: {r:?}");
+            if let Err(e) = r {
+                assert!(e.to_string().contains("on_demand_wait_secs"), "{e}");
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<Config>(&format!("{base}}}"))
+                .unwrap()
+                .on_demand_wait_secs,
+            0
+        );
+    }
+
+    /// F1b: `on_demand_wait_secs` is a global a config reload does not apply: changing it in the
+    /// file is reported as needing a restart, like every other global.
+    #[test]
+    fn on_demand_wait_change_is_reported_as_not_applied_by_reload() {
+        let boot = minimal("");
+        let file = minimal(r#", "on_demand_wait_secs": 120"#);
+        assert_eq!(
+            globals_not_applied(&boot, &file),
+            vec!["on_demand_wait_secs".to_owned()]
         );
     }
 
@@ -2706,6 +3458,23 @@ mod tests {
 
     /// An unchanged file reports nothing — the common path must stay quiet, so
     /// the new field never adds noise to a routine model-only reload.
+    /// C8: the changed keys of a model stanza, by JSON name; an absent key equals `null`.
+    #[test]
+    fn model_entry_changes_names_the_changed_stanza_keys() {
+        let a: ModelEntry = serde_json::from_str(r#"{"vram_gb": 1.0}"#).unwrap();
+        let same: ModelEntry =
+            serde_json::from_str(r#"{"vram_gb": 1.0, "chat_template": null}"#).unwrap();
+        assert!(model_entry_changes(&a, &same).is_empty());
+        let b: ModelEntry = serde_json::from_str(
+            r#"{"vram_gb": 2.0, "chat_template": "templates/lfm2.jinja", "pinned": true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_entry_changes(&a, &b),
+            vec!["chat_template", "pinned", "vram_gb"]
+        );
+    }
+
     #[test]
     fn globals_not_applied_is_empty_when_nothing_changed() {
         let json = r#"{"models_dir":"/m","device":"GPU","total_vram_gb":22.5}"#;
@@ -2862,6 +3631,176 @@ mod tests {
         serde_json::from_str(&json).unwrap()
     }
 
+    /// Test gap (firmness review): every numeric setting `--print-default-config` prints, set to
+    /// `0`, either validates (and CONFIG.md says what 0 does) or is refused at boot. A new numeric
+    /// knob fails this test until it is classified here, so the next `0`-panics knob is caught.
+    #[test]
+    #[allow(clippy::too_many_lines)] // the two classification tables are the point
+    fn every_numeric_knob_at_zero_is_documented_or_refused() {
+        // Valid at 0; the comment is what 0 means (CONFIG.md says the same).
+        const ALLOWED: &[&str] = &[
+            "total_vram_gb",                           // the device's own memory / no gating
+            "max_num_seqs",                            // OV default (256)
+            "cache_size_gb",                           // uncapped KV pool
+            "default_kv_cache_gb",                     // unbounded
+            "vram_safety_margin_gb",                   // no margin
+            "min_kv_cache_gb",                         // no floor
+            "light_model_max_gb",                      // every LLM/VLM is "heavy"
+            "light_stt_max_gb",                        // no effect (kept for compatibility)
+            "dgpu_size_ceiling_fraction",              // default placement skips every dGPU
+            "eviction_grace_secs",                     // no grace window
+            "admission_queue_timeout_ms",              // no queueing: 429 at once when full
+            "device_admission_queue_timeout_ms",       // the same for device_budgets
+            "max_embedding_batch_tokens",              // no budget
+            "max_tokens_cap",                          // uncapped
+            "stream_first_token_timeout_secs",         // off
+            "stream_token_gap_timeout_secs",           // off
+            "port",                                    // the OS picks a free port
+            "ov_cache_max_gb",                         // unbounded
+            "kv_headroom_margin_gib",                  // no margin
+            "kv_headroom_inflight_tokens",             // every vision request holds a reservation
+            "kv_pressure_threshold_pct",               // unset (refused only with the monitor on)
+            "kv_pressure_sustained_secs",              // unset (refused only with the monitor on)
+            "kv_resize_cooldown_secs",                 // no cooldown
+            "load_timeout_secs",                       // no deadline
+            "on_demand_wait_secs",                     // no wait: 503 + Retry-After at once
+            "supervisor.backoff_base_secs",            // respawn without delay
+            "supervisor.backoff_max_secs",             // respawn without delay
+            "supervisor.hang_kill_grace_secs",         // floored at 1 s
+            "supervisor.watchdog_hang_ceiling_secs",   // generation watchdog off
+            "supervisor.gpu_first_load_deadline_secs", // off
+            "supervisor.gpu_probe_deadline_secs",      // probe off
+        ];
+        // Refused at 0 by `Config::validate` (exit 78 at boot).
+        const REFUSED: &[&str] = &[
+            "npu_footprint_factor",
+            "cpu_image_gen_max_pixels",
+            "max_audio_duration_secs",
+            "max_images_per_request",
+            "max_image_pixels_per_request",
+            "max_image_pixels",
+            "max_prompt_array",
+            "max_embedding_inputs",
+            "ov_cache_sweep_interval_secs",
+            "kv_transient_factor",
+            "kv_headroom_min_tokens",
+            "kv_pressure_sweep_interval_secs",
+            "supervisor.max_restarts",
+            "supervisor.restart_window_secs",
+            "supervisor.health_timeout_secs",
+            "supervisor.watchdog_poll_secs",
+        ];
+        fn numeric_paths(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+            if let Some(map) = v.as_object() {
+                for (k, child) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    if child.is_number() {
+                        out.push(path);
+                    } else {
+                        numeric_paths(child, &path, out);
+                    }
+                }
+            }
+        }
+        let template = Config::default_template().unwrap();
+        assert!(
+            serde_json::from_value::<Config>(template.clone())
+                .unwrap()
+                .validate()
+                .is_ok(),
+            "the template itself must validate"
+        );
+        let mut paths = Vec::new();
+        numeric_paths(&template, "", &mut paths);
+        let unclassified: Vec<&String> = paths
+            .iter()
+            .filter(|p| !ALLOWED.contains(&p.as_str()) && !REFUSED.contains(&p.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify these numeric settings at 0 (ALLOWED with a CONFIG.md line, or refused \
+             in Config::validate): {unclassified:?}"
+        );
+        for name in ALLOWED.iter().chain(REFUSED) {
+            assert!(
+                paths.iter().any(|p| p == name),
+                "{name} is not in the template"
+            );
+        }
+        for path in &paths {
+            let mut v = template.clone();
+            let mut slot = &mut v;
+            for part in path.split('.') {
+                slot = slot.get_mut(part).unwrap();
+            }
+            *slot = serde_json::json!(0);
+            let result = serde_json::from_value::<Config>(v)
+                .map_err(anyhow::Error::from)
+                .and_then(|c| c.validate());
+            if REFUSED.contains(&path.as_str()) {
+                let err = result.err().map(|e| e.to_string());
+                let err = err.unwrap_or_else(|| panic!("{path} at 0 must be refused"));
+                let leaf = path.rsplit('.').next().unwrap();
+                assert!(
+                    err.contains(leaf),
+                    "{path}: the error must name the key: {err}"
+                );
+            } else {
+                assert!(result.is_ok(), "{path} at 0 must validate: {result:?}");
+            }
+        }
+    }
+
+    /// FM-4: every config the repo ships (`scripts/*.config.json`: the bundle's example and the
+    /// fleet boxes') still loads and validates under the new interval rules.
+    #[test]
+    fn every_shipped_config_validates() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".config.json") {
+                continue;
+            }
+            Config::load(&path).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            checked += 1;
+        }
+        assert!(
+            checked >= 7,
+            "expected the shipped configs, found {checked}"
+        );
+    }
+
+    /// FM-4: the supervisor seconds fields and both sweep intervals are bounded at one year, so
+    /// the supervisor's sums and `Instant` additions cannot overflow.
+    #[test]
+    fn interval_knobs_have_an_upper_bound() {
+        for key in [
+            "\"supervisor\": {\"backoff_max_secs\": X}",
+            "\"supervisor\": {\"health_timeout_secs\": X}",
+            "\"supervisor\": {\"watchdog_hang_ceiling_secs\": X}",
+            "\"supervisor\": {\"gpu_probe_deadline_secs\": X}",
+            "\"ov_cache_sweep_interval_secs\": X",
+            "\"kv_pressure_sweep_interval_secs\": X",
+        ] {
+            let ok = minimal(&format!(
+                ", {}",
+                key.replace('X', &MAX_INTERVAL_SECS.to_string())
+            ));
+            assert!(ok.validate().is_ok(), "{key} at the bound");
+            for over in [MAX_INTERVAL_SECS + 1, u64::MAX] {
+                let cfg = minimal(&format!(", {}", key.replace('X', &over.to_string())));
+                let err = cfg.validate().unwrap_err().to_string();
+                assert!(err.contains("at most"), "{key}={over}: {err}");
+            }
+        }
+    }
+
     /// A typo of a security-critical key (`api_key`, `cors_origins`, …) is a
     /// hard error — the permissive defaults must never silently take over.
     #[test]
@@ -2908,34 +3847,63 @@ mod tests {
     }
 
     /// Public bind + no keys refuses to start unless explicitly opted in.
-    /// `enforce_open_bind_gate` takes `has_keys` as an explicit bool now (the
-    /// caller resolves it from the keys file, not from `Config` — see its doc
+    /// `enforce_open_bind_gate` takes the key presence as explicit bools (the
+    /// caller resolves them from the keys file, not from `Config` — see its doc
     /// comment) — no need to construct a `Config` with keys in it to test this.
     #[test]
     fn public_bind_without_auth_refuses_to_start() {
         let cfg = minimal(r#", "bind_addr": "0.0.0.0""#);
         let addr = cfg.validated_bind().unwrap();
         let err = cfg
-            .enforce_open_bind_gate(addr, false)
+            .enforce_open_bind_gate(addr, false, false)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("refusing to start"),
+            err.contains("refusing to start") && err.contains("no keys are configured"),
             "open public bind must abort: {err}"
         );
     }
 
-    /// Public bind is fine with `has_keys: true`, or with the explicit
-    /// insecure opt-in even with no keys.
+    /// 0.9.1 S3 (I-05): admin keys alone do not protect inference, so a public bind
+    /// with an admin-only keys file (what `rv start` creates) is refused, and the
+    /// refusal says why.
+    #[test]
+    fn public_bind_with_only_admin_keys_refuses_to_start() {
+        let cfg = minimal(r#", "bind_addr": "0.0.0.0""#);
+        let addr = cfg.validated_bind().unwrap();
+        let err = cfg
+            .enforce_open_bind_gate(addr, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to start") && err.contains("no api_keys"),
+            "admin-only keys on a public bind must abort: {err}"
+        );
+        // An IPv6 wildcard is a network bind too.
+        let v6 = minimal(r#", "bind_addr": "::""#);
+        let addr = v6.validated_bind().unwrap();
+        assert!(v6.enforce_open_bind_gate(addr, false, true).is_err());
+    }
+
+    /// Public bind is fine with inference keys (with or without admin keys), or with
+    /// the explicit insecure opt-in even with no keys or admin keys only. Loopback
+    /// never needs keys.
     #[test]
     fn public_bind_allowed_with_keys_or_explicit_opt_in() {
         let cfg = minimal(r#", "bind_addr": "0.0.0.0""#);
         let addr = cfg.validated_bind().unwrap();
-        assert!(cfg.enforce_open_bind_gate(addr, true).is_ok());
+        assert!(cfg.enforce_open_bind_gate(addr, true, false).is_ok());
+        assert!(cfg.enforce_open_bind_gate(addr, true, true).is_ok());
 
         let opted_in = minimal(r#", "bind_addr": "0.0.0.0", "allow_insecure_public_bind": true"#);
         let addr = opted_in.validated_bind().unwrap();
-        assert!(opted_in.enforce_open_bind_gate(addr, false).is_ok());
+        assert!(opted_in.enforce_open_bind_gate(addr, false, false).is_ok());
+        assert!(opted_in.enforce_open_bind_gate(addr, false, true).is_ok());
+
+        let loopback = minimal("");
+        let addr = loopback.validated_bind().unwrap();
+        assert!(loopback.enforce_open_bind_gate(addr, false, true).is_ok());
+        assert!(loopback.enforce_open_bind_gate(addr, false, false).is_ok());
     }
 
     /// A non-empty `api_keys`/`admin_api_keys` in `config.json` is a
@@ -3009,6 +3977,73 @@ mod tests {
             r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0,"models":{"m":{"vram_gb":5.5}}}"#,
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    /// 0.9.1 C28: `max_image_pixels` defaults to 4 000 000 (also what `--print-default-config`,
+    /// and so `scripts/fill-config-defaults.py`, writes out); 0 and anything under 65 536 are
+    /// refused at load; a value above `max_image_pixels_per_request` is allowed (never fires).
+    #[test]
+    fn max_image_pixels_default_and_validation() {
+        let base = r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0"#;
+        let cfg = from_json(&format!("{base}}}"));
+        assert_eq!(cfg.max_image_pixels, 4_000_000);
+        assert_eq!(
+            Config::default_template().unwrap()["max_image_pixels"],
+            serde_json::json!(4_000_000)
+        );
+        for (v, ok) in [
+            (0_u64, false),
+            (65_535, false),
+            (65_536, true),
+            (4_000_000, true),
+            (1 << 40, true),
+        ] {
+            let cfg = from_json(&format!(r#"{base},"max_image_pixels":{v}}}"#));
+            let r = cfg.validate();
+            assert_eq!(r.is_ok(), ok, "{v}: {r:?}");
+            if let Err(e) = r {
+                assert!(e.to_string().contains("max_image_pixels"), "{e}");
+            }
+        }
+    }
+
+    /// 0.9.1 S1: the stall watchdog keys default to 600 / 120 s (also what
+    /// `--print-default-config`, and so `scripts/fill-config-defaults.py`, writes out); `0` turns
+    /// each one off and is accepted, like any other value; both are restart-only.
+    #[test]
+    fn stream_watchdog_keys_default_and_zero() {
+        let base = r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":16.0"#;
+        let cfg = from_json(&format!("{base}}}"));
+        assert_eq!(cfg.stream_first_token_timeout_secs, 600);
+        assert_eq!(cfg.stream_token_gap_timeout_secs, 120);
+        let tpl = Config::default_template().unwrap();
+        assert_eq!(
+            tpl["stream_first_token_timeout_secs"],
+            serde_json::json!(600)
+        );
+        assert_eq!(tpl["stream_token_gap_timeout_secs"], serde_json::json!(120));
+        let cfg = from_json(&format!(
+            r#"{base},"stream_first_token_timeout_secs":0,"stream_token_gap_timeout_secs":0}}"#
+        ));
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            (
+                cfg.stream_first_token_timeout_secs,
+                cfg.stream_token_gap_timeout_secs
+            ),
+            (0, 0)
+        );
+        let mut file = from_json(&format!("{base}}}"));
+        let boot = from_json(&format!("{base}}}"));
+        file.stream_first_token_timeout_secs = 5;
+        file.stream_token_gap_timeout_secs = 2;
+        assert_eq!(
+            globals_not_applied(&boot, &file),
+            vec![
+                "stream_first_token_timeout_secs".to_owned(),
+                "stream_token_gap_timeout_secs".to_owned()
+            ]
+        );
     }
 
     /// Negative `total_vram_gb` is rejected (would inflate the usable pool).
@@ -3641,6 +4676,62 @@ mod tests {
             err.contains("vram_gb > 0.0"),
             "must name the zero-vram gate: {err}"
         );
+    }
+
+    /// FM-7: `speculative.draft_model` is joined onto `models_dir` like a model id, so it gets the
+    /// same plain-folder-name check (a `../x`, an absolute path or a drive letter would read model
+    /// files outside `models_dir`).
+    #[test]
+    fn speculative_draft_model_must_be_a_plain_folder_name() {
+        for bad in ["../x", "/abs/draft", "a/b", "a\\b", "..", "C:", "c:draft"] {
+            let mut e: ModelEntry = serde_json::from_str(
+                r#"{"vram_gb": 15.0, "speculative": {"draft_model": "d", "draft_vram_gb": 0.8}}"#,
+            )
+            .unwrap();
+            e.policy.speculative.as_mut().unwrap().draft_model = bad.to_owned();
+            let err = validate_model_entry("t", &e).unwrap_err().to_string();
+            assert!(err.contains("draft_model"), "{bad}: {err}");
+        }
+    }
+
+    /// P-C (firmness leftover): a config `models` id gets the same plain-folder-name check at
+    /// validation (boot: `Config::load` fails, exit 78; config reload: 422) as `models/add`
+    /// gives; `qwen:7b` and dotted names stay allowed.
+    #[test]
+    fn config_model_ids_must_be_plain_folder_names() {
+        let base = r#"{"models_dir":"/tmp/m","device":"CPU","total_vram_gb":0.0,"models":"#;
+        for (id, ok) in [
+            ("qwen3-8b-int4-ov", true),
+            ("qwen:7b", true),
+            ("v1.2_model", true),
+            ("../x", false),
+            ("/abs/model", false),
+            ("a/b", false),
+            ("a\\\\b", false),
+            ("..", false),
+            (".", false),
+            ("", false),
+            ("C:", false),
+            ("c:model", false),
+        ] {
+            let text = format!(r#"{base}{{"{id}":{{"vram_gb":0.0}}}}}}"#);
+            let cfg: Config = serde_json::from_str(&text).unwrap();
+            let r = cfg.validate();
+            assert_eq!(r.is_ok(), ok, "{id}: {r:?}");
+            if let Err(e) = r {
+                assert!(e.to_string().contains("directly inside"), "{id}: {e}");
+            }
+        }
+        // Through the boot path: `Config::load` refuses the file (main maps it to exit 78).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            format!(r#"{base}{{"../escape":{{"vram_gb":0.0}}}}}}"#),
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("../escape"), "{err:#}");
     }
 
     /// An unknown field inside the `speculative` block is a hard deserialize
